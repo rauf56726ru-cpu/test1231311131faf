@@ -1,0 +1,48 @@
+{
+  "params": {
+    "objective": "multi:softprob",
+    "eval_metric": "mlogloss",
+    "tree_method": "hist",
+    "verbosity": 0,
+    "n_estimators": 511,
+    "max_depth": 6,
+    "learning_rate": 0.015035675976038158,
+    "subsample": 0.626542421069039,
+    "colsample_bytree": 0.5470113155686288,
+    "min_child_weight": 8.301345840048699,
+    "gamma": 4.674844046326873,
+    "num_class": 2
+  },
+  "study_best_value": 0.015192158031155811,
+  "trials": 7,
+  "class_order": [
+    -1,
+    0,
+    1
+  ],
+  "present_class_indices": [
+    1,
+    2
+  ],
+  "present_classes": [
+    0,
+    1
+  ],
+  "vol_thresholds": {
+    "low": 0.0,
+    "high": 0.0
+  },
+  "grey_zone": {
+    "default": [
+      0.45,
+      0.55
+    ],
+    "med": [
+      0.45,
+      0.55
+    ]
+  },
+  "temperatures": {
+    "med": 1.0
+  }
+}

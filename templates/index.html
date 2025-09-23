@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Autotrading Dashboard</title>
+  <link rel="stylesheet" href="/public/styles.css" />
+  <script src="/public/binanceCandles.js" defer></script>
+</head>
+<body data-page="index">
+  <header class="page-header">
+    <h1>Autotrading Control Center</h1>
+    <p>Заполните параметры и запустите поток предсказаний.</p>
+  </header>
+
+  <main class="card">
+    <form id="launch-form" class="grid-form">
+      <div class="form-field">
+        <label for="symbol">Тикер</label>
+        <input id="symbol" name="symbol" type="text" required value="{{ symbol }}" placeholder="BTCUSDT" />
+      </div>
+
+      <div class="form-field">
+        <label for="interval">Интервал</label>
+        <input list="interval-presets" id="interval" name="interval" required value="{{ interval }}" />
+        <datalist id="interval-presets">
+          <option value="1m"></option>
+          <option value="3m"></option>
+          <option value="5m"></option>
+          <option value="15m"></option>
+          <option value="1h"></option>
+          <option value="4h"></option>
+        </datalist>
+      </div>
+
+      <div class="form-field">
+        <label for="model-family">Тип модели</label>
+        <select id="model-family" name="model_family">
+          {% for family in model_families %}
+          <option value="{{ family }}" {% if family == model_family %}selected{% endif %}>{{ family }}</option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div class="form-field">
+        <label for="model-name">Версия модели</label>
+        <select id="model-name" name="model_name">
+          {% for name in model_names %}
+          <option value="{{ name }}" {% if name == model_name %}selected{% endif %}>{{ name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div class="form-field">
+        <label for="text-embedder">Текстовый эмбеддер</label>
+        <select id="text-embedder" name="text_embedder">
+          {% for embedder in allowed_text_models %}
+          <option value="{{ embedder }}" {% if embedder == text_model %}selected{% endif %}>{{ embedder }}</option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div class="form-field checkbox-field">
+        <label class="checkbox">
+          <input type="checkbox" id="paper-mode" name="paper" value="1" {% if paper_mode %}checked{% endif %} />
+          Бумажный режим
+        </label>
+      </div>
+
+      <div class="form-actions">
+        <button type="submit" class="btn-primary">Начать</button>
+      </div>
+    </form>
+  </main>
+
+  <footer class="page-footer">
+    <p>Autotrading prototype &mdash; управление моделью и памятью в один клик.</p>
+  </footer>
+
+  <script src="/public/app.js" defer></script>
+</body>
+</html>
