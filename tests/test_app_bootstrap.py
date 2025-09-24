@@ -71,6 +71,73 @@ def test_market_provider_reuses_persisted_history(tmp_path, monkeypatch):
     asyncio.run(runner())
 
 
+def test_fetch_gap_fills_internal_missing_segments(monkeypatch):
+    async def runner() -> None:
+        provider = MarketDataProvider()
+        symbol = "BTCUSDT"
+        interval = "1m"
+        interval_ms = 60_000
+        base_rows = []
+        for idx in range(10):
+            open_time = idx * interval_ms
+            base_rows.append(
+                [
+                    open_time,
+                    100.0 + idx,
+                    101.0 + idx,
+                    99.0 + idx,
+                    100.5 + idx,
+                    10.0 + idx,
+                    open_time + interval_ms - 1,
+                ]
+            )
+
+        missing_indices = {3, 4, 5}
+        seeded = []
+        for idx, row in enumerate(base_rows):
+            if idx in missing_indices:
+                continue
+            seeded.append(
+                {
+                    "ts_ms_utc": row[0],
+                    "open": row[1],
+                    "high": row[2],
+                    "low": row[3],
+                    "close": row[4],
+                    "volume": row[5],
+                }
+            )
+
+        key = provider._key(symbol, interval)
+        provider._history[key] = list(seeded)
+
+        calls = []
+
+        async def fake_fetch(symbol_arg, interval_arg, limit=1000, start_time=None, end_time=None):
+            assert symbol_arg == symbol
+            assert interval_arg == interval
+            calls.append((int(start_time or 0), int(end_time or 0)))
+            filtered = [
+                row
+                for row in base_rows
+                if (start_time is None or row[0] >= start_time) and (end_time is None or row[0] <= end_time)
+            ]
+            return filtered
+
+        monkeypatch.setattr("src.live.market.fetch_klines", fake_fetch)
+
+        start_ms = base_rows[0][0]
+        end_ms = base_rows[-1][0]
+        candles = await provider.fetch_gap(symbol, interval, start_ms, end_ms)
+
+        assert calls, "expected fetch to be invoked for internal gap"
+        first_call = calls[0]
+        assert first_call[0] <= base_rows[3][0] <= first_call[1]
+        assert sorted(bar["ts_ms_utc"] for bar in candles) == [row[0] for row in base_rows]
+
+    asyncio.run(runner())
+
+
 def test_aggregated_history_uses_cached_minute(monkeypatch):
     async def runner() -> None:
         provider = MarketDataProvider()

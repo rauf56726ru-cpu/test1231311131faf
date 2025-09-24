@@ -279,7 +279,14 @@ class MarketDataProvider:
                 end_time=current_end,
             )
             if not raw:
-                break
+                next_start = current_end + fetch_interval_ms
+                if next_start <= current_start:
+                    break
+                if next_start > fetch_end:
+                    break
+                current_start = next_start
+                current_end = min(self._chunk_end(current_start, fetch_interval, fetch_limit), fetch_end)
+                continue
             rows.extend(raw)
             last_row = raw[-1] if raw else None
             last_open = int(last_row[0]) if last_row and isinstance(last_row[0], (int, float)) else None
@@ -509,29 +516,82 @@ class MarketDataProvider:
             return [dict(bar) for bar in candles]
 
         interval_ms = self._interval_ms(interval)
+        if interval_ms <= 0:
+            interval_ms = max(self._interval_ms("1m"), 1)
         segments: List[Tuple[int, int]] = []
         async with self._acquire_key(key):
             await self._hydrate_from_store(key, symbol, interval)
             candles = list(self._history.get(key, []))
-            if not candles:
+            timestamps = []
+            for bar in candles:
+                try:
+                    ts_val = int(bar["ts_ms_utc"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                timestamps.append(ts_val)
+            if not timestamps:
                 segments.append((start, end))
             else:
+                ordered = sorted(set(timestamps))
+                in_range = [ts for ts in ordered if start <= ts <= end]
+                if not in_range:
+                    segments.append((start, end))
+                else:
+                    first_ts = in_range[0]
+                    if first_ts - start >= interval_ms:
+                        gap_start = start
+                        gap_end = first_ts - interval_ms
+                        if gap_end >= gap_start:
+                            segments.append((gap_start, gap_end))
+                    prev_ts = first_ts
+                    for ts in in_range[1:]:
+                        if ts <= prev_ts:
+                            prev_ts = ts
+                            continue
+                        delta = ts - prev_ts
+                        if delta > interval_ms:
+                            missing_start = prev_ts + interval_ms
+                            missing_end = ts - interval_ms
+                            if missing_end >= start and missing_start <= end:
+                                gap_start = max(start, missing_start)
+                                gap_end = min(end, missing_end)
+                                if gap_end >= gap_start:
+                                    segments.append((gap_start, gap_end))
+                        prev_ts = ts
+                    if prev_ts + interval_ms <= end:
+                        gap_start = prev_ts + interval_ms
+                        gap_end = end
+                        if gap_end >= gap_start:
+                            segments.append((gap_start, gap_end))
+        normalized_segments: List[Tuple[int, int]] = []
+        if segments:
+            normalized = []
+            for seg_start, seg_end in segments:
                 try:
-                    earliest = int(candles[0]["ts_ms_utc"])
-                    latest = int(candles[-1]["ts_ms_utc"])
-                except (KeyError, TypeError, ValueError, IndexError):
-                    earliest = start
-                    latest = start
-                if start < earliest:
-                    gap_end = min(end, earliest - interval_ms)
-                    if gap_end >= start:
-                        segments.append((start, gap_end))
-                if end > latest:
-                    gap_start = max(start, latest + interval_ms)
-                    if gap_start <= end:
-                        segments.append((gap_start, end))
+                    norm_start = int(seg_start)
+                    norm_end = int(seg_end)
+                except (TypeError, ValueError):
+                    continue
+                if norm_end < norm_start:
+                    continue
+                norm_start = max(start, norm_start)
+                norm_end = min(end, norm_end)
+                if norm_end < norm_start:
+                    continue
+                normalized.append((norm_start, norm_end))
+            if normalized:
+                normalized.sort()
+                merged: List[List[int]] = []
+                for seg_start, seg_end in normalized:
+                    if not merged or seg_start > merged[-1][1] + interval_ms:
+                        merged.append([seg_start, seg_end])
+                    else:
+                        merged[-1][1] = max(merged[-1][1], seg_end)
+                normalized_segments = [(seg[0], seg[1]) for seg in merged]
+        else:
+            normalized_segments = []
         fetched_any = False
-        for seg_start, seg_end in segments:
+        for seg_start, seg_end in normalized_segments:
             if seg_start > seg_end:
                 continue
             batch = await self._fetch_range(symbol, interval, seg_start, seg_end)
