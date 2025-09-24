@@ -18,6 +18,7 @@
   const lastTimeEl = document.getElementById("last-time");
   const lastPriceEl = document.getElementById("last-price");
   const rangeEl = document.getElementById("last-range");
+  const versionEl = document.getElementById("app-version");
 
   if (!chartContainer || !form || !symbolInput || !intervalInput) {
     console.error("Chart container or controls are missing in the DOM");
@@ -82,6 +83,22 @@
     statusEl.textContent = message || "";
     statusEl.dataset.variant = variant;
     statusEl.hidden = !message;
+  }
+
+  async function fetchVersion() {
+    if (!versionEl) return;
+    try {
+      const response = await fetch("/version");
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      const data = await response.json();
+      const version = data && typeof data.version === "string" ? data.version : null;
+      versionEl.textContent = version || "—";
+    } catch (error) {
+      console.warn("Failed to fetch version", error);
+      versionEl.textContent = "—";
+    }
   }
 
   function normaliseBar(bar) {
@@ -426,5 +443,6 @@
     }
   });
 
+  fetchVersion();
   loadSymbol(state.symbol, state.interval);
 })();
