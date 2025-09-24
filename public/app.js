@@ -178,6 +178,28 @@
     updateInfo(lastBar);
   }
 
+  function focusOnLastCandle({ preserveSpan = true } = {}) {
+    if (!state.chart || !state.candles.length) return;
+    const timeScale = state.chart.timeScale();
+    const lastIndex = state.candles.length - 1;
+    let span = 150;
+    if (preserveSpan) {
+      const logicalRange = timeScale.getVisibleLogicalRange();
+      if (logicalRange) {
+        const currentSpan = Number(logicalRange.to) - Number(logicalRange.from);
+        if (Number.isFinite(currentSpan) && currentSpan > 0) {
+          span = currentSpan;
+        }
+      }
+    }
+    const safeSpan = Math.max(25, Math.round(span));
+    const padding = Math.max(2, Math.round(safeSpan * 0.05));
+    const from = Math.max(0, lastIndex - safeSpan);
+    const to = lastIndex + padding;
+    timeScale.setVisibleLogicalRange({ from, to });
+    timeScale.scrollToRealTime();
+  }
+
   function detachWs() {
     if (state.ws) {
       state.ws.onopen = null;
@@ -372,7 +394,7 @@
       const history = await fetchHistory(normalizedSymbol, normalizedInterval, 1000);
       mergeCandles(history, { reset: true });
       applyCandles();
-      state.chart.timeScale().fitContent();
+      focusOnLastCandle({ preserveSpan: false });
       if (state.gapWatcher && typeof state.gapWatcher.updateContext === "function") {
         state.gapWatcher.updateContext({
           symbol: state.symbol,
