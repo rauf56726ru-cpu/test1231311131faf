@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import asyncio
 
+from pathlib import Path
+
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 
 from ..services import (
     TIMEFRAME_WINDOWS,
@@ -18,6 +21,10 @@ from ..services import (
 )
 from ..version import APP_VERSION
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PUBLIC_DIR = PROJECT_ROOT / "public"
+TEMPLATES_DIR = PROJECT_ROOT / "templates"
+
 app = FastAPI(title="Chart OHLC API")
 
 app.add_middleware(
@@ -26,6 +33,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+if PUBLIC_DIR.is_dir():
+    app.mount("/public", StaticFiles(directory=PUBLIC_DIR), name="public")
 
 
 def _render_services_page() -> str:
@@ -238,3 +248,14 @@ async def health() -> dict[str, str]:
 @app.get("/version")
 async def version() -> dict[str, str]:
     return {"version": APP_VERSION}
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index() -> HTMLResponse:
+    try:
+        html = TEMPLATES_DIR.joinpath("index.html").read_text(encoding="utf-8")
+    except FileNotFoundError as exc:  # pragma: no cover - deployment guard
+        raise HTTPException(status_code=500, detail="Index template is missing") from exc
+    return HTMLResponse(content=html)
+
+
