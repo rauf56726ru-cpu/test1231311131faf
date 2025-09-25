@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import html as html_utils
 import json
-from collections import OrderedDict
-from datetime import datetime, timezone
+from collections import OrderedDict, defaultdict
+from datetime import datetime, timezone, timedelta, time as dtime
 import math
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple, DefaultDict
 
 from .ohlc import TIMEFRAME_WINDOWS, TIMEFRAME_TO_MS, normalise_ohlcv
+from ..meta import Meta
 
 Snapshot = Dict[str, Any]
 
@@ -70,6 +71,26 @@ def build_placeholder_snapshot(*, symbol: str = DEFAULT_SYMBOL, timeframe: str =
         window = min(40, len(candles))
         selection = {"start": candles[-window]["t"], "end": candles[-1]["t"]}
 
+    agg_trades: List[Dict[str, Any]] = []
+    sample = candles[-80:] if candles else []
+    for candle in sample:
+        ts = int(candle["t"])
+        close = float(candle.get("c", candle.get("o", 0.0)))
+        open_ = float(candle.get("o", close))
+        qty = max(0.01, abs(close - open_) / max(1.0, interval_ms / 60_000))
+        trade_time = ts + interval_ms // 2
+        agg_trades.append({
+            "t": trade_time,
+            "p": round(close, 2),
+            "q": round(qty, 4),
+            "side": "buy" if close >= open_ else "sell",
+        })
+
+    agg_payload = {
+        "symbol": symbol.upper(),
+        "agg": agg_trades,
+    }
+
     return {
         "id": "placeholder",
         "symbol": symbol.upper(),
@@ -77,10 +98,104 @@ def build_placeholder_snapshot(*, symbol: str = DEFAULT_SYMBOL, timeframe: str =
         "frames": {timeframe_key: {"tf": timeframe_key, "candles": candles}},
         "captured_at": datetime.now(timezone.utc).isoformat(),
         "selection": selection,
+        "agg_trades": agg_payload,
         "meta": {"source": {"kind": "placeholder", "generated": True}},
     }
 
 
+
+
+def _in_session(moment: dtime, start: dtime, end: dtime) -> bool:
+    if start <= end:
+        return start <= moment < end
+    return moment >= start or moment < end
+
+
+def _compute_vwap_value(entries: Iterable[Mapping[str, Any]]) -> float | None:
+    total_pv = 0.0
+    total_volume = 0.0
+    for entry in entries:
+        high = float(entry.get("h", entry.get("high", 0.0)))
+        low = float(entry.get("l", entry.get("low", 0.0)))
+        close = float(entry.get("c", entry.get("close", 0.0)))
+        volume = float(entry.get("v", entry.get("volume", 0.0)))
+        typical_price = (high + low + close) / 3.0
+        total_pv += typical_price * volume
+        total_volume += volume
+    if total_volume <= 0.0:
+        return None
+    return total_pv / total_volume
+
+
+def compute_session_vwaps(symbol: str, candles: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Compute VWAP for daily and configured sessions across recent days."""
+
+    if not candles:
+        return {"symbol": symbol.upper(), "vwap": []}
+
+    bars: List[Tuple[int, float, float, float, float]] = []
+    for candle in candles:
+        if not isinstance(candle, Mapping):
+            continue
+        raw_ts = (
+            candle.get("t")
+            or candle.get("time")
+            or candle.get("openTime")
+        )
+        if raw_ts is None:
+            continue
+        try:
+            open_ms = int(raw_ts)
+            high = float(candle.get("h", candle.get("high", 0.0)))
+            low = float(candle.get("l", candle.get("low", 0.0)))
+            close = float(candle.get("c", candle.get("close", 0.0)))
+            volume = float(candle.get("v", candle.get("volume", 0.0)))
+        except (TypeError, ValueError):
+            continue
+        bars.append((open_ms, high, low, close, volume))
+
+    if not bars:
+        return {"symbol": symbol.upper(), "vwap": []}
+
+    bars.sort(key=lambda item: item[0])
+    last_date = datetime.fromtimestamp(bars[-1][0] / 1000.0, tz=timezone.utc).date()
+    lookback = max(1, int(Meta.VWAP_LOOKBACK_DAYS))
+    start_date = last_date - timedelta(days=lookback - 1)
+    sessions = list(Meta.iter_vwap_sessions())
+
+    daily_buckets: defaultdict = defaultdict(list)  # type: ignore[var-annotated]
+    session_buckets: DefaultDict[Tuple[datetime.date, str], List[Mapping[str, Any]]] = defaultdict(list)
+
+    for open_ms, high, low, close, volume in bars:
+        dt = datetime.fromtimestamp(open_ms / 1000.0, tz=timezone.utc)
+        if dt.date() < start_date:
+            continue
+        entry = {"h": high, "l": low, "c": close, "v": volume}
+        daily_buckets[dt.date()].append(entry)
+        moment = dt.time()
+        for session_name, start_time, end_time in sessions:
+            if _in_session(moment, start_time, end_time):
+                session_buckets[(dt.date(), session_name)].append(entry)
+
+    ordered_dates = sorted(daily_buckets.keys())
+    if len(ordered_dates) > lookback:
+        ordered_dates = ordered_dates[-lookback:]
+
+    results: List[Dict[str, object]] = []
+    for date_key in ordered_dates:
+        daily_value = _compute_vwap_value(daily_buckets[date_key])
+        if daily_value is not None:
+            results.append({"date": date_key.isoformat(), "session": "daily", "value": daily_value})
+        for session_name, _, _ in sessions:
+            entries = session_buckets.get((date_key, session_name))
+            if not entries:
+                continue
+            session_value = _compute_vwap_value(entries)
+            if session_value is None:
+                continue
+            results.append({"date": date_key.isoformat(), "session": session_name, "value": session_value})
+
+    return {"symbol": symbol.upper(), "vwap": results}
 def _coerce_frame(tf_key: str, frame: Mapping[str, Any] | Sequence[Any]) -> Dict[str, Any]:
     if tf_key not in TIMEFRAME_WINDOWS:
         raise ValueError(f"Unsupported timeframe: {tf_key}")
@@ -168,7 +283,7 @@ def register_snapshot(snapshot: Mapping[str, Any]) -> str:
     if selection_data:
         stored["selection"] = selection_data
 
-    for key in ("delta", "vwap", "zones", "smt"):
+    for key in ("delta", "vwap", "zones", "smt", "agg_trades"):
         if key in snapshot:
             stored[key] = snapshot[key]
 
@@ -310,10 +425,22 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
             "value": _compute_vwap(filtered_candles),
         }
 
+    base_candles: Sequence[Mapping[str, Any]] = normalised_frames.get("1m", {}).get("candles", [])
+    if not base_candles and normalised_frames:
+        first_key = next(iter(normalised_frames))
+        base_candles = normalised_frames[first_key].get("candles", [])
+    session_vwap = compute_session_vwaps(symbol, base_candles)
+
     data_section = {
         "symbol": symbol,
         "frames": normalised_frames,
         "selection": selection,
+        "session_vwap": session_vwap,
+        "agg_trades": snapshot.get("agg_trades")
+        or {
+            "status": "unavailable",
+            "detail": "Agg trade data is not present in the snapshot.",
+        },
         "delta_cvd": delta_frames,
         "vwap_tpo": vwap_frames,
         "zones": snapshot.get("zones")
@@ -1327,11 +1454,29 @@ def render_inspection_page(
         const candles = await fetchCandles(resolvedSymbol, tf, selectionStart, selectionEnd);
         framesPayload[tf] = { tf, candles };
       }
+      const baseFrame = uniqueFrames[0] || Object.keys(framesPayload)[0];
+      const baseCandles = (baseFrame && framesPayload[baseFrame]?.candles) || [];
+      const intervalMs = TIMEFRAME_TO_MS[baseFrame] || 60000;
+      const aggTrades = [];
+      for (const candle of baseCandles || []) {
+        const rawTs = Number(candle?.t ?? candle?.time ?? 0);
+        if (!Number.isFinite(rawTs)) continue;
+        const open = Number(candle?.o ?? candle?.open ?? 0);
+        const close = Number(candle?.c ?? candle?.close ?? open);
+        const qty = Math.max(0.01, Math.abs(close - open) / Math.max(1, intervalMs / 60_000));
+        aggTrades.push({
+          t: rawTs + Math.floor(intervalMs / 2),
+          p: Number.isFinite(close) ? Number(close.toFixed(2)) : Number(open.toFixed(2)),
+          q: Number(qty.toFixed(4)),
+          side: close >= open ? "buy" : "sell",
+        });
+      }
       const payload = {
         id: `test-${Date.now()}`,
         symbol: resolvedSymbol,
         frames: framesPayload,
         selection: { start: selectionStart, end: selectionEnd },
+        agg_trades: { symbol: resolvedSymbol, agg: aggTrades },
         meta: {
           source: {
             kind: source,
@@ -1624,6 +1769,8 @@ def render_inspection_page(
           part = state.payload?.DATA?.zones;
         } else if (metric === "smt") {
           part = state.payload?.DATA?.smt;
+        } else if (metric === "agg") {
+          part = state.payload?.DATA?.agg_trades;
         }
         setJson(metricPre, part);
       });
@@ -1798,6 +1945,7 @@ def render_inspection_page(
               <button class=\"secondary\" type=\"button\" data-metric=\"vwap\">VWAP</button>
               <button class=\"secondary\" type=\"button\" data-metric=\"zones\">Zones</button>
               <button class=\"secondary\" type=\"button\" data-metric=\"smt\">SMT</button>
+              <button class=\"secondary\" type=\"button\" data-metric=\"agg\">Agg Trades</button>
             </div>
             <div class=\"json-panels\">
               <div class=\"collapse\">
