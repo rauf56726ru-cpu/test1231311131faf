@@ -5,9 +5,10 @@ import html as html_utils
 import json
 from collections import OrderedDict
 from datetime import datetime, timezone
+import math
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence
 
-from .ohlc import TIMEFRAME_WINDOWS, normalise_ohlcv
+from .ohlc import TIMEFRAME_WINDOWS, TIMEFRAME_TO_MS, normalise_ohlcv
 
 Snapshot = Dict[str, Any]
 
@@ -24,6 +25,60 @@ def _now_iso() -> str:
 def _ensure_snapshot_limit() -> None:
     while len(_SNAPSHOT_STORE) > _MAX_STORED_SNAPSHOTS:
         _SNAPSHOT_STORE.popitem(last=False)
+
+
+def build_placeholder_snapshot(*, symbol: str = DEFAULT_SYMBOL, timeframe: str = "1m") -> Snapshot:
+    """Create a synthetic snapshot used to populate the inspection UI by default."""
+
+    timeframe_key = timeframe.lower()
+    if timeframe_key not in TIMEFRAME_TO_MS:
+        timeframe_key = "1m"
+    interval_ms = TIMEFRAME_TO_MS[timeframe_key]
+
+    total_candles = 120
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    start_ms = now_ms - (total_candles - 1) * interval_ms
+
+    base_price = 100_000.0
+    candles = []
+    rolling_price = base_price
+    for idx in range(total_candles):
+        ts = start_ms + idx * interval_ms
+        wave = math.sin(idx / 6.0) * 140.0
+        drift = idx * 6.5
+        open_price = rolling_price + wave + drift
+        close_variation = math.sin(idx / 3.5) * 60.0 + math.cos(idx / 5.0) * 35.0
+        close_price = max(1.0, open_price + close_variation)
+        high_price = max(open_price, close_price) + abs(math.sin(idx / 4.5)) * 55.0
+        low_price = min(open_price, close_price) - abs(math.cos(idx / 3.8)) * 55.0
+        volume = 180.0 + abs(math.sin(idx / 4.2)) * 90.0
+
+        candles.append(
+            {
+                "t": ts,
+                "o": round(open_price, 2),
+                "h": round(high_price, 2),
+                "l": round(low_price, 2),
+                "c": round(close_price, 2),
+                "v": round(volume, 2),
+            }
+        )
+        rolling_price = close_price
+
+    selection = None
+    if candles:
+        window = min(40, len(candles))
+        selection = {"start": candles[-window]["t"], "end": candles[-1]["t"]}
+
+    return {
+        "id": "placeholder",
+        "symbol": symbol.upper(),
+        "tf": timeframe_key,
+        "frames": {timeframe_key: {"tf": timeframe_key, "candles": candles}},
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "selection": selection,
+        "meta": {"source": {"kind": "placeholder", "generated": True}},
+    }
 
 
 def _coerce_frame(tf_key: str, frame: Mapping[str, Any] | Sequence[Any]) -> Dict[str, Any]:
@@ -317,6 +372,33 @@ def render_inspection_page(
             f'<option value="{html_utils.escape(tf_key)}"{selected}>{html_utils.escape(tf_key)}</option>'
         )
 
+
+    data_section = payload.get("DATA") if isinstance(payload, Mapping) else None
+    diagnostics_section = payload.get("DIAGNOSTICS") if isinstance(payload, Mapping) else None
+
+    def _format_json_block(value: Any) -> str:
+        try:
+            formatted = json.dumps(value if value is not None else None, ensure_ascii=False, indent=2)
+        except (TypeError, ValueError):
+            formatted = json.dumps(None, ensure_ascii=False, indent=2)
+        return html_utils.escape(formatted)
+
+    frames_section: Dict[str, Any] = {}
+    if isinstance(data_section, Mapping):
+        raw_frames = data_section.get("frames")
+        if isinstance(raw_frames, Mapping):
+            frames_section = dict(raw_frames)
+
+    timeframe_key = str(timeframe) if timeframe is not None else ""
+    metric_section = None
+    if frames_section:
+        candidate = frames_section.get(timeframe_key)
+        metric_section = candidate if candidate else frames_section
+
+    data_json_initial = _format_json_block(data_section)
+    diagnostics_json_initial = _format_json_block(diagnostics_section)
+    metric_json_initial = _format_json_block(metric_section)
+
     style_block = """
     :root {
       color-scheme: dark;
@@ -572,6 +654,200 @@ def render_inspection_page(
       border-color: rgba(250, 204, 21, 0.6);
       background: rgba(113, 63, 18, 0.35);
     }
+
+    .main-preview-panel {
+      border: 1px solid rgba(148, 163, 184, 0.18);
+      background: rgba(8, 15, 32, 0.6);
+    }
+    .index-preview {
+      display: flex;
+      flex-direction: column;
+      gap: 1.4rem;
+      border-radius: 16px;
+      border: 1px solid rgba(148, 163, 184, 0.22);
+      background: rgba(15, 23, 42, 0.72);
+      padding: 1.4rem;
+    }
+    .index-preview .page-header {
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+      padding-bottom: 0.6rem;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+    }
+    .index-preview .header-top {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 1rem;
+      flex-wrap: wrap;
+    }
+    .index-preview .header-controls {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+    }
+    .index-preview .app-meta {
+      display: inline-flex;
+      gap: 0.45rem;
+      align-items: center;
+      padding: 0.4rem 0.75rem;
+      border-radius: 999px;
+      background: rgba(15, 23, 42, 0.65);
+      border: 1px solid rgba(148, 163, 184, 0.22);
+      font-variant-numeric: tabular-nums;
+    }
+    .index-preview .app-meta__label {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: rgba(148, 163, 184, 0.75);
+    }
+    .index-preview .app-meta__value {
+      font-weight: 600;
+      font-size: 0.95rem;
+    }
+    .index-preview .page-header p {
+      margin: 0;
+      color: rgba(148, 163, 184, 0.75);
+    }
+    .index-preview .page-main {
+      display: flex;
+      flex-direction: column;
+      gap: 1.2rem;
+    }
+    .index-preview .controls-card,
+    .index-preview .chart-card {
+      border-radius: 16px;
+      border: 1px solid rgba(148, 163, 184, 0.2);
+      background: rgba(11, 22, 38, 0.78);
+      padding: 1.25rem;
+      box-shadow: inset 0 1px 0 rgba(148, 163, 184, 0.12);
+    }
+    .index-preview .controls-form {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1rem 1.4rem;
+      align-items: flex-end;
+    }
+    .index-preview .form-field {
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      min-width: 160px;
+      flex: 1 1 220px;
+    }
+    .index-preview .form-field span {
+      font-size: 0.85rem;
+      color: rgba(148, 163, 184, 0.78);
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .index-preview .form-field input,
+    .index-preview .form-field select {
+      padding: 0.7rem 0.9rem;
+      border-radius: 12px;
+      border: 1px solid rgba(148, 163, 184, 0.28);
+      background: rgba(15, 23, 42, 0.68);
+      color: var(--fg);
+      font: inherit;
+    }
+    .index-preview .btn-primary,
+    .index-preview .btn-secondary {
+      cursor: pointer;
+      font-weight: 600;
+      border-radius: 0.85rem;
+      border: none;
+      transition: transform 0.15s ease, box-shadow 0.15s ease;
+    }
+    .index-preview .btn-primary {
+      padding: 0.8rem 1.6rem;
+      background: linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%);
+      color: #0b1120;
+      box-shadow: 0 12px 32px rgba(56, 189, 248, 0.35);
+    }
+    .index-preview .btn-secondary {
+      padding: 0.65rem 1.3rem;
+      background: rgba(148, 163, 184, 0.16);
+      color: var(--fg);
+    }
+    .index-preview .btn-primary:hover,
+    .index-preview .btn-secondary:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 12px 30px rgba(8, 47, 73, 0.45);
+    }
+    .index-preview .chart-wrapper {
+      width: 100%;
+      height: 420px;
+      border-radius: 16px;
+      border: 1px solid rgba(148, 163, 184, 0.24);
+      background: rgba(7, 14, 30, 0.85);
+      overflow: hidden;
+    }
+    .index-preview .chart-area {
+      width: 100%;
+      height: 100%;
+    }
+    .index-preview .chart-info {
+      margin-top: 1.1rem;
+      display: grid;
+      gap: 0.85rem;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    }
+    .index-preview .chart-info > div {
+      padding: 0.75rem 1rem;
+      border-radius: 12px;
+      background: rgba(15, 23, 42, 0.68);
+      border: 1px solid rgba(148, 163, 184, 0.2);
+      display: flex;
+      flex-direction: column;
+      gap: 0.35rem;
+    }
+    .preview-selection {
+      margin-top: 1.1rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+    }
+    .preview-selection__controls {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.6rem;
+      font-size: 0.95rem;
+      font-variant-numeric: tabular-nums;
+    }
+    .preview-actions {
+      margin-top: 1.1rem;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      align-items: center;
+    }
+    #preview-status {
+      flex: 1 1 260px;
+      min-height: 0;
+    }
+    .index-preview .info-label {
+      color: rgba(148, 163, 184, 0.75);
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .index-preview .info-value {
+      font-size: 1.05rem;
+      font-variant-numeric: tabular-nums;
+    }
+    .index-preview #status-message {
+      margin-top: 1.2rem;
+      padding: 0.85rem 1rem;
+      border-radius: 12px;
+      border-left: 4px solid rgba(148, 163, 184, 0.25);
+      background: rgba(148, 163, 184, 0.14);
+      font-weight: 600;
+    }
     @media (max-width: 960px) {
       main {
         grid-template-columns: 1fr;
@@ -601,10 +877,13 @@ def render_inspection_page(
     "3m": 180000,
     "5m": 300000,
     "15m": 900000,
+    "30m": 1800000,
     "1h": 3600000,
     "4h": 14400000,
     "1d": 86400000,
   };
+  const DEFAULT_TEST_TIMEFRAMES = ["1m", "3m", "5m", "15m", "1h", "4h", "1d"];
+
 
   function toChartBars(candles) {
     return (candles || []).map((candle) => ({
@@ -784,7 +1063,7 @@ def render_inspection_page(
       for (const item of list || []) {
         const option = document.createElement("option");
         option.value = item.id;
-        option.textContent = `${item.id} • ${item.symbol || "?"} • ${item.tf || "?"}`;
+        option.textContent = `${item.id} • ${item.symbol || "-"} • ${item.tf || "-"}`;
         snapshotSelect.append(option);
       }
       if (state.snapshotId && list.some((item) => item.id === state.snapshotId)) {
@@ -883,6 +1162,17 @@ def render_inspection_page(
           borderDownColor: "#ef4444",
           borderVisible: true,
         });
+
+        const seedInitialFrame = () => {
+          const frameKey = state.frame;
+          const frameCandles = state.payload?.DATA?.frames?.[frameKey]?.candles || [];
+          const bars = toChartBars(frameCandles);
+          state.series.setData(bars);
+          if (bars.length && state.chart) {
+            state.chart.timeScale().fitContent();
+          }
+        };
+        seedInitialFrame();
 
         const resize = () => {
           if (!state.chart) return;
@@ -1017,54 +1307,306 @@ def render_inspection_page(
       });
     }
 
+    async function createSnapshotFromSelection({ symbolValue, selection, frames, source = "inspection-ui" }) {
+      if (!selection || !selection.start || !selection.end) {
+        throw new Error('selection-missing');
+      }
+      const uniqueFrames = Array.from(new Set((frames || []).filter(Boolean)));
+      if (!uniqueFrames.length) {
+        throw new Error('frames-missing');
+      }
+      const resolvedSymbol =
+        normaliseSymbol(symbolValue) || normaliseSymbol(initial.symbol) || defaultSymbol;
+      if (!resolvedSymbol) {
+        throw new Error('symbol-invalid');
+      }
+      const selectionStart = Math.floor(Number(selection.start));
+      const selectionEnd = Math.floor(Number(selection.end));
+      const framesPayload = {};
+      for (const tf of uniqueFrames) {
+        const candles = await fetchCandles(resolvedSymbol, tf, selectionStart, selectionEnd);
+        framesPayload[tf] = { tf, candles };
+      }
+      const payload = {
+        id: `test-${Date.now()}`,
+        symbol: resolvedSymbol,
+        frames: framesPayload,
+        selection: { start: selectionStart, end: selectionEnd },
+        meta: {
+          source: {
+            kind: source,
+            frames: uniqueFrames,
+            generated_at: new Date().toISOString(),
+          },
+        },
+      };
+      const result = await postSnapshot(payload);
+      return { snapshotId: result.snapshot_id, payload };
+    }
+
     if (buildButton) {
       buildButton.addEventListener("click", async () => {
         if (!state.selection || !state.selection.start || !state.selection.end) {
-          updateStatus("Сначала выделите диапазон на графике", "warning");
+          updateStatus("Select a range on the chart before creating the test environment", "warning");
           return;
         }
         const selectedFrames = timeframeCheckboxes
           .filter((checkbox) => checkbox.checked)
           .map((checkbox) => checkbox.value);
         if (!selectedFrames.length) {
-          updateStatus("Выберите хотя бы один таймфрейм", "warning");
+          updateStatus("No timeframes selected for testing", "warning");
           return;
         }
-        const symbol = normaliseSymbol(symbolInput ? symbolInput.value : initial.symbol);
-        if (!symbol) {
-          updateStatus(`Укажите символ инструмента (например, ${defaultSymbol})`, "warning");
-          return;
-        }
-        updateStatus("Получаем свечи Binance...", "info");
+        const symbolValue = symbolInput ? symbolInput.value : initial.symbol;
+        updateStatus("Collecting Binance data...", "info");
+        buildButton.disabled = true;
         try {
-          const frames = {};
-          for (const tf of selectedFrames) {
-            const candles = await fetchCandles(symbol, tf, state.selection.start, state.selection.end);
-            frames[tf] = { tf, candles };
-          }
-          const payload = {
-            id: `test-${Date.now()}`,
-            symbol,
-            frames,
-            selection: { start: state.selection.start, end: state.selection.end },
-            meta: {
-              source: "inspection-ui",
-              timeframes: selectedFrames,
-              generated_at: new Date().toISOString(),
-            },
-          };
-          const result = await postSnapshot(payload);
-          state.snapshotId = result.snapshot_id;
+          const { snapshotId } = await createSnapshotFromSelection({
+            symbolValue,
+            selection: state.selection,
+            frames: selectedFrames,
+            source: "inspection-panel",
+          });
+          state.snapshotId = snapshotId;
           await refreshSnapshots();
           if (snapshotSelect) snapshotSelect.value = state.snapshotId;
           await loadSnapshot(state.snapshotId);
-          updateStatus("Тестовая среда создана", "success");
+          updateStatus("Test environment created", "success");
         } catch (error) {
           console.error(error);
-          updateStatus("Не удалось создать тестовую среду", "error");
+          const detail = error && typeof error.message === "string" ? error.message : "";
+          updateStatus(`Failed to create test environment${detail ? `: ${detail}` : ""}`, "error");
+        } finally {
+          buildButton.disabled = false;
         }
       });
     }
+
+    function initPreviewPanel() {
+      const previewRoot = document.querySelector("[data-preview-root]");
+      if (!previewRoot) return;
+
+      const form = document.getElementById("preview-chart-controls");
+      const symbolField = document.getElementById("preview-symbol");
+      const intervalField = document.getElementById("preview-interval");
+      const chartEl = document.getElementById("preview-chart");
+      const lastTimeEl = document.getElementById("preview-last-time");
+      const lastPriceEl = document.getElementById("preview-last-price");
+      const lastRangeEl = document.getElementById("preview-last-range");
+      const statusEl = document.getElementById("preview-status");
+      const selectionLabelEl = document.getElementById("preview-selection-label");
+      const clearSelectionBtn = document.getElementById("preview-clear-selection");
+      const createSessionBtn = document.getElementById("preview-create-session");
+      const versionEl = document.getElementById("preview-app-version");
+      const openInspectionBtn = document.getElementById("preview-open-inspection");
+
+      if (openInspectionBtn) {
+        openInspectionBtn.addEventListener("click", (event) => {
+          event.preventDefault();
+          window.open("/inspection", "_blank", "noopener,noreferrer");
+        });
+      }
+
+      const previewState = {
+        chart: null,
+        series: null,
+        symbol: normaliseSymbol(symbolField ? symbolField.value : initial.symbol) || defaultSymbol,
+        interval: (intervalField && intervalField.value) || "1m",
+        selection: null,
+      };
+
+      function setPreviewStatus(message, tone = "info") {
+        if (!statusEl) return;
+        statusEl.textContent = message || "";
+        statusEl.dataset.tone = tone;
+        statusEl.hidden = !message;
+      }
+
+      function updatePreviewSelectionLabel() {
+        const start = previewState.selection && previewState.selection.start;
+        const end = previewState.selection && previewState.selection.end;
+        const label = selectionLabel(start, end);
+        if (selectionLabelEl) selectionLabelEl.textContent = label;
+      }
+
+      function updatePreviewInfo(candle) {
+        if (!candle) {
+          if (lastTimeEl) lastTimeEl.textContent = "-";
+          if (lastPriceEl) lastPriceEl.textContent = "-";
+          if (lastRangeEl) lastRangeEl.textContent = "-";
+          return;
+        }
+        if (lastTimeEl) lastTimeEl.textContent = formatTs(Number(candle.t));
+        if (lastPriceEl) lastPriceEl.textContent = Number(candle.c ?? candle.close ?? 0).toFixed(2);
+        const high = Number(candle.h ?? candle.high ?? 0);
+        const low = Number(candle.l ?? candle.low ?? 0);
+        const base = Number(candle.c ?? candle.close ?? 0) || 1;
+        const rangeValue = Math.max(0, high - low);
+        const percent = base ? (rangeValue / base) * 100 : 0;
+        if (lastRangeEl) lastRangeEl.textContent = `${rangeValue.toFixed(2)} (${percent.toFixed(2)}%)`;
+      }
+
+      function ensurePreviewChart() {
+        if (previewState.chart || !chartEl || !window.LightweightCharts) return;
+        previewState.chart = LightweightCharts.createChart(chartEl, {
+          autoSize: true,
+          layout: { background: { color: "#0f172a" }, textColor: "#e2e8f0" },
+          rightPriceScale: { borderColor: "rgba(148, 163, 184, 0.4)" },
+          timeScale: { borderColor: "rgba(148, 163, 184, 0.4)", timeVisible: true, secondsVisible: true },
+          crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+          grid: {
+            vertLines: { color: "rgba(15, 23, 42, 0.6)" },
+            horzLines: { color: "rgba(15, 23, 42, 0.6)" },
+          },
+        });
+        previewState.series = previewState.chart.addCandlestickSeries({
+          upColor: "#22c55e",
+          downColor: "#ef4444",
+          wickUpColor: "#f8fafc",
+          wickDownColor: "#f8fafc",
+          borderUpColor: "#22c55e",
+          borderDownColor: "#ef4444",
+          borderVisible: true,
+        });
+
+        const resize = () => {
+          if (!previewState.chart) return;
+          const height = Math.max(
+            320,
+            chartEl.clientHeight ||
+              chartEl.offsetHeight ||
+              (chartEl.parentElement && chartEl.parentElement.clientHeight) ||
+              320,
+          );
+          previewState.chart.applyOptions({ height });
+        };
+        resize();
+        if (window.ResizeObserver) {
+          const observer = new ResizeObserver(resize);
+          observer.observe(chartEl);
+        } else {
+          window.addEventListener("resize", resize);
+        }
+
+        previewState.chart.subscribeClick((param) => {
+          if (!param || typeof param.time === "undefined") return;
+          const ts = Math.floor(Number(param.time) * 1000);
+          if (!previewState.selection || !previewState.selection.start || previewState.selection.end) {
+            previewState.selection = { start: ts, end: null };
+          } else {
+            previewState.selection.end = ts;
+            if (previewState.selection.end < previewState.selection.start) {
+              const tmp = previewState.selection.start;
+              previewState.selection.start = previewState.selection.end;
+              previewState.selection.end = tmp;
+            }
+          }
+          updatePreviewSelectionLabel();
+        });
+      }
+
+      async function loadPreview(symbolRaw, intervalRaw) {
+        const resolvedSymbol =
+          normaliseSymbol(symbolRaw) || normaliseSymbol(initial.symbol) || defaultSymbol;
+        const resolvedInterval = intervalRaw || "1m";
+        previewState.symbol = resolvedSymbol;
+        previewState.interval = resolvedInterval;
+        previewState.selection = null;
+        if (symbolField) symbolField.value = resolvedSymbol;
+        if (intervalField) intervalField.value = resolvedInterval;
+        updatePreviewSelectionLabel();
+        setPreviewStatus("Loading Binance history...", "info");
+        try {
+          ensurePreviewChart();
+          const intervalMs = TIMEFRAME_TO_MS[resolvedInterval] || 60000;
+          const endMs = Date.now();
+          const startMs = Math.max(0, endMs - intervalMs * 500);
+          const candles = await fetchCandles(resolvedSymbol, resolvedInterval, startMs, endMs);
+          const bars = candles.map((candle) => ({
+            time: Math.floor(Number(candle.t) / 1000),
+            open: Number(candle.o ?? candle.open ?? 0),
+            high: Number(candle.h ?? candle.high ?? 0),
+            low: Number(candle.l ?? candle.low ?? 0),
+            close: Number(candle.c ?? candle.close ?? 0),
+          }));
+          if (previewState.series) {
+            previewState.series.setData(bars);
+          }
+          if (previewState.chart && bars.length) {
+            previewState.chart.timeScale().fitContent();
+          }
+          updatePreviewInfo(candles[candles.length - 1]);
+          setPreviewStatus("", "info");
+        } catch (error) {
+          console.error(error);
+          setPreviewStatus("Failed to load Binance history", "error");
+        }
+      }
+
+      if (clearSelectionBtn) {
+        clearSelectionBtn.addEventListener("click", () => {
+          previewState.selection = null;
+          updatePreviewSelectionLabel();
+          setPreviewStatus("", "info");
+        });
+      }
+
+      if (form) {
+        form.addEventListener("submit", (event) => {
+          event.preventDefault();
+          loadPreview(
+            symbolField ? symbolField.value : previewState.symbol,
+            intervalField ? intervalField.value : previewState.interval,
+          );
+        });
+      }
+
+      if (createSessionBtn) {
+        createSessionBtn.addEventListener("click", async () => {
+          if (!previewState.selection || !previewState.selection.start || !previewState.selection.end) {
+            setPreviewStatus("Select a range on the chart first", "warning");
+            return;
+          }
+          createSessionBtn.disabled = true;
+          setPreviewStatus("Building test environment...", "info");
+          try {
+            const { snapshotId } = await createSnapshotFromSelection({
+              symbolValue: symbolField ? symbolField.value : previewState.symbol,
+              selection: previewState.selection,
+              frames: DEFAULT_TEST_TIMEFRAMES,
+              source: "preview-chart",
+            });
+            state.snapshotId = snapshotId;
+            await refreshSnapshots();
+            if (snapshotSelect) snapshotSelect.value = snapshotId;
+            await loadSnapshot(snapshotId);
+            setPreviewStatus("Test environment created", "success");
+          } catch (error) {
+            console.error(error);
+            const detail = error && typeof error.message === "string" ? error.message : "";
+            setPreviewStatus(`Failed to create test environment${detail ? `: ${detail}` : ""}`, "error");
+          } finally {
+            createSessionBtn.disabled = false;
+          }
+        });
+      }
+
+      if (versionEl) {
+        fetch("/version")
+          .then((resp) => (resp.ok ? resp.json() : null))
+          .then((data) => {
+            if (data && typeof data.version === "string" && versionEl) {
+              versionEl.textContent = data.version;
+            }
+          })
+          .catch(() => {});
+      }
+
+      ensurePreviewChart();
+      loadPreview(previewState.symbol, previewState.interval);
+    }
+
+    initPreviewPanel();
 
     metricButtons.forEach((button) => {
       button.addEventListener("click", () => {
@@ -1168,6 +1710,85 @@ def render_inspection_page(
             <button id=\"build-session\" class=\"primary\" type=\"button\">Создать тестовую среду</button>
             <div id=\"snapshot-meta\"></div>
           </section>
+
+          <section class='panel main-preview-panel' data-preview-root>
+            <h2>Main Chart Preview</h2>
+            <div class='index-preview'>
+              <header class='page-header'>
+                <div class='header-top'>
+                  <h3>Interactive Candlestick Chart</h3>
+                  <div class='header-controls'>
+                    <div class='app-meta' aria-live='polite'>
+                      <span class='app-meta__label'>Version:</span>
+                      <span id='preview-app-version' class='app-meta__value'>-</span>
+                    </div>
+                    <button id='preview-open-inspection' class='btn-secondary' type='button'>Open /inspection</button>
+                  </div>
+                </div>
+                <p>This block mirrors the landing page chart so you can select a range and spawn a test environment directly from the inspection panel.</p>
+              </header>
+              <main class='page-main'>
+                <section class='controls-card'>
+                  <form id='preview-chart-controls' class='controls-form'>
+                    <label class='form-field'>
+                      <span>Symbol</span>
+                      <input id='preview-symbol' type='text' value='BTCUSDT' required autocomplete='off' />
+                    </label>
+
+                    <label class='form-field'>
+                      <span>Interval</span>
+                      <select id='preview-interval'>
+                        <option value='1s'>1s</option>
+                        <option value='1m' selected>1m</option>
+                        <option value='3m'>3m</option>
+                        <option value='5m'>5m</option>
+                        <option value='15m'>15m</option>
+                        <option value='30m'>30m</option>
+                        <option value='1h'>1h</option>
+                        <option value='4h'>4h</option>
+                        <option value='1d'>1d</option>
+                      </select>
+                    </label>
+
+                    <button type='submit' class='btn-primary'>Load Chart</button>
+                  </form>
+                </section>
+
+                <section class='chart-card'>
+                  <div class='chart-wrapper'>
+                    <div id='preview-chart' class='chart-area' aria-label='Preview candlestick chart'></div>
+                  </div>
+                  <aside class='chart-info'>
+                    <div>
+                      <span class='info-label'>Last candle:</span>
+                      <span id='preview-last-time' class='info-value'>-</span>
+                    </div>
+                    <div>
+                      <span class='info-label'>Close price:</span>
+                      <span id='preview-last-price' class='info-value'>-</span>
+                    </div>
+                    <div>
+                      <span class='info-label'>Candle range:</span>
+                      <span id='preview-last-range' class='info-value'>-</span>
+                    </div>
+                  </aside>
+                  <div class='preview-selection'>
+                    <span class='badge'>Selection</span>
+                    <div class='preview-selection__controls'>
+                      <span id='preview-selection-label'>-</span>
+                      <button id='preview-clear-selection' class='btn-secondary' type='button'>Reset</button>
+                    </div>
+                  </div>
+                  <div class='preview-actions'>
+                    <button id='preview-create-session' class='btn-primary' type='button'>Create Test Environment</button>
+                    <div id='preview-status' class='status-banner' hidden></div>
+                  </div>
+                </section>
+              </main>
+            </div>
+          </section>
+
+
           <section class=\"panel\">
             <h2>Просмотр данных</h2>
             <div id=\"inspection-chart\" class=\"chart-shell\" data-selection-label=\"—\"></div>
@@ -1184,27 +1805,28 @@ def render_inspection_page(
                   <h3>DATA</h3>
                   <button class=\"secondary\" type=\"button\" data-copy-target=\"data-json\">Copy JSON</button>
                 </header>
-                <pre id=\"data-json\"></pre>
+                <pre id=\"data-json\">{data_json_initial}</pre>
               </div>
               <div class=\"collapse\">
                 <header data-collapse-toggle>
                   <h3>DIAGNOSTICS</h3>
                   <button class=\"secondary\" type=\"button\" data-copy-target=\"diagnostics-json\">Copy JSON</button>
                 </header>
-                <pre id=\"diagnostics-json\"></pre>
+                <pre id=\"diagnostics-json\">{diagnostics_json_initial}</pre>
               </div>
               <div class=\"collapse\">
                 <header data-collapse-toggle>
                   <h3>METRIC</h3>
                   <button class=\"secondary\" type=\"button\" data-copy-target=\"metric-json\">Copy JSON</button>
                 </header>
-                <pre id=\"metric-json\"></pre>
+                <pre id=\"metric-json\">{metric_json_initial}</pre>
               </div>
             </div>
           </section>
         </main>
         <script>{script_block}</script>
         <script src=\"https://unpkg.com/lightweight-charts@4.0.0/dist/lightweight-charts.standalone.production.js\"></script>
+        <script src="/public/binanceCandles.js"></script>
         <script>{ui_script}</script>
       </body>
     </html>

@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 
 from ..services import (
     build_inspection_payload,
+    build_placeholder_snapshot,
     DEFAULT_SYMBOL,
     get_snapshot,
     list_snapshots,
