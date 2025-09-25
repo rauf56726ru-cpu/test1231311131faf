@@ -3,16 +3,18 @@ from __future__ import annotations
 
 import asyncio
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
 from ..services import (
     TIMEFRAME_WINDOWS,
+    build_inspection_payload,
     fetch_bar_delta,
     fetch_ohlcv,
     fetch_session_vwap,
     fetch_tpo_profile,
+    render_inspection_page,
 )
 from ..version import APP_VERSION
 
@@ -186,6 +188,46 @@ async def diagnostics(
         "vwap": vwap_payload,
         "tpo": tpo_payload,
     }
+
+
+@app.get("/inspection", response_class=HTMLResponse)
+async def inspection(
+    request: Request,
+    symbol: str = Query("BTCUSDT", min_length=1, description="Trading pair, e.g. BTCUSDT"),
+    tf: str = Query("1m", description="Timeframe: 1m,3m,5m,15m,1h,4h,1d"),
+    session: str = Query("ny", description="Session name: asia, london, ny"),
+    sessions: int = Query(5, ge=2, le=5, description="Number of sessions to aggregate"),
+):
+    timeframe = tf.lower()
+    if timeframe not in TIMEFRAME_WINDOWS:
+        raise HTTPException(status_code=400, detail=f"Unsupported timeframe: {tf}")
+
+    try:
+        payload = await build_inspection_payload(
+            symbol,
+            timeframe,
+            session=session,
+            sessions=sessions,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:  # pragma: no cover - network errors etc.
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    accept_header = request.headers.get("accept", "").lower()
+    if "application/json" in accept_header:
+        return payload
+
+    html = render_inspection_page(
+        payload,
+        symbol=symbol,
+        timeframe=timeframe,
+        session=session,
+        sessions=sessions,
+    )
+    return HTMLResponse(content=html)
 
 
 @app.get("/health")

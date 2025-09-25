@@ -19,10 +19,29 @@
   const lastPriceEl = document.getElementById("last-price");
   const rangeEl = document.getElementById("last-range");
   const versionEl = document.getElementById("app-version");
+  const inspectionButton = document.getElementById("show-inspection");
 
   if (!chartContainer || !form || !symbolInput || !intervalInput) {
     console.error("Chart container or controls are missing in the DOM");
     return;
+  }
+
+  if (inspectionButton) {
+    inspectionButton.addEventListener("click", (event) => {
+      event.preventDefault();
+      const symbolValue = (symbolInput.value || state.symbol || "BTCUSDT").trim();
+      const intervalValue = intervalInput.value || state.interval || "1m";
+      const url = new URL("/inspection", window.location.origin);
+      if (symbolValue) {
+        url.searchParams.set("symbol", symbolValue.toUpperCase());
+      }
+      if (intervalValue) {
+        url.searchParams.set("tf", intervalValue);
+      }
+      url.searchParams.set("session", "ny");
+      url.searchParams.set("sessions", "5");
+      window.open(url.toString(), "_blank", "noopener,noreferrer");
+    });
   }
 
   const state = {
