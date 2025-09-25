@@ -1,7 +1,7 @@
 """Inspection payload assembly and UI rendering."""
 from __future__ import annotations
 
-import html
+import html as html_utils
 import json
 from collections import OrderedDict
 from datetime import datetime, timezone
@@ -301,15 +301,15 @@ def render_inspection_page(
     payload_json = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
     snapshots_json = json.dumps(snapshots, ensure_ascii=False).replace("</", "<\\/")
 
-    symbol_value = html.escape(symbol.upper())
-    timeframe_value = html.escape(timeframe)
-    snapshot_value = html.escape(snapshot_id or "")
+    symbol_value = html_utils.escape(symbol.upper())
+    timeframe_value = html_utils.escape(timeframe)
+    snapshot_value = html_utils.escape(snapshot_id or "")
 
     timeframe_options = []
     for tf_key in TIMEFRAME_WINDOWS:
         selected = " selected" if tf_key == timeframe else ""
         timeframe_options.append(
-            f'<option value="{html.escape(tf_key)}"{selected}>{html.escape(tf_key)}</option>'
+            f'<option value="{html_utils.escape(tf_key)}"{selected}>{html_utils.escape(tf_key)}</option>'
         )
 
     style_block = """
@@ -1013,7 +1013,7 @@ def render_inspection_page(
 })();
 """
 
-    html = f"""
+    page_html = f"""
     <!DOCTYPE html>
     <html lang=\"ru\">
       <head>
@@ -1111,4 +1111,4 @@ def render_inspection_page(
       </body>
     </html>
     """
-    return html
+    return page_html
