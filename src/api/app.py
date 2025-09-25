@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 
 from ..services import (
     build_inspection_payload,
+    DEFAULT_SYMBOL,
     get_snapshot,
     list_snapshots,
     register_snapshot,
@@ -62,21 +63,21 @@ async def inspection(
     if target_snapshot is None:
         placeholder_payload = {
             "DATA": {
-                "symbol": "—",
+                "symbol": DEFAULT_SYMBOL,
                 "frames": {},
                 "selection": None,
                 "delta_cvd": {},
                 "vwap_tpo": {},
                 "zones": {"status": "waiting", "detail": "Создайте первый снэпшот"},
                 "smt": {"status": "waiting", "detail": "Создайте первый снэпшот"},
-                "meta": {"requested": {"symbol": "—", "frames": []}, "source": {}},
+                "meta": {"requested": {"symbol": DEFAULT_SYMBOL, "frames": []}, "source": {}},
             },
             "DIAGNOSTICS": {"generated_at": None, "snapshot_id": None, "captured_at": None, "frames": {}},
         }
         html = render_inspection_page(
             placeholder_payload,
             snapshot_id=None,
-            symbol="—",
+            symbol=DEFAULT_SYMBOL,
             timeframe="1m",
             snapshots=snapshots,
         )

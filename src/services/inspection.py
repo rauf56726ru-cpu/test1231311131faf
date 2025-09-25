@@ -11,6 +11,8 @@ from .ohlc import TIMEFRAME_WINDOWS, normalise_ohlcv
 
 Snapshot = Dict[str, Any]
 
+DEFAULT_SYMBOL = "BTCUSDT"
+
 _MAX_STORED_SNAPSHOTS = 16
 _SNAPSHOT_STORE: "OrderedDict[str, Snapshot]" = OrderedDict()
 
@@ -301,7 +303,10 @@ def render_inspection_page(
     payload_json = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
     snapshots_json = json.dumps(snapshots, ensure_ascii=False).replace("</", "<\\/")
 
-    symbol_value = html_utils.escape(symbol.upper())
+    symbol_clean = (symbol or "").strip().upper()
+    if not symbol_clean or symbol_clean in {"—", "-", "UNKNOWN"}:
+        symbol_clean = DEFAULT_SYMBOL
+    symbol_value = html_utils.escape(symbol_clean)
     timeframe_value = html_utils.escape(timeframe)
     snapshot_value = html_utils.escape(snapshot_id or "")
 
@@ -582,7 +587,8 @@ def render_inspection_page(
         f"  snapshotId: {json.dumps(snapshot_id or '')},\n"
         f"  symbol: {json.dumps(symbol_value)},\n"
         f"  timeframe: {json.dumps(timeframe_value)},\n"
-        f"  snapshots: {snapshots_json}\n"
+        f"  snapshots: {snapshots_json},\n"
+        f"  defaultSymbol: {json.dumps(DEFAULT_SYMBOL)}\n"
         "};\n"
     )
 
@@ -631,6 +637,12 @@ def render_inspection_page(
     const from = formatTs(start);
     const to = formatTs(end);
     return `${from} → ${to}`;
+  }
+
+  function normaliseSymbol(input) {
+    const trimmed = (input || "").trim().toUpperCase();
+    const cleaned = trimmed.replace(/[^A-Z0-9]/g, "");
+    return cleaned;
   }
 
   async function fetchCandles(symbol, interval, startMs, endMs) {
@@ -715,6 +727,7 @@ def render_inspection_page(
 
   document.addEventListener("DOMContentLoaded", async () => {
     const initial = window.__INSPECTION_INITIAL__ || {};
+    const defaultSymbol = normaliseSymbol(initial.defaultSymbol) || "BTCUSDT";
     const snapshotSelect = document.getElementById("snapshot-select");
     const refreshButton = document.getElementById("refresh-snapshot");
     const dataPre = document.getElementById("data-json");
@@ -729,6 +742,7 @@ def render_inspection_page(
     const timeframeCheckboxes = Array.from(document.querySelectorAll("[data-tf-checkbox]"));
     const statusEl = document.getElementById("inspection-status");
     const metricButtons = Array.from(document.querySelectorAll("[data-metric]"));
+    const symbolInput = document.getElementById("symbol-input");
 
     initCollapsibles();
 
@@ -740,6 +754,12 @@ def render_inspection_page(
       chart: null,
       series: null,
     };
+
+    if (symbolInput) {
+      const initialSymbol =
+        normaliseSymbol(initial.payload?.DATA?.symbol) || normaliseSymbol(initial.symbol) || defaultSymbol;
+      symbolInput.value = initialSymbol;
+    }
 
     function updateStatus(message, tone = "info") {
       if (!statusEl) return;
@@ -790,7 +810,8 @@ def render_inspection_page(
 
     function renderMeta(payload) {
       if (!snapshotMeta) return;
-      const symbol = payload?.DATA?.symbol || initial.symbol;
+      const symbolRaw = payload?.DATA?.symbol || initial.symbol;
+      const symbol = normaliseSymbol(symbolRaw) || "—";
       const frames = payload?.DATA?.meta?.requested?.frames || [];
       const found = (initial.snapshots || []).find((item) => item.id === state.snapshotId);
       const captured = found && found.captured_at;
@@ -913,6 +934,11 @@ def render_inspection_page(
         state.payload = payload;
         state.snapshotId = id;
         state.selection = payload?.DATA?.selection || null;
+        const nextSymbol = payload?.DATA?.symbol || initial.symbol;
+        if (symbolInput) {
+          const resolved = normaliseSymbol(nextSymbol) || normaliseSymbol(initial.symbol) || defaultSymbol;
+          symbolInput.value = resolved;
+        }
         populateFrames(payload);
         renderJson(payload);
         renderMeta(payload);
@@ -967,8 +993,11 @@ def render_inspection_page(
           updateStatus("Выберите хотя бы один таймфрейм", "warning");
           return;
         }
-        const symbolInput = document.getElementById("symbol-input");
-        const symbol = symbolInput ? symbolInput.value.trim().toUpperCase() : (initial.symbol || "BTCUSDT");
+        const symbol = normaliseSymbol(symbolInput ? symbolInput.value : initial.symbol);
+        if (!symbol) {
+          updateStatus(`Укажите символ инструмента (например, ${defaultSymbol})`, "warning");
+          return;
+        }
         updateStatus("Получаем свечи Binance...", "info");
         try {
           const frames = {};
@@ -1066,8 +1095,15 @@ def render_inspection_page(
             <div class=\"controls-grid\">
               <label>
                 <span>Символ</span>
-                <input id=\"symbol-input\" type=\"text\" value=\"{symbol_value}\" autocomplete=\"off\" />
+                <input id=\"symbol-input\" type=\"text\" value=\"{symbol_value}\" autocomplete=\"off\" list=\"symbol-suggestions\" />
               </label>
+              <datalist id=\"symbol-suggestions\">
+                <option value=\"BTCUSDT\"></option>
+                <option value=\"ETHUSDT\"></option>
+                <option value=\"BNBUSDT\"></option>
+                <option value=\"SOLUSDT\"></option>
+                <option value=\"XRPUSDT\"></option>
+              </datalist>
               <label>
                 <span>Таймфрейм для отображения</span>
                 <select id=\"frame-select\">{''.join(timeframe_options)}</select>

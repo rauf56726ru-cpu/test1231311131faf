@@ -2,6 +2,7 @@
 
 from .inspection import (
     build_inspection_payload,
+    DEFAULT_SYMBOL,
     get_snapshot,
     list_snapshots,
     register_snapshot,
@@ -11,6 +12,7 @@ from .ohlc import TIMEFRAME_WINDOWS, normalise_ohlcv, normalise_ohlcv_sync
 
 __all__ = [
     "build_inspection_payload",
+    "DEFAULT_SYMBOL",
     "get_snapshot",
     "list_snapshots",
     "normalise_ohlcv",
