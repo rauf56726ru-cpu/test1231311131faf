@@ -52,6 +52,12 @@ def test_inspection_snapshot_roundtrip(client: TestClient) -> None:
     )
     assert fetch_response.status_code == 200
     body = fetch_response.json()
-    assert body["DATA"]["ohlcv"]["symbol"] == "BTCUSDT"
-    candles = body["DATA"]["ohlcv"]["candles"]
+    assert body["DATA"]["symbol"] == "BTCUSDT"
+    assert "frames" in body["DATA"]
+    candles = body["DATA"]["frames"]["1m"]["candles"]
     assert [candle["t"] for candle in candles] == [0, 60_000]
+
+    list_response = client.get("/inspection/snapshots")
+    assert list_response.status_code == 200
+    entries = list_response.json()
+    assert any(item["id"] == snapshot_id for item in entries)

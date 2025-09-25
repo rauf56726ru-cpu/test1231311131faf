@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from ..services import (
     build_inspection_payload,
     get_snapshot,
+    list_snapshots,
     register_snapshot,
     render_inspection_page,
 )
@@ -46,13 +47,42 @@ async def register_inspection_snapshot(payload: Dict[str, Any] = Body(...)) -> D
 @app.get("/inspection", response_class=HTMLResponse)
 async def inspection(
     request: Request,
-    snapshot: str = Query(..., description="Snapshot identifier"),
+    snapshot: str | None = Query(None, description="Snapshot identifier"),
 ) -> HTMLResponse:
-    snapshot_data = get_snapshot(snapshot)
-    if not snapshot_data:
-        raise HTTPException(status_code=404, detail="Snapshot not found")
+    snapshots = list_snapshots()
 
-    payload = build_inspection_payload(snapshot_data)
+    target_snapshot = None
+    if snapshot:
+        target_snapshot = get_snapshot(snapshot)
+        if target_snapshot is None:
+            raise HTTPException(status_code=404, detail="Snapshot not found")
+    elif snapshots:
+        target_snapshot = get_snapshot(snapshots[0]["id"])  # type: ignore[index]
+
+    if target_snapshot is None:
+        placeholder_payload = {
+            "DATA": {
+                "symbol": "—",
+                "frames": {},
+                "selection": None,
+                "delta_cvd": {},
+                "vwap_tpo": {},
+                "zones": {"status": "waiting", "detail": "Создайте первый снэпшот"},
+                "smt": {"status": "waiting", "detail": "Создайте первый снэпшот"},
+                "meta": {"requested": {"symbol": "—", "frames": []}, "source": {}},
+            },
+            "DIAGNOSTICS": {"generated_at": None, "snapshot_id": None, "captured_at": None, "frames": {}},
+        }
+        html = render_inspection_page(
+            placeholder_payload,
+            snapshot_id=None,
+            symbol="—",
+            timeframe="1m",
+            snapshots=snapshots,
+        )
+        return HTMLResponse(content=html)
+
+    payload = build_inspection_payload(target_snapshot)
 
     accept_header = request.headers.get("accept", "").lower()
     if "application/json" in accept_header:
@@ -60,11 +90,17 @@ async def inspection(
 
     html = render_inspection_page(
         payload,
-        snapshot_id=snapshot_data["id"],
-        symbol=snapshot_data.get("symbol", "UNKNOWN"),
-        timeframe=snapshot_data.get("tf", "1m"),
+        snapshot_id=target_snapshot.get("id"),
+        symbol=target_snapshot.get("symbol", "UNKNOWN"),
+        timeframe=target_snapshot.get("tf", "1m"),
+        snapshots=snapshots,
     )
     return HTMLResponse(content=html)
+
+
+@app.get("/inspection/snapshots")
+async def inspection_snapshots() -> JSONResponse:
+    return JSONResponse(list_snapshots())
 
 
 @app.get("/health")
