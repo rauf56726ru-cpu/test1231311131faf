@@ -31,3 +31,27 @@ def test_static_assets_are_available(client: TestClient) -> None:
     response = client.get("/public/app.js")
     assert response.status_code == 200
     assert "window.LightweightCharts" in response.text
+
+
+def test_inspection_snapshot_roundtrip(client: TestClient) -> None:
+    snapshot_payload = {
+        "symbol": "BTCUSDT",
+        "tf": "1m",
+        "candles": [
+            {"t": 0, "o": 1.0, "h": 1.5, "l": 0.8, "c": 1.2, "v": 10.0},
+            {"t": 60_000, "o": 1.2, "h": 1.7, "l": 1.0, "c": 1.4, "v": 12.0},
+        ],
+    }
+
+    create_response = client.post("/inspection/snapshot", json=snapshot_payload)
+    assert create_response.status_code == 200
+    snapshot_id = create_response.json()["snapshot_id"]
+
+    fetch_response = client.get(
+        f"/inspection?snapshot={snapshot_id}", headers={"Accept": "application/json"}
+    )
+    assert fetch_response.status_code == 200
+    body = fetch_response.json()
+    assert body["DATA"]["ohlcv"]["symbol"] == "BTCUSDT"
+    candles = body["DATA"]["ohlcv"]["candles"]
+    assert [candle["t"] for candle in candles] == [0, 60_000]

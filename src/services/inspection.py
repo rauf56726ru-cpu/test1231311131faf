@@ -1,17 +1,19 @@
-"""Utilities for assembling the inspection payload and UI."""
+"""Inspection payload assembly based on frontend snapshots."""
 from __future__ import annotations
 
-import asyncio
 import html
 import json
+from collections import OrderedDict
 from datetime import datetime, timezone
-from typing import Dict, Iterable, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Tuple
 
 from ..meta import Meta
-from .delta import fetch_bar_delta
-from .ohlc import TIMEFRAME_WINDOWS, fetch_ohlcv
-from .tpo import MAX_SESSIONS, MIN_SESSIONS, fetch_tpo_profile
-from .vwap import fetch_session_vwap
+from .ohlc import TIMEFRAME_WINDOWS, normalise_ohlcv
+
+Snapshot = Dict[str, Any]
+
+_MAX_STORED_SNAPSHOTS = 16
+_SNAPSHOT_STORE: "OrderedDict[str, Snapshot]" = OrderedDict()
 
 
 def _session_options() -> Iterable[Tuple[str, str, str]]:
@@ -19,89 +21,120 @@ def _session_options() -> Iterable[Tuple[str, str, str]]:
         yield name, start.strftime("%H:%M"), end.strftime("%H:%M")
 
 
-async def build_inspection_payload(
-    symbol: str,
-    timeframe: str,
-    *,
-    session: str = "ny",
-    sessions: int = MAX_SESSIONS,
-) -> Dict[str, object]:
-    """Collect data required for the inspection dashboard."""
+def _ensure_snapshot_limit() -> None:
+    while len(_SNAPSHOT_STORE) > _MAX_STORED_SNAPSHOTS:
+        _SNAPSHOT_STORE.popitem(last=False)
 
-    timeframe = timeframe.lower()
+
+def register_snapshot(snapshot: Mapping[str, Any]) -> str:
+    """Store a snapshot captured by the chart frontend."""
+
+    if "candles" not in snapshot:
+        raise ValueError("Snapshot must include candles")
+
+    try:
+        candles = list(snapshot["candles"])  # type: ignore[index]
+    except TypeError as exc:  # pragma: no cover - defensive guard
+        raise ValueError("Snapshot candles must be iterable") from exc
+
+    symbol = str(snapshot.get("symbol") or snapshot.get("ticker") or "UNKNOWN").upper()
+    timeframe = str(snapshot.get("tf") or snapshot.get("timeframe") or "1m").lower()
+    snapshot_id = str(
+        snapshot.get("id")
+        or snapshot.get("snapshot_id")
+        or snapshot.get("snapshot")
+        or f"snap-{int(datetime.now(timezone.utc).timestamp()*1000)}"
+    )
+
+    meta: MutableMapping[str, Any] = {}
+    for key in ("meta", "diagnostics", "source"):
+        value = snapshot.get(key)
+        if isinstance(value, Mapping):
+            meta[key] = dict(value)
+
+    stored: Snapshot = {
+        "id": snapshot_id,
+        "symbol": symbol,
+        "tf": timeframe,
+        "candles": candles,
+        "captured_at": snapshot.get("captured_at")
+        or datetime.now(timezone.utc).isoformat(),
+        "meta": meta,
+    }
+
     if timeframe not in TIMEFRAME_WINDOWS:
         raise ValueError(f"Unsupported timeframe: {timeframe}")
 
-    session = session.lower()
-    sessions = max(MIN_SESSIONS, min(MAX_SESSIONS, sessions))
+    _SNAPSHOT_STORE[snapshot_id] = stored
+    _SNAPSHOT_STORE.move_to_end(snapshot_id)
+    _ensure_snapshot_limit()
+    return snapshot_id
 
-    ohlc_task = fetch_ohlcv(symbol, timeframe, include_diagnostics=True)
-    delta_task = fetch_bar_delta(symbol, timeframe)
-    vwap_task = fetch_session_vwap(symbol)
-    tpo_task = fetch_tpo_profile(symbol, session=session, sessions=sessions)
 
-    ohlc_payload, delta_payload, vwap_payload, tpo_payload = await asyncio.gather(
-        ohlc_task,
-        delta_task,
-        vwap_task,
-        tpo_task,
+def get_snapshot(snapshot_id: str) -> Snapshot | None:
+    """Return a stored snapshot if present."""
+
+    snapshot = _SNAPSHOT_STORE.get(snapshot_id)
+    if snapshot is not None:
+        # Refresh LRU ordering so recently accessed snapshots persist longer.
+        _SNAPSHOT_STORE.move_to_end(snapshot_id)
+    return snapshot
+
+
+def _extract_section(snapshot: Snapshot, key: str) -> Any:
+    value = snapshot.get(key)
+    if isinstance(value, Mapping):
+        return dict(value)
+    return value
+
+
+def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
+    """Build a combined inspection payload from a stored snapshot."""
+
+    symbol = snapshot.get("symbol", "UNKNOWN")
+    timeframe = snapshot.get("tf", "1m")
+    candles = snapshot.get("candles", [])
+
+    ohlc_payload = normalise_ohlcv(
+        symbol,
+        timeframe,
+        candles,
+        include_diagnostics=True,
     )
 
-    ohlc_diagnostics = (
-        ohlc_payload.pop("diagnostics") if isinstance(ohlc_payload, dict) else None
-    )
-
-    meta_section = {
-        "requested": {
-            "symbol": symbol.upper(),
-            "tf": timeframe,
-            "session": session,
-            "sessions": sessions,
-        },
-        "vwap_lookback_days": Meta.VWAP_LOOKBACK_DAYS,
-        "sessions": [
-            {"name": name, "start": start, "end": end}
-            for name, start, end in _session_options()
-        ],
-    }
+    ohlc_diagnostics = ohlc_payload.pop("diagnostics", None)
 
     data_section = {
         "ohlcv": ohlc_payload,
-        "delta_cvd": delta_payload,
-        "vwap_tpo": {"vwap": vwap_payload, "tpo": tpo_payload},
-        "zones": {
+        "delta_cvd": _extract_section(snapshot, "delta"),
+        "vwap_tpo": _extract_section(snapshot, "vwap"),
+        "zones": snapshot.get("zones")
+        or {
             "status": "unavailable",
-            "detail": "Zones provider is not configured for the test build.",
+            "detail": "Zones provider is not configured in the snapshot.",
         },
-        "smt": {
+        "smt": snapshot.get("smt")
+        or {
             "status": "unavailable",
-            "detail": "SMT provider is not configured for the test build.",
+            "detail": "SMT provider is not configured in the snapshot.",
         },
-        "meta": meta_section,
+        "meta": {
+            "requested": {
+                "symbol": symbol,
+                "tf": timeframe,
+            },
+            "source": snapshot.get("meta", {}),
+        },
     }
 
     diagnostics_section = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "request": meta_section["requested"],
+        "snapshot_id": snapshot.get("id"),
+        "captured_at": snapshot.get("captured_at"),
         "ohlcv": ohlc_diagnostics,
-        "delta_cvd": {
-            "bars": len(delta_payload.get("bar_delta", []))
-            if isinstance(delta_payload, dict)
-            else None
-        },
-        "vwap": {
-            "rows": len(vwap_payload.get("vwap", []))
-            if isinstance(vwap_payload, dict)
-            else None
-        },
-        "tpo": {
-            "sessions": tpo_payload.get("sessions")
-            if isinstance(tpo_payload, dict)
-            else None
-        },
         "notes": {
-            "zones": "Zones data source is not yet implemented.",
-            "smt": "SMT data source is not yet implemented.",
+            "delta": "Delta/CVD data was not provided in the snapshot." if "delta" not in snapshot else None,
+            "vwap": "VWAP/TPO data was not provided in the snapshot." if "vwap" not in snapshot else None,
         },
     }
 
@@ -109,12 +142,11 @@ async def build_inspection_payload(
 
 
 def render_inspection_page(
-    payload: Dict[str, object],
+    payload: Dict[str, Any],
     *,
+    snapshot_id: str,
     symbol: str,
     timeframe: str,
-    session: str,
-    sessions: int,
 ) -> str:
     """Render the inspection dashboard HTML."""
 
@@ -123,21 +155,13 @@ def render_inspection_page(
 
     symbol_value = html.escape(symbol.upper())
     timeframe_value = html.escape(timeframe)
-    session_value = html.escape(session)
-    sessions_value = html.escape(str(sessions))
+    snapshot_value = html.escape(snapshot_id)
 
     timeframe_options = []
     for tf_key in TIMEFRAME_WINDOWS:
         selected = " selected" if tf_key == timeframe else ""
         timeframe_options.append(
             f'<option value="{html.escape(tf_key)}"{selected}>{html.escape(tf_key)}</option>'
-        )
-
-    session_options = []
-    for name, _, _ in _session_options():
-        selected = " selected" if name == session else ""
-        session_options.append(
-            f'<option value="{html.escape(name)}"{selected}>{html.escape(name)}</option>'
         )
 
     style_block = """
@@ -199,315 +223,217 @@ def render_inspection_page(
     label {
       display: flex;
       flex-direction: column;
-      gap: 0.4rem;
-      font-size: 0.9rem;
+      gap: 0.35rem;
       color: var(--muted);
-      font-weight: 600;
+      font-size: 0.85rem;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
     }
-    input,
-    select {
+    input, select {
+      background: rgba(15, 23, 42, 0.6);
+      border: 1px solid var(--border);
+      border-radius: 0.75rem;
       padding: 0.65rem 0.9rem;
-      border-radius: 0.85rem;
-      border: 1px solid rgba(148, 163, 184, 0.35);
-      background: rgba(15, 23, 42, 0.65);
       color: var(--fg);
       font-size: 0.95rem;
-    }
-    .controls-actions {
-      display: flex;
-      gap: 0.75rem;
     }
     button {
       cursor: pointer;
-      border-radius: 0.85rem;
+      border-radius: 0.75rem;
       border: none;
       font-weight: 600;
+      font-size: 0.95rem;
+      padding: 0.7rem 1.2rem;
+      transition: transform 0.15s ease, box-shadow 0.15s ease;
     }
     .btn-primary {
-      padding: 0.7rem 1.5rem;
+      background: linear-gradient(120deg, var(--accent) 0%, var(--accent-strong) 100%);
       color: #0b1120;
-      background: linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%);
-      box-shadow: 0 12px 32px rgba(14, 165, 233, 0.35);
+      box-shadow: 0 10px 30px rgba(14, 165, 233, 0.3);
+    }
+    .btn-primary:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 12px 34px rgba(14, 165, 233, 0.36);
     }
     .btn-secondary {
-      padding: 0.7rem 1.2rem;
-      background: rgba(148, 163, 184, 0.15);
-      border: 1px solid rgba(148, 163, 184, 0.35);
+      background: rgba(30, 41, 59, 0.85);
       color: var(--fg);
+      border: 1px solid rgba(56, 189, 248, 0.35);
     }
-    .payload-group {
-      margin-top: 1rem;
-      display: flex;
-      flex-direction: column;
-      gap: 0.75rem;
+    .btn-secondary:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 12px 30px rgba(8, 145, 178, 0.28);
     }
-    .payload-group h2 {
-      margin: 0;
-      font-size: 1.2rem;
-      color: var(--accent);
-      letter-spacing: 0.04em;
-    }
-    details {
-      border: 1px solid rgba(148, 163, 184, 0.2);
-      border-radius: 0.9rem;
-      background: rgba(2, 6, 23, 0.6);
+    .section {
+      border-radius: 1rem;
+      border: 1px solid var(--border);
+      background: rgba(15, 23, 42, 0.72);
       overflow: hidden;
     }
-    summary {
-      cursor: pointer;
-      list-style: none;
-      padding: 0.9rem 1rem;
+    .section summary {
+      margin: 0;
+      padding: 1rem 1.25rem;
       font-weight: 600;
-      position: relative;
-    }
-    summary::after {
-      content: "";
-      position: absolute;
-      right: 1rem;
-      top: 50%;
-      width: 0.6rem;
-      height: 0.6rem;
-      border-right: 2px solid var(--muted);
-      border-bottom: 2px solid var(--muted);
-      transform: translateY(-60%) rotate(45deg);
-      transition: transform 0.2s ease;
-    }
-    details[open] summary::after {
-      transform: translateY(-20%) rotate(-135deg);
-    }
-    .section-body {
-      padding: 0 1rem 1rem;
       display: flex;
-      flex-direction: column;
-      gap: 0.75rem;
+      justify-content: space-between;
+      align-items: center;
+      cursor: pointer;
     }
-    .section-toolbar {
+    .section pre {
+      margin: 0;
+      padding: 1rem 1.25rem 1.5rem;
+      background: rgba(8, 47, 73, 0.55);
+      border-top: 1px solid rgba(56, 189, 248, 0.15);
+      font-family: "Fira Code", "SFMono-Regular", ui-monospace, Menlo, Consolas, "Liberation Mono", monospace;
+      font-size: 0.86rem;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .section-actions {
       display: flex;
-      justify-content: flex-end;
+      gap: 0.5rem;
+      align-items: center;
     }
-    .copy-btn {
-      padding: 0.45rem 1.1rem;
-      border-radius: 0.75rem;
-      border: 1px solid rgba(148, 163, 184, 0.35);
-      background: rgba(30, 41, 59, 0.9);
-      color: var(--fg);
+    .status-bar {
       font-size: 0.85rem;
-    }
-    pre {
-      margin: 0;
-      padding: 0.9rem;
-      border-radius: 0.75rem;
-      background: rgba(15, 23, 42, 0.85);
-      border: 1px solid rgba(148, 163, 184, 0.25);
-      color: #f8fafc;
-      overflow-x: auto;
-      font-size: 0.85rem;
-    }
-    .empty-note {
-      margin: 0;
-      padding: 1rem;
-      border-radius: 0.85rem;
-      border: 1px dashed rgba(148, 163, 184, 0.4);
-      text-align: center;
       color: var(--muted);
-      font-size: 0.95rem;
+    }
+    .empty {
+      color: rgba(148, 163, 184, 0.65);
+      font-style: italic;
     }
     @media (max-width: 640px) {
-      .controls-actions {
-        flex-direction: column;
+      header {
+        padding: 1.5rem 1rem 0.75rem;
       }
-      button {
-        width: 100%;
+      main {
+        width: min(100%, 95%);
       }
     }
     """
 
-    script_block = """
-    (function () {
-      const payloadRoot = document.getElementById("payload-root");
-      const form = document.getElementById("inspection-form");
-      const refreshBtn = document.getElementById("inspection-refresh");
-      let sectionCounter = 0;
+    script_block = f"""
+    const SNAPSHOT_ID = "{snapshot_value}";
+    let currentPayload = {payload_json};
 
-      function renderSection(container, key, value) {
-        const details = document.createElement("details");
-        details.className = "inspection-section";
-        details.open = true;
-
-        const summary = document.createElement("summary");
-        summary.textContent = key;
+    function renderSections(payload) {{
+      const container = document.querySelector('#inspection-sections');
+      if (!container) return;
+      container.innerHTML = '';
+      const entries = Object.entries(payload || {{}});
+      if (!entries.length) {{
+        container.innerHTML = '<p class="empty">Нет данных</p>';
+        return;
+      }}
+      for (const [key, value] of entries) {{
+        const details = document.createElement('details');
+        details.className = 'section';
+        details.open = key === 'ohlcv';
+        const summary = document.createElement('summary');
+        summary.innerHTML = `<span>${{key}}</span>`;
+        const actions = document.createElement('div');
+        actions.className = 'section-actions';
+        const copyButton = document.createElement('button');
+        copyButton.type = 'button';
+        copyButton.className = 'btn-secondary';
+        copyButton.textContent = 'Copy JSON';
+        copyButton.addEventListener('click', () => {{
+          navigator.clipboard?.writeText(JSON.stringify(value, null, 2)).catch(() => {{}});
+        }});
+        actions.appendChild(copyButton);
+        summary.appendChild(actions);
         details.appendChild(summary);
-
-        const body = document.createElement("div");
-        body.className = "section-body";
-
-        const toolbar = document.createElement("div");
-        toolbar.className = "section-toolbar";
-        const copyBtn = document.createElement("button");
-        copyBtn.type = "button";
-        copyBtn.className = "copy-btn";
-        copyBtn.textContent = "Copy JSON";
-        const preId = `json-section-${sectionCounter++}`;
-        copyBtn.dataset.copyTarget = preId;
-        toolbar.appendChild(copyBtn);
-        body.appendChild(toolbar);
-
-        const pre = document.createElement("pre");
-        pre.id = preId;
+        const pre = document.createElement('pre');
         pre.textContent = JSON.stringify(value, null, 2);
-        body.appendChild(pre);
-
-        details.appendChild(body);
+        details.appendChild(pre);
         container.appendChild(details);
-      }
+      }}
+    }}
 
-      function renderGroup(title, value) {
-        const group = document.createElement("section");
-        group.className = "payload-group";
-        const heading = document.createElement("h2");
-        heading.textContent = title;
-        group.appendChild(heading);
+    function renderDiagnostics(diagnostics) {{
+      const target = document.querySelector('#diagnostics');
+      if (!target) return;
+      target.textContent = JSON.stringify(diagnostics || {{}}, null, 2);
+    }}
 
-        const entries = value && typeof value === "object" ? Object.entries(value) : [];
-        if (!entries.length) {
-          const empty = document.createElement("p");
-          empty.className = "empty-note";
-          empty.textContent = "Нет данных";
-          group.appendChild(empty);
-        } else {
-          for (const [key, entryValue] of entries) {
-            renderSection(group, key, entryValue);
-          }
-        }
+    async function refreshPayload() {{
+      const status = document.querySelector('#status-bar');
+      if (status) {{
+        status.textContent = 'Обновляем данные...';
+      }}
+      try {{
+        const response = await fetch(`/inspection?snapshot=${{encodeURIComponent(SNAPSHOT_ID)}}`, {{
+          headers: {{ 'Accept': 'application/json' }}
+        }});
+        if (!response.ok) {{
+          throw new Error(`HTTP ${{response.status}}`);
+        }}
+        currentPayload = await response.json();
+        renderSections(currentPayload.DATA);
+        renderDiagnostics(currentPayload.DIAGNOSTICS);
+        if (status) {{
+          status.textContent = 'Обновлено: ' + new Date().toLocaleTimeString();
+        }}
+      }} catch (error) {{
+        console.error('Refresh failed', error);
+        if (status) {{
+          status.textContent = 'Ошибка обновления: ' + error.message;
+        }}
+      }}
+    }}
 
-        payloadRoot.appendChild(group);
-      }
-
-      function renderPayload(data) {
-        payloadRoot.innerHTML = "";
-        sectionCounter = 0;
-        if (!data || typeof data !== "object") {
-          renderGroup("DATA", {});
-          renderGroup("DIAGNOSTICS", {});
-          return;
-        }
-        renderGroup("DATA", data.DATA || {});
-        renderGroup("DIAGNOSTICS", data.DIAGNOSTICS || {});
-      }
-
-      document.addEventListener("click", (event) => {
-        const target = event.target;
-        if (!target || !target.dataset || !target.dataset.copyTarget) {
-          return;
-        }
-        const pre = document.getElementById(target.dataset.copyTarget);
-        if (!pre) return;
-        navigator.clipboard?.writeText(pre.textContent || "").then(
-          () => {
-            const original = target.textContent;
-            target.textContent = "Copied!";
-            setTimeout(() => {
-              target.textContent = original;
-            }, 1200);
-          },
-          () => {
-            target.textContent = "Copy failed";
-            setTimeout(() => {
-              target.textContent = "Copy JSON";
-            }, 1500);
-          }
-        );
-      });
-
-      form?.addEventListener("submit", (event) => {
-        event.preventDefault();
-        const formData = new FormData(form);
-        const url = new URL(window.location.pathname, window.location.origin);
-        for (const [key, value] of formData.entries()) {
-          if (value) {
-            url.searchParams.set(key, String(value).trim());
-          }
-        }
-        window.location.href = url.toString();
-      });
-
-      refreshBtn?.addEventListener("click", async () => {
-        const formData = new FormData(form);
-        const url = new URL(window.location.pathname, window.location.origin);
-        for (const [key, value] of formData.entries()) {
-          if (value) {
-            url.searchParams.set(key, String(value).trim());
-          }
-        }
-        try {
-          refreshBtn.disabled = true;
-          const original = refreshBtn.textContent;
-          refreshBtn.textContent = "Refreshing...";
-          const response = await fetch(url.toString(), {
-            headers: { Accept: "application/json" },
-          });
-          if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
-          }
-          const json = await response.json();
-          window.history.replaceState(null, document.title, url.toString());
-          window.__INSPECTION_PAYLOAD__ = json;
-          renderPayload(json);
-          refreshBtn.textContent = original;
-        } catch (error) {
-          console.error("Failed to refresh inspection payload", error);
-          alert(`Не удалось обновить данные: ${error.message}`);
-          refreshBtn.textContent = "Refresh";
-        } finally {
-          refreshBtn.disabled = false;
-        }
-      });
-
-      renderPayload(window.__INSPECTION_PAYLOAD__ || {});
-    })();
+    document.addEventListener('DOMContentLoaded', () => {{
+      renderSections(currentPayload.DATA);
+      renderDiagnostics(currentPayload.DIAGNOSTICS);
+      const refreshButton = document.querySelector('#refresh-inspection');
+      refreshButton?.addEventListener('click', refreshPayload);
+    }});
     """
 
-    return f"""<!DOCTYPE html>
-<html lang=\"ru\">
-  <head>
-    <meta charset=\"utf-8\" />
-    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
-    <title>Inspection Dashboard</title>
-    <style>{style_block}</style>
-  </head>
-  <body>
-    <header>
-      <h1>Inspection Dashboard</h1>
-      <p>Проверка собранных данных для {symbol_value} на таймфрейме {timeframe_value}. Сессия {session_value}, окон {sessions_value}.</p>
-    </header>
-    <main>
-      <section class=\"inspection-card\">
-        <form id=\"inspection-form\">
-          <label>
-            <span>Symbol</span>
-            <input name=\"symbol\" value=\"{symbol_value}\" required autocomplete=\"off\" />
-          </label>
-          <label>
-            <span>Timeframe</span>
-            <select name=\"tf\">{''.join(timeframe_options)}</select>
-          </label>
-          <label>
-            <span>Session</span>
-            <select name=\"session\">{''.join(session_options)}</select>
-          </label>
-          <label>
-            <span>Sessions</span>
-            <input type=\"number\" name=\"sessions\" min=\"{MIN_SESSIONS}\" max=\"{MAX_SESSIONS}\" value=\"{sessions_value}\" />
-          </label>
-          <div class=\"controls-actions\">
-            <button type=\"submit\" class=\"btn-primary\">Load</button>
-            <button type=\"button\" id=\"inspection-refresh\" class=\"btn-secondary\">Refresh</button>
-          </div>
-        </form>
-      </section>
-      <section class=\"inspection-card\" id=\"payload-root\"></section>
-    </main>
-    <script>window.__INSPECTION_PAYLOAD__ = {payload_json};</script>
-    <script>{script_block}</script>
-  </body>
-</html>"""
+    return f"""
+    <!DOCTYPE html>
+    <html lang=\"ru\">
+      <head>
+        <meta charset=\"utf-8\" />
+        <title>Inspection snapshot {snapshot_value}</title>
+        <style>{style_block}</style>
+      </head>
+      <body>
+        <header>
+          <h1>Inspection snapshot</h1>
+          <p>Снимок данных для {symbol_value} · {timeframe_value} · ID {snapshot_value}</p>
+        </header>
+        <main>
+          <section class=\"inspection-card\">
+            <form id=\"inspection-form\" onsubmit=\"return false;\">
+              <label>
+                <span>Символ</span>
+                <input value=\"{symbol_value}\" readonly />
+              </label>
+              <label>
+                <span>Таймфрейм</span>
+                <select disabled>{''.join(timeframe_options)}</select>
+              </label>
+              <label>
+                <span>Snapshot</span>
+                <input value=\"{snapshot_value}\" readonly />
+              </label>
+              <button id=\"refresh-inspection\" type=\"button\" class=\"btn-primary\">Refresh</button>
+            </form>
+            <p id=\"status-bar\" class=\"status-bar\">Загружено: {datetime.now(timezone.utc).isoformat()}</p>
+          </section>
+          <section class=\"inspection-card\">
+            <h2>DATA</h2>
+            <div id=\"inspection-sections\"></div>
+          </section>
+          <section class=\"inspection-card\">
+            <h2>DIAGNOSTICS</h2>
+            <pre id=\"diagnostics\" class=\"diagnostics\"></pre>
+          </section>
+        </main>
+        <script>{script_block}</script>
+      </body>
+    </html>
+    """
+
