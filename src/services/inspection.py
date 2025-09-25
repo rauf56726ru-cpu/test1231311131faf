@@ -468,6 +468,8 @@ def render_inspection_page(
     }
     .chart-shell {
       height: 420px;
+      min-height: 360px;
+      width: 100%;
       border-radius: 14px;
       overflow: hidden;
       border: 1px solid rgba(148, 163, 184, 0.25);
@@ -834,71 +836,106 @@ def render_inspection_page(
 
     function ensureChart() {
       if (!chartContainer) return;
-      if (!window.LightweightCharts) {
-        console.warn("LightweightCharts not loaded");
-        return;
-      }
-      if (state.chart) return;
-      state.chart = LightweightCharts.createChart(chartContainer, {
-        layout: {
-          background: { color: "#0f172a" },
-          textColor: "#e2e8f0",
-        },
-        rightPriceScale: {
-          borderColor: "rgba(148, 163, 184, 0.4)",
-        },
-        timeScale: {
-          borderColor: "rgba(148, 163, 184, 0.4)",
-          timeVisible: true,
-          secondsVisible: true,
-        },
-        crosshair: {
-          mode: LightweightCharts.CrosshairMode.Normal,
-        },
-        grid: {
-          vertLines: { color: "rgba(15, 23, 42, 0.6)" },
-          horzLines: { color: "rgba(15, 23, 42, 0.6)" },
-        },
-      });
-      state.series = state.chart.addCandlestickSeries({
-        upColor: "#22c55e",
-        downColor: "#ef4444",
-        wickUpColor: "#f8fafc",
-        wickDownColor: "#f8fafc",
-        borderUpColor: "#22c55e",
-        borderDownColor: "#ef4444",
-        borderVisible: true,
-      });
-
-      const resize = () => {
-        const { clientWidth, clientHeight } = chartContainer;
-        if (clientWidth && clientHeight) {
-          state.chart.applyOptions({ width: clientWidth, height: clientHeight });
+      const ensureLibrary = () => {
+        if (window.LightweightCharts) {
+          initialiseChart();
         }
       };
-      resize();
-      if (window.ResizeObserver) {
-        const observer = new ResizeObserver(resize);
-        observer.observe(chartContainer);
-      } else {
-        window.addEventListener("resize", resize);
+
+      function initialiseChart() {
+        if (state.chart) return;
+        const baseHeight = Math.max(
+          320,
+          chartContainer.clientHeight ||
+            chartContainer.offsetHeight ||
+            (chartContainer.parentElement && chartContainer.parentElement.clientHeight) ||
+            320,
+        );
+        state.chart = LightweightCharts.createChart(chartContainer, {
+          autoSize: true,
+          height: baseHeight,
+          layout: {
+            background: { color: "#0f172a" },
+            textColor: "#e2e8f0",
+          },
+          rightPriceScale: {
+            borderColor: "rgba(148, 163, 184, 0.4)",
+          },
+          timeScale: {
+            borderColor: "rgba(148, 163, 184, 0.4)",
+            timeVisible: true,
+            secondsVisible: true,
+          },
+          crosshair: {
+            mode: LightweightCharts.CrosshairMode.Normal,
+          },
+          grid: {
+            vertLines: { color: "rgba(15, 23, 42, 0.6)" },
+            horzLines: { color: "rgba(15, 23, 42, 0.6)" },
+          },
+        });
+        state.series = state.chart.addCandlestickSeries({
+          upColor: "#22c55e",
+          downColor: "#ef4444",
+          wickUpColor: "#f8fafc",
+          wickDownColor: "#f8fafc",
+          borderUpColor: "#22c55e",
+          borderDownColor: "#ef4444",
+          borderVisible: true,
+        });
+
+        const resize = () => {
+          if (!state.chart) return;
+          const nextHeight = Math.max(
+            320,
+            chartContainer.clientHeight ||
+              chartContainer.offsetHeight ||
+              (chartContainer.parentElement && chartContainer.parentElement.clientHeight) ||
+              baseHeight,
+          );
+          state.chart.applyOptions({ height: nextHeight });
+        };
+
+        resize();
+        if (window.ResizeObserver) {
+          const observer = new ResizeObserver(resize);
+          observer.observe(chartContainer);
+        } else {
+          window.addEventListener("resize", resize);
+        }
+
+        state.chart.subscribeClick((param) => {
+          if (!param || typeof param.time === "undefined") return;
+          const ts = Math.floor(Number(param.time) * 1000);
+          if (!state.selection || !state.selection.start || state.selection.end) {
+            state.selection = { start: ts, end: null };
+          } else {
+            state.selection.end = ts;
+            if (state.selection.end < state.selection.start) {
+              const tmp = state.selection.start;
+              state.selection.start = state.selection.end;
+              state.selection.end = tmp;
+            }
+          }
+          updateSelectionLabel();
+        });
       }
 
-      state.chart.subscribeClick((param) => {
-        if (!param || typeof param.time === "undefined") return;
-        const ts = Math.floor(Number(param.time) * 1000);
-        if (!state.selection || !state.selection.start || state.selection.end) {
-          state.selection = { start: ts, end: null };
-        } else {
-          state.selection.end = ts;
-          if (state.selection.end < state.selection.start) {
-            const tmp = state.selection.start;
-            state.selection.start = state.selection.end;
-            state.selection.end = tmp;
-          }
-        }
-        updateSelectionLabel();
-      });
+      if (window.LightweightCharts) {
+        initialiseChart();
+        return;
+      }
+
+      let loader = document.getElementById("lw-chart-loader");
+      if (!loader) {
+        loader = document.createElement("script");
+        loader.src = "https://unpkg.com/lightweight-charts@4.0.0/dist/lightweight-charts.standalone.production.js";
+        loader.id = "lw-chart-loader";
+        loader.async = false;
+        loader.onload = ensureLibrary;
+        loader.onerror = () => updateStatus("Не удалось загрузить библиотеку графика", "error");
+        document.head.appendChild(loader);
+      }
     }
 
     function renderChart() {
