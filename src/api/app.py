@@ -1,20 +1,28 @@
 """Minimal FastAPI app that exposes OHLCV history for the chart."""
 from __future__ import annotations
 
-import asyncio
+from pathlib import Path
+from typing import Any, Dict
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from ..services import (
-    TIMEFRAME_WINDOWS,
-    fetch_bar_delta,
-    fetch_ohlcv,
-    fetch_session_vwap,
-    fetch_tpo_profile,
+    build_inspection_payload,
+    build_placeholder_snapshot,
+    DEFAULT_SYMBOL,
+    get_snapshot,
+    list_snapshots,
+    register_snapshot,
+    render_inspection_page,
 )
 from ..version import APP_VERSION
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PUBLIC_DIR = PROJECT_ROOT / "public"
+TEMPLATES_DIR = PROJECT_ROOT / "templates"
 
 app = FastAPI(title="Chart OHLC API")
 
@@ -25,167 +33,76 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-def _render_services_page() -> str:
-    services = [
-        {
-            "title": "OHLCV History",
-            "endpoint": "/ohlc",
-            "description": "Возвращает свечи Binance с синхронизированными границами и метаданными закрытия.",
-            "inputs": ["symbol (str)", "tf (str: 1m,3m,5m,15m,1h,4h,1d)"],
-            "output": "{ symbol, tf, candles:[{t,o,h,l,c,v}], last_price, last_ts, next_close_ts, time_to_close_ms }",
-        },
-        {
-            "title": "Bar Delta",
-            "endpoint": "/delta",
-            "description": "Считает buy/sell delta и CVD по барным границам на основе aggTrades.",
-            "inputs": ["symbol (str)", "tf (str как в /ohlc)"],
-            "output": "{ symbol, bar_delta:[{t,tf,delta,deltaMax,deltaMin,deltaPct,cvd}] }",
-        },
-        {
-            "title": "Session VWAP",
-            "endpoint": "/vwap",
-            "description": "Агрегирует дневной и сессионный VWAP по окнам Meta за 5 дней.",
-            "inputs": ["symbol (str)"],
-            "output": "{ symbol, vwap:[{date,session,value}] }",
-        },
-        {
-            "title": "TPO / Volume Profile",
-            "endpoint": "/tpo",
-            "description": "Строит TPO и volume profile по последним 2–5 сессиям выбранного окна.",
-            "inputs": ["symbol (str)", "session (str: asia|london|ny)", "sessions (int 2-5)"],
-            "output": "{ symbol, session, requested_sessions, sessions, tpo:[{date,session,VAL,VAH,POC}], profile:[{price,volume}] }",
-        },
-        {
-            "title": "Diagnostics Bundle",
-            "endpoint": "/diagnostics",
-            "description": "Параллельно собирает ответы всех сервисов для проверки реальными данными.",
-            "inputs": [
-                "symbol (str)",
-                "tf (str как в /ohlc)",
-                "session (str: asia|london|ny)",
-                "sessions (int 2-5)",
-            ],
-            "output": "{ symbol, tf, session, sessions, ohlc, delta, vwap, tpo }",
-        },
-    ]
-
-    body = ["<!DOCTYPE html>", "<html lang=\"ru\">", "<head>", "<meta charset=\"utf-8\" />", "<title>Документация сервисов</title>", "<style>body{font-family:Inter,system-ui,-apple-system,sans-serif;padding:24px;max-width:960px;margin:0 auto;line-height:1.5;}section{margin-bottom:24px;border-bottom:1px solid #e0e0e0;padding-bottom:16px;}h1{margin-top:0;}code,pre{font-family:SFMono-Regular,ui-monospace,Menlo,Monaco,Consolas,monospace;}</style>", "</head>", "<body>", "<h1>Сервисы расчёта и данные Binance</h1>"]
-    for service in services:
-        body.append("<section>")
-        body.append(f"<h2>{service['title']}</h2>")
-        body.append(f"<p><strong>Endpoint:</strong> {service['endpoint']}</p>")
-        body.append(f"<p>{service['description']}</p>")
-        body.append("<p><strong>Вход:</strong> " + ", ".join(service["inputs"]) + "</p>")
-        body.append(f"<p><strong>Выход:</strong> {service['output']}</p>")
-        body.append("</section>")
-    body.append("</body>")
-    body.append("</html>")
-    return "\n".join(body)
+if PUBLIC_DIR.is_dir():
+    app.mount("/public", StaticFiles(directory=PUBLIC_DIR), name="public")
 
 
-@app.get("/services", response_class=HTMLResponse)
-async def services_page() -> HTMLResponse:
-    return HTMLResponse(content=_render_services_page())
-
-
-@app.get("/ohlc")
-async def ohlc(
-    symbol: str = Query(..., min_length=1, description="Trading pair, e.g. BTCUSDT"),
-    tf: str = Query("1m", description="Timeframe: 1m,3m,5m,15m,1h,4h,1d"),
-):
-    timeframe = tf.lower()
-    if timeframe not in TIMEFRAME_WINDOWS:
-        raise HTTPException(status_code=400, detail=f"Unsupported timeframe: {tf}")
+@app.post("/inspection/snapshot")
+async def register_inspection_snapshot(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
     try:
-        payload = await fetch_ohlcv(symbol, timeframe)
-    except HTTPException:
-        raise
-    except Exception as exc:  # pragma: no cover - network errors etc.
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    return payload
-
-
-@app.get("/delta")
-async def delta(
-    symbol: str = Query(..., min_length=1, description="Trading pair, e.g. BTCUSDT"),
-    tf: str = Query("1m", description="Timeframe: 1m,3m,5m,15m,1h,4h,1d"),
-):
-    timeframe = tf.lower()
-    if timeframe not in TIMEFRAME_WINDOWS:
-        raise HTTPException(status_code=400, detail=f"Unsupported timeframe: {tf}")
-    try:
-        payload = await fetch_bar_delta(symbol, timeframe)
-    except HTTPException:
-        raise
-    except Exception as exc:  # pragma: no cover - network errors etc.
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    return payload
-
-
-@app.get("/vwap")
-async def vwap(symbol: str = Query(..., min_length=1, description="Trading pair")):
-    try:
-        payload = await fetch_session_vwap(symbol)
-    except HTTPException:
-        raise
-    except Exception as exc:  # pragma: no cover - network errors etc.
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    return payload
-
-
-@app.get("/tpo")
-async def tpo(
-    symbol: str = Query(..., min_length=1, description="Trading pair, e.g. BTCUSDT"),
-    session: str = Query("ny", description="Session name: asia, london, ny"),
-    sessions: int = Query(5, ge=2, le=5, description="Number of sessions to aggregate"),
-):
-    try:
-        payload = await fetch_tpo_profile(symbol, session=session, sessions=sessions)
+        snapshot_id = register_snapshot(payload)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except HTTPException:
-        raise
-    except Exception as exc:  # pragma: no cover
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    return payload
+    return {"snapshot_id": snapshot_id}
 
 
-@app.get("/diagnostics")
-async def diagnostics(
-    symbol: str = Query(..., min_length=1, description="Trading pair, e.g. BTCUSDT"),
-    tf: str = Query("1m", description="Timeframe: 1m,3m,5m,15m,1h,4h,1d"),
-    session: str = Query("ny", description="Session name: asia, london, ny"),
-    sessions: int = Query(5, ge=2, le=5, description="Number of sessions to aggregate"),
-):
-    timeframe = tf.lower()
-    if timeframe not in TIMEFRAME_WINDOWS:
-        raise HTTPException(status_code=400, detail=f"Unsupported timeframe: {tf}")
-    try:
-        ohlc_task = fetch_ohlcv(symbol, timeframe)
-        delta_task = fetch_bar_delta(symbol, timeframe)
-        vwap_task = fetch_session_vwap(symbol)
-        tpo_task = fetch_tpo_profile(symbol, session=session, sessions=sessions)
-        ohlc_payload, delta_payload, vwap_payload, tpo_payload = await asyncio.gather(
-            ohlc_task,
-            delta_task,
-            vwap_task,
-            tpo_task,
+@app.get("/inspection", response_class=HTMLResponse)
+async def inspection(
+    request: Request,
+    snapshot: str | None = Query(None, description="Snapshot identifier"),
+) -> HTMLResponse:
+    snapshots = list_snapshots()
+
+    target_snapshot = None
+    if snapshot:
+        target_snapshot = get_snapshot(snapshot)
+        if target_snapshot is None:
+            raise HTTPException(status_code=404, detail="Snapshot not found")
+    elif snapshots:
+        target_snapshot = get_snapshot(snapshots[0]["id"])  # type: ignore[index]
+
+    if target_snapshot is None:
+        placeholder_payload = {
+            "DATA": {
+                "symbol": DEFAULT_SYMBOL,
+                "frames": {},
+                "selection": None,
+                "delta_cvd": {},
+                "vwap_tpo": {},
+                "zones": {"status": "waiting", "detail": "Создайте первый снэпшот"},
+                "smt": {"status": "waiting", "detail": "Создайте первый снэпшот"},
+                "meta": {"requested": {"symbol": DEFAULT_SYMBOL, "frames": []}, "source": {}},
+            },
+            "DIAGNOSTICS": {"generated_at": None, "snapshot_id": None, "captured_at": None, "frames": {}},
+        }
+        html = render_inspection_page(
+            placeholder_payload,
+            snapshot_id=None,
+            symbol=DEFAULT_SYMBOL,
+            timeframe="1m",
+            snapshots=snapshots,
         )
-    except HTTPException:
-        raise
-    except Exception as exc:  # pragma: no cover - network errors etc.
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    return {
-        "symbol": symbol.upper(),
-        "tf": timeframe,
-        "session": session.lower(),
-        "sessions": sessions,
-        "ohlc": ohlc_payload,
-        "delta": delta_payload,
-        "vwap": vwap_payload,
-        "tpo": tpo_payload,
-    }
+        return HTMLResponse(content=html)
+
+    payload = build_inspection_payload(target_snapshot)
+
+    accept_header = request.headers.get("accept", "").lower()
+    if "application/json" in accept_header:
+        return JSONResponse(payload)
+
+    html = render_inspection_page(
+        payload,
+        snapshot_id=target_snapshot.get("id"),
+        symbol=target_snapshot.get("symbol", "UNKNOWN"),
+        timeframe=target_snapshot.get("tf", "1m"),
+        snapshots=snapshots,
+    )
+    return HTMLResponse(content=html)
+
+
+@app.get("/inspection/snapshots")
+async def inspection_snapshots() -> JSONResponse:
+    return JSONResponse(list_snapshots())
 
 
 @app.get("/health")
@@ -196,3 +113,14 @@ async def health() -> dict[str, str]:
 @app.get("/version")
 async def version() -> dict[str, str]:
     return {"version": APP_VERSION}
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index() -> HTMLResponse:
+    try:
+        html = TEMPLATES_DIR.joinpath("index.html").read_text(encoding="utf-8")
+    except FileNotFoundError as exc:  # pragma: no cover - deployment guard
+        raise HTTPException(status_code=500, detail="Index template is missing") from exc
+    return HTMLResponse(content=html)
+
+

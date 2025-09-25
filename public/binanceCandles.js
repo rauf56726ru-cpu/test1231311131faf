@@ -120,9 +120,13 @@
     if (!symbol || !interval) {
       throw new Error("symbol and interval are required");
     }
-    const url = `${BASE_URL}?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&limit=${encodeURIComponent(
-      limit,
-    )}`;
+
+    const cappedLimit = Math.max(1, Math.min(Number(limit) || 500, 1000));
+    const url =
+      `${BASE_URL}?symbol=${encodeURIComponent(symbol)}` +
+      `&interval=${encodeURIComponent(interval)}` +
+      `&limit=${encodeURIComponent(cappedLimit)}`;
+
     const resp = await fetch(url);
     if (!resp.ok) {
       throw new Error(`klines ${resp.status}`);

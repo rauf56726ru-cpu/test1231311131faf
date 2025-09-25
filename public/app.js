@@ -19,6 +19,7 @@
   const lastPriceEl = document.getElementById("last-price");
   const rangeEl = document.getElementById("last-range");
   const versionEl = document.getElementById("app-version");
+  const inspectionButton = document.getElementById("show-inspection");
 
   if (!chartContainer || !form || !symbolInput || !intervalInput) {
     console.error("Chart container or controls are missing in the DOM");
@@ -62,6 +63,74 @@
       "1d": 86_400_000,
     };
     return map[value] || 60_000;
+  }
+
+  function buildInspectionSnapshot() {
+    const createdAt = Date.now();
+    const id = `snap-${createdAt}-${Math.random().toString(36).slice(2, 8)}`;
+    const candles = state.candles.map((bar) => {
+      const timeMs = Number(bar.ts_ms_utc || bar.t || bar.time * 1000 || 0);
+      const open = Number(bar.open ?? bar.o ?? 0);
+      const high = Number(bar.high ?? bar.h ?? open);
+      const low = Number(bar.low ?? bar.l ?? open);
+      const close = Number(bar.close ?? bar.c ?? open);
+      const volume = Number(bar.volume ?? bar.v ?? 0);
+      return {
+        t: Number.isFinite(timeMs) ? timeMs : 0,
+        o: Number.isFinite(open) ? open : close,
+        h: Number.isFinite(high) ? high : close,
+        l: Number.isFinite(low) ? low : close,
+        c: Number.isFinite(close) ? close : open,
+        v: Number.isFinite(volume) ? volume : 0,
+      };
+    });
+    return {
+      id,
+      symbol: state.symbol,
+      tf: state.interval,
+      candles,
+      meta: {
+        source: "chart-ui",
+        generated_at: new Date(createdAt).toISOString(),
+        candle_count: candles.length,
+      },
+    };
+  }
+
+  async function sendInspectionSnapshot(snapshot) {
+    const response = await fetch("/inspection/snapshot", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(snapshot),
+    });
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => "");
+      throw new Error(`Failed to register snapshot: ${response.status} ${errorText}`);
+    }
+    const data = await response.json().catch(() => ({}));
+    return typeof data.snapshot_id === "string" ? data.snapshot_id : snapshot.id;
+  }
+
+  if (inspectionButton) {
+    inspectionButton.addEventListener("click", async (event) => {
+      event.preventDefault();
+      const previewWindow = window.open("about:blank", "_blank", "noopener,noreferrer");
+      if (!previewWindow) {
+        notifyStatus("Браузер заблокировал окно инспекции", "warning");
+        return;
+      }
+      try {
+        const snapshot = buildInspectionSnapshot();
+        const snapshotId = await sendInspectionSnapshot(snapshot);
+        const url = new URL("/inspection", window.location.origin);
+        url.searchParams.set("snapshot", snapshotId);
+        previewWindow.location.href = url.toString();
+      } catch (error) {
+        console.error("Failed to open inspection", error);
+        previewWindow.close();
+        notifyStatus("Не удалось подготовить данные инспекции", "error");
+      }
+    });
   }
 
   function formatNumber(value, digits = 2) {
