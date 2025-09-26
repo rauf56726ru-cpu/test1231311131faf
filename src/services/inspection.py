@@ -745,10 +745,111 @@ def render_inspection_page(
       display: flex;
       flex-wrap: wrap;
       gap: 0.6rem;
+      align-items: center;
     }
     .metrics-bar button.active {
       background: rgba(56, 189, 248, 0.22);
       color: #f8fafc;
+    }
+    .metrics-hours {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45rem;
+      padding: 0.4rem 0.75rem;
+      border-radius: 12px;
+      border: 1px solid rgba(148, 163, 184, 0.25);
+      background: rgba(15, 23, 42, 0.75);
+      color: rgba(226, 232, 240, 0.88);
+      font-size: 0.85rem;
+    }
+    .metrics-hours select {
+      background: transparent;
+      border: 1px solid rgba(148, 163, 184, 0.35);
+      border-radius: 10px;
+      color: inherit;
+      font-size: 0.9rem;
+      padding: 0.3rem 0.6rem;
+    }
+    .metrics-hours select:focus {
+      outline: none;
+      border-color: rgba(56, 189, 248, 0.6);
+      box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.25);
+    }
+    .data-check-container {
+      margin-top: 1rem;
+      border-top: 1px solid rgba(148, 163, 184, 0.2);
+      padding-top: 1rem;
+      display: grid;
+      gap: 1rem;
+    }
+    .collapse.collapsed .data-check-container {
+      display: none;
+    }
+    .data-check-status {
+      padding: 0.5rem 0.75rem;
+      border-radius: 10px;
+      border: 1px solid rgba(148, 163, 184, 0.35);
+      background: rgba(15, 23, 42, 0.6);
+      font-size: 0.85rem;
+    }
+    .data-check-status[data-tone="success"] {
+      border-color: rgba(34, 197, 94, 0.6);
+      background: rgba(22, 101, 52, 0.3);
+    }
+    .data-check-status[data-tone="error"] {
+      border-color: rgba(248, 113, 113, 0.6);
+      background: rgba(127, 29, 29, 0.35);
+    }
+    .data-check-status[data-tone="warning"] {
+      border-color: rgba(250, 204, 21, 0.6);
+      background: rgba(113, 63, 18, 0.35);
+    }
+    .data-check-grid {
+      display: grid;
+      gap: 1rem;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      align-items: start;
+    }
+    .data-check-json {
+      border-radius: 12px;
+      border: 1px solid rgba(148, 163, 184, 0.2);
+      background: rgba(15, 23, 42, 0.78);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .data-check-json__header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.8rem;
+      padding: 0.75rem 1rem;
+      background: rgba(56, 189, 248, 0.18);
+    }
+    .data-check-json__header h4 {
+      margin: 0;
+      font-size: 0.9rem;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+    .data-check-json pre {
+      margin: 0;
+      border-top: 1px solid rgba(148, 163, 184, 0.18);
+      padding: 0.85rem 1rem;
+      max-height: 260px;
+      overflow: auto;
+      font-size: 0.85rem;
+      background: rgba(15, 23, 42, 0.78);
+    }
+    .data-check-panel {
+      border-radius: 12px;
+      border: 1px solid rgba(148, 163, 184, 0.2);
+      background: rgba(15, 23, 42, 0.78);
+      overflow: hidden;
+    }
+    .data-check-panel > * {
+      width: 100%;
+      display: block;
     }
     .meta-grid {
       display: grid;
@@ -1159,9 +1260,11 @@ def render_inspection_page(
     const metricButtons = Array.from(document.querySelectorAll("[data-metric]"));
     const symbolInput = document.getElementById("symbol-input");
     const checkAllDatasButton = document.getElementById("btn-check-all-datas");
+    const checkAllDatasHours = document.getElementById("check-all-datas-hours");
     const dataCheckJson = document.getElementById("data-check-json");
     const dataCheckPanel = document.getElementById("data-check-panel");
     const dataCheckStatus = document.getElementById("data-check-status");
+    const dataCheckContainer = document.getElementById("data-check-container");
 
     initCollapsibles();
 
@@ -1175,10 +1278,30 @@ def render_inspection_page(
     };
 
     function setDataCheckStatus(message, tone = "info") {
+      if (dataCheckContainer) {
+        dataCheckContainer.hidden = false;
+      }
       if (!dataCheckStatus) return;
+      if (typeof tone === "string" && tone) {
+        dataCheckStatus.dataset.tone = tone;
+      }
       dataCheckStatus.textContent = message || "";
-      dataCheckStatus.dataset.tone = tone;
       dataCheckStatus.hidden = !message;
+    }
+
+    function resolveHoursSelection() {
+      const fallback = 4;
+      if (!checkAllDatasHours) return fallback;
+      const raw = Number.parseInt(checkAllDatasHours.value, 10);
+      if (!Number.isFinite(raw)) {
+        checkAllDatasHours.value = String(fallback);
+        return fallback;
+      }
+      const clamped = Math.min(4, Math.max(2, raw));
+      if (String(clamped) !== checkAllDatasHours.value) {
+        checkAllDatasHours.value = String(clamped);
+      }
+      return clamped;
     }
 
     if (symbolInput) {
@@ -1261,11 +1384,13 @@ def render_inspection_page(
     async function fetchCheckAllDatasOverview() {
       if (!checkAllDatasButton) return;
       const url = new URL("/inspection/check-all-datas", window.location.origin);
-      url.searchParams.set("hours", "4");
-      setDataCheckStatus("Загрузка агрегированных данных…", "info");
+      const hours = resolveHoursSelection();
+      url.searchParams.set("hours", String(hours));
+      setDataCheckStatus(`Загрузка агрегированных данных за ${hours} ч…`, "info");
       checkAllDatasButton.disabled = true;
       if (dataCheckJson) dataCheckJson.textContent = "null";
       if (dataCheckPanel) dataCheckPanel.innerHTML = "";
+      if (dataCheckContainer) dataCheckContainer.hidden = false;
       try {
         const jsonResponse = await fetch(url.toString(), {
           headers: { Accept: "application/json" },
@@ -1310,6 +1435,13 @@ def render_inspection_page(
       } finally {
         checkAllDatasButton.disabled = false;
       }
+    }
+
+    if (checkAllDatasHours) {
+      resolveHoursSelection();
+      checkAllDatasHours.addEventListener("change", () => {
+        resolveHoursSelection();
+      });
     }
 
     function ensureChart() {
@@ -2024,7 +2156,15 @@ def render_inspection_page(
               <button class=\"secondary\" type=\"button\" data-metric=\"zones\">Zones</button>
               <button class=\"secondary\" type=\"button\" data-metric=\"smt\">SMT</button>
               <button class=\"secondary\" type=\"button\" data-metric=\"agg\">Agg Trades</button>
-              <button id=\"btn-check-all-datas\" class=\"primary\" type=\"button\">Check all datas</button>
+              <button id=\"btn-check-all-datas\" class=\"secondary\" type=\"button\">Check all datas</button>
+              <label class=\"metrics-hours\" for=\"check-all-datas-hours\">
+                <span>Детализация (часы)</span>
+                <select id=\"check-all-datas-hours\">
+                  <option value=\"2\">2</option>
+                  <option value=\"3\">3</option>
+                  <option value=\"4\" selected>4</option>
+                </select>
+              </label>
             </div>
             <div class=\"json-panels\">
               <div class=\"collapse\">
@@ -2033,6 +2173,20 @@ def render_inspection_page(
                   <button class=\"secondary\" type=\"button\" data-copy-target=\"data-json\">Copy JSON</button>
                 </header>
                 <pre id=\"data-json\">{data_json_initial}</pre>
+                <div id=\"data-check-container\" class=\"data-check-container\" hidden>
+                  <span class=\"badge\">Aggregated market slice</span>
+                  <div id=\"data-check-status\" class=\"data-check-status\" hidden data-tone=\"info\"></div>
+                  <div class=\"data-check-grid\">
+                    <div class=\"data-check-json\">
+                      <div class=\"data-check-json__header\">
+                        <h4>Check all datas JSON</h4>
+                        <button class=\"secondary\" type=\"button\" data-copy-target=\"data-check-json\">Copy JSON</button>
+                      </div>
+                      <pre id=\"data-check-json\">null</pre>
+                    </div>
+                    <div id=\"data-check-panel\" class=\"data-check-panel\"></div>
+                  </div>
+                </div>
               </div>
               <div class=\"collapse\">
                 <header data-collapse-toggle>
@@ -2047,22 +2201,6 @@ def render_inspection_page(
                   <button class=\"secondary\" type=\"button\" data-copy-target=\"metric-json\">Copy JSON</button>
                 </header>
                 <pre id=\"metric-json\">{metric_json_initial}</pre>
-              </div>
-            </div>
-            <div class=\"data-check-block\">
-              <div class=\"data-check-header\">
-                <span class=\"badge\">Aggregated market slice</span>
-              </div>
-              <div id=\"data-check-status\" class=\"status-banner\" hidden data-tone=\"info\"></div>
-              <div class=\"data-check-grid\">
-                <div class=\"collapse\">
-                  <header data-collapse-toggle>
-                    <h3>Check all datas JSON</h3>
-                    <button class=\"secondary\" type=\"button\" data-copy-target=\"data-check-json\">Copy JSON</button>
-                  </header>
-                  <pre id=\"data-check-json\">null</pre>
-                </div>
-                <div id=\"data-check-panel\" class=\"data-check-panel\"></div>
               </div>
             </div>
           </section>
