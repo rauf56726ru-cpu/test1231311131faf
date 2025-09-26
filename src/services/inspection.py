@@ -492,6 +492,7 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
             tf_key,
             candles,
             include_diagnostics=True,
+            use_full_span=(tf_key == "1m"),
         )
         diagnostics = result.pop("diagnostics", {})
 
