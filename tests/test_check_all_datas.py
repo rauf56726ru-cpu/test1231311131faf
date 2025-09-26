@@ -119,11 +119,12 @@ def test_historical_snapshot_still_populates_window(client: TestClient) -> None:
     body = response.json()
 
     expected_last = base + timedelta(minutes=len(payload["candles"]) - 1)
-    expected_last_iso = expected_last.isoformat()
+    expected_reference = expected_last + timedelta(minutes=1)
+    expected_last_iso = expected_reference.isoformat()
 
     assert body["snapshot_id"] == snapshot_id
     assert body["asof_utc"].startswith(expected_last_iso)
-    assert body["latest_candle_utc"].startswith(expected_last_iso)
+    assert body["latest_candle_utc"].startswith(expected_last.isoformat())
     assert body["latest_candle"]["t"] == int(expected_last.timestamp() * 1000)
     assert body["datas_for_last_N_hours"]["hours"] == 2
     assert (
@@ -134,7 +135,7 @@ def test_historical_snapshot_still_populates_window(client: TestClient) -> None:
         body["datas_for_last_N_hours"]["frames"]["1m"]["candles"][-1]["t"]
         == payload["candles"][-1]["t"]
     )
-    detailed_start_ms = payload["candles"][-1]["t"] - 2 * 3_600_000
+    detailed_start_ms = (payload["candles"][-1]["t"] + 60_000) - 2 * 3_600_000
     expected_detailed_start = datetime.fromtimestamp(
         detailed_start_ms / 1000, tz=timezone.utc
     ).isoformat()
@@ -203,6 +204,7 @@ def test_check_all_after_reload_returns_data(client: TestClient) -> None:
     body = response.json()
 
     expected_last = base + timedelta(minutes=len(payload["candles"]) - 1)
+    expected_reference = expected_last + timedelta(minutes=1)
     assert body["snapshot_id"] == snapshot_id
     assert body["latest_candle"]["t"] == int(expected_last.timestamp() * 1000)
     assert (
@@ -210,7 +212,7 @@ def test_check_all_after_reload_returns_data(client: TestClient) -> None:
         == len(payload["candles"])
     )
     assert body["datas_for_last_N_hours"]["hours"] == 3
-    detailed_start_ms = payload["candles"][-1]["t"] - 3 * 3_600_000
+    detailed_start_ms = (payload["candles"][-1]["t"] + 60_000) - 3 * 3_600_000
     expected_detailed_start = datetime.fromtimestamp(
         detailed_start_ms / 1000, tz=timezone.utc
     ).isoformat()
@@ -269,3 +271,12 @@ def test_detailed_section_backfills_minute_frame(client: TestClient) -> None:
     assert minute_candles[0]["t"] >= expected_start_ms
     assert minute_candles[-1]["t"] <= expected_end_ms
     assert minute_frame["summary"]["count"] == len(minute_candles) == 60
+
+    delta_cvd = detailed["indicators"]["delta_cvd"]
+    assert "1m" in delta_cvd
+    assert delta_cvd["1m"], "minute delta/CVD series should be populated"
+    assert "3m" not in delta_cvd
+    assert "5m" not in delta_cvd
+
+    assert "3m" not in detailed["frames"]
+    assert "5m" not in detailed["frames"]

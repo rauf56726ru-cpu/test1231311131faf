@@ -473,6 +473,31 @@ def build_check_all_datas(
 
     _ensure_minute_frame(frames, primary_key=primary_key, primary_candles=primary_candles)
 
+    # Drop unused granularities to keep the payload focused on the requested set.
+    frames.pop("3m", None)
+    frames.pop("5m", None)
+
+    minute_candles = frames.get("1m", [])
+
+    derived_reference_ts: int | None = (
+        minute_candles[-1]["t"] + MINUTE_INTERVAL_MS if minute_candles else None
+    )
+    if derived_reference_ts is None:
+        interval_ms = _timeframe_interval_ms(primary_key) or 0
+        if interval_ms > 0:
+            derived_reference_ts = primary_candles[-1]["t"] + max(
+                0, interval_ms - MINUTE_INTERVAL_MS
+            )
+    if derived_reference_ts is None:
+        for candles in frames.values():
+            if not candles:
+                continue
+            candidate_ts = candles[-1]["t"]
+            if derived_reference_ts is None or candidate_ts > derived_reference_ts:
+                derived_reference_ts = candidate_ts
+    if derived_reference_ts is None:
+        derived_reference_ts = primary_candles[-1]["t"]
+
     snapshot_selection = snapshot.get("selection") if isinstance(snapshot.get("selection"), Mapping) else None
     start_ms = selection_start_ms or _safe_int(snapshot_selection.get("start")) if snapshot_selection else None
     end_ms = selection_end_ms or _safe_int(snapshot_selection.get("end")) if snapshot_selection else None
@@ -494,7 +519,7 @@ def build_check_all_datas(
             reference_dt = now_utc.astimezone(UTC)
         reference_ts = int(reference_dt.timestamp() * 1000)
     else:
-        reference_ts = end_ms
+        reference_ts = derived_reference_ts
         reference_dt = datetime.fromtimestamp(reference_ts / 1000.0, tz=UTC)
 
     detailed_start_ts = reference_ts - hours_window * MS_IN_HOUR
@@ -504,7 +529,7 @@ def build_check_all_datas(
     if movement_end_ts > reference_ts:
         movement_end_ts = reference_ts
 
-    latest_candle_ts = primary_candles[-1]["t"]
+    latest_candle_ts = minute_candles[-1]["t"] if minute_candles else primary_candles[-1]["t"]
     latest_candle_dt = datetime.fromtimestamp(latest_candle_ts / 1000.0, tz=UTC)
 
     detailed_start_dt = datetime.fromtimestamp(detailed_start_ts / 1000.0, tz=UTC)
@@ -607,6 +632,10 @@ def build_check_all_datas(
 
     movement_key = f"movement_datas_for_{movement_days}_days"
 
+    latest_candle_payload = (
+        dict(minute_candles[-1]) if minute_candles else dict(primary_candles[-1])
+    )
+
     return {
         "snapshot_id": snapshot.get("id"),
         "symbol": snapshot.get("symbol"),
@@ -614,7 +643,7 @@ def build_check_all_datas(
         "selection": {"start": start_ms, "end": end_ms},
         "asof_utc": reference_dt.isoformat(),
         "latest_candle_utc": latest_candle_dt.isoformat(),
-        "latest_candle": dict(primary_candles[-1]),
+        "latest_candle": dict(latest_candle_payload),
         "datas_for_last_N_hours": detailed_section,
         movement_key: movement_section,
     }
