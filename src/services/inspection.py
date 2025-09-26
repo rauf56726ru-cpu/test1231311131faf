@@ -12,6 +12,12 @@ from pathlib import Path
 from typing import Any, DefaultDict, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple
 
 from .ohlc import TIMEFRAME_WINDOWS, TIMEFRAME_TO_MS, normalise_ohlcv
+from .profile import (
+    build_volume_profile,
+    compute_session_profiles,
+    flatten_profile,
+    split_by_sessions,
+)
 from ..meta import Meta
 
 Snapshot = Dict[str, Any]
@@ -520,11 +526,74 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
         base_candles = normalised_frames[first_key].get("candles", [])
     session_vwap = compute_session_vwaps(symbol, base_candles)
 
+    tpo_entries: List[Dict[str, object]] = []
+    flattened_profile: List[Dict[str, float]] = []
+    sessions = list(Meta.iter_vwap_sessions())
+    profile_settings: Mapping[str, Any] = {}
+    meta_section = snapshot.get("meta")
+    if isinstance(meta_section, Mapping):
+        candidate = meta_section.get("profile")
+        if isinstance(candidate, Mapping):
+            profile_settings = candidate
+
+    profile_last_n = 3
+    if profile_settings:
+        try:
+            profile_last_n = int(profile_settings.get("last_n", profile_last_n))
+        except (TypeError, ValueError):
+            profile_last_n = 3
+    if profile_last_n <= 0:
+        profile_last_n = 3
+
+    tick_size_value: float | None = None
+    if profile_settings and "tick_size" in profile_settings:
+        try:
+            tick_size_value = float(profile_settings.get("tick_size"))
+        except (TypeError, ValueError):
+            tick_size_value = None
+
+    adaptive_bins_flag = bool(profile_settings.get("adaptive_bins")) if profile_settings else False
+    value_area_pct = 0.70
+    if profile_settings and "value_area_pct" in profile_settings:
+        try:
+            value_area_pct = float(profile_settings.get("value_area_pct", value_area_pct))
+        except (TypeError, ValueError):
+            value_area_pct = 0.70
+
+    if base_candles and sessions:
+        tpo_entries = compute_session_profiles(
+            base_candles,
+            sessions=sessions,
+            last_n=profile_last_n,
+            tick_size=tick_size_value,
+            adaptive_bins=adaptive_bins_flag,
+            value_area_pct=value_area_pct,
+        )
+        if tpo_entries:
+            latest = tpo_entries[-1]
+            latest_date = latest.get("date")
+            latest_session = latest.get("session")
+            session_map = split_by_sessions(base_candles, sessions)
+            if latest_date and latest_session and session_map:
+                for (session_date, session_name), session_candles in session_map.items():
+                    if session_date.isoformat() == latest_date and session_name == latest_session:
+                        last_profile = build_volume_profile(
+                            session_candles,
+                            tick_size=tick_size_value,
+                            adaptive_bins=adaptive_bins_flag,
+                            value_area_pct=value_area_pct,
+                        )
+                        if last_profile.prices:
+                            flattened_profile = flatten_profile(last_profile)
+                        break
+
     data_section = {
         "symbol": symbol,
         "frames": normalised_frames,
         "selection": selection,
         "session_vwap": session_vwap,
+        "tpo": tpo_entries,
+        "profile": flattened_profile,
         "agg_trades": snapshot.get("agg_trades")
         or {
             "status": "unavailable",

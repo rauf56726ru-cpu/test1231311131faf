@@ -42,3 +42,38 @@
 - `public/` &mdash; JS/стили для графика (`app.js`, `binanceCandles.js`, `chart-gap-watcher.js`, `styles.css`).
 - `templates/index.html` &mdash; единственная страница с графиком и панелью управления.
 - `src/` &mdash; минимальный FastAPI-проект с обработчиками `/inspection/snapshot`, `/inspection`, `health`, `version` и вспомогательными модулями `services/`.
+
+## Профиль объёма и TPO
+
+Эндпоинт `/profile` возвращает рассчитанный профиль объёма и уровни VAH/VAL/POC для последних торговых сессий:
+
+```http
+GET /profile?snapshot=<SNAPSHOT_ID>&tf=1m&last_n=3&adaptive_bins=false&value_area_pct=0.7
+```
+
+Параметры запроса:
+
+- `snapshot` — обязательный идентификатор ранее сохранённого снапшота.
+- `tf` — таймфрейм, по умолчанию `1m`.
+- `last_n` — количество последних сессий (1–5, по умолчанию 3).
+- `tick_size` — фиксированный шаг цены, если известен.
+- `adaptive_bins` — переключает адаптивный расчёт шага бина (0.5 × ATR), когда `tick_size` не задан.
+- `value_area_pct` — доля объёма в value area (по умолчанию 0.7).
+
+Пример ответа:
+
+```json
+{
+  "symbol": "BTCUSDT",
+  "tpo": [
+    {"date": "2024-05-12", "session": "asia", "POC": 61050.0, "VAL": 60920.0, "VAH": 61200.0},
+    {"date": "2024-05-12", "session": "london", "POC": 61310.0, "VAH": 61420.0, "VAL": 61210.0}
+  ],
+  "profile": [
+    {"price": 61200.0, "volume": 15.2},
+    {"price": 61250.0, "volume": 18.7}
+  ]
+}
+```
+
+Секция `tpo` содержит сводку по последним сессиям, а `profile` — дискретный профиль объёма для самой свежей сессии.

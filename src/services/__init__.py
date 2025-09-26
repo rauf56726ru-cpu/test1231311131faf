@@ -10,6 +10,12 @@ from .inspection import (
     register_snapshot,
     render_inspection_page,
 )
+from .profile import (
+    build_volume_profile,
+    compute_session_profiles,
+    flatten_profile,
+    split_by_sessions,
+)
 from .ohlc import TIMEFRAME_WINDOWS, normalise_ohlcv, normalise_ohlcv_sync
 from .vwap import fetch_daily_vwap, fetch_daily_vwap_sync
 from .trades import AggTradeCollector
@@ -29,4 +35,8 @@ __all__ = [
     "AggTradeCollector",
     "fetch_daily_vwap",
     "fetch_daily_vwap_sync",
+    "build_volume_profile",
+    "compute_session_profiles",
+    "flatten_profile",
+    "split_by_sessions",
 ]
