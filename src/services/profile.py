@@ -1,10 +1,11 @@
 """Volume profile and TPO helpers for inspection payloads."""
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, time as dtime, timedelta, timezone
 import math
-from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Any, DefaultDict, Dict, Iterable, List, Mapping, Sequence, Tuple
 
 
 _PROFILE_CACHE: Dict[Tuple[Any, ...], "VolumeProfile"] = {}
@@ -308,46 +309,50 @@ def compute_session_profiles(
     target_bins: int = 80,
     cache_token: Any | None = None,
 ) -> List[Dict[str, object]]:
-    """Return volume profile summaries for the latest trading sessions."""
+    """Return volume profile summaries grouped by calendar day."""
 
     session_list = list(sessions)
-    if not session_list:
+    session_map = (
+        split_by_sessions(candles_1m, session_list) if session_list else {}
+    )
+
+    daily_buckets: DefaultDict[date, List[Mapping[str, Any]]] = defaultdict(list)
+    for candle in candles_1m:
+        if not isinstance(candle, Mapping):
+            continue
+        ts = _extract_timestamp(candle)
+        if ts is None:
+            continue
+        dt = datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc)
+        daily_buckets[dt.date()].append(dict(candle))
+
+    if not daily_buckets:
         return []
 
-    session_map = split_by_sessions(candles_1m, session_list)
-    if not session_map:
-        return []
-
-    order_map = {name: index for index, (name, _, _) in enumerate(session_list)}
-    ordered_keys = _sort_session_keys(session_map, order_map)
+    ordered_dates = sorted(daily_buckets.keys())
     if last_n > 0:
-        ordered_keys = ordered_keys[-last_n:]
+        ordered_dates = ordered_dates[-last_n:]
 
-    summaries: List[Dict[str, object]] = []
-    for key in ordered_keys:
-        session_candles = session_map.get(key, [])
+    def resolve_profile(
+        candles_seq: Sequence[Mapping[str, Any]],
+        cache_key: Tuple[date, str],
+    ) -> VolumeProfile:
         cache_scope = None
+        profile: VolumeProfile | None = None
         if cache_token is not None:
             cache_scope = (
                 cache_token,
-                key,
+                cache_key,
                 round(float(tick_size or 0.0), 12),
                 bool(adaptive_bins),
                 round(float(value_area_pct), 4),
                 round(float(atr_multiplier), 4),
                 int(target_bins),
             )
-            cached = _PROFILE_CACHE.get(cache_scope)
-            if cached is not None:
-                profile = cached
-            else:
-                profile = None
-        else:
-            profile = None
-
+            profile = _PROFILE_CACHE.get(cache_scope)
         if profile is None:
             profile = build_volume_profile(
-                session_candles,
+                candles_seq,
                 tick_size=tick_size,
                 adaptive_bins=adaptive_bins,
                 value_area_pct=value_area_pct,
@@ -355,9 +360,14 @@ def compute_session_profiles(
                 target_bins=target_bins,
                 cache_scope=cache_scope,
             )
+        return profile
+
+    def make_payload(
+        day_key: date, session_label: str, profile: VolumeProfile
+    ) -> Dict[str, object]:
         payload: Dict[str, object] = {
-            "date": key[0].isoformat(),
-            "session": key[1],
+            "date": day_key.isoformat(),
+            "session": session_label,
         }
         if profile.diagnostics:
             payload["DIAGNOSTICS"] = dict(profile.diagnostics)
@@ -367,7 +377,32 @@ def compute_session_profiles(
                 payload["VAH"] = profile.vah
             if math.isfinite(profile.val):
                 payload["VAL"] = profile.val
-        summaries.append(payload)
+        return payload
+
+    summaries: List[Dict[str, object]] = []
+    for day_key in ordered_dates:
+        day_candles = daily_buckets.get(day_key, [])
+        if not day_candles:
+            continue
+
+        daily_profile = resolve_profile(day_candles, (day_key, "daily"))
+        day_payload = make_payload(day_key, "daily", daily_profile)
+
+        session_payloads: List[Dict[str, object]] = []
+        for session_name, _, _ in session_list:
+            session_candles = session_map.get((day_key, session_name))
+            if not session_candles:
+                continue
+            session_profile = resolve_profile(session_candles, (day_key, session_name))
+            session_payload = make_payload(day_key, session_name, session_profile)
+            session_payloads.append(session_payload)
+
+        if session_payloads:
+            day_payload["sessions"] = [dict(item) for item in session_payloads]
+
+        summaries.append(day_payload)
+        summaries.extend(session_payloads)
+
     return summaries
 
 
