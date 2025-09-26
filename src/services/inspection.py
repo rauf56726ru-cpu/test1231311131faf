@@ -12,12 +12,8 @@ from pathlib import Path
 from typing import Any, DefaultDict, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple
 
 from .ohlc import TIMEFRAME_WINDOWS, TIMEFRAME_TO_MS, normalise_ohlcv
-from .profile import (
-    build_volume_profile,
-    compute_session_profiles,
-    flatten_profile,
-    split_by_sessions,
-)
+from .profile import build_profile_package
+from .presets import resolve_profile_config
 from ..meta import Meta
 
 Snapshot = Dict[str, Any]
@@ -195,7 +191,6 @@ def build_placeholder_snapshot(*, symbol: str = DEFAULT_SYMBOL, timeframe: str =
         "agg_trades": agg_payload,
         "meta": {"source": {"kind": "placeholder", "generated": True}},
     }
-
 
 
 
@@ -520,72 +515,57 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
             "value": _compute_vwap(filtered_candles),
         }
 
-    base_candles: Sequence[Mapping[str, Any]] = normalised_frames.get("1m", {}).get("candles", [])
+    profile_config = resolve_profile_config(symbol, snapshot.get("meta"))
+    preset = profile_config["preset"]
+    raw_profile_defaults = profile_config.get("raw_defaults")
+    preset_payload = profile_config.get("preset_payload")
+    preset_required = profile_config.get("preset_required", False)
+    target_tf_key = profile_config.get("target_tf_key", "1m")
+
+    base_candles = normalised_frames.get(target_tf_key, {}).get("candles", [])
+    if not base_candles:
+        base_candles = normalised_frames.get("1m", {}).get("candles", [])
     if not base_candles and normalised_frames:
         first_key = next(iter(normalised_frames))
         base_candles = normalised_frames[first_key].get("candles", [])
+
     session_vwap = compute_session_vwaps(symbol, base_candles)
 
+    sessions = list(Meta.iter_vwap_sessions())
     tpo_entries: List[Dict[str, object]] = []
     flattened_profile: List[Dict[str, float]] = []
-    sessions = list(Meta.iter_vwap_sessions())
-    profile_settings: Mapping[str, Any] = {}
-    meta_section = snapshot.get("meta")
-    if isinstance(meta_section, Mapping):
-        candidate = meta_section.get("profile")
-        if isinstance(candidate, Mapping):
-            profile_settings = candidate
+    zone_items: List[Dict[str, Any]] = []
 
-    profile_last_n = 3
-    if profile_settings:
-        try:
-            profile_last_n = int(profile_settings.get("last_n", profile_last_n))
-        except (TypeError, ValueError):
-            profile_last_n = 3
-    if profile_last_n <= 0:
-        profile_last_n = 3
+    tick_size_value = profile_config.get("tick_size")
+    adaptive_bins_flag = bool(profile_config.get("adaptive_bins", True))
+    value_area_pct = float(profile_config.get("value_area_pct", 0.7))
+    profile_last_n = int(profile_config.get("last_n", 3))
+    atr_multiplier = float(profile_config.get("atr_multiplier", 0.5))
+    target_bins = int(profile_config.get("target_bins", 80))
+    clip_threshold = float(profile_config.get("clip_threshold", 0.0))
+    smooth_window = int(profile_config.get("smooth_window", 1))
 
-    tick_size_value: float | None = None
-    if profile_settings and "tick_size" in profile_settings:
-        try:
-            tick_size_value = float(profile_settings.get("tick_size"))
-        except (TypeError, ValueError):
-            tick_size_value = None
-
-    adaptive_bins_flag = bool(profile_settings.get("adaptive_bins")) if profile_settings else False
-    value_area_pct = 0.70
-    if profile_settings and "value_area_pct" in profile_settings:
-        try:
-            value_area_pct = float(profile_settings.get("value_area_pct", value_area_pct))
-        except (TypeError, ValueError):
-            value_area_pct = 0.70
-
-    if base_candles and sessions:
-        tpo_entries = compute_session_profiles(
+    if preset and base_candles and sessions:
+        cache_token = (
+            "inspection",
+            snapshot.get("id"),
+            symbol,
+            target_tf_key,
+        )
+        (tpo_entries, flattened_profile, zone_items) = build_profile_package(
             base_candles,
             sessions=sessions,
             last_n=profile_last_n,
             tick_size=tick_size_value,
             adaptive_bins=adaptive_bins_flag,
             value_area_pct=value_area_pct,
+            atr_multiplier=atr_multiplier,
+            target_bins=target_bins,
+            clip_threshold=clip_threshold,
+            smooth_window=smooth_window,
+            cache_token=cache_token,
+            tf_key=target_tf_key,
         )
-        if tpo_entries:
-            latest = tpo_entries[-1]
-            latest_date = latest.get("date")
-            latest_session = latest.get("session")
-            session_map = split_by_sessions(base_candles, sessions)
-            if latest_date and latest_session and session_map:
-                for (session_date, session_name), session_candles in session_map.items():
-                    if session_date.isoformat() == latest_date and session_name == latest_session:
-                        last_profile = build_volume_profile(
-                            session_candles,
-                            tick_size=tick_size_value,
-                            adaptive_bins=adaptive_bins_flag,
-                            value_area_pct=value_area_pct,
-                        )
-                        if last_profile.prices:
-                            flattened_profile = flatten_profile(last_profile)
-                        break
 
     data_section = {
         "symbol": symbol,
@@ -594,6 +574,8 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
         "session_vwap": session_vwap,
         "tpo": tpo_entries,
         "profile": flattened_profile,
+        "zones": zone_items,
+        "zones_raw": snapshot.get("zones"),
         "agg_trades": snapshot.get("agg_trades")
         or {
             "status": "unavailable",
@@ -601,16 +583,14 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
         },
         "delta_cvd": delta_frames,
         "vwap_tpo": vwap_frames,
-        "zones": snapshot.get("zones")
-        or {
-            "status": "unavailable",
-            "detail": "Zones provider is not configured in the snapshot.",
-        },
         "smt": snapshot.get("smt")
         or {
             "status": "unavailable",
             "detail": "SMT provider is not configured in the snapshot.",
         },
+        "profile_preset": preset_payload,
+        "profile_preset_required": bool(preset_required),
+        "profile_defaults": raw_profile_defaults,
         "meta": {
             "requested": {
                 "symbol": symbol,
@@ -967,6 +947,158 @@ def render_inspection_page(
     .status-banner[data-tone="warning"] {
       border-color: rgba(250, 204, 21, 0.6);
       background: rgba(113, 63, 18, 0.35);
+    }
+    .preset-controls {
+      margin-top: 0.8rem;
+      margin-bottom: 0.8rem;
+      display: flex;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .preset-chip {
+      display: inline-flex;
+      align-items: center;
+      padding: 0.35rem 0.75rem;
+      border-radius: 999px;
+      font-size: 0.82rem;
+      font-weight: 600;
+      background: rgba(14, 165, 233, 0.25);
+      color: #f8fafc;
+    }
+    .preset-chip[data-variant="warning"] {
+      background: rgba(249, 115, 22, 0.5);
+      color: #0f172a;
+    }
+    .preset-chip[data-variant="success"] {
+      background: rgba(34, 197, 94, 0.55);
+      color: #0f172a;
+    }
+    .preset-chip[data-variant="info"] {
+      background: rgba(14, 165, 233, 0.55);
+      color: #0f172a;
+    }
+    .modal {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      z-index: 40;
+    }
+    .modal[hidden] {
+      display: none;
+    }
+    .modal__backdrop {
+      position: absolute;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.7);
+    }
+    .modal__dialog {
+      position: relative;
+      margin: 6vh auto;
+      max-width: 640px;
+      width: min(92vw, 640px);
+      background: rgba(15, 23, 42, 0.96);
+      border-radius: 16px;
+      padding: 1.5rem;
+      border: 1px solid rgba(148, 163, 184, 0.35);
+      color: #e2e8f0;
+      box-shadow: 0 32px 64px rgba(15, 23, 42, 0.45);
+    }
+    .modal__header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 1rem;
+    }
+    .modal__header h3 {
+      margin: 0;
+      font-size: 1.2rem;
+    }
+    .modal__close {
+      background: none;
+      border: none;
+      color: #94a3b8;
+      font-size: 1.5rem;
+      cursor: pointer;
+      padding: 0;
+      line-height: 1;
+    }
+    .modal__body {
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+      max-height: 70vh;
+      overflow-y: auto;
+    }
+    .preset-form-grid {
+      display: grid;
+      gap: 0.8rem;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    }
+    .preset-form-grid label {
+      display: flex;
+      flex-direction: column;
+      gap: 0.35rem;
+      font-size: 0.85rem;
+    }
+    .preset-form-grid input,
+    .preset-form-grid select {
+      padding: 0.45rem 0.6rem;
+      border-radius: 8px;
+      border: 1px solid rgba(148, 163, 184, 0.28);
+      background: rgba(15, 23, 42, 0.8);
+      color: #e2e8f0;
+    }
+    .preset-form-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 0.75rem;
+      margin-top: 0.5rem;
+    }
+    .preset-list {
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+    .preset-list__item {
+      padding: 0.75rem 0.9rem;
+      border-radius: 10px;
+      background: rgba(15, 23, 42, 0.85);
+      border: 1px solid rgba(148, 163, 184, 0.25);
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 0.5rem;
+    }
+    .preset-list__title {
+      font-weight: 600;
+      font-size: 1rem;
+    }
+    .preset-list__meta {
+      font-size: 0.82rem;
+      color: #94a3b8;
+    }
+    .preset-list__actions {
+      display: flex;
+      gap: 0.5rem;
+    }
+    .preset-list__empty {
+      margin: 0;
+      color: #94a3b8;
+    }
+    .btn-danger {
+      background: rgba(239, 68, 68, 0.85);
+      color: #0f172a;
+      border: none;
+      border-radius: 8px;
+      padding: 0.45rem 0.75rem;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .btn-danger:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
     }
 
     .main-preview-panel {
@@ -1341,6 +1473,31 @@ def render_inspection_page(
     const statusEl = document.getElementById("inspection-status");
     const metricButtons = Array.from(document.querySelectorAll("[data-metric]"));
     const symbolInput = document.getElementById("symbol-input");
+    const presetChip = document.getElementById("preset-chip");
+    const managePresetsButton = document.getElementById("manage-presets");
+    const presetModal = document.getElementById("preset-modal");
+    const presetBackdrop = document.getElementById("preset-modal-backdrop");
+    const presetForm = document.getElementById("preset-form");
+    const presetListView = document.getElementById("preset-list-view");
+    const presetListContainer = document.getElementById("preset-list");
+    const presetFormSection = document.getElementById("preset-form-section");
+    const presetModalTitle = document.getElementById("preset-modal-title");
+    const presetModeField = document.getElementById("preset-mode-input");
+    const presetSymbolField = document.getElementById("preset-symbol");
+    const presetTfField = document.getElementById("preset-tf");
+    const presetLastNField = document.getElementById("preset-last-n");
+    const presetValueAreaField = document.getElementById("preset-value-area");
+    const presetBinningModeField = document.getElementById("preset-binning-mode");
+    const presetTickSizeField = document.getElementById("preset-tick-size");
+    const presetAtrField = document.getElementById("preset-atr-multiplier");
+    const presetBinsField = document.getElementById("preset-target-bins");
+    const presetClipField = document.getElementById("preset-clip-tail");
+    const presetSmoothField = document.getElementById("preset-smooth-window");
+    const presetTickRow = document.querySelector("[data-preset-tick]");
+    const presetAdaptiveRow = document.querySelector("[data-preset-adaptive]");
+    const presetSubmitButton = document.getElementById("preset-submit");
+    const presetCancelButtons = Array.from(document.querySelectorAll("[data-close-preset]"));
+    const presetCreateButton = document.getElementById("preset-create-button");
 
     initCollapsibles();
 
@@ -1359,8 +1516,298 @@ def render_inspection_page(
       series: null,
       checkAll: null,
       hours: checkAllHours ? resolveHours(checkAllHours.value) : 1,
+      profilePreset: initial.payload?.DATA?.profile_preset || null,
+      presetRequired: Boolean(initial.payload?.DATA?.profile_preset_required),
+      presetDefaults: initial.payload?.DATA?.profile_defaults || null,
+      presetList: [],
+      presetModalMode: null,
+      managingSymbol: null,
+      presetModalOpen: false,
     };
 
+    const AUTO_PRESET_SYMBOLS = new Set(["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
+
+    function autoPresetSymbol(symbol) {
+      const normalised = normaliseSymbol(symbol);
+      return normalised ? AUTO_PRESET_SYMBOLS.has(normalised) : false;
+    }
+
+    function activeSymbol() {
+      return (
+        normaliseSymbol(state.payload?.DATA?.symbol) ||
+        normaliseSymbol(initial.payload?.DATA?.symbol) ||
+        normaliseSymbol(initial.symbol) ||
+        defaultSymbol
+      );
+    }
+
+    function renderPresetChip() {
+      if (!presetChip) return;
+      const symbol = activeSymbol();
+      const preset = state.profilePreset;
+      if (state.presetRequired && !preset) {
+        presetChip.textContent = `Требуется пресет для ${symbol}`;
+        presetChip.dataset.variant = "warning";
+        presetChip.hidden = false;
+        return;
+      }
+      if (preset) {
+        const name = preset.symbol || symbol;
+        const suffix = preset.builtin ? " (auto)" : "";
+        presetChip.textContent = `Preset: ${name}${suffix}`;
+        presetChip.dataset.variant = preset.builtin ? "info" : "success";
+        presetChip.hidden = false;
+        return;
+      }
+      if (autoPresetSymbol(symbol)) {
+        presetChip.textContent = `Preset: ${symbol} (auto)`;
+        presetChip.dataset.variant = "info";
+        presetChip.hidden = false;
+        return;
+      }
+      presetChip.hidden = true;
+    }
+
+    function handleBinningModeChange() {
+      if (!presetBinningModeField) return;
+      const mode = presetBinningModeField.value === "tick" ? "tick" : "adaptive";
+      if (presetTickRow) presetTickRow.hidden = mode !== "tick";
+      if (presetAdaptiveRow) presetAdaptiveRow.hidden = mode !== "adaptive";
+    }
+
+    function populatePresetForm(preset, symbol) {
+      if (!presetForm) return;
+      const defaults = preset || state.presetDefaults || {};
+      const binningDefaults = preset?.binning || defaults.binning || {};
+      const extrasDefaults = preset?.extras || defaults.extras || {};
+
+      const mode = (binningDefaults.mode || (defaults.adaptive_bins === false ? "tick" : "adaptive")).toLowerCase() === "tick"
+        ? "tick"
+        : "adaptive";
+
+      if (presetModeField) presetModeField.value = preset ? "edit" : "create";
+      if (presetSymbolField) {
+        presetSymbolField.value = symbol || preset?.symbol || defaults.symbol || "";
+        presetSymbolField.readOnly = Boolean(preset);
+      }
+      if (presetTfField) presetTfField.value = preset?.tf || defaults.tf || "1m";
+      if (presetLastNField) presetLastNField.value = preset?.last_n ?? defaults.last_n ?? 3;
+      if (presetValueAreaField) presetValueAreaField.value = preset?.value_area_pct ?? defaults.value_area_pct ?? defaults.value_area ?? 0.7;
+      if (presetBinningModeField) presetBinningModeField.value = mode;
+      if (presetTickSizeField)
+        presetTickSizeField.value =
+          mode === "tick"
+            ? binningDefaults.tick_size ?? defaults.tick_size ?? ""
+            : "";
+      if (presetAtrField) presetAtrField.value = binningDefaults.atr_multiplier ?? defaults.atr_multiplier ?? 0.5;
+      if (presetBinsField) presetBinsField.value = binningDefaults.target_bins ?? defaults.target_bins ?? 80;
+      if (presetClipField) presetClipField.value = extrasDefaults.clip_low_volume_tail ?? defaults.clip_low_volume_tail ?? 0.005;
+      if (presetSmoothField) presetSmoothField.value = extrasDefaults.smooth_window ?? defaults.smooth_window ?? 1;
+
+      handleBinningModeChange();
+    }
+
+    function openPresetModal(options = {}) {
+      if (!presetModal) return;
+      const symbol = options.symbol || activeSymbol();
+      presetModal.hidden = false;
+      if (presetBackdrop) presetBackdrop.hidden = false;
+      state.presetModalOpen = true;
+
+      if (options.mode === "list") {
+        state.presetModalMode = "list";
+        if (presetModalTitle) presetModalTitle.textContent = "Управление пресетами";
+        if (presetListView) presetListView.hidden = false;
+        if (presetFormSection) presetFormSection.hidden = true;
+        refreshPresetList();
+      } else {
+        state.presetModalMode = "form";
+        if (presetModalTitle) presetModalTitle.textContent = options.title || "Настроить пресет TPO";
+        if (presetListView) presetListView.hidden = true;
+        if (presetFormSection) presetFormSection.hidden = false;
+        populatePresetForm(options.preset || null, symbol);
+      }
+    }
+
+    function closePresetModal() {
+      if (!presetModal) return;
+      presetModal.hidden = true;
+      if (presetBackdrop) presetBackdrop.hidden = true;
+      state.presetModalOpen = false;
+      state.presetModalMode = null;
+    }
+
+    function readPresetForm() {
+      if (!presetForm) return null;
+      const symbol = (presetSymbolField?.value || "").trim().toUpperCase();
+      if (!symbol) {
+        throw new Error("Укажите символ");
+      }
+      const mode = presetBinningModeField?.value === "tick" ? "tick" : "adaptive";
+      const payload = {
+        symbol,
+        tf: (presetTfField?.value || "1m").toLowerCase(),
+        last_n: Number(presetLastNField?.value || 3),
+        value_area_pct: Number(presetValueAreaField?.value || 0.7),
+        binning: {
+          mode,
+          tick_size: mode === "tick" ? Number(presetTickSizeField?.value || 0) : null,
+          atr_multiplier: Number(presetAtrField?.value || 0.5),
+          target_bins: Number(presetBinsField?.value || 80),
+        },
+        extras: {
+          clip_low_volume_tail: Number(presetClipField?.value || 0.005),
+          smooth_window: Number(presetSmoothField?.value || 1),
+        },
+      };
+
+      payload.last_n = Math.min(5, Math.max(1, Math.round(payload.last_n)));
+      payload.value_area_pct = Math.min(0.95, Math.max(0.01, payload.value_area_pct));
+      if (mode === "tick") {
+        if (!payload.binning.tick_size || payload.binning.tick_size <= 0) {
+          throw new Error("Tick size должен быть положительным числом");
+        }
+      } else {
+        payload.binning.tick_size = null;
+        payload.binning.atr_multiplier = Math.min(2, Math.max(0.1, payload.binning.atr_multiplier));
+        payload.binning.target_bins = Math.min(200, Math.max(40, Math.round(payload.binning.target_bins)));
+      }
+      payload.extras.clip_low_volume_tail = Math.min(0.05, Math.max(0, payload.extras.clip_low_volume_tail));
+      payload.extras.smooth_window = Math.min(5, Math.max(1, Math.round(payload.extras.smooth_window)));
+      return payload;
+    }
+
+    async function refreshPresetList() {
+      if (!presetListContainer) return;
+      try {
+        const response = await fetch("/presets", { headers: { Accept: "application/json" } });
+        const data = await response.json();
+        const list = Array.isArray(data?.presets) ? data.presets : [];
+        state.presetList = list;
+      } catch (error) {
+        console.error("Failed to load presets", error);
+        state.presetList = [];
+      }
+      renderPresetList();
+    }
+
+    function renderPresetList() {
+      if (!presetListContainer) return;
+      presetListContainer.innerHTML = "";
+      const entries = Array.isArray(state.presetList) ? state.presetList : [];
+      if (!entries.length) {
+        const empty = document.createElement("p");
+        empty.className = "preset-list__empty";
+        empty.textContent = "Сохранённых пресетов пока нет";
+        presetListContainer.appendChild(empty);
+        return;
+      }
+      for (const preset of entries) {
+        const row = document.createElement("div");
+        row.className = "preset-list__item";
+        const title = document.createElement("div");
+        title.className = "preset-list__title";
+        const symbol = (preset?.symbol || "").toUpperCase();
+        title.textContent = symbol;
+        row.appendChild(title);
+
+        const meta = document.createElement("div");
+        meta.className = "preset-list__meta";
+        const modeLabel = preset?.binning?.mode === "tick" ? "Tick" : "Adaptive";
+        meta.textContent = `TF: ${preset?.tf || "1m"} · ${modeLabel}`;
+        row.appendChild(meta);
+
+        const actions = document.createElement("div");
+        actions.className = "preset-list__actions";
+
+        const editButton = document.createElement("button");
+        editButton.type = "button";
+        editButton.className = "btn-secondary";
+        editButton.textContent = "Редактировать";
+        editButton.disabled = Boolean(preset?.builtin);
+        editButton.addEventListener("click", () => {
+          populatePresetForm(preset, symbol);
+          if (presetModalTitle) presetModalTitle.textContent = `Редактировать пресет ${symbol}`;
+          if (presetListView) presetListView.hidden = true;
+          if (presetFormSection) presetFormSection.hidden = false;
+          state.presetModalMode = "form";
+        });
+        actions.appendChild(editButton);
+
+        const deleteButton = document.createElement("button");
+        deleteButton.type = "button";
+        deleteButton.className = "btn-danger";
+        deleteButton.textContent = "Удалить";
+        deleteButton.disabled = Boolean(preset?.builtin);
+        deleteButton.addEventListener("click", async () => {
+          if (!window.confirm(`Удалить пресет ${symbol}?`)) return;
+          try {
+            const response = await fetch(`/presets/${symbol}`, { method: "DELETE" });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            if (normaliseSymbol(symbol) === normaliseSymbol(activeSymbol())) {
+              state.profilePreset = null;
+              state.presetRequired = autoPresetSymbol(symbol) ? false : true;
+            }
+            await refreshPresetList();
+            renderPresetState();
+            updateCheckAllState();
+          } catch (error) {
+            console.error("Failed to delete preset", error);
+            updateStatus("Не удалось удалить пресет", "error");
+          }
+        });
+        actions.appendChild(deleteButton);
+
+        row.appendChild(actions);
+        presetListContainer.appendChild(row);
+      }
+    }
+
+    async function submitPresetForm(event) {
+      event.preventDefault();
+      if (!presetForm) return;
+      try {
+        const payload = readPresetForm();
+        if (!payload) return;
+        const mode = presetModeField?.value === "edit" ? "edit" : "create";
+        const url = mode === "edit" ? `/presets/${payload.symbol}` : "/presets";
+        const method = mode === "edit" ? "PUT" : "POST";
+        const response = await fetch(url, {
+          method,
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const data = await response.json();
+        const stored = data?.preset || payload;
+        if (normaliseSymbol(payload.symbol) === activeSymbol()) {
+          state.profilePreset = stored;
+          state.presetRequired = false;
+        }
+        closePresetModal();
+        renderPresetState();
+        updateCheckAllState();
+        if (checkAllButton && !checkAllButton.disabled) {
+          checkAllButton.click();
+        }
+      } catch (error) {
+        console.error("Failed to save preset", error);
+        updateStatus("Не удалось сохранить пресет", "error");
+      }
+    }
+
+    function renderPresetState() {
+      renderPresetChip();
+      if (state.presetRequired && !state.profilePreset && !state.presetModalOpen) {
+        openPresetModal({ mode: "form", title: "Настроить пресет TPO", symbol: activeSymbol() });
+      } else if (!state.presetRequired && state.presetModalOpen && state.presetModalMode === "form") {
+        closePresetModal();
+      }
+    }
+
+    renderPresetState();
     updateCheckAllState();
 
     if (symbolInput) {
@@ -1391,7 +1838,8 @@ def render_inspection_page(
       if (checkAllHours && hoursValid) {
         checkAllHours.value = String(state.hours);
       }
-      checkAllButton.disabled = !state.snapshotId || !hasSelection || !hoursValid;
+      const presetReady = !state.presetRequired;
+      checkAllButton.disabled = !state.snapshotId || !hasSelection || !hoursValid || !presetReady;
     }
 
     function populateSnapshots(list) {
@@ -1666,6 +2114,10 @@ def render_inspection_page(
         state.checkAll = null;
         setJson(checkAllPre, null);
         updateCheckAllState();
+        state.profilePreset = payload?.DATA?.profile_preset || null;
+        state.presetRequired = Boolean(payload?.DATA?.profile_preset_required);
+        state.presetDefaults = payload?.DATA?.profile_defaults || null;
+        renderPresetState();
         const nextSymbol = payload?.DATA?.symbol || initial.symbol;
         if (symbolInput) {
           const resolved = normaliseSymbol(nextSymbol) || normaliseSymbol(initial.symbol) || defaultSymbol;
@@ -1704,6 +2156,46 @@ def render_inspection_page(
         }
       });
     }
+
+    if (managePresetsButton) {
+      managePresetsButton.addEventListener("click", () => {
+        openPresetModal({ mode: "list" });
+      });
+    }
+
+    if (presetCreateButton) {
+      presetCreateButton.addEventListener("click", () => {
+        if (presetModalTitle) presetModalTitle.textContent = "Создать пресет";
+        if (presetListView) presetListView.hidden = true;
+        if (presetFormSection) presetFormSection.hidden = false;
+        state.presetModalMode = "form";
+        populatePresetForm(null, activeSymbol());
+      });
+    }
+
+    if (presetForm) {
+      presetForm.addEventListener("submit", submitPresetForm);
+    }
+
+    if (presetBinningModeField) {
+      presetBinningModeField.addEventListener("change", handleBinningModeChange);
+    }
+
+    presetCancelButtons.forEach((btn) => {
+      btn.addEventListener("click", () => {
+        closePresetModal();
+      });
+    });
+
+    if (presetBackdrop) {
+      presetBackdrop.addEventListener("click", () => closePresetModal());
+    }
+
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && state.presetModalOpen) {
+        closePresetModal();
+      }
+    });
 
     if (checkAllHours) {
       checkAllHours.value = String(state.hours);
@@ -2115,6 +2607,10 @@ def render_inspection_page(
               <button id=\"refresh-snapshot\" class=\"secondary\" type=\"button\">Refresh</button>
             </div>
             <div class=\"status-banner\" id=\"inspection-status\" hidden data-tone=\"info\"></div>
+            <div class=\"preset-controls\">
+              <span id=\"preset-chip\" class=\"preset-chip\" hidden></span>
+              <button id=\"manage-presets\" class=\"secondary\" type=\"button\">Управление пресетами</button>
+            </div>
             <div class=\"controls-grid\">
               <label>
                 <span>Символ</span>
@@ -2287,6 +2783,153 @@ def render_inspection_page(
               </div>
             </div>
           </section>
+        <div id=\"preset-modal\" class=\"modal\" hidden>
+          <div id=\"preset-modal-backdrop\" class=\"modal__backdrop\"></div>
+          <div class=\"modal__dialog\" role=\"dialog\" aria-modal=\"true\" aria-labelledby=\"preset-modal-title\">
+            <header class=\"modal__header\">
+              <h3 id=\"preset-modal-title\">Настроить пресет TPO</h3>
+              <button class=\"modal__close\" type=\"button\" data-close-preset>&times;</button>
+            </header>
+            <div class=\"modal__body\">
+              <div id=\"preset-list-view\" hidden>
+                <div class=\"preset-list\" id=\"preset-list\"></div>
+                <button id=\"preset-create-button\" class=\"btn-primary\" type=\"button\">Создать пресет</button>
+              </div>
+              <form id=\"preset-form\" hidden>
+                <input type=\"hidden\" id=\"preset-mode-input\" value=\"create\" />
+                <div class=\"preset-form-grid\" id=\"preset-form-section\">
+                  <label>
+                    <span>Символ</span>
+                    <input id=\"preset-symbol\" type=\"text\" required autocomplete=\"off\" />
+                  </label>
+                  <label>
+                    <span>Таймфрейм</span>
+                    <select id=\"preset-tf\">
+                      <option value=\"1m\">1m</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>Количество сессий</span>
+                    <input id=\"preset-last-n\" type=\"number\" min=\"1\" max=\"5\" step=\"1\" />
+                  </label>
+                  <label>
+                    <span>Value area %</span>
+                    <input id=\"preset-value-area\" type=\"number\" min=\"0.1\" max=\"0.95\" step=\"0.01\" />
+                  </label>
+                  <label>
+                    <span>Режим биннинга</span>
+                    <select id=\"preset-binning-mode\">
+                      <option value=\"adaptive\">Adaptive (ATR)</option>
+                      <option value=\"tick\">Tick size</option>
+                    </select>
+                  </label>
+                  <label data-preset-tick>
+                    <span>Tick size</span>
+                    <input id=\"preset-tick-size\" type=\"number\" step=\"0.0001\" min=\"0\" />
+                  </label>
+                  <label data-preset-adaptive>
+                    <span>ATR multiplier</span>
+                    <input id=\"preset-atr-multiplier\" type=\"number\" step=\"0.05\" min=\"0.1\" max=\"2\" />
+                  </label>
+                  <label data-preset-adaptive>
+                    <span>Целевые бины</span>
+                    <input id=\"preset-target-bins\" type=\"number\" step=\"5\" min=\"40\" max=\"200\" />
+                  </label>
+                  <label>
+                    <span>Отсечение хвоста</span>
+                    <input id=\"preset-clip-tail\" type=\"number\" step=\"0.001\" min=\"0\" max=\"0.05\" />
+                  </label>
+                  <label>
+                    <span>Сглаживание</span>
+                    <select id=\"preset-smooth-window\">
+                      <option value=\"1\">Без сглаживания</option>
+                      <option value=\"2\">Окно 2</option>
+                      <option value=\"3\">Окно 3</option>
+                    </select>
+                  </label>
+                </div>
+                <div class=\"preset-form-actions\">
+                  <button id=\"preset-submit\" class=\"btn-primary\" type=\"submit\">Сохранить</button>
+                  <button class=\"btn-secondary\" type=\"button\" data-close-preset>Отмена</button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </div>
+
+        <div id="preset-modal" class="modal" hidden>
+          <div id="preset-modal-backdrop" class="modal__backdrop"></div>
+          <div class="modal__dialog" role="dialog" aria-modal="true" aria-labelledby="preset-modal-title">
+            <header class="modal__header">
+              <h3 id="preset-modal-title">Настроить пресет TPO</h3>
+              <button class="modal__close" type="button" data-close-preset>&times;</button>
+            </header>
+            <div class="modal__body">
+              <div id="preset-list-view" hidden>
+                <div class="preset-list" id="preset-list"></div>
+                <button id="preset-create-button" class="btn-primary" type="button">Создать пресет</button>
+              </div>
+              <form id="preset-form" hidden>
+                <input type="hidden" id="preset-mode-input" value="create" />
+                <div class="preset-form-grid" id="preset-form-section">
+                  <label>
+                    <span>Символ</span>
+                    <input id="preset-symbol" type="text" required autocomplete="off" />
+                  </label>
+                  <label>
+                    <span>Таймфрейм</span>
+                    <select id="preset-tf">
+                      <option value="1m">1m</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>Количество сессий</span>
+                    <input id="preset-last-n" type="number" min="1" max="5" step="1" />
+                  </label>
+                  <label>
+                    <span>Value area %</span>
+                    <input id="preset-value-area" type="number" min="0.1" max="0.95" step="0.01" />
+                  </label>
+                  <label>
+                    <span>Режим биннинга</span>
+                    <select id="preset-binning-mode">
+                      <option value="adaptive">Adaptive (ATR)</option>
+                      <option value="tick">Tick size</option>
+                    </select>
+                  </label>
+                  <label data-preset-tick>
+                    <span>Tick size</span>
+                    <input id="preset-tick-size" type="number" step="0.0001" min="0" />
+                  </label>
+                  <label data-preset-adaptive>
+                    <span>ATR multiplier</span>
+                    <input id="preset-atr-multiplier" type="number" step="0.05" min="0.1" max="2" />
+                  </label>
+                  <label data-preset-adaptive>
+                    <span>Целевые бины</span>
+                    <input id="preset-target-bins" type="number" step="5" min="40" max="200" />
+                  </label>
+                  <label>
+                    <span>Отсечение хвоста</span>
+                    <input id="preset-clip-tail" type="number" step="0.001" min="0" max="0.05" />
+                  </label>
+                  <label>
+                    <span>Сглаживание</span>
+                    <select id="preset-smooth-window">
+                      <option value="1">Без сглаживания</option>
+                      <option value="2">Окно 2</option>
+                      <option value="3">Окно 3</option>
+                    </select>
+                  </label>
+                </div>
+                <div class="preset-form-actions">
+                  <button id="preset-submit" class="btn-primary" type="submit">Сохранить</button>
+                  <button class="btn-secondary" type="button" data-close-preset>Отмена</button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </div>
         </main>
         <script>{script_block}</script>
         <script src=\"https://unpkg.com/lightweight-charts@4.0.0/dist/lightweight-charts.standalone.production.js\"></script>

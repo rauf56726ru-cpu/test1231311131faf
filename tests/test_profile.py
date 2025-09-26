@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from src.api.app import app
 import src.services.inspection as inspection
 from src.meta import Meta
+from src.services import presets
 from src.services.profile import (
     build_volume_profile,
     compute_session_profiles,
@@ -22,6 +23,17 @@ from src.services.profile import (
 @pytest.fixture()
 def client() -> TestClient:
     return TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def preset_storage(tmp_path, monkeypatch):
+    storage_path = tmp_path / "presets.json"
+    monkeypatch.setattr(presets, "_PRESET_STORAGE_PATH", storage_path)
+    presets._PRESET_CACHE.clear()
+    presets._STORAGE_LOADED = False
+    yield
+    presets._PRESET_CACHE.clear()
+    presets._STORAGE_LOADED = False
 
 
 @pytest.fixture(autouse=True)
@@ -201,8 +213,18 @@ def test_profile_endpoint_returns_payload(client: TestClient) -> None:
     assert profile_response.status_code == 200
     body = profile_response.json()
     assert body["symbol"] == "BTCUSDT"
-    assert "tpo" in body
-    assert "profile" in body
+    assert body["tf"] == "1m"
+    assert "tpo" in body and isinstance(body["tpo"], list)
+    assert "profile" in body and isinstance(body["profile"], list)
+    assert "zones" in body and isinstance(body["zones"], list)
+    preset = body.get("preset")
+    assert preset is not None
+    assert preset["symbol"] == "BTCUSDT"
+    assert preset["builtin"] is True
+    assert body.get("preset_required") is False
+    if body["zones"]:
+        zone_types = {item["type"] for item in body["zones"]}
+        assert {"tpo_poc", "tpo_vah", "tpo_val"}.issubset(zone_types)
     if body["tpo"]:
         latest = body["tpo"][-1]
         assert "session" in latest
@@ -220,3 +242,22 @@ def test_profile_endpoint_is_deterministic(client: TestClient) -> None:
     second = client.get("/profile", params=params)
     assert first.status_code == second.status_code == 200
     assert first.json() == second.json()
+
+
+def test_profile_endpoint_marks_missing_preset(client: TestClient) -> None:
+    candles = make_unimodal(
+        n=360,
+        base=datetime(2024, 8, 1, tzinfo=timezone.utc),
+    )
+    payload = dict(_snapshot_payload(candles))
+    payload["symbol"] = "ABCUSDT"
+    response = client.post("/inspection/snapshot", json=payload)
+    assert response.status_code == 200
+    snapshot_id = response.json()["snapshot_id"]
+
+    profile_response = client.get("/profile", params={"snapshot": snapshot_id})
+    assert profile_response.status_code == 200
+    body = profile_response.json()
+    assert body["symbol"] == "ABCUSDT"
+    assert body.get("preset") is None
+    assert body.get("preset_required") is True

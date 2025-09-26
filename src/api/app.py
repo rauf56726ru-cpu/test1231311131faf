@@ -15,16 +15,19 @@ from ..services import (
     build_check_all_datas,
     build_inspection_payload,
     build_placeholder_snapshot,
+    build_profile_package,
     DEFAULT_SYMBOL,
+    delete_preset,
     get_snapshot,
+    list_presets_configs,
     list_snapshots,
     normalise_ohlcv,
+    preset_to_payload,
     register_snapshot,
     render_inspection_page,
-    compute_session_profiles,
-    flatten_profile,
-    split_by_sessions,
-    build_volume_profile,
+    resolve_profile_config,
+    save_preset,
+    update_preset,
 )
 from ..version import APP_VERSION
 from ..meta import Meta
@@ -71,6 +74,7 @@ async def inspection(
         target_snapshot = get_snapshot(snapshots[0]["id"])  # type: ignore[index]
 
     if target_snapshot is None:
+        profile_config = resolve_profile_config(DEFAULT_SYMBOL, None)
         placeholder_payload = {
             "DATA": {
                 "symbol": DEFAULT_SYMBOL,
@@ -78,7 +82,13 @@ async def inspection(
                 "selection": None,
                 "delta_cvd": {},
                 "vwap_tpo": {},
-                "zones": {"status": "waiting", "detail": "Создайте первый снэпшот"},
+                "zones": [],
+                "zones_raw": None,
+                "tpo": [],
+                "profile": [],
+                "profile_preset": profile_config.get("preset_payload"),
+                "profile_preset_required": bool(profile_config.get("preset_required", False)),
+                "profile_defaults": None,
                 "smt": {"status": "waiting", "detail": "Создайте первый снэпшот"},
                 "meta": {"requested": {"symbol": DEFAULT_SYMBOL, "frames": []}, "source": {}},
             },
@@ -172,13 +182,58 @@ async def inspection_check_all(
     return JSONResponse(payload)
 
 
+@app.get("/presets")
+async def list_presets_endpoint() -> JSONResponse:
+    presets = [preset_to_payload(item) for item in list_presets_configs()]
+    return JSONResponse({"ok": True, "presets": presets})
+
+
+@app.get("/presets/{symbol}")
+async def get_preset_endpoint(symbol: str) -> JSONResponse:
+    config = resolve_profile_config(symbol, None)
+    preset = config.get("preset")
+    payload = preset_to_payload(preset) if preset else None
+    return JSONResponse({"ok": True, "preset": payload})
+
+
+@app.post("/presets")
+async def create_preset_endpoint(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
+    symbol = payload.get("symbol")
+    if not symbol or not isinstance(symbol, str):
+        raise HTTPException(status_code=400, detail="symbol is required")
+    symbol_value = symbol.strip().upper()
+    body = dict(payload)
+    body.pop("symbol", None)
+    try:
+        preset = save_preset(symbol_value, body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse({"ok": True, "preset": preset_to_payload(preset)})
+
+
+@app.put("/presets/{symbol}")
+async def update_preset_endpoint(symbol: str, payload: Dict[str, Any] = Body(...)) -> JSONResponse:
+    body = dict(payload)
+    try:
+        preset = update_preset(symbol, body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse({"ok": True, "preset": preset_to_payload(preset)})
+
+
+@app.delete("/presets/{symbol}")
+async def delete_preset_endpoint(symbol: str) -> JSONResponse:
+    delete_preset(symbol)
+    return JSONResponse({"ok": True})
+
+
 @app.get("/profile")
 async def profile_endpoint(
     snapshot: str = Query(..., description="Snapshot identifier"),
     tf: str = Query("1m", description="Timeframe to analyse"),
     last_n: int = Query(3, description="Number of recent sessions to include"),
     tick_size: float | None = Query(None, description="Optional explicit tick size"),
-    adaptive_bins: bool = Query(False, description="Use adaptive ATR-based binning when no tick size"),
+    adaptive_bins: bool | None = Query(None, description="Use adaptive ATR-based binning when no tick size"),
     value_area_pct: float = Query(0.7, description="Value area coverage (0-1)"),
 ) -> JSONResponse:
     target_snapshot = get_snapshot(snapshot)
@@ -188,10 +243,9 @@ async def profile_endpoint(
     symbol = str(target_snapshot.get("symbol") or target_snapshot.get("pair") or "UNKNOWN").upper()
 
     timeframe = str(tf or target_snapshot.get("tf") or "1m").lower()
+
     if last_n <= 0:
         raise HTTPException(status_code=400, detail="last_n must be positive")
-
-    value_area_pct = max(0.0, min(1.0, value_area_pct))
 
     frames_data = target_snapshot.get("frames")
     frames = frames_data if isinstance(frames_data, Mapping) else {}
@@ -215,39 +269,51 @@ async def profile_endpoint(
 
     candles = normalised.get("candles", []) if isinstance(normalised, dict) else []
 
-    sessions = list(Meta.iter_vwap_sessions())
-    tpo_entries = compute_session_profiles(
-        candles,
-        sessions=sessions,
-        last_n=last_n,
-        tick_size=tick_size,
-        adaptive_bins=adaptive_bins,
-        value_area_pct=value_area_pct,
-    )
+    profile_config = resolve_profile_config(symbol, target_snapshot.get("meta") if isinstance(target_snapshot.get("meta"), Mapping) else None)
 
+    target_tf_key = timeframe or profile_config.get("target_tf_key", "1m")
+    last_n_value = max(1, min(5, int(last_n or profile_config.get("last_n", 3))))
+
+    tick_size_value = tick_size if tick_size is not None else profile_config.get("tick_size")
+    adaptive_flag = adaptive_bins
+    if tick_size is None:
+        adaptive_flag = adaptive_bins if adaptive_bins is not None else bool(profile_config.get("adaptive_bins", True))
+    else:
+        adaptive_flag = bool(adaptive_bins)
+
+    value_area = value_area_pct if value_area_pct is not None else float(profile_config.get("value_area_pct", 0.7))
+    value_area = max(0.0, min(1.0, float(value_area)))
+
+    sessions = list(Meta.iter_vwap_sessions())
+    tpo_entries: list[dict[str, object]] = []
     flattened_profile: list[dict[str, float]] = []
-    if tpo_entries and sessions and candles:
-        latest = tpo_entries[-1]
-        latest_date = latest.get("date")
-        latest_session = latest.get("session")
-        session_map = split_by_sessions(candles, sessions)
-        if latest_date and latest_session and session_map:
-            for (session_date, session_name), session_candles in session_map.items():
-                if session_date.isoformat() == latest_date and session_name == latest_session:
-                    profile = build_volume_profile(
-                        session_candles,
-                        tick_size=tick_size,
-                        adaptive_bins=adaptive_bins,
-                        value_area_pct=value_area_pct,
-                    )
-                    if profile.prices:
-                        flattened_profile = flatten_profile(profile)
-                    break
+    zones: list[dict[str, Any]] = []
+
+    if candles and sessions:
+        cache_token = ("profile", snapshot, symbol, target_tf_key)
+        (tpo_entries, flattened_profile, zones) = build_profile_package(
+            candles,
+            sessions=sessions,
+            last_n=last_n_value,
+            tick_size=tick_size_value,
+            adaptive_bins=bool(adaptive_flag),
+            value_area_pct=value_area,
+            atr_multiplier=float(profile_config.get("atr_multiplier", 0.5)),
+            target_bins=int(profile_config.get("target_bins", 80)),
+            clip_threshold=float(profile_config.get("clip_threshold", 0.0)),
+            smooth_window=int(profile_config.get("smooth_window", 1)),
+            cache_token=cache_token,
+            tf_key=target_tf_key,
+        )
 
     payload = {
         "symbol": symbol,
+        "tf": target_tf_key,
         "tpo": tpo_entries,
         "profile": flattened_profile,
+        "zones": zones,
+        "preset": profile_config.get("preset_payload"),
+        "preset_required": bool(profile_config.get("preset_required", False)),
     }
     return JSONResponse(payload)
 

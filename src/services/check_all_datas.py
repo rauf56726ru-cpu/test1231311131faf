@@ -4,6 +4,10 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence
 
+from .presets import resolve_profile_config
+from .profile import build_profile_package
+from ..meta import Meta
+
 
 UTC = timezone.utc
 MS_IN_HOUR = 3_600_000
@@ -479,6 +483,42 @@ def build_check_all_datas(
 
     minute_candles = frames.get("1m", [])
 
+    symbol = str(snapshot.get("symbol") or snapshot.get("pair") or "UNKNOWN").upper()
+    profile_config = resolve_profile_config(symbol, snapshot.get("meta") if isinstance(snapshot.get("meta"), Mapping) else None)
+    sessions = list(Meta.iter_vwap_sessions())
+    profile_tpo: List[Dict[str, Any]] = []
+    profile_flat: List[Dict[str, float]] = []
+    profile_zones: List[Dict[str, Any]] = []
+
+    target_tf_key = profile_config.get("target_tf_key", "1m")
+    base_candles = frames.get(target_tf_key, [])
+    if not base_candles:
+        base_candles = minute_candles
+    if not base_candles and frames:
+        base_candles = next(iter(frames.values()))
+
+    if profile_config.get("preset") and base_candles and sessions:
+        cache_token = (
+            "check_all",
+            snapshot.get("id"),
+            symbol,
+            target_tf_key,
+        )
+        (profile_tpo, profile_flat, profile_zones) = build_profile_package(
+            base_candles,
+            sessions=sessions,
+            last_n=int(profile_config.get("last_n", 3)),
+            tick_size=profile_config.get("tick_size"),
+            adaptive_bins=bool(profile_config.get("adaptive_bins", True)),
+            value_area_pct=float(profile_config.get("value_area_pct", 0.7)),
+            atr_multiplier=float(profile_config.get("atr_multiplier", 0.5)),
+            target_bins=int(profile_config.get("target_bins", 80)),
+            clip_threshold=float(profile_config.get("clip_threshold", 0.0)),
+            smooth_window=int(profile_config.get("smooth_window", 1)),
+            cache_token=cache_token,
+            tf_key=target_tf_key,
+        )
+
     derived_reference_ts: int | None = (
         minute_candles[-1]["t"] + MINUTE_INTERVAL_MS if minute_candles else None
     )
@@ -646,4 +686,9 @@ def build_check_all_datas(
         "latest_candle": dict(latest_candle_payload),
         "datas_for_last_N_hours": detailed_section,
         movement_key: movement_section,
+        "tpo": profile_tpo,
+        "profile": profile_flat,
+        "zones": profile_zones,
+        "profile_preset": profile_config.get("preset_payload"),
+        "profile_preset_required": bool(profile_config.get("preset_required", False)),
     }

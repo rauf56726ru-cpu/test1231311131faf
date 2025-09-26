@@ -7,6 +7,9 @@ import math
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
 
+_PROFILE_CACHE: Dict[Tuple[Any, ...], "VolumeProfile"] = {}
+
+
 @dataclass(slots=True)
 class VolumeProfile:
     """Aggregated volume distribution for a given set of candles."""
@@ -105,6 +108,8 @@ def _select_bin_size(
     tick_size: float | None,
     adaptive_bins: bool,
     min_bins: int,
+    atr_multiplier: float,
+    target_bins: int,
 ) -> float | None:
     if tick_size is not None:
         try:
@@ -118,14 +123,16 @@ def _select_bin_size(
         true_ranges = _compute_true_ranges(candles)
         if true_ranges:
             avg_tr = sum(true_ranges) / len(true_ranges)
-            bin_size = max(avg_tr * 0.5, 0.0)
+            multiplier = atr_multiplier if atr_multiplier > 0 else 0.5
+            bin_size = max(avg_tr * multiplier, 0.0)
             if bin_size > 0:
                 return bin_size
 
     n = len(candles)
     if n <= 0:
         return None
-    bins = max(min_bins, math.ceil(math.log2(n)) + 1 if n > 1 else min_bins)
+    suggested = math.ceil(math.log2(n)) + 1 if n > 1 else min_bins
+    bins = max(min_bins, target_bins if target_bins > 0 else min_bins, suggested)
     highs = [_ensure_float(c.get("h") or c.get("high")) for c in candles]
     lows = [_ensure_float(c.get("l") or c.get("low")) for c in candles]
     highs = [value for value in highs if math.isfinite(value)]
@@ -145,6 +152,9 @@ def build_volume_profile(
     adaptive_bins: bool,
     value_area_pct: float = 0.70,
     min_bins: int = 10,
+    atr_multiplier: float = 0.5,
+    target_bins: int = 80,
+    cache_scope: Tuple[Any, ...] | None = None,
 ) -> VolumeProfile:
     """Construct a volume profile from a sequence of OHLCV candles."""
 
@@ -154,7 +164,21 @@ def build_volume_profile(
     if len(entries) < 30:
         diagnostics["warn"] = "too few bars"
 
-    bin_size = _select_bin_size(entries, tick_size=tick_size, adaptive_bins=adaptive_bins, min_bins=min_bins)
+    if value_area_pct <= 0:
+        value_area_pct = 0.0
+    elif value_area_pct > 1:
+        value_area_pct = 1.0
+
+    target_bins = max(min_bins, int(target_bins) if target_bins else min_bins)
+
+    bin_size = _select_bin_size(
+        entries,
+        tick_size=tick_size,
+        adaptive_bins=adaptive_bins,
+        min_bins=min_bins,
+        atr_multiplier=atr_multiplier,
+        target_bins=target_bins,
+    )
     if not bin_size or bin_size <= 0:
         prices: List[float] = []
         volumes: List[float] = []
@@ -247,7 +271,7 @@ def build_volume_profile(
     vah_price = max(selected_prices) if selected_prices else math.nan
     val_price = min(selected_prices) if selected_prices else math.nan
 
-    return VolumeProfile(
+    profile = VolumeProfile(
         prices=prices,
         volumes=volumes,
         poc=poc_price,
@@ -255,6 +279,11 @@ def build_volume_profile(
         val=val_price,
         diagnostics=diagnostics,
     )
+
+    if cache_scope is not None:
+        _PROFILE_CACHE[cache_scope] = profile
+
+    return profile
 
 
 def _sort_session_keys(
@@ -275,6 +304,9 @@ def compute_session_profiles(
     tick_size: float | None = None,
     adaptive_bins: bool = False,
     value_area_pct: float = 0.70,
+    atr_multiplier: float = 0.5,
+    target_bins: int = 80,
+    cache_token: Any | None = None,
 ) -> List[Dict[str, object]]:
     """Return volume profile summaries for the latest trading sessions."""
 
@@ -294,12 +326,35 @@ def compute_session_profiles(
     summaries: List[Dict[str, object]] = []
     for key in ordered_keys:
         session_candles = session_map.get(key, [])
-        profile = build_volume_profile(
-            session_candles,
-            tick_size=tick_size,
-            adaptive_bins=adaptive_bins,
-            value_area_pct=value_area_pct,
-        )
+        cache_scope = None
+        if cache_token is not None:
+            cache_scope = (
+                cache_token,
+                key,
+                round(float(tick_size or 0.0), 12),
+                bool(adaptive_bins),
+                round(float(value_area_pct), 4),
+                round(float(atr_multiplier), 4),
+                int(target_bins),
+            )
+            cached = _PROFILE_CACHE.get(cache_scope)
+            if cached is not None:
+                profile = cached
+            else:
+                profile = None
+        else:
+            profile = None
+
+        if profile is None:
+            profile = build_volume_profile(
+                session_candles,
+                tick_size=tick_size,
+                adaptive_bins=adaptive_bins,
+                value_area_pct=value_area_pct,
+                atr_multiplier=atr_multiplier,
+                target_bins=target_bins,
+                cache_scope=cache_scope,
+            )
         payload: Dict[str, object] = {
             "date": key[0].isoformat(),
             "session": key[1],
@@ -316,11 +371,171 @@ def compute_session_profiles(
     return summaries
 
 
-def flatten_profile(profile: VolumeProfile) -> List[Dict[str, float]]:
+def flatten_profile(
+    profile: VolumeProfile,
+    *,
+    clip_threshold: float | None = None,
+    smooth_window: int = 1,
+) -> List[Dict[str, float]]:
     """Flatten a volume profile into a list of dictionaries for JSON output."""
+
+    prices = list(profile.prices)
+    volumes = list(profile.volumes)
+
+    if smooth_window and smooth_window > 1 and len(volumes) > 1:
+        window = max(1, int(smooth_window))
+        window = min(window, len(volumes))
+        smoothed: List[float] = []
+        for idx in range(len(volumes)):
+            half = window // 2
+            start = max(0, idx - half)
+            end = start + window
+            if end > len(volumes):
+                end = len(volumes)
+                start = max(0, end - window)
+            slice_vols = volumes[start:end]
+            smoothed.append(sum(slice_vols) / len(slice_vols) if slice_vols else volumes[idx])
+        volumes = smoothed
+
+    if clip_threshold and clip_threshold > 0 and len(volumes) > 1:
+        total = sum(volumes)
+        if total > 0:
+            left = 0
+            right = len(volumes) - 1
+            threshold = float(clip_threshold)
+            while left <= right:
+                changed = False
+                share_left = volumes[left] / total if total else 0.0
+                if share_left <= threshold and left < right:
+                    total -= volumes[left]
+                    left += 1
+                    changed = True
+                share_right = volumes[right] / total if total else 0.0
+                if share_right <= threshold and right >= left:
+                    total -= volumes[right]
+                    right -= 1
+                    changed = True
+                if not changed:
+                    break
+            prices = prices[left : right + 1]
+            volumes = volumes[left : right + 1]
 
     return [
         {"price": float(price), "volume": float(volume)}
-        for price, volume in zip(profile.prices, profile.volumes)
+        for price, volume in zip(prices, volumes)
     ]
+
+
+def build_profile_package(
+    candles: Sequence[Mapping[str, Any]],
+    *,
+    sessions: Iterable[Tuple[str, dtime, dtime]],
+    last_n: int,
+    tick_size: float | None,
+    adaptive_bins: bool,
+    value_area_pct: float,
+    atr_multiplier: float,
+    target_bins: int,
+    clip_threshold: float = 0.0,
+    smooth_window: int = 1,
+    cache_token: Any | None = None,
+    tf_key: str = "1m",
+) -> Tuple[List[Dict[str, object]], List[Dict[str, float]], List[Dict[str, Any]]]:
+    """Compute TPO summaries, flattened profile, and derived zones."""
+
+    session_list = list(sessions)
+    if not candles or not session_list:
+        return [], [], []
+
+    token = cache_token
+    tpo_entries = compute_session_profiles(
+        candles,
+        sessions=session_list,
+        last_n=last_n,
+        tick_size=tick_size,
+        adaptive_bins=adaptive_bins,
+        value_area_pct=value_area_pct,
+        atr_multiplier=atr_multiplier,
+        target_bins=target_bins,
+        cache_token=token,
+    )
+
+    flattened: List[Dict[str, float]] = []
+    zones: List[Dict[str, Any]] = []
+
+    if not tpo_entries:
+        return tpo_entries, flattened, zones
+
+    session_map = split_by_sessions(candles, session_list)
+    latest = tpo_entries[-1] if tpo_entries else None
+    latest_date = latest.get("date") if isinstance(latest, Mapping) else None
+    latest_session = latest.get("session") if isinstance(latest, Mapping) else None
+
+    if latest_date and latest_session and session_map:
+        for (session_date, session_name), session_candles in session_map.items():
+            if session_date.isoformat() != latest_date or session_name != latest_session:
+                continue
+            cache_scope = None
+            if token is not None:
+                cache_scope = (
+                    token,
+                    (session_date, session_name),
+                    round(float(tick_size or 0.0), 12),
+                    bool(adaptive_bins),
+                    round(float(value_area_pct), 4),
+                    round(float(atr_multiplier), 4),
+                    int(target_bins),
+                )
+            last_profile = build_volume_profile(
+                session_candles,
+                tick_size=tick_size,
+                adaptive_bins=adaptive_bins,
+                value_area_pct=value_area_pct,
+                atr_multiplier=atr_multiplier,
+                target_bins=target_bins,
+                cache_scope=cache_scope,
+            )
+            if last_profile.prices:
+                flattened = flatten_profile(
+                    last_profile,
+                    clip_threshold=clip_threshold,
+                    smooth_window=smooth_window,
+                )
+            break
+
+    for entry in tpo_entries:
+        if not isinstance(entry, Mapping):
+            continue
+        date_value = entry.get("date")
+        session_value = entry.get("session")
+        meta_payload = {
+            "value_area_pct": value_area_pct,
+            "source": "tpo",
+        }
+        price_fields = {
+            "tpo_poc": entry.get("POC"),
+            "tpo_vah": entry.get("VAH"),
+            "tpo_val": entry.get("VAL"),
+        }
+        for zone_type, price_value in price_fields.items():
+            if price_value is None:
+                continue
+            try:
+                price_float = float(price_value)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(price_float):
+                continue
+            zones.append(
+                {
+                    "type": zone_type,
+                    "price": price_float,
+                    "date": date_value,
+                    "session": session_value,
+                    "tf": tf_key,
+                    "meta": meta_payload,
+                }
+            )
+
+    return tpo_entries, flattened, zones
 

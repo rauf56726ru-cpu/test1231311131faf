@@ -8,11 +8,23 @@ from fastapi.testclient import TestClient
 
 from src.api.app import app
 import src.services.inspection as inspection
+from src.services import presets
 
 
 @pytest.fixture()
 def client() -> TestClient:
     return TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def preset_storage(tmp_path, monkeypatch):
+    storage_path = tmp_path / "presets.json"
+    monkeypatch.setattr(presets, "_PRESET_STORAGE_PATH", storage_path)
+    presets._PRESET_CACHE.clear()
+    presets._STORAGE_LOADED = False
+    yield
+    presets._PRESET_CACHE.clear()
+    presets._STORAGE_LOADED = False
 
 
 @pytest.fixture(autouse=True)
@@ -151,6 +163,17 @@ def test_historical_snapshot_still_populates_window(client: TestClient) -> None:
         expected_movement_end_ms / 1000, tz=timezone.utc
     ).isoformat()
     assert body[movement_key]["range"]["end_utc"].startswith(expected_movement_end)
+    assert "tpo" in body and isinstance(body["tpo"], list)
+    assert "profile" in body and isinstance(body["profile"], list)
+    assert "zones" in body and isinstance(body["zones"], list)
+    preset_payload = body.get("profile_preset")
+    assert preset_payload is not None
+    assert preset_payload["symbol"] == "BTCUSDT"
+    assert preset_payload["builtin"] is True
+    assert body.get("profile_preset_required") is False
+    if body["zones"]:
+        zone_types = {zone["type"] for zone in body["zones"]}
+        assert {"tpo_poc", "tpo_vah", "tpo_val"}.issubset(zone_types)
 
 
 def test_snapshot_persisted_locally(client: TestClient) -> None:
@@ -227,6 +250,7 @@ def test_check_all_after_reload_returns_data(client: TestClient) -> None:
         expected_movement_end_ms / 1000, tz=timezone.utc
     ).isoformat()
     assert body[movement_key]["range"]["end_utc"].startswith(expected_movement_end)
+    assert "zones" in body
 
 
 def test_detailed_section_backfills_minute_frame(client: TestClient) -> None:
