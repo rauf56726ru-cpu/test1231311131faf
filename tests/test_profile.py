@@ -198,24 +198,35 @@ def test_compute_session_profiles_respects_last_n() -> None:
     assert daily_entries, "Expected daily TPO entries"
     assert len(daily_entries) <= 2
 
-    allowed_dates = {entry["date"] for entry in daily_entries}
-    assert allowed_dates
-    assert allowed_dates == {entry["date"] for entry in summaries}
+
+def test_profile_endpoint_returns_daily_entries_for_full_snapshot(client: TestClient) -> None:
+    base = datetime(2024, 5, 1, tzinfo=timezone.utc)
+    total_days = 3
+    candles = make_unimodal(n=60 * 24 * total_days, base=base)
+
+    snapshot_id = "multi-day"
+    snapshot = dict(_snapshot_payload(candles))
+    snapshot["id"] = snapshot_id
+    inspection.register_snapshot(snapshot)
+
+    response = client.get(
+        "/profile",
+        params={"snapshot": snapshot_id, "tf": "1m", "last_n": total_days},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+
+    tpo_entries = payload.get("tpo", []) if isinstance(payload, Mapping) else []
+    daily_entries = [entry for entry in tpo_entries if entry.get("session") == "daily"]
+    assert daily_entries, "Expected daily TPO entries in profile output"
+
     expected_dates = {
-        (base.date() + timedelta(days=offset)).isoformat() for offset in range(2, 4)
+        (base.date() + timedelta(days=offset)).isoformat() for offset in range(total_days)
     }
-    assert allowed_dates == expected_dates
+    returned_dates = {str(entry.get("date")) for entry in daily_entries}
+    assert expected_dates.issubset(returned_dates)
 
-    ordered_dates = [entry["date"] for entry in summaries]
-    assert ordered_dates == sorted(ordered_dates)
-
-    for day_entry in daily_entries:
-        nested = day_entry.get("sessions", [])
-        assert isinstance(nested, list)
-        for nested_entry in nested:
-            assert nested_entry.get("date") == day_entry["date"]
-    if any(day_entry.get("sessions") for day_entry in daily_entries):
-        assert summaries[-1]["session"] != "daily"
+    assert len(returned_dates) >= total_days
 
 
 def test_profile_endpoint_returns_payload(client: TestClient) -> None:

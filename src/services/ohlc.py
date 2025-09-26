@@ -130,9 +130,11 @@ def _to_candle_mapping(row: Mapping[str, object] | Sequence[object]) -> Candle |
     )
 
 
-def _limit_window(interval_ms: int, window: timedelta) -> int:
+def _limit_window(interval_ms: int, window: timedelta, *, max_candles: int | None = 1_000) -> int:
     candles_required = max(1, math.ceil(window.total_seconds() * 1000 / interval_ms))
-    return min(1_000, candles_required)
+    if max_candles is None:
+        return candles_required
+    return min(max_candles, candles_required)
 
 
 def _prepare_index(
@@ -156,6 +158,7 @@ def normalise_ohlcv(
     raw_rows: Sequence[Mapping[str, object] | Sequence[object]],
     *,
     include_diagnostics: bool = False,
+    full_snapshot: bool = False,
 ) -> Dict[str, object]:
     """Normalise raw OHLC candles gathered by the frontend into aligned bars."""
 
@@ -188,7 +191,10 @@ def normalise_ohlcv(
     last_open_ms = _align_to_interval(ordered_times[-1], interval_ms)
     first_open_ms = _align_to_interval(ordered_times[0], interval_ms)
     span_candles = max(1, (last_open_ms - first_open_ms) // interval_ms + 1)
-    limit = min(limit_default, span_candles)
+    if full_snapshot:
+        limit = span_candles
+    else:
+        limit = min(limit_default, span_candles)
     start_open_ms = last_open_ms - (limit - 1) * interval_ms
 
     normalized: List[Candle] = []
@@ -245,8 +251,19 @@ def normalise_ohlcv(
 
 
 def normalise_ohlcv_sync(
-    symbol: str, timeframe: str, raw_rows: Sequence[Mapping[str, object] | Sequence[object]]
+    symbol: str,
+    timeframe: str,
+    raw_rows: Sequence[Mapping[str, object] | Sequence[object]],
+    *,
+    include_diagnostics: bool = False,
+    full_snapshot: bool = False,
 ) -> Dict[str, object]:
     """Synchronous helper for normalising OHLCV snapshots."""
 
-    return normalise_ohlcv(symbol, timeframe, raw_rows)
+    return normalise_ohlcv(
+        symbol,
+        timeframe,
+        raw_rows,
+        include_diagnostics=include_diagnostics,
+        full_snapshot=full_snapshot,
+    )
