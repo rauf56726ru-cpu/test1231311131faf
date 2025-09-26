@@ -28,7 +28,13 @@ from .presets import (
     save_preset,
     update_preset,
 )
-from .ohlc import TIMEFRAME_WINDOWS, normalise_ohlcv, normalise_ohlcv_sync
+from .ohlc import (
+    TIMEFRAME_WINDOWS,
+    fetch_ohlcv,
+    fetch_ohlcv_sync,
+    normalise_ohlcv,
+    normalise_ohlcv_sync,
+)
 from .vwap import fetch_daily_vwap, fetch_daily_vwap_sync
 from .trades import AggTradeCollector
 
@@ -39,6 +45,8 @@ __all__ = [
     "DEFAULT_SYMBOL",
     "get_snapshot",
     "list_snapshots",
+    "fetch_ohlcv",
+    "fetch_ohlcv_sync",
     "normalise_ohlcv",
     "normalise_ohlcv_sync",
     "register_snapshot",

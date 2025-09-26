@@ -1,10 +1,23 @@
-"""Utilities for normalising OHLCV data collected by the chart frontend."""
+"""Utilities for normalising and fetching OHLCV data."""
 from __future__ import annotations
 
+import asyncio
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Iterable, List, Mapping, MutableMapping, Sequence
+from typing import (
+    Awaitable,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    MutableMapping,
+    Sequence,
+    Tuple,
+)
+
+import httpx
 
 # Mapping of supported timeframes to their window sizes.
 TIMEFRAME_WINDOWS: Dict[str, timedelta] = {
@@ -128,6 +141,221 @@ def _to_candle_mapping(row: Mapping[str, object] | Sequence[object]) -> Candle |
         c=float(close_price),
         v=float(volume),
     )
+
+
+def _ensure_cache_entry(symbol: str, timeframe: str) -> CandleCache:
+    key = (symbol.upper(), timeframe)
+    entry = _CANDLE_CACHE.get(key)
+    interval_ms = TIMEFRAME_TO_MS[timeframe]
+    if entry is None or entry.interval_ms != interval_ms:
+        entry = CandleCache(interval_ms=interval_ms)
+        _CANDLE_CACHE[key] = entry
+    return entry
+
+
+def _merge_candles(entry: CandleCache, new_candles: Sequence[Candle]) -> None:
+    if not new_candles:
+        return
+    mapping: Dict[int, Candle] = {candle.t: candle for candle in entry.candles}
+    for candle in new_candles:
+        mapping[candle.t] = candle
+    entry.candles = [mapping[key] for key in sorted(mapping)]
+
+
+def compute_window_end_from_store_or_exchange(
+    entry: CandleCache | None,
+    *,
+    interval_ms: int,
+    exchange_latest_open: int | None = None,
+) -> int:
+    """Compute the exclusive end timestamp for the rolling window."""
+
+    latest_open = exchange_latest_open
+    if entry and entry.candles:
+        latest_open = entry.candles[-1].t if latest_open is None else max(latest_open, entry.candles[-1].t)
+    if latest_open is None:
+        raise ValueError("No candles available to anchor the window")
+    return latest_open + interval_ms
+
+
+async def slice_or_fetch_missing(
+    symbol: str,
+    timeframe: str,
+    *,
+    start_ms: int,
+    end_ms: int,
+    fetcher: Callable[[str, str, int | None, int | None, int | None], Awaitable[Sequence[Mapping[str, object] | Sequence[object]]]],
+    limit: int,
+) -> List[Candle]:
+    """Return candles covering [start_ms, end_ms) fetching only missing tails."""
+
+    interval_ms = TIMEFRAME_TO_MS[timeframe]
+    entry = _ensure_cache_entry(symbol, timeframe)
+    existing: Dict[int, Candle] = {
+        candle.t: candle
+        for candle in entry.candles
+        if start_ms <= candle.t < end_ms
+    }
+
+    cursor = start_ms
+    required_times: List[int] = []
+    while cursor < end_ms:
+        if cursor not in existing:
+            required_times.append(cursor)
+            break
+        cursor += interval_ms
+
+    if required_times:
+        fetch_start = required_times[0]
+        raw_rows = await fetcher(symbol, timeframe, fetch_start, end_ms, limit)
+        fetched = []
+        for row in raw_rows:
+            candle = _to_candle_mapping(row)
+            if candle is None:
+                continue
+            if candle.t < fetch_start or candle.t >= end_ms:
+                continue
+            fetched.append(candle)
+        _merge_candles(entry, fetched)
+        existing = {
+            candle.t: candle
+            for candle in entry.candles
+            if start_ms <= candle.t < end_ms
+        }
+
+    ordered: List[Candle] = []
+    cursor = start_ms
+    while cursor < end_ms:
+        candle = existing.get(cursor)
+        if candle is not None:
+            ordered.append(candle)
+        cursor += interval_ms
+
+    return ordered
+
+
+async def _fetch_binance_klines(
+    symbol: str,
+    timeframe: str,
+    start_ms: int | None,
+    end_ms: int | None,
+    limit: int | None,
+) -> Sequence[Sequence[object]]:
+    params = {
+        "symbol": symbol.upper(),
+        "interval": timeframe,
+    }
+    if start_ms is not None:
+        params["startTime"] = str(start_ms)
+    if end_ms is not None:
+        params["endTime"] = str(end_ms)
+    if limit is not None:
+        params["limit"] = str(limit)
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(BINANCE_FAPI_REST, params=params)
+        response.raise_for_status()
+        data = response.json()
+    if not isinstance(data, Sequence):
+        return []
+    return data  # type: ignore[return-value]
+
+
+async def fetch_ohlcv(
+    symbol: str,
+    timeframe: str,
+    *,
+    hours: int | None = None,
+    fetcher: Callable[[str, str, int | None, int | None, int | None], Awaitable[Sequence[Mapping[str, object] | Sequence[object]]]] | None = None,
+) -> Dict[str, object]:
+    """Fetch OHLC candles anchored to the latest available Binance bar."""
+
+    timeframe = timeframe.lower()
+    if timeframe not in TIMEFRAME_TO_MS:
+        raise ValueError(f"Unsupported timeframe: {timeframe}")
+
+    interval_ms = TIMEFRAME_TO_MS[timeframe]
+    if hours is not None and hours <= 0:
+        raise ValueError("hours must be positive")
+
+    window_ms = (
+        hours * 3_600_000
+        if hours is not None
+        else int(TIMEFRAME_WINDOWS[timeframe].total_seconds() * 1000)
+    )
+    candles_required = max(1, math.ceil(window_ms / interval_ms))
+
+    entry = _ensure_cache_entry(symbol, timeframe)
+    fetcher_fn = fetcher or _fetch_binance_klines
+
+    exchange_latest_open: int | None = None
+    if not entry.candles:
+        raw_rows = await fetcher_fn(symbol, timeframe, None, None, candles_required)
+        fetched = []
+        for row in raw_rows:
+            candle = _to_candle_mapping(row)
+            if candle is None:
+                continue
+            fetched.append(candle)
+        if fetched:
+            exchange_latest_open = fetched[-1].t
+        _merge_candles(entry, fetched)
+    else:
+        tail_start = entry.candles[-1].t + interval_ms
+        raw_rows = await fetcher_fn(symbol, timeframe, tail_start, None, candles_required)
+        fetched = []
+        for row in raw_rows:
+            candle = _to_candle_mapping(row)
+            if candle is None:
+                continue
+            if candle.t <= entry.candles[-1].t:
+                continue
+            fetched.append(candle)
+        if fetched:
+            _merge_candles(entry, fetched)
+            exchange_latest_open = fetched[-1].t
+        else:
+            exchange_latest_open = entry.candles[-1].t
+
+    if exchange_latest_open is None and entry.candles:
+        exchange_latest_open = entry.candles[-1].t
+
+    if exchange_latest_open is None:
+        return {"symbol": symbol.upper(), "tf": timeframe, "candles": [], "last_ts": None}
+
+    end_ms = compute_window_end_from_store_or_exchange(
+        entry,
+        interval_ms=interval_ms,
+        exchange_latest_open=exchange_latest_open,
+    )
+    start_ms = end_ms - candles_required * interval_ms
+
+    candles = await slice_or_fetch_missing(
+        symbol,
+        timeframe,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        fetcher=fetcher_fn,
+        limit=candles_required,
+    )
+
+    payload = {
+        "symbol": symbol.upper(),
+        "tf": timeframe,
+        "candles": [candle.as_dict() for candle in candles],
+        "last_ts": candles[-1].t if candles else None,
+    }
+    return payload
+
+
+def fetch_ohlcv_sync(
+    symbol: str,
+    timeframe: str,
+    *,
+    hours: int | None = None,
+) -> Dict[str, object]:
+    """Synchronous helper for fetching OHLC candles."""
+
+    return asyncio.run(fetch_ohlcv(symbol, timeframe, hours=hours))
 
 
 def _limit_window(interval_ms: int, window: timedelta) -> int:
@@ -265,3 +493,16 @@ def normalise_ohlcv_sync(
         include_diagnostics=include_diagnostics,
         use_full_span=use_full_span,
     )
+BINANCE_FAPI_REST = "https://fapi.binance.com/fapi/v1/klines"
+
+
+@dataclass(slots=True)
+class CandleCache:
+    """In-memory cache of Binance OHLC candles."""
+
+    interval_ms: int
+    candles: List["Candle"] = field(default_factory=list)
+
+
+_CANDLE_CACHE: Dict[Tuple[str, str], CandleCache] = {}
+

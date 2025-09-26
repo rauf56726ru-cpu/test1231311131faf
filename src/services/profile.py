@@ -17,9 +17,9 @@ class VolumeProfile:
 
     prices: List[float]
     volumes: List[float]
-    poc: float
-    vah: float
-    val: float
+    poc: float | None
+    vah: float | None
+    val: float | None
     diagnostics: Dict[str, str]
 
 
@@ -156,14 +156,16 @@ def build_volume_profile(
     atr_multiplier: float = 0.5,
     target_bins: int = 80,
     cache_scope: Tuple[Any, ...] | None = None,
+    min_value_area_bars: int = 60,
 ) -> VolumeProfile:
     """Construct a volume profile from a sequence of OHLCV candles."""
 
     entries = [dict(candle) for candle in candles if isinstance(candle, Mapping)]
     diagnostics: Dict[str, str] = {}
 
-    if len(entries) < 30:
-        diagnostics["warn"] = "too few bars"
+    allow_value_area = len(entries) >= max(1, int(min_value_area_bars))
+    if not allow_value_area:
+        diagnostics["warn"] = "too_few_bars"
 
     if value_area_pct <= 0:
         value_area_pct = 0.0
@@ -180,19 +182,23 @@ def build_volume_profile(
         atr_multiplier=atr_multiplier,
         target_bins=target_bins,
     )
+    if tick_size and tick_size > 0 and bin_size:
+        step_multiple = max(1, round(bin_size / tick_size))
+        bin_size = tick_size * step_multiple
+
     if not bin_size or bin_size <= 0:
         prices: List[float] = []
         volumes: List[float] = []
-        diagnostics.setdefault("warn", "degenerate profile")
-        return VolumeProfile(prices=prices, volumes=volumes, poc=math.nan, vah=math.nan, val=math.nan, diagnostics=diagnostics)
+        diagnostics.setdefault("warn", diagnostics.get("warn", "degenerate profile"))
+        return VolumeProfile(prices=prices, volumes=volumes, poc=None, vah=None, val=None, diagnostics=diagnostics)
 
     lows = [_ensure_float(item.get("l") or item.get("low")) for item in entries]
     highs = [_ensure_float(item.get("h") or item.get("high")) for item in entries]
     lows = [value for value in lows if math.isfinite(value)]
     highs = [value for value in highs if math.isfinite(value)]
     if not lows or not highs:
-        diagnostics.setdefault("warn", "degenerate profile")
-        return VolumeProfile(prices=[], volumes=[], poc=math.nan, vah=math.nan, val=math.nan, diagnostics=diagnostics)
+        diagnostics.setdefault("warn", diagnostics.get("warn", "degenerate profile"))
+        return VolumeProfile(prices=[], volumes=[], poc=None, vah=None, val=None, diagnostics=diagnostics)
 
     min_price = min(lows)
     max_price = max(highs)
@@ -248,29 +254,41 @@ def build_volume_profile(
         total_volume += volume
 
     if total_volume <= 0:
-        diagnostics.setdefault("warn", "degenerate profile")
-        return VolumeProfile(prices=prices, volumes=volumes, poc=math.nan, vah=math.nan, val=math.nan, diagnostics=diagnostics)
+        diagnostics.setdefault("warn", diagnostics.get("warn", "degenerate profile"))
+        return VolumeProfile(prices=prices, volumes=volumes, poc=None, vah=None, val=None, diagnostics=diagnostics)
 
-    max_volume = max(volumes)
-    poc_indices = [idx for idx, value in enumerate(volumes) if math.isclose(value, max_volume)]
-    poc_index = min(poc_indices, key=lambda idx: prices[idx]) if poc_indices else 0
-    poc_price = prices[poc_index] if prices else math.nan
+    poc_price: float | None = None
+    vah_price: float | None = None
+    val_price: float | None = None
 
-    threshold = max(0.0, min(1.0, value_area_pct)) * total_volume
-    order = sorted(range(len(volumes)), key=lambda idx: (-volumes[idx], prices[idx]))
-    covered = 0.0
-    selected: set[int] = set()
-    for idx in order:
-        selected.add(idx)
-        covered += volumes[idx]
-        if covered >= threshold:
-            break
-    if not selected:
-        selected = {poc_index}
+    if allow_value_area and total_volume > 0 and prices and volumes:
+        weighted_price = sum(price * volume for price, volume in zip(prices, volumes)) / total_volume
+        max_volume = max(volumes)
+        poc_candidates = [idx for idx, value in enumerate(volumes) if math.isclose(value, max_volume)]
+        poc_index = min(
+            poc_candidates,
+            key=lambda idx: (abs(prices[idx] - weighted_price), prices[idx]),
+        ) if poc_candidates else 0
+        poc_price = prices[poc_index]
 
-    selected_prices = [prices[idx] for idx in selected]
-    vah_price = max(selected_prices) if selected_prices else math.nan
-    val_price = min(selected_prices) if selected_prices else math.nan
+        threshold = max(0.0, min(1.0, value_area_pct)) * total_volume
+        order = sorted(
+            range(len(volumes)),
+            key=lambda idx: (-volumes[idx], abs(prices[idx] - weighted_price), prices[idx]),
+        )
+        covered = 0.0
+        selected: set[int] = set()
+        for idx in order:
+            selected.add(idx)
+            covered += volumes[idx]
+            if covered >= threshold:
+                break
+        if not selected:
+            selected = {poc_index}
+
+        selected_prices = [prices[idx] for idx in selected]
+        vah_price = max(selected_prices) if selected_prices else None
+        val_price = min(selected_prices) if selected_prices else None
 
     profile = VolumeProfile(
         prices=prices,
@@ -359,6 +377,7 @@ def compute_session_profiles(
                 atr_multiplier=atr_multiplier,
                 target_bins=target_bins,
                 cache_scope=cache_scope,
+                min_value_area_bars=60,
             )
         return profile
 
@@ -369,14 +388,22 @@ def compute_session_profiles(
             "date": day_key.isoformat(),
             "session": session_label,
         }
+        warn_code = profile.diagnostics.get("warn") if profile.diagnostics else None
         if profile.diagnostics:
             payload["DIAGNOSTICS"] = dict(profile.diagnostics)
-        if profile.prices and profile.volumes and math.isfinite(profile.poc):
-            payload["POC"] = profile.poc
-            if math.isfinite(profile.vah):
-                payload["VAH"] = profile.vah
-            if math.isfinite(profile.val):
-                payload["VAL"] = profile.val
+        include_value_area = warn_code != "too_few_bars"
+        if (
+            include_value_area
+            and profile.prices
+            and profile.volumes
+            and profile.poc is not None
+            and math.isfinite(float(profile.poc))
+        ):
+            payload["POC"] = float(profile.poc)
+            if profile.vah is not None and math.isfinite(float(profile.vah)):
+                payload["VAH"] = float(profile.vah)
+            if profile.val is not None and math.isfinite(float(profile.val)):
+                payload["VAL"] = float(profile.val)
         return payload
 
     summaries: List[Dict[str, object]] = []
@@ -529,6 +556,7 @@ def build_profile_package(
                 atr_multiplier=atr_multiplier,
                 target_bins=target_bins,
                 cache_scope=cache_scope,
+                min_value_area_bars=60,
             )
             if last_profile.prices:
                 flattened = flatten_profile(
@@ -538,11 +566,15 @@ def build_profile_package(
                 )
             break
 
+    seen_zone_keys: set[Tuple[str | None, str | None, str | None]] = set()
+
     for entry in tpo_entries:
         if not isinstance(entry, Mapping):
             continue
         date_value = entry.get("date")
         session_value = entry.get("session")
+        diagnostics = entry.get("DIAGNOSTICS") if isinstance(entry.get("DIAGNOSTICS"), Mapping) else None
+        warn_code = diagnostics.get("warn") if isinstance(diagnostics, Mapping) else None
         meta_payload = {
             "value_area_pct": value_area_pct,
             "source": "tpo",
@@ -552,8 +584,11 @@ def build_profile_package(
             "tpo_vah": entry.get("VAH"),
             "tpo_val": entry.get("VAL"),
         }
+        include_value_area = warn_code != "too_few_bars"
         for zone_type, price_value in price_fields.items():
             if price_value is None:
+                continue
+            if not include_value_area:
                 continue
             try:
                 price_float = float(price_value)
@@ -561,6 +596,10 @@ def build_profile_package(
                 continue
             if not math.isfinite(price_float):
                 continue
+            key = (zone_type, str(date_value) if date_value is not None else None, str(session_value) if session_value is not None else None)
+            if key in seen_zone_keys:
+                continue
+            seen_zone_keys.add(key)
             zones.append(
                 {
                     "type": zone_type,

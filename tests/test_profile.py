@@ -13,6 +13,7 @@ import src.services.inspection as inspection
 from src.meta import Meta
 from src.services import presets
 from src.services.profile import (
+    build_profile_package,
     build_volume_profile,
     compute_session_profiles,
     flatten_profile,
@@ -150,7 +151,10 @@ def test_volume_profile_bimodal_prefers_dominant_peak() -> None:
 def test_volume_profile_warns_on_short_series() -> None:
     candles = make_unimodal(n=10)
     profile = build_volume_profile(candles, tick_size=0.1, adaptive_bins=False, value_area_pct=0.7)
-    assert profile.diagnostics.get("warn") == "too few bars"
+    assert profile.diagnostics.get("warn") == "too_few_bars"
+    assert profile.poc is None
+    assert profile.vah is None
+    assert profile.val is None
 
 
 def test_split_by_sessions_groups_candles() -> None:
@@ -218,6 +222,27 @@ def test_compute_session_profiles_respects_last_n() -> None:
         assert summaries[-1]["session"] != "daily"
 
 
+def test_compute_session_profiles_marks_sparse_days() -> None:
+    base = datetime(2024, 5, 10, tzinfo=timezone.utc)
+    candles = make_unimodal(n=45, base=base)
+    sessions = list(Meta.iter_vwap_sessions())
+    summaries = compute_session_profiles(
+        candles,
+        sessions=sessions,
+        last_n=1,
+        tick_size=0.1,
+        adaptive_bins=False,
+        value_area_pct=0.7,
+    )
+    assert summaries, "Expected TPO summaries"
+    daily_entry = next(entry for entry in summaries if entry.get("session") == "daily")
+    diagnostics = daily_entry.get("DIAGNOSTICS")
+    assert diagnostics and diagnostics.get("warn") == "too_few_bars"
+    assert "POC" not in daily_entry
+    assert "VAH" not in daily_entry
+    assert "VAL" not in daily_entry
+
+
 def test_profile_endpoint_returns_payload(client: TestClient) -> None:
     candles = make_unimodal(n=720, base=datetime(2024, 6, 1, tzinfo=timezone.utc))
     response = client.post("/inspection/snapshot", json=_snapshot_payload(candles))
@@ -283,6 +308,32 @@ def test_profile_endpoint_includes_all_snapshot_days(client: TestClient) -> None
 
     zone_dates = {zone.get("date") for zone in body.get("zones", [])}
     assert expected_dates.issubset(zone_dates)
+
+    zone_keys = {(zone.get("type"), zone.get("date"), zone.get("session")) for zone in body.get("zones", [])}
+    assert len(zone_keys) == len(body.get("zones", []))
+
+
+def test_profile_package_skips_zones_for_sparse_days() -> None:
+    base = datetime(2024, 9, 1, tzinfo=timezone.utc)
+    candles = make_unimodal(n=40, base=base)
+    sessions = list(Meta.iter_vwap_sessions())
+    tpo, _, zones = build_profile_package(
+        candles,
+        sessions=sessions,
+        last_n=1,
+        tick_size=0.1,
+        adaptive_bins=False,
+        value_area_pct=0.7,
+        atr_multiplier=0.5,
+        target_bins=80,
+        cache_token=None,
+        tf_key="1m",
+    )
+    assert tpo, "Expected TPO diagnostics"
+    daily_entry = next(entry for entry in tpo if entry.get("session") == "daily")
+    diagnostics = daily_entry.get("DIAGNOSTICS")
+    assert diagnostics and diagnostics.get("warn") == "too_few_bars"
+    assert zones == []
 
 
 def test_profile_endpoint_is_deterministic(client: TestClient) -> None:
