@@ -182,7 +182,7 @@ def _snapshot_payload(candles: Iterable[Mapping[str, float]]) -> Mapping[str, ob
 
 def test_compute_session_profiles_respects_last_n() -> None:
     base = datetime(2024, 5, 1, tzinfo=timezone.utc)
-    candles = make_unimodal(n=800, base=base)
+    candles = make_unimodal(n=60 * 24 * 4, base=base)
     sessions = list(Meta.iter_vwap_sessions())
     summaries = compute_session_profiles(
         candles,
@@ -192,10 +192,30 @@ def test_compute_session_profiles_respects_last_n() -> None:
         adaptive_bins=False,
         value_area_pct=0.7,
     )
-    assert len(summaries) <= 2
-    if summaries:
-        dates = [entry["date"] for entry in summaries]
-        assert dates == sorted(dates)
+    assert summaries, "Expected at least one TPO summary"
+
+    daily_entries = [entry for entry in summaries if entry.get("session") == "daily"]
+    assert daily_entries, "Expected daily TPO entries"
+    assert len(daily_entries) <= 2
+
+    allowed_dates = {entry["date"] for entry in daily_entries}
+    assert allowed_dates
+    assert allowed_dates == {entry["date"] for entry in summaries}
+    expected_dates = {
+        (base.date() + timedelta(days=offset)).isoformat() for offset in range(2, 4)
+    }
+    assert allowed_dates == expected_dates
+
+    ordered_dates = [entry["date"] for entry in summaries]
+    assert ordered_dates == sorted(ordered_dates)
+
+    for day_entry in daily_entries:
+        nested = day_entry.get("sessions", [])
+        assert isinstance(nested, list)
+        for nested_entry in nested:
+            assert nested_entry.get("date") == day_entry["date"]
+    if any(day_entry.get("sessions") for day_entry in daily_entries):
+        assert summaries[-1]["session"] != "daily"
 
 
 def test_profile_endpoint_returns_payload(client: TestClient) -> None:
@@ -229,6 +249,40 @@ def test_profile_endpoint_returns_payload(client: TestClient) -> None:
         latest = body["tpo"][-1]
         assert "session" in latest
         assert "date" in latest
+
+
+def test_profile_endpoint_includes_all_snapshot_days(client: TestClient) -> None:
+    base = datetime(2025, 9, 21, tzinfo=timezone.utc)
+    candles = make_unimodal(n=60 * 24 * 5, base=base)
+
+    response = client.post("/inspection/snapshot", json=_snapshot_payload(candles))
+    assert response.status_code == 200
+    snapshot_id = response.json()["snapshot_id"]
+
+    profile_response = client.get(
+        "/profile",
+        params={
+            "snapshot": snapshot_id,
+            "last_n": 5,
+            "value_area_pct": 0.7,
+        },
+    )
+    assert profile_response.status_code == 200
+    body = profile_response.json()
+
+    tpo_entries = body.get("tpo", [])
+    assert tpo_entries, "Expected TPO entries to be present"
+    daily_entries = [entry for entry in tpo_entries if entry.get("session") == "daily"]
+    assert len(daily_entries) == 5
+
+    expected_dates = {
+        (base.date() + timedelta(days=offset)).isoformat() for offset in range(5)
+    }
+    observed_dates = {entry.get("date") for entry in daily_entries}
+    assert observed_dates == expected_dates
+
+    zone_dates = {zone.get("date") for zone in body.get("zones", [])}
+    assert expected_dates.issubset(zone_dates)
 
 
 def test_profile_endpoint_is_deterministic(client: TestClient) -> None:

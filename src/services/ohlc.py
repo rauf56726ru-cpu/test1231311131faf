@@ -156,6 +156,7 @@ def normalise_ohlcv(
     raw_rows: Sequence[Mapping[str, object] | Sequence[object]],
     *,
     include_diagnostics: bool = False,
+    use_full_span: bool = False,
 ) -> Dict[str, object]:
     """Normalise raw OHLC candles gathered by the frontend into aligned bars."""
 
@@ -188,7 +189,10 @@ def normalise_ohlcv(
     last_open_ms = _align_to_interval(ordered_times[-1], interval_ms)
     first_open_ms = _align_to_interval(ordered_times[0], interval_ms)
     span_candles = max(1, (last_open_ms - first_open_ms) // interval_ms + 1)
-    limit = min(limit_default, span_candles)
+    if use_full_span:
+        limit = span_candles
+    else:
+        limit = min(limit_default, span_candles)
     start_open_ms = last_open_ms - (limit - 1) * interval_ms
 
     normalized: List[Candle] = []
@@ -245,8 +249,19 @@ def normalise_ohlcv(
 
 
 def normalise_ohlcv_sync(
-    symbol: str, timeframe: str, raw_rows: Sequence[Mapping[str, object] | Sequence[object]]
+    symbol: str,
+    timeframe: str,
+    raw_rows: Sequence[Mapping[str, object] | Sequence[object]],
+    *,
+    include_diagnostics: bool = False,
+    use_full_span: bool = False,
 ) -> Dict[str, object]:
     """Synchronous helper for normalising OHLCV snapshots."""
 
-    return normalise_ohlcv(symbol, timeframe, raw_rows)
+    return normalise_ohlcv(
+        symbol,
+        timeframe,
+        raw_rows,
+        include_diagnostics=include_diagnostics,
+        use_full_span=use_full_span,
+    )
