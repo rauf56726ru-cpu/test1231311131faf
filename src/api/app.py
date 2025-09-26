@@ -263,7 +263,12 @@ async def profile_endpoint(
         raw_candles = []
 
     try:
-        normalised = normalise_ohlcv(symbol, timeframe, raw_candles)
+        normalised = normalise_ohlcv(
+            symbol,
+            timeframe,
+            raw_candles,
+            full_snapshot=True,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
