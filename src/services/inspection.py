@@ -1330,6 +1330,7 @@ def render_inspection_page(
     "1d": 86400000,
   };
   const DEFAULT_TEST_TIMEFRAMES = ["1m", "3m", "5m", "15m", "1h", "4h", "1d"];
+  const PREVIEW_REFRESH_INTERVAL_MS = 10_000;
 
 
   function toChartBars(candles) {
@@ -1353,6 +1354,17 @@ def render_inspection_page(
     const date = new Date(ts);
     if (Number.isNaN(date.getTime())) return "—";
     return date.toISOString().replace("T", " ").replace(".000Z", "Z");
+  }
+
+  function computeCandleDisplayTime(candle, intervalMs, lastUpdateMs) {
+    if (!candle) return Number.NaN;
+    const openMs = Number(candle.t ?? candle.time ?? 0);
+    if (!Number.isFinite(openMs)) return Number.NaN;
+    const safeInterval = Math.max(1, Number(intervalMs) || 0);
+    const closingMs = openMs + safeInterval;
+    const reference = Number.isFinite(lastUpdateMs) ? Number(lastUpdateMs) : Date.now();
+    const alignedReference = Math.max(openMs, reference);
+    return Math.min(closingMs, alignedReference);
   }
 
   function setJson(pre, data) {
@@ -2348,6 +2360,10 @@ def render_inspection_page(
         symbol: normaliseSymbol(symbolField ? symbolField.value : initial.symbol) || defaultSymbol,
         interval: (intervalField && intervalField.value) || "1m",
         selection: null,
+        candles: [],
+        refreshTimer: null,
+        lastFetchedAtMs: null,
+        isFetching: false,
       };
 
       function setPreviewStatus(message, tone = "info") {
@@ -2364,14 +2380,20 @@ def render_inspection_page(
         if (selectionLabelEl) selectionLabelEl.textContent = label;
       }
 
-      function updatePreviewInfo(candle) {
+      function updatePreviewInfo(candle, options = {}) {
+        const intervalMs =
+          Number.isFinite(options.intervalMs) && options.intervalMs
+            ? Number(options.intervalMs)
+            : TIMEFRAME_TO_MS[previewState.interval] || 60000;
+        const lastUpdateMs = Number(options.lastUpdateMs);
         if (!candle) {
           if (lastTimeEl) lastTimeEl.textContent = "-";
           if (lastPriceEl) lastPriceEl.textContent = "-";
           if (lastRangeEl) lastRangeEl.textContent = "-";
           return;
         }
-        if (lastTimeEl) lastTimeEl.textContent = formatTs(Number(candle.t));
+        const displayTs = computeCandleDisplayTime(candle, intervalMs, lastUpdateMs);
+        if (lastTimeEl) lastTimeEl.textContent = formatTs(displayTs);
         if (lastPriceEl) lastPriceEl.textContent = Number(candle.c ?? candle.close ?? 0).toFixed(2);
         const high = Number(candle.h ?? candle.high ?? 0);
         const low = Number(candle.l ?? candle.low ?? 0);
@@ -2379,6 +2401,69 @@ def render_inspection_page(
         const rangeValue = Math.max(0, high - low);
         const percent = base ? (rangeValue / base) * 100 : 0;
         if (lastRangeEl) lastRangeEl.textContent = `${rangeValue.toFixed(2)} (${percent.toFixed(2)}%)`;
+      }
+
+      function stopPreviewRefresh() {
+        if (previewState.refreshTimer) {
+          clearTimeout(previewState.refreshTimer);
+          previewState.refreshTimer = null;
+        }
+      }
+
+      function schedulePreviewRefresh() {
+        stopPreviewRefresh();
+        previewState.refreshTimer = setTimeout(async () => {
+          previewState.refreshTimer = null;
+          await refreshPreviewCandles({ silent: true });
+          schedulePreviewRefresh();
+        }, PREVIEW_REFRESH_INTERVAL_MS);
+      }
+
+      async function requestPreviewCandles(symbol, interval) {
+        const intervalMs = TIMEFRAME_TO_MS[interval] || 60000;
+        const endMs = Date.now();
+        const startMs = Math.max(0, endMs - intervalMs * 500);
+        const candles = await fetchCandles(symbol, interval, startMs, endMs);
+        return { candles, fetchedAt: Date.now(), intervalMs };
+      }
+
+      function applyPreviewCandles(candles, fetchedAtMs, intervalMs, { fitContent = false } = {}) {
+        previewState.candles = Array.isArray(candles) ? candles.slice() : [];
+        previewState.lastFetchedAtMs = fetchedAtMs;
+        const bars = toChartBars(previewState.candles);
+        if (previewState.series) {
+          previewState.series.setData(bars);
+        }
+        if (fitContent && previewState.chart && bars.length) {
+          previewState.chart.timeScale().fitContent();
+        }
+        updatePreviewInfo(previewState.candles[previewState.candles.length - 1], {
+          intervalMs,
+          lastUpdateMs: fetchedAtMs,
+        });
+      }
+
+      async function refreshPreviewCandles({ silent = false } = {}) {
+        if (previewState.isFetching) return;
+        if (!previewState.symbol || !previewState.interval) return;
+        previewState.isFetching = true;
+        try {
+          const { candles, fetchedAt, intervalMs } = await requestPreviewCandles(
+            previewState.symbol,
+            previewState.interval,
+          );
+          applyPreviewCandles(candles, fetchedAt, intervalMs, { fitContent: false });
+          if (!silent) {
+            setPreviewStatus("", "info");
+          }
+        } catch (error) {
+          console.error("Failed to refresh preview candles", error);
+          if (!silent) {
+            setPreviewStatus("Failed to load Binance history", "error");
+          }
+        } finally {
+          previewState.isFetching = false;
+        }
       }
 
       function ensurePreviewChart() {
@@ -2447,34 +2532,24 @@ def render_inspection_page(
         previewState.symbol = resolvedSymbol;
         previewState.interval = resolvedInterval;
         previewState.selection = null;
+        stopPreviewRefresh();
         if (symbolField) symbolField.value = resolvedSymbol;
         if (intervalField) intervalField.value = resolvedInterval;
         updatePreviewSelectionLabel();
         setPreviewStatus("Loading Binance history...", "info");
         try {
           ensurePreviewChart();
-          const intervalMs = TIMEFRAME_TO_MS[resolvedInterval] || 60000;
-          const endMs = Date.now();
-          const startMs = Math.max(0, endMs - intervalMs * 500);
-          const candles = await fetchCandles(resolvedSymbol, resolvedInterval, startMs, endMs);
-          const bars = candles.map((candle) => ({
-            time: Math.floor(Number(candle.t) / 1000),
-            open: Number(candle.o ?? candle.open ?? 0),
-            high: Number(candle.h ?? candle.high ?? 0),
-            low: Number(candle.l ?? candle.low ?? 0),
-            close: Number(candle.c ?? candle.close ?? 0),
-          }));
-          if (previewState.series) {
-            previewState.series.setData(bars);
-          }
-          if (previewState.chart && bars.length) {
-            previewState.chart.timeScale().fitContent();
-          }
-          updatePreviewInfo(candles[candles.length - 1]);
+          const { candles, fetchedAt, intervalMs } = await requestPreviewCandles(
+            resolvedSymbol,
+            resolvedInterval,
+          );
+          applyPreviewCandles(candles, fetchedAt, intervalMs, { fitContent: true });
           setPreviewStatus("", "info");
+          schedulePreviewRefresh();
         } catch (error) {
           console.error(error);
           setPreviewStatus("Failed to load Binance history", "error");
+          stopPreviewRefresh();
         }
       }
 
@@ -2495,6 +2570,10 @@ def render_inspection_page(
           );
         });
       }
+
+      window.addEventListener("beforeunload", () => {
+        stopPreviewRefresh();
+      });
 
       if (createSessionBtn) {
         createSessionBtn.addEventListener("click", async () => {
