@@ -1,0 +1,101 @@
+<div class="check-all-datas-widget">
+  <section class="check-all-datas-section">
+    <h3>Previous days summary</h3>
+    {% if payload.previous_days_summary %}
+    <table class="check-all-datas-table">
+      <thead>
+        <tr>
+          <th>date_utc</th>
+          <th>date_local</th>
+          <th>bars</th>
+          <th>open</th>
+          <th>high</th>
+          <th>low</th>
+          <th>close</th>
+          <th>volume_sum</th>
+          <th>ret_close_pct</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in payload.previous_days_summary %}
+        <tr>
+          <td>{{ row.date_utc }}</td>
+          <td>{{ row.date_local }}</td>
+          <td>{{ '%.0f'|format(row.bars) }}</td>
+          <td>{{ '%.2f'|format(row.open) }}</td>
+          <td>{{ '%.2f'|format(row.high) }}</td>
+          <td>{{ '%.2f'|format(row.low) }}</td>
+          <td>{{ '%.2f'|format(row.close) }}</td>
+          <td>{{ '%.6f'|format(row.volume_sum) }}</td>
+          <td>{{ '%.4f'|format(row.ret_close_pct) }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <table class="check-all-datas-aggregate">
+      <tbody>
+        <tr><th>days</th><td>{{ payload.previous_days_aggregate.days }}</td></tr>
+        <tr><th>volume_sum</th><td>{{ '%.6f'|format(payload.previous_days_aggregate.volume_sum) }}</td></tr>
+        <tr><th>ret_close_pct_avg</th><td>{{ '%.4f'|format(payload.previous_days_aggregate.ret_close_pct_avg) }}</td></tr>
+        <tr><th>high_max</th><td>{{ '%.2f'|format(payload.previous_days_aggregate.high_max) }}</td></tr>
+        <tr><th>low_min</th><td>{{ '%.2f'|format(payload.previous_days_aggregate.low_min) }}</td></tr>
+      </tbody>
+    </table>
+    {% else %}
+    <div class="check-all-datas-empty">No previous days data</div>
+    {% endif %}
+  </section>
+
+  <section class="check-all-datas-section">
+    <h3>Last {{ payload.last_hours_detailed.hours }} hours detailed</h3>
+    <table class="check-all-datas-meta">
+      <tbody>
+        <tr><th>window_from_utc</th><td>{{ payload.last_hours_detailed.window_utc['from'] }}</td></tr>
+        <tr><th>window_to_utc</th><td>{{ payload.last_hours_detailed.window_utc['to'] }}</td></tr>
+        <tr><th>ohlc_open</th><td>{{ '%.4f'|format(payload.last_hours_detailed.ohlc_window.o) }}</td></tr>
+        <tr><th>ohlc_high</th><td>{{ '%.4f'|format(payload.last_hours_detailed.ohlc_window.h) }}</td></tr>
+        <tr><th>ohlc_low</th><td>{{ '%.4f'|format(payload.last_hours_detailed.ohlc_window.l) }}</td></tr>
+        <tr><th>ohlc_close</th><td>{{ '%.4f'|format(payload.last_hours_detailed.ohlc_window.c) }}</td></tr>
+        <tr><th>volume_window</th><td>{{ '%.6f'|format(payload.last_hours_detailed.volume_window) }}</td></tr>
+        <tr><th>ret_window_pct</th><td>{{ '%.4f'|format(payload.last_hours_detailed.ret_window_pct) }}</td></tr>
+        <tr><th>max_drawdown_pct</th><td>{{ '%.4f'|format(payload.last_hours_detailed.max_drawdown_pct) }}</td></tr>
+      </tbody>
+    </table>
+    <div class="check-all-datas-table-wrapper">
+      <table class="check-all-datas-table">
+        <thead>
+          <tr>
+            <th>t</th>
+            <th>o</th>
+            <th>h</th>
+            <th>l</th>
+            <th>c</th>
+            <th>v</th>
+            <th>ret_1m</th>
+            <th>sma_5</th>
+            <th>sma_15</th>
+            <th>vwap_window</th>
+            <th>volatility_15m</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for bar in payload.last_hours_detailed.bars %}
+          <tr>
+            <td>{{ bar.t }}</td>
+            <td>{{ '%.4f'|format(bar.o) }}</td>
+            <td>{{ '%.4f'|format(bar.h) }}</td>
+            <td>{{ '%.4f'|format(bar.l) }}</td>
+            <td>{{ '%.4f'|format(bar.c) }}</td>
+            <td>{{ '%.6f'|format(bar.v) }}</td>
+            <td>{{ '%.4f'|format(bar.ret_1m) }}</td>
+            <td>{{ '%.4f'|format(bar.sma_5) }}</td>
+            <td>{{ '%.4f'|format(bar.sma_15) }}</td>
+            <td>{{ '%.4f'|format(bar.vwap_window) }}</td>
+            <td>{{ '%.4f'|format(bar.volatility_15m) }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+</div>

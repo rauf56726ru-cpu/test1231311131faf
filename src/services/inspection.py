@@ -1158,6 +1158,10 @@ def render_inspection_page(
     const statusEl = document.getElementById("inspection-status");
     const metricButtons = Array.from(document.querySelectorAll("[data-metric]"));
     const symbolInput = document.getElementById("symbol-input");
+    const checkAllDatasButton = document.getElementById("btn-check-all-datas");
+    const dataCheckJson = document.getElementById("data-check-json");
+    const dataCheckPanel = document.getElementById("data-check-panel");
+    const dataCheckStatus = document.getElementById("data-check-status");
 
     initCollapsibles();
 
@@ -1169,6 +1173,13 @@ def render_inspection_page(
       chart: null,
       series: null,
     };
+
+    function setDataCheckStatus(message, tone = "info") {
+      if (!dataCheckStatus) return;
+      dataCheckStatus.textContent = message || "";
+      dataCheckStatus.dataset.tone = tone;
+      dataCheckStatus.hidden = !message;
+    }
 
     if (symbolInput) {
       const initialSymbol =
@@ -1245,6 +1256,60 @@ def render_inspection_page(
     function renderJson(payload) {
       setJson(dataPre, payload?.DATA);
       setJson(diagnosticsPre, payload?.DIAGNOSTICS);
+    }
+
+    async function fetchCheckAllDatasOverview() {
+      if (!checkAllDatasButton) return;
+      const url = new URL("/inspection/check-all-datas", window.location.origin);
+      url.searchParams.set("hours", "4");
+      setDataCheckStatus("Загрузка агрегированных данных…", "info");
+      checkAllDatasButton.disabled = true;
+      if (dataCheckJson) dataCheckJson.textContent = "null";
+      if (dataCheckPanel) dataCheckPanel.innerHTML = "";
+      try {
+        const jsonResponse = await fetch(url.toString(), {
+          headers: { Accept: "application/json" },
+        });
+        let hasData = false;
+        if (jsonResponse.status === 204) {
+          setDataCheckStatus("Нет данных для агрегирования", "warning");
+        } else if (jsonResponse.ok) {
+          const payload = await jsonResponse.json();
+          setJson(dataCheckJson, payload);
+          hasData = true;
+        } else {
+          const text = await jsonResponse.text().catch(() => "");
+          throw new Error(`JSON ${jsonResponse.status} ${text}`);
+        }
+
+        const htmlResponse = await fetch(url.toString(), {
+          headers: { Accept: "text/html" },
+        });
+
+        if (htmlResponse.status === 204) {
+          if (!hasData) {
+            setDataCheckStatus("Нет данных для агрегирования", "warning");
+          }
+        } else if (htmlResponse.ok) {
+          const html = await htmlResponse.text();
+          if (dataCheckPanel) {
+            dataCheckPanel.innerHTML = html;
+          }
+          hasData = true;
+        } else {
+          const text = await htmlResponse.text().catch(() => "");
+          throw new Error(`HTML ${htmlResponse.status} ${text}`);
+        }
+
+        if (hasData) {
+          setDataCheckStatus("", "info");
+        }
+      } catch (error) {
+        console.error("check-all-datas", error);
+        setDataCheckStatus("Ошибка загрузки агрегированных данных", "error");
+      } finally {
+        checkAllDatasButton.disabled = false;
+      }
     }
 
     function ensureChart() {
@@ -1438,6 +1503,12 @@ def render_inspection_page(
       clearSelection.addEventListener("click", () => {
         state.selection = null;
         updateSelectionLabel();
+      });
+    }
+
+    if (checkAllDatasButton) {
+      checkAllDatasButton.addEventListener("click", () => {
+        fetchCheckAllDatasOverview();
       });
     }
 
@@ -1953,6 +2024,7 @@ def render_inspection_page(
               <button class=\"secondary\" type=\"button\" data-metric=\"zones\">Zones</button>
               <button class=\"secondary\" type=\"button\" data-metric=\"smt\">SMT</button>
               <button class=\"secondary\" type=\"button\" data-metric=\"agg\">Agg Trades</button>
+              <button id=\"btn-check-all-datas\" class=\"primary\" type=\"button\">Check all datas</button>
             </div>
             <div class=\"json-panels\">
               <div class=\"collapse\">
@@ -1975,6 +2047,22 @@ def render_inspection_page(
                   <button class=\"secondary\" type=\"button\" data-copy-target=\"metric-json\">Copy JSON</button>
                 </header>
                 <pre id=\"metric-json\">{metric_json_initial}</pre>
+              </div>
+            </div>
+            <div class=\"data-check-block\">
+              <div class=\"data-check-header\">
+                <span class=\"badge\">Aggregated market slice</span>
+              </div>
+              <div id=\"data-check-status\" class=\"status-banner\" hidden data-tone=\"info\"></div>
+              <div class=\"data-check-grid\">
+                <div class=\"collapse\">
+                  <header data-collapse-toggle>
+                    <h3>Check all datas JSON</h3>
+                    <button class=\"secondary\" type=\"button\" data-copy-target=\"data-check-json\">Copy JSON</button>
+                  </header>
+                  <pre id=\"data-check-json\">null</pre>
+                </div>
+                <div id=\"data-check-panel\" class=\"data-check-panel\"></div>
               </div>
             </div>
           </section>

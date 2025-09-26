@@ -2,20 +2,24 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
-from fastapi import Body, FastAPI, HTTPException, Query, Request
+from fastapi import Body, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from ..services import (
+    InsufficientDataError,
     build_inspection_payload,
+    build_market_overview,
     build_placeholder_snapshot,
     DEFAULT_SYMBOL,
     get_snapshot,
     list_snapshots,
     register_snapshot,
+    render_market_overview_html,
     render_inspection_page,
 )
 from ..version import APP_VERSION
@@ -25,6 +29,12 @@ PUBLIC_DIR = PROJECT_ROOT / "public"
 TEMPLATES_DIR = PROJECT_ROOT / "templates"
 
 app = FastAPI(title="Chart OHLC API")
+
+template_env = Environment(
+    loader=FileSystemLoader(str(TEMPLATES_DIR)),
+    autoescape=select_autoescape(["html", "xml"]),
+)
+check_all_datas_template = template_env.get_template("check_all_datas.html")
 
 app.add_middleware(
     CORSMiddleware,
@@ -103,6 +113,64 @@ async def inspection(
 @app.get("/inspection/snapshots")
 async def inspection_snapshots() -> JSONResponse:
     return JSONResponse(list_snapshots())
+
+
+def _parse_accept_header(header: str | None) -> Tuple[str | None, bool]:
+    if not header:
+        return "application/json", True
+
+    parts = [part.strip() for part in header.split(",") if part.strip()]
+    if not parts:
+        return "application/json", True
+
+    ranked: list[tuple[str, float, int]] = []
+    for idx, part in enumerate(parts):
+        mime = part
+        q = 1.0
+        if ";" in part:
+            tokens = [token.strip() for token in part.split(";") if token.strip()]
+            mime = tokens[0]
+            for token in tokens[1:]:
+                if token.startswith("q="):
+                    try:
+                        q = float(token[2:])
+                    except ValueError:
+                        q = 0.0
+        ranked.append((mime.lower(), q, idx))
+
+    ranked.sort(key=lambda item: (-item[1], item[2]))
+
+    for mime, _, _ in ranked:
+        if mime in {"application/json", "application/*", "*/*"}:
+            return "application/json", True
+        if mime in {"text/html", "text/*"}:
+            return "text/html", True
+    return None, False
+
+
+@app.get("/inspection/check-all-datas")
+async def inspection_check_all_datas(
+    request: Request,
+    hours: int = Query(4, ge=2, le=4),
+) -> Response:
+    accept_value, matched = _parse_accept_header(request.headers.get("accept"))
+    if not matched or accept_value is None:
+        raise HTTPException(status_code=406, detail="Not Acceptable")
+
+    try:
+        payload = build_market_overview(hours=hours)
+    except InsufficientDataError:
+        return Response(status_code=204)
+
+    if accept_value == "application/json":
+        if hasattr(payload, "model_dump"):
+            content = payload.model_dump(mode="json", by_alias=True)
+        else:
+            content = payload.dict(by_alias=True)
+        return JSONResponse(content)
+
+    html = render_market_overview_html(payload, check_all_datas_template)
+    return HTMLResponse(content=html)
 
 
 @app.get("/health")
