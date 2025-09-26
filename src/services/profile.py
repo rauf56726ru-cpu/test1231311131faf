@@ -344,6 +344,17 @@ def compute_session_profiles(
         dt = datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc)
         daily_buckets[dt.date()].append(dict(candle))
 
+
+    daily_buckets: DefaultDict[date, List[Mapping[str, Any]]] = defaultdict(list)
+    for candle in candles_1m:
+        if not isinstance(candle, Mapping):
+            continue
+        ts = _extract_timestamp(candle)
+        if ts is None:
+            continue
+        dt = datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc)
+        daily_buckets[dt.date()].append(dict(candle))
+
     if not daily_buckets:
         return []
 
@@ -404,6 +415,12 @@ def compute_session_profiles(
                 payload["VAH"] = float(profile.vah)
             if profile.val is not None and math.isfinite(float(profile.val)):
                 payload["VAL"] = float(profile.val)
+        if profile.prices and profile.volumes and math.isfinite(profile.poc):
+            payload["POC"] = profile.poc
+            if math.isfinite(profile.vah):
+                payload["VAH"] = profile.vah
+            if math.isfinite(profile.val):
+                payload["VAL"] = profile.val
         return payload
 
     summaries: List[Dict[str, object]] = []
