@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import html as html_utils
 import json
-from collections import OrderedDict, defaultdict
-from datetime import datetime, timezone, timedelta, time as dtime
 import math
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple, DefaultDict
+import os
+import re
+from collections import OrderedDict, defaultdict
+from datetime import datetime, timedelta, timezone, time as dtime
+from pathlib import Path
+from typing import Any, DefaultDict, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple
 
 from .ohlc import TIMEFRAME_WINDOWS, TIMEFRAME_TO_MS, normalise_ohlcv
 from ..meta import Meta
@@ -18,6 +21,58 @@ DEFAULT_SYMBOL = "BTCUSDT"
 _MAX_STORED_SNAPSHOTS = 16
 _SNAPSHOT_STORE: "OrderedDict[str, Snapshot]" = OrderedDict()
 
+_DEFAULT_STORAGE_ROOT = Path(__file__).resolve().parents[2] / "var" / "snapshots"
+SNAPSHOT_STORAGE_DIR = Path(
+    os.environ.get("INSPECTION_SNAPSHOT_DIR", str(_DEFAULT_STORAGE_ROOT))
+).expanduser()
+_SNAPSHOT_ID_SANITISER = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _ensure_storage_dir() -> None:
+    try:
+        SNAPSHOT_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # Failing to create the directory should not break the request flow; in-memory
+        # storage will continue to function even without persistence on disk.
+        pass
+
+
+def _snapshot_path(snapshot_id: str) -> Path:
+    safe_id = _SNAPSHOT_ID_SANITISER.sub("_", snapshot_id or "snapshot")
+    return SNAPSHOT_STORAGE_DIR / f"{safe_id}.json"
+
+
+def _persist_snapshot(snapshot: Snapshot) -> None:
+    if not snapshot:
+        return
+
+    _ensure_storage_dir()
+
+    snapshot_id = str(snapshot.get("id") or "snapshot")
+    path = _snapshot_path(snapshot_id)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+
+    try:
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            json.dump(snapshot, handle, ensure_ascii=False, indent=2)
+        tmp_path.replace(path)
+    except OSError:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+
+
+def _remove_snapshot_file(snapshot_id: str) -> None:
+    path = _snapshot_path(snapshot_id)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -25,7 +80,40 @@ def _now_iso() -> str:
 
 def _ensure_snapshot_limit() -> None:
     while len(_SNAPSHOT_STORE) > _MAX_STORED_SNAPSHOTS:
-        _SNAPSHOT_STORE.popitem(last=False)
+        removed_id, _ = _SNAPSHOT_STORE.popitem(last=False)
+        _remove_snapshot_file(removed_id)
+
+
+def _load_existing_snapshots() -> None:
+    if not SNAPSHOT_STORAGE_DIR.exists():
+        return
+
+    try:
+        files = sorted(
+            SNAPSHOT_STORAGE_DIR.glob("*.json"),
+            key=lambda item: item.stat().st_mtime,
+        )
+    except OSError:
+        return
+
+    for path in files:
+        try:
+            raw = path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, Mapping):
+            continue
+        snapshot_id = str(data.get("id") or path.stem)
+        snapshot = dict(data)
+        snapshot["id"] = snapshot_id
+        _SNAPSHOT_STORE[snapshot_id] = snapshot
+        _SNAPSHOT_STORE.move_to_end(snapshot_id)
+
+    _ensure_snapshot_limit()
+
+
+_load_existing_snapshots()
 
 
 def build_placeholder_snapshot(*, symbol: str = DEFAULT_SYMBOL, timeframe: str = "1m") -> Snapshot:
@@ -289,6 +377,7 @@ def register_snapshot(snapshot: Mapping[str, Any]) -> str:
 
     _SNAPSHOT_STORE[snapshot_id] = stored
     _SNAPSHOT_STORE.move_to_end(snapshot_id)
+    _persist_snapshot(stored)
     _ensure_snapshot_limit()
     return snapshot_id
 
@@ -525,6 +614,7 @@ def render_inspection_page(
     data_json_initial = _format_json_block(data_section)
     diagnostics_json_initial = _format_json_block(diagnostics_section)
     metric_json_initial = _format_json_block(metric_section)
+    check_all_json_initial = _format_json_block(None)
 
     style_block = """
     :root {
@@ -715,6 +805,11 @@ def render_inspection_page(
       background: rgba(14, 165, 233, 0.18);
       cursor: pointer;
       gap: 1rem;
+    }
+    .collapse header .actions {
+      display: inline-flex;
+      gap: 0.5rem;
+      align-items: center;
     }
     .collapse header h3 {
       margin: 0;
@@ -1141,6 +1236,8 @@ def render_inspection_page(
     const dataPre = document.getElementById("data-json");
     const diagnosticsPre = document.getElementById("diagnostics-json");
     const metricPre = document.getElementById("metric-json");
+    const checkAllPre = document.getElementById("checkall-json");
+    const checkAllButton = document.getElementById("fetch-check-all");
     const snapshotMeta = document.getElementById("snapshot-meta");
     const frameSelect = document.getElementById("frame-select");
     const chartContainer = document.getElementById("inspection-chart");
@@ -1161,7 +1258,10 @@ def render_inspection_page(
       frame: initial.timeframe || initial.payload?.DATA?.meta?.requested?.frames?.[0] || "1m",
       chart: null,
       series: null,
+      checkAll: null,
     };
+
+    updateCheckAllState();
 
     if (symbolInput) {
       const initialSymbol =
@@ -1184,18 +1284,28 @@ def render_inspection_page(
       if (chartContainer) chartContainer.setAttribute("data-selection-label", label);
     }
 
+    function updateCheckAllState() {
+      if (!checkAllButton) return;
+      checkAllButton.disabled = !state.snapshotId;
+    }
+
     function populateSnapshots(list) {
       if (!snapshotSelect) return;
       snapshotSelect.innerHTML = "";
-      for (const item of list || []) {
+      const entries = Array.isArray(list) ? list : [];
+      if (state.snapshotId && !entries.some((item) => item.id === state.snapshotId)) {
+        state.snapshotId = null;
+      }
+      for (const item of entries) {
         const option = document.createElement("option");
         option.value = item.id;
         option.textContent = `${item.id} • ${item.symbol || "-"} • ${item.tf || "-"}`;
         snapshotSelect.append(option);
       }
-      if (state.snapshotId && list.some((item) => item.id === state.snapshotId)) {
+      if (state.snapshotId && entries.some((item) => item.id === state.snapshotId)) {
         snapshotSelect.value = state.snapshotId;
       }
+      updateCheckAllState();
     }
 
     function populateFrames(payload) {
@@ -1238,6 +1348,47 @@ def render_inspection_page(
     function renderJson(payload) {
       setJson(dataPre, payload?.DATA);
       setJson(diagnosticsPre, payload?.DIAGNOSTICS);
+      setJson(checkAllPre, state.checkAll);
+    }
+
+    async function requestCheckAllData() {
+      if (!state.snapshotId) {
+        updateStatus("Выберите снэпшот для запроса check-all данных", "warning");
+        return;
+      }
+
+      if (checkAllButton) {
+        checkAllButton.disabled = true;
+      }
+
+      try {
+        updateStatus("Загружаем check-all данные...", "info");
+        const url = new URL("/inspection/check-all", window.location.origin);
+        url.searchParams.set("snapshot", state.snapshotId);
+        const response = await fetch(url.toString(), {
+          headers: { Accept: "application/json" },
+        });
+        if (response.status === 204) {
+          state.checkAll = null;
+          setJson(checkAllPre, null);
+          updateStatus("Check-all данные отсутствуют", "warning");
+          return;
+        }
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const payload = await response.json();
+        state.checkAll = payload;
+        setJson(checkAllPre, payload);
+        updateStatus("Check-all данные обновлены", "success");
+      } catch (error) {
+        console.error(error);
+        state.checkAll = null;
+        setJson(checkAllPre, null);
+        updateStatus("Ошибка запроса check-all данных", "error");
+      } finally {
+        updateCheckAllState();
+      }
     }
 
     function ensureChart() {
@@ -1388,6 +1539,9 @@ def render_inspection_page(
         state.payload = payload;
         state.snapshotId = id;
         state.selection = payload?.DATA?.selection || null;
+        state.checkAll = null;
+        setJson(checkAllPre, null);
+        updateCheckAllState();
         const nextSymbol = payload?.DATA?.symbol || initial.symbol;
         if (symbolInput) {
           const resolved = normaliseSymbol(nextSymbol) || normaliseSymbol(initial.symbol) || defaultSymbol;
@@ -1424,6 +1578,14 @@ def render_inspection_page(
         if (state.snapshotId) {
           loadSnapshot(state.snapshotId);
         }
+      });
+    }
+
+    if (checkAllButton) {
+      checkAllButton.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        requestCheckAllData();
       });
     }
 
@@ -1513,6 +1675,7 @@ def render_inspection_page(
             source: "inspection-panel",
           });
           state.snapshotId = snapshotId;
+          updateCheckAllState();
           await refreshSnapshots();
           if (snapshotSelect) snapshotSelect.value = state.snapshotId;
           await loadSnapshot(state.snapshotId);
@@ -1961,6 +2124,16 @@ def render_inspection_page(
                   <button class=\"secondary\" type=\"button\" data-copy-target=\"diagnostics-json\">Copy JSON</button>
                 </header>
                 <pre id=\"diagnostics-json\">{diagnostics_json_initial}</pre>
+              </div>
+              <div class=\"collapse\">
+                <header data-collapse-toggle>
+                  <h3>CHECK ALL DATAS</h3>
+                  <div class=\"actions\">
+                    <button id=\"fetch-check-all\" class=\"secondary\" type=\"button\">Check all datas</button>
+                    <button class=\"secondary\" type=\"button\" data-copy-target=\"checkall-json\">Copy JSON</button>
+                  </div>
+                </header>
+                <pre id=\"checkall-json\">{check_all_json_initial}</pre>
               </div>
               <div class=\"collapse\">
                 <header data-collapse-toggle>
