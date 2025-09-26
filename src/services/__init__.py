@@ -1,5 +1,6 @@
 """Service layer exports for the chart backend."""
 
+from .check_all_datas import build_check_all_datas
 from .inspection import (
     build_inspection_payload,
     build_placeholder_snapshot,
@@ -17,6 +18,7 @@ __all__ = [
     "build_inspection_payload",
     "build_placeholder_snapshot",
     "DEFAULT_SYMBOL",
+    "build_check_all_datas",
     "get_snapshot",
     "list_snapshots",
     "normalise_ohlcv",

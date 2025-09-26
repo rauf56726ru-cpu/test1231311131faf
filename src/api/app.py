@@ -4,12 +4,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict
 
-from fastapi import Body, FastAPI, HTTPException, Query, Request
+from datetime import datetime, timezone
+
+from fastapi import Body, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from ..services import (
+    build_check_all_datas,
     build_inspection_payload,
     build_placeholder_snapshot,
     DEFAULT_SYMBOL,
@@ -103,6 +106,46 @@ async def inspection(
 @app.get("/inspection/snapshots")
 async def inspection_snapshots() -> JSONResponse:
     return JSONResponse(list_snapshots())
+
+
+@app.get("/inspection/check-all")
+async def inspection_check_all(
+    snapshot: str | None = Query(None, description="Snapshot identifier"),
+    now: str | None = Query(
+        None,
+        description="Override the as-of timestamp (ISO 8601, defaults to last candle)",
+    ),
+) -> Response:
+    snapshots = list_snapshots()
+
+    target_snapshot = None
+    if snapshot:
+        target_snapshot = get_snapshot(snapshot)
+        if target_snapshot is None:
+            raise HTTPException(status_code=404, detail="Snapshot not found")
+    elif snapshots:
+        target_snapshot = get_snapshot(snapshots[0]["id"])  # type: ignore[index]
+
+    if target_snapshot is None:
+        return Response(status_code=204)
+
+    now_override = None
+    if now:
+        try:
+            parsed = datetime.fromisoformat(now)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid now parameter") from exc
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        else:
+            parsed = parsed.astimezone(timezone.utc)
+        now_override = parsed
+
+    payload = build_check_all_datas(target_snapshot, now_utc=now_override)
+    if payload is None:
+        return Response(status_code=204)
+
+    return JSONResponse(payload)
 
 
 @app.get("/health")
