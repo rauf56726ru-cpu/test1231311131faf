@@ -142,7 +142,8 @@ def _ensure_minute_frame(
     primary_key: str,
     primary_candles: Sequence[Mapping[str, Any]],
 ) -> None:
-    if "1m" in frames:
+    existing = frames.get("1m")
+    if isinstance(existing, list) and existing:
         return
 
     if primary_key == "1m":
