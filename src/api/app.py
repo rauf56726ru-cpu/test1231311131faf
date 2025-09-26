@@ -115,6 +115,18 @@ async def inspection_check_all(
         None,
         description="Override the as-of timestamp (ISO 8601, defaults to last candle)",
     ),
+    selection_start: int | None = Query(
+        None,
+        description="Override the start of the analysed window (milliseconds)",
+    ),
+    selection_end: int | None = Query(
+        None,
+        description="Override the end of the analysed window (milliseconds)",
+    ),
+    hours: int | None = Query(
+        None,
+        description="Number of recent hours to collect detailed data for (1-4)",
+    ),
 ) -> Response:
     snapshots = list_snapshots()
 
@@ -141,7 +153,13 @@ async def inspection_check_all(
             parsed = parsed.astimezone(timezone.utc)
         now_override = parsed
 
-    payload = build_check_all_datas(target_snapshot, now_utc=now_override)
+    payload = build_check_all_datas(
+        target_snapshot,
+        now_utc=now_override,
+        selection_start_ms=selection_start,
+        selection_end_ms=selection_end,
+        hours=hours,
+    )
     if payload is None:
         return Response(status_code=204)
 

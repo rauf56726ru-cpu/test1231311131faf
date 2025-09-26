@@ -817,6 +817,29 @@ def render_inspection_page(
       letter-spacing: 0.08em;
       text-transform: uppercase;
     }
+    .checkall-control {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.6rem;
+      padding: 0.75rem 1rem 0.5rem;
+      background: rgba(15, 23, 42, 0.85);
+      border-top: 1px solid rgba(148, 163, 184, 0.16);
+    }
+    .checkall-control span {
+      font-size: 0.75rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: rgba(148, 163, 184, 0.78);
+    }
+    .checkall-control select {
+      background: rgba(15, 23, 42, 0.65);
+      border: 1px solid rgba(148, 163, 184, 0.3);
+      border-radius: 12px;
+      padding: 0.4rem 0.7rem;
+      color: var(--fg);
+      min-width: 110px;
+    }
     .collapse pre {
       margin: 0;
       padding: 1rem;
@@ -1238,6 +1261,7 @@ def render_inspection_page(
     const metricPre = document.getElementById("metric-json");
     const checkAllPre = document.getElementById("checkall-json");
     const checkAllButton = document.getElementById("fetch-check-all");
+    const checkAllHours = document.getElementById("checkall-hours");
     const snapshotMeta = document.getElementById("snapshot-meta");
     const frameSelect = document.getElementById("frame-select");
     const chartContainer = document.getElementById("inspection-chart");
@@ -1251,6 +1275,12 @@ def render_inspection_page(
 
     initCollapsibles();
 
+    const resolveHours = (value) => {
+      const parsed = Number(value);
+      if (!Number.isFinite(parsed)) return 1;
+      return Math.min(4, Math.max(1, Math.floor(parsed)));
+    };
+
     const state = {
       payload: initial.payload || null,
       snapshotId: initial.snapshotId || null,
@@ -1259,6 +1289,7 @@ def render_inspection_page(
       chart: null,
       series: null,
       checkAll: null,
+      hours: checkAllHours ? resolveHours(checkAllHours.value) : 1,
     };
 
     updateCheckAllState();
@@ -1286,7 +1317,12 @@ def render_inspection_page(
 
     function updateCheckAllState() {
       if (!checkAllButton) return;
-      checkAllButton.disabled = !state.snapshotId;
+      const hasSelection = Boolean(state.selection && state.selection.start && state.selection.end);
+      const hoursValid = Number.isFinite(state.hours) && state.hours >= 1 && state.hours <= 4;
+      if (checkAllHours && hoursValid) {
+        checkAllHours.value = String(state.hours);
+      }
+      checkAllButton.disabled = !state.snapshotId || !hasSelection || !hoursValid;
     }
 
     function populateSnapshots(list) {
@@ -1357,6 +1393,21 @@ def render_inspection_page(
         return;
       }
 
+      const rawStart = state.selection && state.selection.start ? Number(state.selection.start) : null;
+      const rawEnd = state.selection && state.selection.end ? Number(state.selection.end) : null;
+      if (!Number.isFinite(rawStart) || !Number.isFinite(rawEnd)) {
+        updateStatus("Выберите две свечи на графике перед сбором подробных данных", "warning");
+        updateCheckAllState();
+        return;
+      }
+
+      const selectionStart = Math.min(Math.floor(rawStart), Math.floor(rawEnd));
+      const selectionEnd = Math.max(Math.floor(rawStart), Math.floor(rawEnd));
+      state.hours = resolveHours(state.hours);
+      if (checkAllHours) {
+        checkAllHours.value = String(state.hours);
+      }
+
       if (checkAllButton) {
         checkAllButton.disabled = true;
       }
@@ -1365,6 +1416,9 @@ def render_inspection_page(
         updateStatus("Загружаем check-all данные...", "info");
         const url = new URL("/inspection/check-all", window.location.origin);
         url.searchParams.set("snapshot", state.snapshotId);
+        url.searchParams.set("selection_start", String(selectionStart));
+        url.searchParams.set("selection_end", String(selectionEnd));
+        url.searchParams.set("hours", String(state.hours));
         const response = await fetch(url.toString(), {
           headers: { Accept: "application/json" },
         });
@@ -1486,6 +1540,7 @@ def render_inspection_page(
             }
           }
           updateSelectionLabel();
+          updateCheckAllState();
         });
       }
 
@@ -1581,6 +1636,15 @@ def render_inspection_page(
       });
     }
 
+    if (checkAllHours) {
+      checkAllHours.value = String(state.hours);
+      checkAllHours.addEventListener("change", () => {
+        state.hours = resolveHours(checkAllHours.value);
+        checkAllHours.value = String(state.hours);
+        updateCheckAllState();
+      });
+    }
+
     if (checkAllButton) {
       checkAllButton.addEventListener("click", (event) => {
         event.preventDefault();
@@ -1593,6 +1657,7 @@ def render_inspection_page(
       clearSelection.addEventListener("click", () => {
         state.selection = null;
         updateSelectionLabel();
+        updateCheckAllState();
       });
     }
 
@@ -2133,6 +2198,15 @@ def render_inspection_page(
                     <button class=\"secondary\" type=\"button\" data-copy-target=\"checkall-json\">Copy JSON</button>
                   </div>
                 </header>
+                <div class=\"checkall-control\">
+                  <span>Собрать подробно информацию за N часов</span>
+                  <select id=\"checkall-hours\">
+                    <option value=\"1\">1 час</option>
+                    <option value=\"2\">2 часа</option>
+                    <option value=\"3\">3 часа</option>
+                    <option value=\"4\">4 часа</option>
+                  </select>
+                </div>
                 <pre id=\"checkall-json\">{check_all_json_initial}</pre>
               </div>
               <div class=\"collapse\">

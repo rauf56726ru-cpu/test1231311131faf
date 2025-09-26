@@ -47,7 +47,11 @@ def _build_snapshot_payload(base: datetime, count: int = 12) -> dict:
             }
         )
 
-    return {"symbol": "BTCUSDT", "tf": "1m", "candles": candles}
+    selection = {"start": candles[0]["t"], "end": candles[-1]["t"]} if candles else None
+    payload = {"symbol": "BTCUSDT", "tf": "1m", "candles": candles}
+    if selection:
+        payload["selection"] = selection
+    return payload
 
 
 def test_historical_snapshot_still_populates_window(client: TestClient) -> None:
@@ -62,7 +66,13 @@ def test_historical_snapshot_still_populates_window(client: TestClient) -> None:
     assert create_response.status_code == 200
     snapshot_id = create_response.json()["snapshot_id"]
 
-    response = client.get(f"/inspection/check-all?snapshot={snapshot_id}")
+    params = {
+        "snapshot": snapshot_id,
+        "selection_start": payload["candles"][0]["t"],
+        "selection_end": payload["candles"][-1]["t"],
+        "hours": 2,
+    }
+    response = client.get("/inspection/check-all", params=params)
     assert response.status_code == 200
     body = response.json()
 
@@ -72,9 +82,32 @@ def test_historical_snapshot_still_populates_window(client: TestClient) -> None:
     assert body["snapshot_id"] == snapshot_id
     assert body["asof_utc"].startswith(expected_last_iso)
     assert body["latest_candle_utc"].startswith(expected_last_iso)
-    assert body["last_candle"]["t"] == int(expected_last.timestamp() * 1000)
-    assert body["current_day"]["summary"]["count"] == len(payload["candles"])
-    assert body["last_hours"]["summary"]["count"] == len(payload["candles"])
+    assert body["latest_candle"]["t"] == int(expected_last.timestamp() * 1000)
+    assert body["datas_for_last_N_hours"]["hours"] == 2
+    assert (
+        body["datas_for_last_N_hours"]["frames"]["1m"]["summary"]["count"]
+        == len(payload["candles"])
+    )
+    assert (
+        body["datas_for_last_N_hours"]["frames"]["1m"]["candles"][-1]["t"]
+        == payload["candles"][-1]["t"]
+    )
+    detailed_start_ms = payload["candles"][-1]["t"] - 2 * 3_600_000
+    expected_detailed_start = datetime.fromtimestamp(
+        detailed_start_ms / 1000, tz=timezone.utc
+    ).isoformat()
+    assert body["datas_for_last_N_hours"]["range"]["start_utc"].startswith(
+        expected_detailed_start
+    )
+    movement_key = next(
+        key for key in body.keys() if isinstance(key, str) and key.startswith("movement_datas_for_")
+    )
+    assert body[movement_key]["days"] == 0
+    expected_movement_end_ms = max(payload["candles"][0]["t"], detailed_start_ms)
+    expected_movement_end = datetime.fromtimestamp(
+        expected_movement_end_ms / 1000, tz=timezone.utc
+    ).isoformat()
+    assert body[movement_key]["range"]["end_utc"].startswith(expected_movement_end)
 
 
 def test_snapshot_persisted_locally(client: TestClient) -> None:
@@ -117,11 +150,36 @@ def test_check_all_after_reload_returns_data(client: TestClient) -> None:
     inspection._SNAPSHOT_STORE.clear()
     inspection._load_existing_snapshots()
 
-    response = client.get(f"/inspection/check-all?snapshot={snapshot_id}")
+    params = {
+        "snapshot": snapshot_id,
+        "selection_start": payload["candles"][0]["t"],
+        "selection_end": payload["candles"][-1]["t"],
+        "hours": 3,
+    }
+    response = client.get("/inspection/check-all", params=params)
     assert response.status_code == 200
     body = response.json()
 
     expected_last = base + timedelta(minutes=len(payload["candles"]) - 1)
     assert body["snapshot_id"] == snapshot_id
-    assert body["last_candle"]["t"] == int(expected_last.timestamp() * 1000)
-    assert body["last_hours"]["summary"]["count"] == len(payload["candles"])
+    assert body["latest_candle"]["t"] == int(expected_last.timestamp() * 1000)
+    assert (
+        body["datas_for_last_N_hours"]["frames"]["1m"]["summary"]["count"]
+        == len(payload["candles"])
+    )
+    assert body["datas_for_last_N_hours"]["hours"] == 3
+    detailed_start_ms = payload["candles"][-1]["t"] - 3 * 3_600_000
+    expected_detailed_start = datetime.fromtimestamp(
+        detailed_start_ms / 1000, tz=timezone.utc
+    ).isoformat()
+    assert body["datas_for_last_N_hours"]["range"]["start_utc"].startswith(
+        expected_detailed_start
+    )
+    movement_key = next(
+        key for key in body.keys() if isinstance(key, str) and key.startswith("movement_datas_for_")
+    )
+    expected_movement_end_ms = max(payload["candles"][0]["t"], detailed_start_ms)
+    expected_movement_end = datetime.fromtimestamp(
+        expected_movement_end_ms / 1000, tz=timezone.utc
+    ).isoformat()
+    assert body[movement_key]["range"]["end_utc"].startswith(expected_movement_end)
