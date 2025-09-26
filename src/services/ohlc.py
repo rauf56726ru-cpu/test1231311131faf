@@ -156,6 +156,7 @@ def normalise_ohlcv(
     raw_rows: Sequence[Mapping[str, object] | Sequence[object]],
     *,
     include_diagnostics: bool = False,
+    window_limit: int | None = None,
 ) -> Dict[str, object]:
     """Normalise raw OHLC candles gathered by the frontend into aligned bars."""
 
@@ -167,6 +168,13 @@ def normalise_ohlcv(
     window = TIMEFRAME_WINDOWS[timeframe]
     candles_by_time, duplicate_times = _prepare_index(raw_rows)
     limit_default = _limit_window(interval_ms, window)
+    if window_limit is not None:
+        try:
+            window_limit = int(window_limit)
+        except (TypeError, ValueError):
+            window_limit = None
+        if window_limit is not None and window_limit <= 0:
+            window_limit = None
     if not candles_by_time:
         payload: Dict[str, object] = {
             "symbol": symbol.upper(),
@@ -176,7 +184,7 @@ def normalise_ohlcv(
         if include_diagnostics:
             payload["diagnostics"] = {
                 "interval_ms": interval_ms,
-                "expected_candles": limit_default,
+                "expected_candles": window_limit or limit_default,
                 "unique_candles": 0,
                 "duplicates": duplicate_times,
                 "missing_bars": [],
@@ -188,7 +196,8 @@ def normalise_ohlcv(
     last_open_ms = _align_to_interval(ordered_times[-1], interval_ms)
     first_open_ms = _align_to_interval(ordered_times[0], interval_ms)
     span_candles = max(1, (last_open_ms - first_open_ms) // interval_ms + 1)
-    limit = min(limit_default, span_candles)
+    limit_cap = window_limit if window_limit is not None else limit_default
+    limit = min(limit_cap, span_candles)
     start_open_ms = last_open_ms - (limit - 1) * interval_ms
 
     normalized: List[Candle] = []
