@@ -397,11 +397,18 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
             except TypeError:
                 candles = []
 
+        window_limit = None
+        interval_ms = TIMEFRAME_TO_MS.get(tf_key.lower())
+        if interval_ms and start is not None and end is not None:
+            span_ms = abs(end - start)
+            window_limit = max(1, math.ceil(span_ms / interval_ms) + 1)
+
         result = normalise_ohlcv(
             symbol,
             tf_key,
             candles,
             include_diagnostics=True,
+            window_limit=window_limit,
         )
         diagnostics = result.pop("diagnostics", {})
 
