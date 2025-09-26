@@ -10,6 +10,13 @@ MS_IN_HOUR = 3_600_000
 MS_IN_DAY = 86_400_000
 VALID_HOUR_WINDOWS = {1, 2, 3, 4}
 
+try:
+    from .ohlc import TIMEFRAME_TO_MS
+except ImportError:  # pragma: no cover - circular import guard
+    TIMEFRAME_TO_MS = {"1m": MS_IN_HOUR // 60}
+
+MINUTE_INTERVAL_MS = TIMEFRAME_TO_MS.get("1m", MS_IN_HOUR // 60)
+
 
 def _coerce_float(value: Any) -> float:
     try:
@@ -123,6 +130,74 @@ def _normalise_frames(snapshot: Mapping[str, Any]) -> Dict[str, List[MutableMapp
         frames[default_tf] = _normalise_candles(snapshot)
 
     return frames
+
+
+def _timeframe_interval_ms(tf_key: str) -> int | None:
+    return TIMEFRAME_TO_MS.get(tf_key)
+
+
+def _ensure_minute_frame(
+    frames: MutableMapping[str, List[MutableMapping[str, Any]]],
+    *,
+    primary_key: str,
+    primary_candles: Sequence[Mapping[str, Any]],
+) -> None:
+    if "1m" in frames:
+        return
+
+    if primary_key == "1m":
+        frames["1m"] = [dict(candle) for candle in primary_candles]
+        return
+
+    ordered_frames = sorted(
+        frames.items(),
+        key=lambda item: _timeframe_interval_ms(item[0]) or float("inf"),
+    )
+
+    for tf_key, candles in ordered_frames:
+        interval_ms = _timeframe_interval_ms(tf_key)
+        if interval_ms is None or interval_ms < MINUTE_INTERVAL_MS:
+            continue
+        ratio = interval_ms // MINUTE_INTERVAL_MS
+        if ratio <= 0:
+            continue
+        expanded: List[MutableMapping[str, Any]] = []
+        for candle in candles:
+            ts = _safe_int(candle.get("t"))
+            if ts is None:
+                continue
+            open_price = _coerce_float(candle.get("o"))
+            high_price = _coerce_float(candle.get("h"))
+            low_price = _coerce_float(candle.get("l"))
+            close_price = _coerce_float(candle.get("c"))
+            volume = _coerce_float(candle.get("v"))
+            portion = volume / ratio if ratio else volume
+            for idx in range(ratio):
+                expanded.append(
+                    {
+                        "t": ts + idx * MINUTE_INTERVAL_MS,
+                        "o": open_price,
+                        "h": high_price,
+                        "l": low_price,
+                        "c": close_price,
+                        "v": portion,
+                    }
+                )
+        if expanded:
+            frames["1m"] = expanded
+            return
+
+    frames["1m"] = [
+        {
+            "t": _safe_int(candle.get("t")) or 0,
+            "o": _coerce_float(candle.get("o")),
+            "h": _coerce_float(candle.get("h")),
+            "l": _coerce_float(candle.get("l")),
+            "c": _coerce_float(candle.get("c")),
+            "v": _coerce_float(candle.get("v")),
+        }
+        for candle in primary_candles
+    ]
 
 
 def _primary_frame_key(snapshot: Mapping[str, Any], frames: Mapping[str, Sequence[Mapping[str, Any]]]) -> str | None:
@@ -394,6 +469,8 @@ def build_check_all_datas(
     primary_candles = frames.get(primary_key, [])
     if not primary_candles:
         return None
+
+    _ensure_minute_frame(frames, primary_key=primary_key, primary_candles=primary_candles)
 
     snapshot_selection = snapshot.get("selection") if isinstance(snapshot.get("selection"), Mapping) else None
     start_ms = selection_start_ms or _safe_int(snapshot_selection.get("start")) if snapshot_selection else None

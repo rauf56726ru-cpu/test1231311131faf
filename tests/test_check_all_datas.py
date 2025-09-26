@@ -54,6 +54,48 @@ def _build_snapshot_payload(base: datetime, count: int = 12) -> dict:
     return payload
 
 
+def _build_timeframe_candles(
+    base: datetime,
+    *,
+    count: int,
+    interval: timedelta,
+    open_increment: float = 1.0,
+    symbol: str = "BTCUSDT",
+    tf: str = "4h",
+) -> dict:
+    candles = []
+    for index in range(count):
+        moment = base + index * interval
+        ts_ms = int(moment.timestamp() * 1000)
+        open_price = 1000.0 + index * open_increment
+        close_price = open_price + 10.0
+        high_price = close_price + 5.0
+        low_price = open_price - 5.0
+        volume = 50.0 + index
+        candles.append(
+            {
+                "t": ts_ms,
+                "o": round(open_price, 2),
+                "h": round(high_price, 2),
+                "l": round(low_price, 2),
+                "c": round(close_price, 2),
+                "v": round(volume, 3),
+            }
+        )
+
+    selection = None
+    if candles:
+        selection = {
+            "start": candles[0]["t"],
+            "end": candles[-1]["t"] + int(interval.total_seconds() * 1000),
+        }
+
+    payload = {"symbol": symbol, "tf": tf, "candles": candles}
+    if selection:
+        payload["selection"] = selection
+    return payload
+
+
 def test_historical_snapshot_still_populates_window(client: TestClient) -> None:
     base = (
         datetime.now(timezone.utc)
@@ -183,3 +225,47 @@ def test_check_all_after_reload_returns_data(client: TestClient) -> None:
         expected_movement_end_ms / 1000, tz=timezone.utc
     ).isoformat()
     assert body[movement_key]["range"]["end_utc"].startswith(expected_movement_end)
+
+
+def test_detailed_section_backfills_minute_frame(client: TestClient) -> None:
+    base = (
+        datetime.now(timezone.utc)
+        .replace(hour=8, minute=0, second=0, microsecond=0)
+        - timedelta(days=1)
+    )
+    interval = timedelta(hours=4)
+    payload = _build_timeframe_candles(
+        base,
+        count=3,
+        interval=interval,
+        symbol="ETHUSDT",
+        tf="4h",
+    )
+
+    create_response = client.post("/inspection/snapshot", json=payload)
+    assert create_response.status_code == 200
+    snapshot_id = create_response.json()["snapshot_id"]
+
+    params = {
+        "snapshot": snapshot_id,
+        "selection_start": payload["selection"]["start"],
+        "selection_end": payload["selection"]["end"],
+        "hours": 1,
+    }
+    response = client.get("/inspection/check-all", params=params)
+    assert response.status_code == 200
+    body = response.json()
+
+    detailed = body["datas_for_last_N_hours"]
+    assert "1m" in detailed["frames"]
+
+    minute_frame = detailed["frames"]["1m"]
+    assert minute_frame["candles"], "minute candles should be synthesised from higher timeframe"
+
+    expected_end_ms = payload["selection"]["end"]
+    expected_start_ms = expected_end_ms - 3_600_000
+
+    minute_candles = minute_frame["candles"]
+    assert minute_candles[0]["t"] >= expected_start_ms
+    assert minute_candles[-1]["t"] <= expected_end_ms
+    assert minute_frame["summary"]["count"] == len(minute_candles) == 60
