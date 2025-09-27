@@ -8,8 +8,14 @@ import math
 import statistics
 from typing import Any, Dict, List, Mapping, MutableMapping, Sequence
 
+import logging
+
+from .ohlc import TIMEFRAME_TO_MS, resample_ohlcv
+
 MS_IN_DAY = 86_400_000
 SUPPORTED_TIMEFRAMES: tuple[str, ...] = ("15m", "1h")
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -85,6 +91,44 @@ def _extract_candles(frame: Mapping[str, Any] | None) -> List[Mapping[str, Any]]
     if isinstance(candles, Sequence):
         return [c for c in candles if isinstance(c, Mapping)]  # type: ignore[list-item]
     return []
+
+
+def _augment_supported_frames(
+    frames: Mapping[str, Mapping[str, Any]]
+) -> Dict[str, Mapping[str, Any]]:
+    augmented: Dict[str, Mapping[str, Any]] = {
+        key: dict(value) if isinstance(value, Mapping) else {"candles": []}
+        for key, value in frames.items()
+    }
+
+    minute_candles = _extract_candles(augmented.get("1m"))
+    LOGGER.debug(
+        "Liquidity minute seed stats",
+        extra={"tf": "1m", "candles": len(minute_candles)},
+    )
+
+    if not minute_candles:
+        return augmented
+
+    for target_tf in SUPPORTED_TIMEFRAMES:
+        existing = _extract_candles(augmented.get(target_tf))
+        if existing:
+            LOGGER.debug(
+                "Liquidity timeframe already present",
+                extra={"tf": target_tf, "candles": len(existing)},
+            )
+            continue
+        interval_ms = TIMEFRAME_TO_MS.get(target_tf)
+        if not interval_ms:
+            continue
+        aggregated = resample_ohlcv(minute_candles, interval_ms)
+        LOGGER.debug(
+            "Liquidity generated higher timeframe",
+            extra={"tf": target_tf, "candles": len(aggregated), "interval_ms": interval_ms},
+        )
+        augmented[target_tf] = {"candles": aggregated}
+
+    return augmented
 
 
 def _detect_swings(
@@ -171,6 +215,15 @@ def _cluster_swings(
     for cluster in clusters:
         swings_ts = sorted(set(cluster["swings"]))
         if len(swings_ts) < 2:
+            LOGGER.debug(
+                "Skipping swing cluster due to size",
+                extra={
+                    "reason": "cluster_too_small",
+                    "tf": timeframe,
+                    "level_type": level_type,
+                    "swings": swings_ts,
+                },
+            )
             continue
         prices = cluster["prices"]
         if not prices:
@@ -365,8 +418,28 @@ def _detect_sweeps(
                 if overshoot <= 0:
                     continue
                 if tick_min > 0 and overshoot < tick_min:
+                    LOGGER.debug(
+                        "Skipping sweep candidate due to tolerance",
+                        extra={
+                            "reason": "tolerance_fail",
+                            "tf": timeframe,
+                            "level_type": level_type,
+                            "overshoot": overshoot,
+                            "tolerance": tick_min,
+                        },
+                    )
                     continue
                 if atr_component > 0 and overshoot > atr_component:
+                    LOGGER.debug(
+                        "Skipping sweep candidate due to ATR breach",
+                        extra={
+                            "reason": "atr_breach",
+                            "tf": timeframe,
+                            "level_type": level_type,
+                            "overshoot": overshoot,
+                            "atr_limit": atr_component,
+                        },
+                    )
                     continue
                 if close >= level_price:
                     continue
@@ -411,8 +484,28 @@ def _detect_sweeps(
                 if overshoot <= 0:
                     continue
                 if tick_min > 0 and overshoot < tick_min:
+                    LOGGER.debug(
+                        "Skipping sweep candidate due to tolerance",
+                        extra={
+                            "reason": "tolerance_fail",
+                            "tf": timeframe,
+                            "level_type": level_type,
+                            "overshoot": overshoot,
+                            "tolerance": tick_min,
+                        },
+                    )
                     continue
                 if atr_component > 0 and overshoot > atr_component:
+                    LOGGER.debug(
+                        "Skipping sweep candidate due to ATR breach",
+                        extra={
+                            "reason": "atr_breach",
+                            "tf": timeframe,
+                            "level_type": level_type,
+                            "overshoot": overshoot,
+                            "atr_limit": atr_component,
+                        },
+                    )
                     continue
                 if close <= level_price:
                     continue
@@ -441,9 +534,10 @@ def build_liquidity_snapshot(
 
     resolved_config = _resolve_config(config)
 
-    levels = _prepare_levels(frames, tick_size=tick_size, config=resolved_config)
+    augmented_frames = _augment_supported_frames(frames)
+    levels = _prepare_levels(augmented_frames, tick_size=tick_size, config=resolved_config)
 
-    daily_candles = _extract_candles(frames.get("1d"))
+    daily_candles = _extract_candles(augmented_frames.get("1d"))
     selection_end = None
     if isinstance(selection, Mapping):
         end_value = selection.get("end")
@@ -452,13 +546,22 @@ def build_liquidity_snapshot(
     daily_levels = _resolve_previous_day(daily_candles, reference_end_ms=selection_end)
 
     sweeps = _detect_sweeps(
-        frames,
+        augmented_frames,
         tick_size=tick_size,
         config=resolved_config,
         eqh=levels["eqh"],
         eql=levels["eql"],
         pdh=daily_levels["pdh"],
         pdl=daily_levels["pdl"],
+    )
+
+    LOGGER.debug(
+        "Liquidity detection summary",
+        extra={
+            "eqh": len(levels["eqh"]),
+            "eql": len(levels["eql"]),
+            "sweeps": len(sweeps),
+        },
     )
 
     return {

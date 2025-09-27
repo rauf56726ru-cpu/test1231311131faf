@@ -26,7 +26,7 @@ from typing import (
 import httpx
 
 from .liquidity import build_liquidity_snapshot
-from .ohlc import TIMEFRAME_WINDOWS, TIMEFRAME_TO_MS, normalise_ohlcv
+from .ohlc import TIMEFRAME_WINDOWS, TIMEFRAME_TO_MS, normalise_ohlcv, resample_ohlcv
 from .profile import build_profile_package
 from .presets import resolve_profile_config
 from .zones import Config as ZonesConfig, detect_zones
@@ -151,6 +151,50 @@ def _normalise_minute_rows(
             continue
         minutes[candle["t"]] = candle
     return minutes
+
+
+def ensure_higher_timeframes(
+    candles_by_tf: Mapping[str, Sequence[Mapping[str, Any]]]
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Guarantee 15m and 1h frames by resampling minute candles when missing."""
+
+    logger = logging.getLogger(__name__)
+    minute_seed = candles_by_tf.get("1m")
+    minute_candles: List[Mapping[str, Any]] = (
+        list(minute_seed) if isinstance(minute_seed, Sequence) else []
+    )
+    logger.debug(
+        "Ensuring higher timeframes for liquidity",
+        extra={"seed_tf": "1m", "seed_candles": len(minute_candles)},
+    )
+
+    generated: Dict[str, List[Dict[str, Any]]] = {}
+    if not minute_candles:
+        return generated
+
+    for target_tf in ("15m", "1h"):
+        existing = candles_by_tf.get(target_tf)
+        existing_count = len(existing) if isinstance(existing, Sequence) else 0
+        if existing_count:
+            logger.debug(
+                "Skipping resample for timeframe with existing data",
+                extra={"tf": target_tf, "candles": existing_count},
+            )
+            continue
+        interval_ms = TIMEFRAME_TO_MS.get(target_tf)
+        if not interval_ms:
+            continue
+        aggregated = resample_ohlcv(minute_candles, interval_ms)
+        generated[target_tf] = aggregated
+        logger.debug(
+            "Generated higher timeframe from minute seed",
+            extra={
+                "tf": target_tf,
+                "candles": len(aggregated),
+                "interval_ms": interval_ms,
+            },
+        )
+    return generated
 
 
 def _expected_minute_sequence(start_ms: int, end_ms: int) -> List[int]:
@@ -943,6 +987,7 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
     diagnostics_frames: Dict[str, Any] = {}
     delta_frames: Dict[str, List[Dict[str, Any]]] = {}
     vwap_frames: Dict[str, Dict[str, Any]] = {}
+    full_candles_by_tf: Dict[str, List[Mapping[str, Any]]] = {}
 
     for tf_key, frame in frames.items():
         candles = frame.get("candles", []) if isinstance(frame, Mapping) else []
@@ -961,7 +1006,15 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
         )
         diagnostics = result.pop("diagnostics", {})
 
-        filtered_candles = _filter_by_selection(result.get("candles", []), start=start, end=end)
+        raw_candles_seq = result.get("candles", [])
+        raw_candles = [
+            candle
+            for candle in raw_candles_seq
+            if isinstance(candle, Mapping)
+        ]
+        full_candles_by_tf[tf_key] = raw_candles
+
+        filtered_candles = _filter_by_selection(raw_candles, start=start, end=end)
         result["candles"] = filtered_candles
 
         if isinstance(diagnostics, Mapping):
@@ -980,6 +1033,27 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
             "selection": {"start": start, "end": end},
             "value": _compute_vwap(filtered_candles),
         }
+
+    generated_frames = ensure_higher_timeframes(full_candles_by_tf)
+    for tf_key, candles in generated_frames.items():
+        filtered_candles = _filter_by_selection(candles, start=start, end=end)
+        frame_payload: Dict[str, Any] = {
+            "symbol": symbol,
+            "tf": tf_key,
+            "candles": filtered_candles,
+        }
+        if candles:
+            last_candle = candles[-1]
+            frame_payload["last_price"] = _coerce_float(last_candle.get("c"))
+            frame_payload["last_ts"] = last_candle.get("t")
+        normalised_frames[tf_key] = frame_payload
+        diagnostics_frames.setdefault(tf_key, {})
+        delta_frames[tf_key] = _compute_delta_series(filtered_candles)
+        vwap_frames[tf_key] = {
+            "selection": {"start": start, "end": end},
+            "value": _compute_vwap(filtered_candles),
+        }
+        full_candles_by_tf[tf_key] = candles
 
     profile_config = resolve_profile_config(symbol, snapshot.get("meta"))
     preset = profile_config["preset"]
@@ -1328,6 +1402,34 @@ def render_inspection_page(
       background: rgba(30, 41, 59, 0.6);
       border: 1px solid rgba(148, 163, 184, 0.18);
       font-size: 0.85rem;
+    }
+    .chart-toolbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+    }
+    .tf-toggle {
+      display: inline-flex;
+      gap: 0.4rem;
+      padding: 0.2rem;
+      border-radius: 999px;
+      background: rgba(30, 41, 59, 0.6);
+      border: 1px solid rgba(148, 163, 184, 0.24);
+    }
+    .tf-toggle button {
+      border-radius: 999px;
+      background: transparent;
+      padding: 0.45rem 0.9rem;
+      color: var(--fg);
+      border: none;
+      font-weight: 600;
+    }
+    .tf-toggle button.active {
+      background: var(--accent);
+      color: #0f172a;
+      box-shadow: 0 12px 26px rgba(14, 165, 233, 0.25);
     }
     .badge {
       display: inline-flex;
@@ -2246,6 +2348,7 @@ def render_inspection_page(
     const buildButton = document.getElementById("build-session");
     const clearSelection = document.getElementById("clear-selection");
     const timeframeCheckboxes = Array.from(document.querySelectorAll("[data-tf-checkbox]"));
+    const timeframeToggle = document.getElementById("chart-tf-toggle");
     const statusEl = document.getElementById("inspection-status");
     const metricButtons = Array.from(document.querySelectorAll("[data-metric]"));
     const symbolInput = document.getElementById("symbol-input");
@@ -2283,11 +2386,41 @@ def render_inspection_page(
       return Math.min(4, Math.max(1, Math.floor(parsed)));
     };
 
+    const PREFERRED_CHART_FRAMES = ["15m", "1h", "1m"];
+
+    function frameHasCandles(frames, tf) {
+      if (!frames || !tf) return false;
+      const entry = frames[tf];
+      if (!entry || typeof entry !== "object") return false;
+      const candles = Array.isArray(entry.candles) ? entry.candles : [];
+      return candles.length > 0;
+    }
+
+    function selectPreferredFrame(frames, desired) {
+      const frameMap = frames || {};
+      if (desired && frameHasCandles(frameMap, desired)) {
+        return desired;
+      }
+      for (const tf of PREFERRED_CHART_FRAMES) {
+        if (frameHasCandles(frameMap, tf)) {
+          return tf;
+        }
+      }
+      const keys = Object.keys(frameMap);
+      if (keys.length) {
+        return keys.sort()[0];
+      }
+      return desired || PREFERRED_CHART_FRAMES[0];
+    }
+
+    const initialFrameMap = initial.payload?.DATA?.frames || {};
+    const defaultFrame = selectPreferredFrame(initialFrameMap, initial.timeframe);
+
     const state = {
       payload: initial.payload || null,
       snapshotId: initial.snapshotId || null,
       selection: initial.payload?.DATA?.selection || null,
-      frame: initial.timeframe || initial.payload?.DATA?.meta?.requested?.frames?.[0] || "1m",
+      frame: defaultFrame,
       chart: null,
       series: null,
       checkAll: null,
@@ -2641,7 +2774,14 @@ def render_inspection_page(
       if (!frameSelect) return;
       frameSelect.innerHTML = "";
       const frames = payload?.DATA?.frames || {};
-      const keys = Object.keys(frames);
+      const keys = Object.keys(frames).sort((a, b) => {
+        const weight = (key) => {
+          const idx = PREFERRED_CHART_FRAMES.indexOf(key);
+          return idx === -1 ? PREFERRED_CHART_FRAMES.length : idx;
+        };
+        const diff = weight(a) - weight(b);
+        return diff !== 0 ? diff : a.localeCompare(b);
+      });
       for (const key of keys) {
         const option = document.createElement("option");
         option.value = key;
@@ -2649,9 +2789,22 @@ def render_inspection_page(
         frameSelect.append(option);
       }
       if (keys.length) {
-        const target = keys.includes(state.frame) ? state.frame : keys[0];
+        const target = selectPreferredFrame(frames, state.frame);
         frameSelect.value = target;
         state.frame = target;
+      }
+      updateTimeframeToggle();
+    }
+
+    function updateTimeframeToggle() {
+      if (!timeframeToggle) return;
+      const frames = state.payload?.DATA?.frames || {};
+      const buttons = Array.from(timeframeToggle.querySelectorAll("[data-tf]"));
+      for (const button of buttons) {
+        const tf = button.dataset.tf;
+        const enabled = frameHasCandles(frames, tf);
+        button.disabled = !enabled;
+        button.classList.toggle("active", enabled && state.frame === tf);
       }
     }
 
@@ -2866,6 +3019,7 @@ def render_inspection_page(
         state.chart.timeScale().fitContent();
       }
       updateSelectionLabel();
+      updateTimeframeToggle();
     }
 
     async function refreshSnapshots() {
@@ -2922,6 +3076,22 @@ def render_inspection_page(
       frameSelect.addEventListener("change", () => {
         state.frame = frameSelect.value;
         renderChart();
+        updateTimeframeToggle();
+      });
+    }
+
+    if (timeframeToggle) {
+      timeframeToggle.addEventListener("click", (event) => {
+        const button = event.target.closest("[data-tf]");
+        if (!button || button.disabled) return;
+        const tf = button.dataset.tf;
+        if (!tf) return;
+        state.frame = tf;
+        if (frameSelect) {
+          frameSelect.value = tf;
+        }
+        renderChart();
+        updateTimeframeToggle();
       });
     }
 
@@ -4089,6 +4259,14 @@ def render_inspection_page(
 
           <section class=\"panel\">
             <h2>Просмотр данных</h2>
+            <div class=\"chart-toolbar\">
+              <span class=\"badge\">Таймфрейм</span>
+              <div class=\"tf-toggle\" id=\"chart-tf-toggle\">
+                <button type=\"button\" data-tf=\"1m\">1m</button>
+                <button type=\"button\" data-tf=\"15m\">15m</button>
+                <button type=\"button\" data-tf=\"1h\">1h</button>
+              </div>
+            </div>
             <div id=\"inspection-chart\" class=\"chart-shell\" data-selection-label=\"—\"></div>
             <div class=\"metrics-bar\">
               <button class=\"secondary\" type=\"button\" data-metric=\"ohlcv\">OHLCV</button>
