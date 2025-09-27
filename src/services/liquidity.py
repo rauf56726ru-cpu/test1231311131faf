@@ -51,6 +51,29 @@ def _quantise(price: float, tick_size: float | None) -> float:
     return ticks * tick_size
 
 
+def _count_pairs_within_tolerance(
+    swings: Sequence[Mapping[str, Any]],
+    *,
+    tolerance: float,
+    tick_size: float | None,
+) -> int:
+    if tolerance <= 0 or not swings:
+        return 0
+    quantised: List[float] = []
+    for swing in swings:
+        price_value = _coerce_float(swing.get("price"))
+        if price_value is None:
+            continue
+        quantised.append(_quantise(price_value, tick_size))
+    count = 0
+    for left in range(len(quantised)):
+        base = quantised[left]
+        for right in range(left + 1, len(quantised)):
+            if abs(base - quantised[right]) <= tolerance + 1e-9:
+                count += 1
+    return count
+
+
 def _append_reason(
     sink: List[Dict[str, Any]] | None,
     reason: str,
@@ -406,8 +429,8 @@ def _prepare_levels(
             "atr_period": config.atr_period,
             "atr_mult": config.sweep_atr_multiplier,
             "reasons": [],
-            "eqh": {"swing_count": 0, "cluster_count": 0, "reasons": []},
-            "eql": {"swing_count": 0, "cluster_count": 0, "reasons": []},
+            "eqh": {"swing_count": 0, "cluster_count": 0, "pairs_within_tol": 0, "reasons": []},
+            "eql": {"swing_count": 0, "cluster_count": 0, "pairs_within_tol": 0, "reasons": []},
         }
         diagnostics[timeframe] = frame_diag
 
@@ -453,12 +476,24 @@ def _prepare_levels(
             swings_low = swings_low[-config.lookback_swings :]
         frame_diag["eqh"]["swing_count"] = len(swings_high)
         frame_diag["eql"]["swing_count"] = len(swings_low)
+        frame_diag["eqh"]["pairs_within_tol"] = _count_pairs_within_tolerance(
+            swings_high,
+            tolerance=tolerance,
+            tick_size=tick_size,
+        )
+        frame_diag["eql"]["pairs_within_tol"] = _count_pairs_within_tolerance(
+            swings_low,
+            tolerance=tolerance,
+            tick_size=tick_size,
+        )
         LOGGER.debug(
             "Liquidity swings detected",
             extra={
                 "tf": timeframe,
                 "swing_highs": len(swings_high),
                 "swing_lows": len(swings_low),
+                "pairs_within_tol_high": frame_diag["eqh"]["pairs_within_tol"],
+                "pairs_within_tol_low": frame_diag["eql"]["pairs_within_tol"],
                 "used_source": source_label,
             },
         )
@@ -503,6 +538,8 @@ def _prepare_levels(
                 "swing_lows": len(swings_low),
                 "eqh_clusters": len(eqh_cluster),
                 "eql_clusters": len(eql_cluster),
+                "pairs_within_tol_high": frame_diag["eqh"]["pairs_within_tol"],
+                "pairs_within_tol_low": frame_diag["eql"]["pairs_within_tol"],
                 "tick_size": tick_size,
                 "r_ticks": config.r_ticks,
                 "tolerance": tolerance,

@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence
 
 import httpx
 
+import src.services.inspection as inspection
 from .inspection import build_htf_section, resolve_liquidity_tick_size
 from .liquidity import build_liquidity_snapshot
 from .presets import resolve_profile_config
@@ -1350,6 +1351,7 @@ def build_check_all_datas(
         symbol,
         tick_size_value,
         tick_inference_frames,
+        meta=raw_meta,
         logger=logging.getLogger(__name__),
     )
 
@@ -1357,6 +1359,7 @@ def build_check_all_datas(
         "Liquidity tick size resolved for check-all",  # contextual debug entry
         extra={
             "symbol": symbol,
+            "normalized_symbol": inspection._normalise_symbol_for_tick(symbol) or "UNKNOWN",
             "tick_size": tick_size_numeric,
             "tick_size_source": tick_size_source,
         },

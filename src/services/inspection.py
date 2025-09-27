@@ -53,6 +53,7 @@ BINANCE_FAPI_REST = "https://fapi.binance.com/fapi/v1/klines"
 
 _PRICE_FIELDS: Tuple[str, ...] = ("o", "h", "l", "c")
 _MAX_TICK_SAMPLES = 5000
+_SYMBOL_SUFFIXES: Tuple[str, ...] = ("PERP",)
 
 
 def _safe_int(value: object | None) -> int | None:
@@ -77,6 +78,46 @@ def _align_to_interval(timestamp_ms: int, interval_ms: int) -> int:
     if interval_ms <= 0:
         raise ValueError("interval_ms must be positive")
     return (timestamp_ms // interval_ms) * interval_ms
+
+
+def _normalise_symbol_for_tick(symbol: str | None) -> str:
+    """Normalise symbol identifiers before tick-size lookup."""
+
+    if not symbol:
+        return ""
+
+    text = re.sub(r"\s+", "", str(symbol).upper())
+    if not text:
+        return ""
+
+    split_candidates = [part for part in re.split(r"[:/@ ]", text) if part]
+    if not split_candidates:
+        split_candidates = [text]
+    else:
+        split_candidates.append(text)
+
+    preferred: List[str] = []
+    fallback: List[str] = []
+
+    for candidate in split_candidates:
+        cleaned = re.sub(r"[^A-Z0-9]", "", candidate)
+        if not cleaned:
+            continue
+        for suffix in _SYMBOL_SUFFIXES:
+            if cleaned.endswith(suffix):
+                cleaned = cleaned[: -len(suffix)]
+        if cleaned.endswith("USDTPERP"):
+            cleaned = cleaned[: -len("USDTPERP")] + "USDT"
+        if cleaned.endswith("USD") or "USDT" in cleaned or "USDC" in cleaned:
+            preferred.append(cleaned)
+        else:
+            fallback.append(cleaned)
+
+    if preferred:
+        return preferred[0]
+    if fallback:
+        return fallback[0]
+    return ""
 
 
 def _extract_frame_candles(
@@ -260,17 +301,108 @@ def _infer_tick_size_from_frames(
     return None
 
 
+def _extract_tick_size_from_meta(
+    meta: Mapping[str, Any] | None,
+    normalized_symbol: str,
+) -> float | None:
+    """Search snapshot metadata for a matching tick size."""
+
+    if not normalized_symbol or not isinstance(meta, Mapping):
+        return None
+
+    visited: set[int] = set()
+
+    def _candidate_from_entry(
+        entry: Mapping[str, Any],
+        *,
+        symbol_hint: str | None,
+    ) -> float | None:
+        candidate_symbol = entry.get("symbol") or entry.get("pair") or entry.get("instrument")
+        if isinstance(candidate_symbol, str):
+            candidate_norm = _normalise_symbol_for_tick(candidate_symbol)
+        else:
+            candidate_norm = None
+        if not candidate_norm:
+            candidate_norm = symbol_hint
+
+        tick_fields = (
+            entry.get("tickSize"),
+            entry.get("tick_size"),
+            entry.get("ticksize"),
+        )
+        for value in tick_fields:
+            numeric = _coerce_float(value)
+            if numeric and numeric > 0 and candidate_norm == normalized_symbol:
+                return float(numeric)
+
+        filters = entry.get("filters")
+        if isinstance(filters, Sequence):
+            for filt in filters:
+                if not isinstance(filt, Mapping):
+                    continue
+                filter_type = filt.get("filterType") or filt.get("type")
+                if filter_type and str(filter_type).upper() not in {"PRICE_FILTER", "TICK_SIZE"}:
+                    continue
+                for key in ("tickSize", "tick_size", "ticksize"):
+                    numeric = _coerce_float(filt.get(key))
+                    if numeric and numeric > 0 and candidate_norm == normalized_symbol:
+                        return float(numeric)
+
+        return None
+
+    def _visit(node: Any, symbol_hint: str | None = None) -> float | None:
+        if isinstance(node, Mapping):
+            node_id = id(node)
+            if node_id in visited:
+                return None
+            visited.add(node_id)
+
+            direct = _candidate_from_entry(node, symbol_hint=symbol_hint)
+            if direct is not None:
+                return direct
+
+            for key, value in node.items():
+                next_hint = symbol_hint
+                if isinstance(key, str):
+                    key_norm = _normalise_symbol_for_tick(key)
+                    if key_norm:
+                        next_hint = key_norm
+                result = _visit(value, symbol_hint=next_hint)
+                if result is not None:
+                    return result
+        elif isinstance(node, Sequence) and not isinstance(node, (str, bytes, bytearray)):
+            for item in node:
+                result = _visit(item, symbol_hint=symbol_hint)
+                if result is not None:
+                    return result
+        return None
+
+    for key in ("exchange_info", "exchangeInfo", "exchange", "symbol_info", "symbolInfo"):
+        candidate = meta.get(key)
+        value = _visit(candidate)
+        if value is not None:
+            return value
+
+    return _visit(meta)
+
+
 def resolve_liquidity_tick_size(
     symbol: str,
     profile_tick_size: Any,
     frames: Mapping[str, Sequence[Mapping[str, Any]]],
     *,
+    meta: Mapping[str, Any] | None = None,
     logger: logging.Logger | None = None,
 ) -> Tuple[float, str]:
     """Resolve a positive tick size for liquidity detection with fallbacks."""
 
     log = logger or logging.getLogger(__name__)
-    symbol_key = (symbol or "UNKNOWN").upper()
+    normalized_symbol = _normalise_symbol_for_tick(symbol)
+    symbol_label = symbol or "UNKNOWN"
+    base_extra = {
+        "symbol": symbol_label,
+        "normalized_symbol": normalized_symbol or "UNKNOWN",
+    }
 
     profile_numeric: float | None = None
     if isinstance(profile_tick_size, (int, float)):
@@ -286,24 +418,38 @@ def resolve_liquidity_tick_size(
         tick_source = "tick_size_from_profile"
         log.debug(
             "Resolved liquidity tick size from profile",
-            extra={"symbol": symbol_key, "tick_size": tick_size, "tick_size_source": tick_source},
+            extra={**base_extra, "tick_size": tick_size, "tick_size_source": tick_source},
         )
         return tick_size, tick_source
 
-    hardcoded = HARDCODED_TICK_SIZES.get(symbol_key)
+    exchange_tick = _extract_tick_size_from_meta(meta, normalized_symbol)
+    if exchange_tick is not None and exchange_tick > 0:
+        tick_size = float(exchange_tick)
+        tick_source = "tick_size_from_exchange"
+        log.debug(
+            "Resolved liquidity tick size from exchange meta",
+            extra={**base_extra, "tick_size": tick_size, "tick_size_source": tick_source},
+        )
+        return tick_size, tick_source
+
+    hardcoded = HARDCODED_TICK_SIZES.get(normalized_symbol)
     if isinstance(hardcoded, (int, float)) and hardcoded > 0:
         tick_size = float(hardcoded)
         tick_source = "tick_size_from_hardcoded"
         log.debug(
             "Using hardcoded liquidity tick size fallback",
-            extra={"symbol": symbol_key, "tick_size": tick_size, "tick_size_source": tick_source},
+            extra={**base_extra, "tick_size": tick_size, "tick_size_source": tick_source},
         )
         return tick_size, tick_source
+    log.warning(
+        "Hardcoded liquidity tick size unavailable; falling back to inference",
+        extra={**base_extra, "tick_size_source": "tick_size_from_hardcoded"},
+    )
 
     tick_source = "tick_size_from_auto"
     log.warning(
         "Profile tick size missing; attempting auto inference",
-        extra={"symbol": symbol_key, "tick_size_source": tick_source},
+        extra={**base_extra, "tick_size_source": tick_source},
     )
 
     inferred = _infer_tick_size_from_frames(frames)
@@ -311,18 +457,18 @@ def resolve_liquidity_tick_size(
         tick_size = float(inferred)
         log.debug(
             "Auto-inferred liquidity tick size",
-            extra={"symbol": symbol_key, "tick_size": tick_size, "tick_size_source": tick_source},
+            extra={**base_extra, "tick_size": tick_size, "tick_size_source": tick_source},
         )
         return tick_size, tick_source
 
     tick_size = 1.0
     log.warning(
         "Auto tick size inference failed; defaulting to 1.0",
-        extra={"symbol": symbol_key, "tick_size_source": tick_source},
+        extra={**base_extra, "tick_size_source": tick_source},
     )
     log.debug(
         "Using default liquidity tick size after inference failure",
-        extra={"symbol": symbol_key, "tick_size": tick_size, "tick_size_source": tick_source},
+        extra={**base_extra, "tick_size": tick_size, "tick_size_source": tick_source},
     )
     return tick_size, tick_source
 
@@ -1349,6 +1495,7 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
         symbol,
         tick_size_value,
         full_candles_by_tf,
+        meta=raw_meta,
         logger=logging.getLogger(__name__),
     )
     liquidity_frames: Dict[str, Dict[str, Any]] = {}
@@ -1385,6 +1532,7 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
         "Liquidity tick size applied",
         extra={
             "symbol": symbol,
+            "normalized_symbol": _normalise_symbol_for_tick(symbol) or "UNKNOWN",
             "tick_size": tick_size,
             "tick_size_source": tick_size_source,
         },

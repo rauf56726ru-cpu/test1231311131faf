@@ -33,22 +33,12 @@ def _sample_candles(base: datetime) -> List[Dict[str, Any]]:
     return candles
 
 
-@pytest.mark.parametrize(
-    "symbol, expected_tick",
-    [
-        ("BTCUSDT", 0.1),
-        ("ETHUSDT", 0.01),
-        ("SOLUSDT", 0.001),
-    ],
-)
-def test_inspection_liquidity_uses_hardcoded_tick_size(monkeypatch: pytest.MonkeyPatch, symbol: str, expected_tick: float) -> None:
-    base = datetime(2024, 6, 1, tzinfo=UTC)
-    candles_15m = _sample_candles(base)
-    candles_1d = [
-        _make_candle(int((base - timedelta(days=1)).timestamp() * 1000), 100.0, 105.0, 95.0, 101.0),
-        _make_candle(int(base.timestamp() * 1000), 101.0, 106.0, 96.0, 104.0),
-    ]
-
+def _install_common_stubs(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    candles_15m: List[Dict[str, Any]],
+    candles_1d: List[Dict[str, Any]],
+) -> None:
     monkeypatch.setattr(
         inspection,
         "build_htf_section",
@@ -61,7 +51,10 @@ def test_inspection_liquidity_uses_hardcoded_tick_size(monkeypatch: pytest.Monke
     monkeypatch.setattr(
         inspection,
         "detect_zones",
-        lambda *args, **kwargs: {"symbol": symbol, "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []}},
+        lambda *args, **kwargs: {
+            "symbol": args[2] if len(args) > 2 else kwargs.get("symbol"),
+            "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
+        },
     )
     monkeypatch.setattr(
         inspection,
@@ -74,6 +67,34 @@ def test_inspection_liquidity_uses_hardcoded_tick_size(monkeypatch: pytest.Monke
             "tick_size": None,
         },
     )
+
+
+@pytest.mark.parametrize(
+    "symbol, expected_tick",
+    [
+        ("BTCUSDT", 0.1),
+        ("btcusdt", 0.1),
+        ("BTCUSDTPERP", 0.1),
+        ("BTCUSDT_PERP", 0.1),
+        ("BTCUSDT:BINANCE", 0.1),
+        ("BINANCE:BTCUSDT", 0.1),
+        ("ETHUSDT", 0.01),
+        ("SOLUSDT", 0.001),
+    ],
+)
+def test_inspection_liquidity_uses_normalised_tick_size(
+    monkeypatch: pytest.MonkeyPatch,
+    symbol: str,
+    expected_tick: float,
+) -> None:
+    base = datetime(2024, 6, 1, tzinfo=UTC)
+    candles_15m = _sample_candles(base)
+    candles_1d = [
+        _make_candle(int((base - timedelta(days=1)).timestamp() * 1000), 100.0, 105.0, 95.0, 101.0),
+        _make_candle(int(base.timestamp() * 1000), 101.0, 106.0, 96.0, 104.0),
+    ]
+
+    _install_common_stubs(monkeypatch, candles_15m=candles_15m, candles_1d=candles_1d)
 
     selection = {"start": candles_15m[0]["t"], "end": candles_15m[-1]["t"]}
     snapshot = {
@@ -101,3 +122,44 @@ def test_inspection_liquidity_uses_hardcoded_tick_size(monkeypatch: pytest.Monke
     summary = diagnostics.get("summary")
     assert isinstance(summary, dict)
     assert summary.get("eqh") >= 0
+
+
+def test_inspection_liquidity_prefers_exchange_tick_size(monkeypatch: pytest.MonkeyPatch) -> None:
+    base = datetime(2024, 6, 1, tzinfo=UTC)
+    candles_15m = _sample_candles(base)
+    candles_1d = [
+        _make_candle(int((base - timedelta(days=1)).timestamp() * 1000), 100.0, 105.0, 95.0, 101.0),
+        _make_candle(int(base.timestamp() * 1000), 101.0, 106.0, 96.0, 104.0),
+    ]
+
+    _install_common_stubs(monkeypatch, candles_15m=candles_15m, candles_1d=candles_1d)
+
+    snapshot = {
+        "id": "snap-exchange",
+        "symbol": "ETHUSDT",
+        "frames": {"15m": {"candles": candles_15m}, "1d": {"candles": candles_1d}},
+        "selection": {"start": candles_15m[0]["t"], "end": candles_15m[-1]["t"]},
+        "agg_trades": {"status": "unavailable"},
+        "meta": {
+            "liquidity": {"r_ticks": 5, "swing_window": 1, "lookback": 20},
+            "exchange_info": {
+                "symbols": [
+                    {
+                        "symbol": "ETHUSDT",
+                        "filters": [
+                            {"filterType": "PRICE_FILTER", "tickSize": "0.05"},
+                        ],
+                    }
+                ]
+            },
+        },
+    }
+
+    payload = inspection.build_inspection_payload(snapshot)
+    diagnostics = payload["DIAGNOSTICS"]["liquidity"]
+    assert diagnostics["config"]["tick_size"] == pytest.approx(0.05)
+    eqh_levels = payload["DATA"]["liquidity"]["eqh"]
+    assert eqh_levels
+    tolerances = {level["tolerance"] for level in eqh_levels if level.get("tolerance")}
+    assert tolerances, "Expected tolerances to be reported"
+    assert all(math.isclose(tol, max(5 * 0.05, 0.05)) for tol in tolerances)
