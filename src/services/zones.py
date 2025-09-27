@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Mapping, Sequence
 
 from .ohlc import normalise_ohlcv
@@ -13,7 +13,7 @@ from .ohlc import normalise_ohlcv
 class Config:
     """Configuration parameters controlling zone detection."""
 
-    min_gap_pct: float = 0.02
+    min_gap_pct: float | None = None
     tick_size: float | None = None
     atr_period: int = 14
     k_impulse: float = 1.5
@@ -22,12 +22,51 @@ class Config:
     m_wick_atr: float = 0.5
 
 
+def _default_min_gap_pct(tf: str) -> float:
+    tf_key = str(tf or "").lower()
+    if tf_key == "1m":
+        return 0.0001
+    if tf_key == "5m":
+        return 0.0005
+    return 0.02
+
+
 def _round_tick(value: float, tick_size: float | None) -> float:
     if tick_size is None or not math.isfinite(value):
         return float(value)
     if tick_size <= 0:
         return float(value)
     return round(value / tick_size) * tick_size
+
+
+def _infer_tick_size(candles: Sequence[Mapping[str, Any]]) -> float | None:
+    min_diff = math.inf
+    prev_close: float | None = None
+    for candle in candles:
+        close = candle.get("c")
+        if close is None:
+            continue
+        try:
+            close_value = float(close)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(close_value):
+            continue
+        if prev_close is not None:
+            diff = abs(close_value - prev_close)
+            if diff > 0 and diff < min_diff:
+                min_diff = diff
+        prev_close = close_value
+
+    if not math.isfinite(min_diff) or min_diff == math.inf:
+        return None
+
+    exponent = math.floor(math.log10(min_diff)) if min_diff > 0 else None
+    if exponent is None:
+        return None
+    exponent = min(0, exponent)
+    tick = 10 ** exponent
+    return tick
 
 
 def _true_range(current: Mapping[str, float], previous: Mapping[str, float]) -> float:
@@ -86,7 +125,15 @@ def _overlaps(a_bot: float, a_top: float, b_bot: float, b_top: float, *, thresho
 
 def detect_fvg(candles: Sequence[Mapping[str, Any]], cfg: Config, tf: str) -> List[Dict[str, Any]]:
     normalised = list(candles)
-    zones, _ = _detect_fvg_internal(normalised, cfg, tf)
+    inferred_tick = _infer_tick_size(normalised)
+    effective_cfg = replace(
+        cfg,
+        tick_size=cfg.tick_size or inferred_tick,
+        min_gap_pct=(
+            cfg.min_gap_pct if cfg.min_gap_pct is not None else _default_min_gap_pct(tf)
+        ),
+    )
+    zones, _ = _detect_fvg_internal(normalised, effective_cfg, tf)
     return zones
 
 
@@ -96,8 +143,12 @@ def _detect_fvg_internal(
     if len(candles) < 3:
         return [], []
 
-    tick = cfg.tick_size
-    threshold = _fvg_merge_threshold(tick)
+    min_gap_pct = (
+        cfg.min_gap_pct if cfg.min_gap_pct is not None else _default_min_gap_pct(tf)
+    )
+    inferred_tick = _infer_tick_size(candles)
+    effective_tick = cfg.tick_size or inferred_tick
+    threshold = _fvg_merge_threshold(effective_tick)
     raw: List[Dict[str, Any]] = []
     for i in range(1, len(candles) - 1):
         prev_candle = candles[i - 1]
@@ -111,7 +162,8 @@ def _detect_fvg_internal(
             bot = prev_candle["h"]
             top = next_candle["l"]
             gap_pct = _calc_gap_pct(bot, top)
-            if gap_pct < cfg.min_gap_pct and (tick is None or (top - bot) < tick):
+            too_small = effective_tick is not None and (top - bot) < effective_tick
+            if gap_pct < min_gap_pct and too_small:
                 continue
             raw.append(
                 {
@@ -127,7 +179,8 @@ def _detect_fvg_internal(
             bot = next_candle["h"]
             top = prev_candle["l"]
             gap_pct = _calc_gap_pct(bot, top)
-            if gap_pct < cfg.min_gap_pct and (tick is None or (top - bot) < tick):
+            too_small = effective_tick is not None and (top - bot) < effective_tick
+            if gap_pct < min_gap_pct and too_small:
                 continue
             raw.append(
                 {
@@ -164,9 +217,9 @@ def _detect_fvg_internal(
     for zone in merged:
         zone["indices"] = sorted(set(zone["indices"]))
         zone["fvl"] = (zone["bot"] + zone["top"]) / 2
-        zone["bot"] = _round_tick(zone["bot"], tick)
-        zone["top"] = _round_tick(zone["top"], tick)
-        zone["fvl"] = _round_tick(zone["fvl"], tick)
+        zone["bot"] = _round_tick(zone["bot"], effective_tick)
+        zone["top"] = _round_tick(zone["top"], effective_tick)
+        zone["fvl"] = _round_tick(zone["fvl"], effective_tick)
 
     for zone in merged:
         created_idx = min(zone["indices"])
@@ -620,11 +673,19 @@ def detect_zones(
 ) -> Dict[str, Any]:
     payload = normalise_ohlcv(symbol, tf, candles, use_full_span=True)
     series = payload.get("candles", []) if isinstance(payload, Mapping) else []
-    fvg_zones, _ = _detect_fvg_internal(series, cfg, tf)
-    ob_zones, _ = _detect_ob_internal(series, cfg, tf)
-    swings = compute_swings(series, cfg.w_swing)
-    inducement = detect_inducement(series, fvg_zones, ob_zones, cfg, tf)
-    cisd = detect_cisd(series, fvg_zones, swings, cfg, tf)
+    inferred_tick = _infer_tick_size(series)
+    effective_cfg = replace(
+        cfg,
+        tick_size=cfg.tick_size or inferred_tick,
+        min_gap_pct=(
+            cfg.min_gap_pct if cfg.min_gap_pct is not None else _default_min_gap_pct(tf)
+        ),
+    )
+    fvg_zones, _ = _detect_fvg_internal(series, effective_cfg, tf)
+    ob_zones, _ = _detect_ob_internal(series, effective_cfg, tf)
+    swings = compute_swings(series, effective_cfg.w_swing)
+    inducement = detect_inducement(series, fvg_zones, ob_zones, effective_cfg, tf)
+    cisd = detect_cisd(series, fvg_zones, swings, effective_cfg, tf)
 
     return {
         "symbol": symbol,

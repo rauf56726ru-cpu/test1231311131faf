@@ -118,6 +118,30 @@ def test_detect_fvg_up_down_with_filters() -> None:
     assert down_zone["status"] == "open"
 
 
+def test_detect_fvg_retains_small_gap_with_tick_inference() -> None:
+    candles = [
+        make_candle(0, 100000.0, 100000.0, 99999.5, 100000.00),
+        make_candle(1, 100000.1, 100000.2, 99999.9, 100000.01),
+        make_candle(2, 100000.6, 100001.0, 100000.5, 100000.51),
+    ]
+
+    cfg_explicit = Config(min_gap_pct=0.0001, tick_size=0.01)
+    zones_explicit = detect_fvg(candles, cfg_explicit, "1m")
+    assert len(zones_explicit) == 1
+    zone = zones_explicit[0]
+    assert zone["bot"] == pytest.approx(100000.0)
+    assert zone["top"] == pytest.approx(100000.5)
+    assert zone["status"] == "open"
+
+    cfg_inferred = Config(min_gap_pct=0.0001, tick_size=None)
+    zones_inferred = detect_fvg(candles, cfg_inferred, "1m")
+    assert len(zones_inferred) == 1
+    inferred_zone = zones_inferred[0]
+    assert inferred_zone["bot"] == pytest.approx(zone["bot"])
+    assert inferred_zone["top"] == pytest.approx(zone["top"])
+    assert inferred_zone["status"] == zone["status"]
+
+
 def test_detect_fvg_merges_overlapping_and_marks_closed() -> None:
     candles = [
         make_candle(0, 100.0, 100.5, 99.2, 99.6),
