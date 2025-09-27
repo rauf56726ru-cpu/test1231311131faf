@@ -61,6 +61,28 @@ def stub_binance_minutes(monkeypatch):
         return candles
 
     monkeypatch.setattr(check_all_datas, "_download_missing_minutes", filler)
+
+    def filler_htf(symbol: str, gaps, *, fetcher, target):
+        inserted = 0
+        for gap in gaps:
+            cursor = int(gap.get("from", 0))
+            limit = int(gap.get("to", cursor))
+            while cursor <= limit:
+                candle = {
+                    "t": cursor,
+                    "o": 100.0,
+                    "h": 101.0,
+                    "l": 99.0,
+                    "c": 100.5,
+                    "v": 1.0,
+                }
+                if cursor not in target:
+                    inserted += 1
+                target[cursor] = candle
+                cursor += 60_000
+        return inserted
+
+    monkeypatch.setattr(inspection, "_download_missing_minutes", filler_htf)
     yield
 
 
@@ -198,6 +220,12 @@ def test_historical_snapshot_still_populates_window(client: TestClient) -> None:
     assert "profile" in body and isinstance(body["profile"], list)
     assert "zones" in body and isinstance(body["zones"], dict)
     assert body["zones"].get("zones") is not None
+    assert "htf" in body and isinstance(body["htf"], dict)
+    assert set(body["htf"].get("candles", {}).keys()).issuperset({"15m", "1h", "4h", "1d"})
+    dq_htf = body.get("data_quality_htf")
+    assert isinstance(dq_htf, dict)
+    assert dq_htf.get("minute_missing_before") >= 0
+    assert dq_htf.get("minute_missing_after") == 0
     preset_payload = body.get("profile_preset")
     assert preset_payload is not None
     assert preset_payload["symbol"] == "BTCUSDT"

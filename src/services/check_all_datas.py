@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence
 
 import httpx
 
+from .inspection import build_htf_section
 from .presets import resolve_profile_config
 from .profile import build_profile_package
 from .zones import Config as ZonesConfig, detect_zones
@@ -934,6 +935,12 @@ def build_check_all_datas(
     if primary_key == target_tf_key:
         primary_candles = base_candles
 
+    selection_payload: Dict[str, Any] = {
+        "start": selection_start,
+        "end": selection_end,
+    }
+    htf_section, htf_quality = build_htf_section(symbol, frames, selection_payload)
+
     reference_ts = window_end_ms + MINUTE_INTERVAL_MS
     reference_dt = datetime.fromtimestamp(reference_ts / 1000.0, tz=UTC)
     detailed_start_ts = window_start_ms
@@ -1118,6 +1125,8 @@ def build_check_all_datas(
         "profile": profile_flat,
         "zones": detected_zones,
         "data_quality": data_quality,
+        "htf": htf_section,
+        "data_quality_htf": htf_quality,
         "profile_preset": profile_config.get("preset_payload"),
         "profile_preset_required": bool(profile_config.get("preset_required", False)),
     }
