@@ -1365,6 +1365,22 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
         config=liquidity_config if isinstance(liquidity_config, Mapping) else None,
     )
 
+    liquidity_diagnostics: Dict[str, Any] = {}
+    if isinstance(liquidity_payload, Mapping):
+        diagnostics_payload = liquidity_payload.get("diagnostics")
+        if isinstance(diagnostics_payload, Mapping):
+            liquidity_diagnostics = diagnostics_payload
+        liquidity_payload = dict(liquidity_payload)
+        liquidity_payload.pop("diagnostics", None)
+    else:
+        liquidity_payload = {
+            "eqh": [],
+            "eql": [],
+            "pdh": None,
+            "pdl": None,
+            "sweeps": [],
+        }
+
     logging.getLogger(__name__).debug(
         "Liquidity tick size applied",
         extra={
@@ -1415,6 +1431,7 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
         "snapshot_id": snapshot.get("id"),
         "captured_at": snapshot.get("captured_at"),
         "frames": diagnostics_frames,
+        "liquidity": liquidity_diagnostics,
     }
 
     return {"DATA": data_section, "DIAGNOSTICS": diagnostics_section}

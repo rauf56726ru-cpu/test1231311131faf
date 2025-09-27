@@ -51,6 +51,23 @@ def _quantise(price: float, tick_size: float | None) -> float:
     return ticks * tick_size
 
 
+def _append_reason(
+    sink: List[Dict[str, Any]] | None,
+    reason: str,
+    **context: Any,
+) -> None:
+    """Record a structured diagnostic reason if a sink is provided."""
+
+    if sink is None:
+        return
+    entry: Dict[str, Any] = {"reason": reason}
+    for key, value in context.items():
+        if value is None:
+            continue
+        entry[key] = value
+    sink.append(entry)
+
+
 def _resolve_config(raw: Mapping[str, Any] | None) -> LiquidityConfig:
     if not isinstance(raw, Mapping):
         return LiquidityConfig()
@@ -212,6 +229,7 @@ def _cluster_swings(
     tick_size: float | None,
     level_type: str,
     timeframe: str,
+    reason_sink: List[Dict[str, Any]] | None = None,
 ) -> List[Dict[str, Any]]:
     if not swings:
         LOGGER.debug(
@@ -222,6 +240,7 @@ def _cluster_swings(
                 "reason": "no_swings",
             },
         )
+        _append_reason(reason_sink, "no_swings")
         return []
 
     ordered = sorted(swings, key=lambda item: item.get("t", 0))
@@ -264,6 +283,13 @@ def _cluster_swings(
                     "tick_size": tick_size,
                 },
             )
+            _append_reason(
+                reason_sink,
+                "min_points_fail",
+                swings=swings_ts,
+                tolerance=tolerance,
+                tick_size=tick_size,
+            )
             continue
         prices = cluster["prices"]
         if not prices:
@@ -278,6 +304,14 @@ def _cluster_swings(
                 "swings": swings_ts,
                 "tolerance": tolerance,
             }
+        )
+    if not payload:
+        _append_reason(
+            reason_sink,
+            "no_clusters",
+            swings=len(swings),
+            tolerance=tolerance,
+            tick_size=tick_size,
         )
     return payload
 
@@ -318,11 +352,13 @@ def _prepare_levels(
     *,
     tick_size: float | None,
     config: LiquidityConfig,
-) -> Dict[str, List[Dict[str, Any]]]:
+) -> tuple[Dict[str, List[Mapping[str, Any]]], Dict[str, Any]]:
     eqh_levels: List[Dict[str, Any]] = []
     eql_levels: List[Dict[str, Any]] = []
 
     tolerance = (config.r_ticks * tick_size) if tick_size and tick_size > 0 else 0.0
+
+    diagnostics: Dict[str, Any] = {}
 
     LOGGER.debug(
         "Liquidity swing detection config",
@@ -335,11 +371,30 @@ def _prepare_levels(
         },
     )
 
+    minimum_required = 2 * config.swing_window + 1
+
     for timeframe in SUPPORTED_TIMEFRAMES:
         frame_payload = frames.get(timeframe)
         source_label = _frame_source(frame_payload) or "unknown"
         candles = _extract_candles(frame_payload)
         candle_count = len(candles)
+
+        frame_diag = {
+            "used_source": source_label,
+            "n_bars_total": candle_count,
+            "tick_size": tick_size,
+            "r_ticks": config.r_ticks,
+            "tolerance": tolerance,
+            "swing_window": config.swing_window,
+            "lookback": config.lookback_swings,
+            "atr_period": config.atr_period,
+            "atr_mult": config.sweep_atr_multiplier,
+            "reasons": [],
+            "eqh": {"swing_count": 0, "cluster_count": 0, "reasons": []},
+            "eql": {"swing_count": 0, "cluster_count": 0, "reasons": []},
+        }
+        diagnostics[timeframe] = frame_diag
+
         LOGGER.debug(
             "Evaluating liquidity swings",
             extra={
@@ -348,7 +403,7 @@ def _prepare_levels(
                 "used_source": source_label,
             },
         )
-        if candle_count < 2 * config.swing_window + 1:
+        if candle_count < minimum_required:
             LOGGER.debug(
                 "Skipping liquidity timeframe",
                 extra={
@@ -358,12 +413,20 @@ def _prepare_levels(
                     "used_source": source_label,
                 },
             )
+            _append_reason(
+                frame_diag["reasons"],
+                "too_few_bars",
+                candles=candle_count,
+                required=minimum_required,
+            )
             continue
         swings_high = _detect_swings(candles, window=config.swing_window, kind="high")
         swings_low = _detect_swings(candles, window=config.swing_window, kind="low")
         if config.lookback_swings > 0:
             swings_high = swings_high[-config.lookback_swings :]
             swings_low = swings_low[-config.lookback_swings :]
+        frame_diag["eqh"]["swing_count"] = len(swings_high)
+        frame_diag["eql"]["swing_count"] = len(swings_low)
         LOGGER.debug(
             "Liquidity swings detected",
             extra={
@@ -379,7 +442,9 @@ def _prepare_levels(
             tick_size=tick_size,
             level_type="eqh",
             timeframe=timeframe,
+            reason_sink=frame_diag["eqh"]["reasons"],
         )
+        frame_diag["eqh"]["cluster_count"] = len(eqh_cluster)
         if not eqh_cluster:
             LOGGER.debug(
                 "No EQH clusters on timeframe",
@@ -393,7 +458,9 @@ def _prepare_levels(
             tick_size=tick_size,
             level_type="eql",
             timeframe=timeframe,
+            reason_sink=frame_diag["eql"]["reasons"],
         )
+        frame_diag["eql"]["cluster_count"] = len(eql_cluster)
         if not eql_cluster:
             LOGGER.debug(
                 "No EQL clusters on timeframe",
@@ -424,20 +491,25 @@ def _prepare_levels(
     if not eql_levels:
         LOGGER.debug("No EQL clusters formed", extra={"reason": "no_clusters"})
 
-    return {"eqh": eqh_levels, "eql": eql_levels}
+    return {"eqh": eqh_levels, "eql": eql_levels}, diagnostics
 
 
 def _resolve_previous_day(
     candles: Sequence[Mapping[str, Any]],
     *,
     reference_end_ms: int | None,
-) -> Dict[str, Dict[str, Any] | None]:
+) -> tuple[Dict[str, Dict[str, Any] | None], Dict[str, Any]]:
+    diagnostics: Dict[str, Any] = {
+        "candles": len(candles),
+        "reasons": [],
+    }
     if not candles:
         LOGGER.debug(
             "Unable to resolve previous day levels",
             extra={"reason": "no_daily_candles"},
         )
-        return {"pdh": None, "pdl": None}
+        _append_reason(diagnostics["reasons"], "no_daily_candles")
+        return {"pdh": None, "pdl": None}, diagnostics
 
     if reference_end_ms is None:
         last_ts = candles[-1].get("t")
@@ -448,7 +520,8 @@ def _resolve_previous_day(
             "Unable to resolve previous day levels",
             extra={"reason": "no_reference_time"},
         )
-        return {"pdh": None, "pdl": None}
+        _append_reason(diagnostics["reasons"], "no_reference_time")
+        return {"pdh": None, "pdl": None}, diagnostics
 
     reference_day = datetime.fromtimestamp(reference_end_ms / 1000, tz=timezone.utc).date()
     previous_day = reference_day - timedelta(days=1)
@@ -476,8 +549,16 @@ def _resolve_previous_day(
             "Previous day levels unavailable",
             extra={"reason": "no_daily_candle_prev_utc", "day": str(previous_day)},
         )
+        _append_reason(
+            diagnostics["reasons"],
+            "no_daily_candle_prev_utc",
+            day=str(previous_day),
+        )
 
-    return {"pdh": target_high, "pdl": target_low}
+    diagnostics["found"] = bool(target_high and target_low)
+    diagnostics["day"] = str(previous_day)
+
+    return {"pdh": target_high, "pdl": target_low}, diagnostics
 
 
 def _detect_sweeps(
@@ -489,7 +570,7 @@ def _detect_sweeps(
     eql: Sequence[Mapping[str, Any]],
     pdh: Mapping[str, Any] | None,
     pdl: Mapping[str, Any] | None,
-) -> List[Dict[str, Any]]:
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
     sweeps: List[Dict[str, Any]] = []
     tick_min = tick_size if tick_size and tick_size > 0 else 0.0
 
@@ -520,23 +601,47 @@ def _detect_sweeps(
         if pdl:
             lower_levels_by_tf[tf].append({"type": "pdl", "price": pdl["price"], "t": pdl["t"]})  # type: ignore[index]
 
-    for timeframe, levels in upper_levels_by_tf.items():
+    diagnostics: Dict[str, Any] = {}
+
+    for timeframe in SUPPORTED_TIMEFRAMES:
         frame_payload = frames.get(timeframe)
         source_label = _frame_source(frame_payload) or "unknown"
         candles = _extract_candles(frame_payload)
+        upper_levels = upper_levels_by_tf.get(timeframe, [])
+        lower_levels = lower_levels_by_tf.get(timeframe, [])
+
+        frame_diag = {
+            "used_source": source_label,
+            "candles": len(candles),
+            "atr_period": config.atr_period,
+            "atr_mult": config.sweep_atr_multiplier,
+            "tick_size": tick_size,
+            "upper": {"levels": len(upper_levels), "events": 0, "reasons": []},
+            "lower": {"levels": len(lower_levels), "events": 0, "reasons": []},
+        }
+        diagnostics[timeframe] = frame_diag
+
+        if not upper_levels:
+            _append_reason(frame_diag["upper"]["reasons"], "no_levels")
+        if not lower_levels:
+            _append_reason(frame_diag["lower"]["reasons"], "no_levels")
+
         if not candles:
             LOGGER.debug(
                 "Skipping sweep evaluation due to empty frame",
                 extra={"tf": timeframe, "reason": "no_candles", "used_source": source_label},
             )
+            _append_reason(frame_diag["upper"]["reasons"], "no_candles")
+            _append_reason(frame_diag["lower"]["reasons"], "no_candles")
             continue
+
         LOGGER.debug(
             "Evaluating sweep candidates",
             extra={
                 "tf": timeframe,
                 "direction": "upper",
                 "candles": len(candles),
-                "levels": len(levels),
+                "levels": len(upper_levels),
                 "used_source": source_label,
             },
         )
@@ -551,7 +656,7 @@ def _detect_sweeps(
             epsilon = max(tick_min, atr_component)
             min_required = tick_min if tick_min and tick_min > 0 else epsilon
             atr_cap = atr_component if atr_component > 0 else None
-            for level in levels:
+            for level in upper_levels:
                 level_price = _coerce_float(level.get("price"))
                 if level_price is None:
                     continue
@@ -582,6 +687,14 @@ def _detect_sweeps(
                             "used_source": source_label,
                         },
                     )
+                    _append_reason(
+                        frame_diag["upper"]["reasons"],
+                        "tolerance_fail",
+                        level_type=level_type,
+                        overshoot=overshoot,
+                        tolerance=min_required,
+                        epsilon=epsilon,
+                    )
                     continue
                 if atr_cap is not None and overshoot > atr_cap + 1e-9:
                     LOGGER.debug(
@@ -596,6 +709,14 @@ def _detect_sweeps(
                             "used_source": source_label,
                         },
                     )
+                    _append_reason(
+                        frame_diag["upper"]["reasons"],
+                        "atr_breach",
+                        level_type=level_type,
+                        overshoot=overshoot,
+                        atr_limit=atr_cap,
+                        epsilon=epsilon,
+                    )
                     continue
                 if close >= level_price:
                     continue
@@ -608,28 +729,18 @@ def _detect_sweeps(
                         "atr_tolerance": epsilon,
                     }
                 )
+                frame_diag["upper"]["events"] += 1
 
-    for timeframe, levels in lower_levels_by_tf.items():
-        frame_payload = frames.get(timeframe)
-        source_label = _frame_source(frame_payload) or "unknown"
-        candles = _extract_candles(frame_payload)
-        if not candles:
-            LOGGER.debug(
-                "Skipping sweep evaluation due to empty frame",
-                extra={"tf": timeframe, "reason": "no_candles", "used_source": source_label},
-            )
-            continue
         LOGGER.debug(
             "Evaluating sweep candidates",
             extra={
                 "tf": timeframe,
                 "direction": "lower",
                 "candles": len(candles),
-                "levels": len(levels),
+                "levels": len(lower_levels),
                 "used_source": source_label,
             },
         )
-        atr_values = _compute_atr_series(candles, period=config.atr_period)
         for index, candle in enumerate(candles):
             low = _coerce_float(candle.get("l"))
             close = _coerce_float(candle.get("c"))
@@ -640,7 +751,7 @@ def _detect_sweeps(
             epsilon = max(tick_min, atr_component)
             min_required = tick_min if tick_min and tick_min > 0 else epsilon
             atr_cap = atr_component if atr_component > 0 else None
-            for level in levels:
+            for level in lower_levels:
                 level_price = _coerce_float(level.get("price"))
                 if level_price is None:
                     continue
@@ -671,6 +782,14 @@ def _detect_sweeps(
                             "used_source": source_label,
                         },
                     )
+                    _append_reason(
+                        frame_diag["lower"]["reasons"],
+                        "tolerance_fail",
+                        level_type=level_type,
+                        overshoot=overshoot,
+                        tolerance=min_required,
+                        epsilon=epsilon,
+                    )
                     continue
                 if atr_cap is not None and overshoot > atr_cap + 1e-9:
                     LOGGER.debug(
@@ -685,6 +804,14 @@ def _detect_sweeps(
                             "used_source": source_label,
                         },
                     )
+                    _append_reason(
+                        frame_diag["lower"]["reasons"],
+                        "atr_breach",
+                        level_type=level_type,
+                        overshoot=overshoot,
+                        atr_limit=atr_cap,
+                        epsilon=epsilon,
+                    )
                     continue
                 if close <= level_price:
                     continue
@@ -697,9 +824,10 @@ def _detect_sweeps(
                         "atr_tolerance": epsilon,
                     }
                 )
+                frame_diag["lower"]["events"] += 1
 
     sweeps.sort(key=lambda item: item.get("t", 0))
-    return sweeps
+    return sweeps, diagnostics
 
 
 def build_liquidity_snapshot(
@@ -714,7 +842,11 @@ def build_liquidity_snapshot(
     resolved_config = _resolve_config(config)
 
     augmented_frames = _augment_supported_frames(frames)
-    levels = _prepare_levels(augmented_frames, tick_size=tick_size, config=resolved_config)
+    levels, level_diagnostics = _prepare_levels(
+        augmented_frames,
+        tick_size=tick_size,
+        config=resolved_config,
+    )
 
     daily_candles = _extract_candles(augmented_frames.get("1d"))
     selection_end = None
@@ -722,9 +854,12 @@ def build_liquidity_snapshot(
         end_value = selection.get("end")
         if isinstance(end_value, (int, float)):
             selection_end = int(end_value)
-    daily_levels = _resolve_previous_day(daily_candles, reference_end_ms=selection_end)
+    daily_levels, daily_diagnostics = _resolve_previous_day(
+        daily_candles,
+        reference_end_ms=selection_end,
+    )
 
-    sweeps = _detect_sweeps(
+    sweeps, sweep_diagnostics = _detect_sweeps(
         augmented_frames,
         tick_size=tick_size,
         config=resolved_config,
@@ -743,11 +878,31 @@ def build_liquidity_snapshot(
         },
     )
 
+    diagnostics_payload = {
+        "config": {
+            "swing_window": resolved_config.swing_window,
+            "lookback": resolved_config.lookback_swings,
+            "r_ticks": resolved_config.r_ticks,
+            "atr_period": resolved_config.atr_period,
+            "sweep_atr_multiplier": resolved_config.sweep_atr_multiplier,
+            "tick_size": tick_size,
+        },
+        "levels": level_diagnostics,
+        "daily": daily_diagnostics,
+        "sweeps": sweep_diagnostics,
+        "summary": {
+            "eqh": len(levels["eqh"]),
+            "eql": len(levels["eql"]),
+            "sweeps": len(sweeps),
+        },
+    }
+
     return {
         "eqh": levels["eqh"],
         "eql": levels["eql"],
         "pdh": daily_levels["pdh"],
         "pdl": daily_levels["pdl"],
         "sweeps": sweeps,
+        "diagnostics": diagnostics_payload,
     }
 

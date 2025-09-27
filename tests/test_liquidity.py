@@ -115,6 +115,22 @@ def test_liquidity_detects_equal_levels_and_sweeps() -> None:
     for event in liquidity["sweeps"]:
         assert event["atr_tolerance"] >= 0
 
+    diagnostics = liquidity.get("diagnostics")
+    assert isinstance(diagnostics, dict)
+    summary = diagnostics.get("summary")
+    assert isinstance(summary, dict)
+    assert summary.get("eqh") == len(eqh_levels)
+    levels_diag = diagnostics.get("levels")
+    assert isinstance(levels_diag, dict)
+    tf_diag = levels_diag.get("15m")
+    assert isinstance(tf_diag, dict)
+    eqh_diag = tf_diag.get("eqh")
+    eql_diag = tf_diag.get("eql")
+    assert isinstance(eqh_diag, dict)
+    assert isinstance(eql_diag, dict)
+    assert eqh_diag.get("cluster_count") == len(eqh_levels)
+    assert eql_diag.get("cluster_count") == len(eql_levels)
+
 
 def test_liquidity_respects_atr_tolerance() -> None:
     base = datetime(2024, 5, 1, tzinfo=UTC)
@@ -142,6 +158,13 @@ def test_liquidity_respects_atr_tolerance() -> None:
     # Equal highs should still be detected, but sweep should be filtered out.
     assert liquidity["eqh"]
     assert liquidity["sweeps"] == []
+
+    diagnostics = liquidity.get("diagnostics")
+    assert isinstance(diagnostics, dict)
+    summary = diagnostics.get("summary")
+    assert isinstance(summary, dict)
+    assert summary.get("sweeps") == 0
+
 
 
 def test_liquidity_aggregates_minute_seed() -> None:
@@ -196,6 +219,12 @@ def test_liquidity_aggregates_minute_seed() -> None:
     sweep_types = {event["type"] for event in liquidity["sweeps"]}
     assert "sweep_top" in sweep_types
     assert "sweep_bottom" in sweep_types
+
+    diagnostics = liquidity.get("diagnostics")
+    assert isinstance(diagnostics, dict)
+    summary = diagnostics.get("summary")
+    assert isinstance(summary, dict)
+    assert summary.get("eqh") == len(liquidity["eqh"])
 
 
 def test_liquidity_detects_pdh_pdl_sweeps_from_minute_seed() -> None:

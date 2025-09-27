@@ -95,3 +95,9 @@ def test_inspection_liquidity_uses_hardcoded_tick_size(monkeypatch: pytest.Monke
     tolerance_per_tick = [level["tolerance"] / 5 for level in eqh_levels if level.get("tolerance")]
     assert tolerance_per_tick, "Liquidity levels should report tolerance values"
     assert any(math.isclose(value, expected_tick, rel_tol=1e-9, abs_tol=1e-9) for value in tolerance_per_tick)
+
+    diagnostics = payload["DIAGNOSTICS"].get("liquidity")
+    assert isinstance(diagnostics, dict)
+    summary = diagnostics.get("summary")
+    assert isinstance(summary, dict)
+    assert summary.get("eqh") >= 0
