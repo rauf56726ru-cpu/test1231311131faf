@@ -1331,6 +1331,12 @@ def render_inspection_page(
   };
   const DEFAULT_TEST_TIMEFRAMES = ["1m", "3m", "5m", "15m", "1h", "4h", "1d"];
   const PREVIEW_REFRESH_INTERVAL_MS = 10_000;
+  const PREVIEW_SOURCE_INTERVAL = "1m";
+  const PREVIEW_SOURCE_INTERVAL_MS = TIMEFRAME_TO_MS[PREVIEW_SOURCE_INTERVAL];
+  const PREVIEW_SOURCE_MIN_LIMIT = 120;
+  const PREVIEW_SOURCE_MAX_LIMIT = 1000;
+  const PREVIEW_TARGET_BARS = 10;
+  const PREVIEW_MAX_TARGET_CANDLES = 500;
 
 
   function toChartBars(candles) {
@@ -1367,6 +1373,117 @@ def render_inspection_page(
     return Math.min(closingMs, alignedReference);
   }
 
+  function computePreviewMinuteLimit(targetInterval) {
+    const targetMs = TIMEFRAME_TO_MS[targetInterval] || PREVIEW_SOURCE_INTERVAL_MS;
+    const ratio = Math.max(1, Math.round(targetMs / PREVIEW_SOURCE_INTERVAL_MS));
+    const projected = ratio * PREVIEW_TARGET_BARS;
+    const minimum = Math.max(PREVIEW_SOURCE_MIN_LIMIT, ratio * 2);
+    return Math.min(PREVIEW_SOURCE_MAX_LIMIT, Math.max(minimum, projected));
+  }
+
+  function normalisePreviewCandle(raw) {
+    const openTime = Number(raw?.t ?? raw?.time ?? 0);
+    if (!Number.isFinite(openTime)) {
+      return null;
+    }
+    const open = Number(raw?.o ?? raw?.open ?? 0);
+    const high = Number(raw?.h ?? raw?.high ?? open);
+    const low = Number(raw?.l ?? raw?.low ?? open);
+    const close = Number(raw?.c ?? raw?.close ?? open);
+    const volume = Number(raw?.v ?? raw?.volume ?? 0);
+    return { t: openTime, o: open, h: high, l: low, c: close, v: volume };
+  }
+
+  function aggregateMinuteCandles(sourceCandles, targetInterval, fetchedAtMs) {
+    const targetMs = TIMEFRAME_TO_MS[targetInterval] || PREVIEW_SOURCE_INTERVAL_MS;
+    const cleanedSource = (sourceCandles || [])
+      .map((item) => normalisePreviewCandle(item))
+      .filter((item) => item !== null)
+      .sort((a, b) => a.t - b.t);
+
+    const referenceMs = Number.isFinite(fetchedAtMs) ? Number(fetchedAtMs) : Date.now();
+
+    if (targetMs <= PREVIEW_SOURCE_INTERVAL_MS) {
+      const trimmed =
+        cleanedSource.length > PREVIEW_MAX_TARGET_CANDLES
+          ? cleanedSource.slice(cleanedSource.length - PREVIEW_MAX_TARGET_CANDLES)
+          : cleanedSource;
+      const last = trimmed[trimmed.length - 1];
+      if (!last) {
+        return { candles: [], lastUpdateMs: Number.NaN };
+      }
+      const theoreticalClose = last.t + PREVIEW_SOURCE_INTERVAL_MS;
+      const lastUpdateMs = Math.min(theoreticalClose, Math.max(last.t, referenceMs));
+      return { candles: trimmed, lastUpdateMs };
+    }
+
+    const aggregated = [];
+    let bucket = null;
+
+    const flushBucket = () => {
+      if (!bucket) return;
+      const closing = bucket.t + targetMs;
+      const aligned = Math.max(bucket.t, bucket.lastUpdateMs ?? bucket.t);
+      const lastUpdateMs = Math.min(closing, aligned);
+      aggregated.push({
+        t: bucket.t,
+        o: bucket.o,
+        h: bucket.h,
+        l: bucket.l,
+        c: bucket.c,
+        v: bucket.v,
+        _lastUpdateMs: lastUpdateMs,
+      });
+      bucket = null;
+    };
+
+    for (const candle of cleanedSource) {
+      const bucketStart = Math.floor(candle.t / targetMs) * targetMs;
+      if (!bucket || bucket.t !== bucketStart) {
+        flushBucket();
+        bucket = {
+          t: bucketStart,
+          o: candle.o,
+          h: candle.h,
+          l: candle.l,
+          c: candle.c,
+          v: Math.max(0, candle.v),
+          lastUpdateMs: Math.min(candle.t + PREVIEW_SOURCE_INTERVAL_MS, referenceMs),
+        };
+        continue;
+      }
+
+      bucket.c = candle.c;
+      bucket.h = Math.max(bucket.h, candle.h, candle.o, candle.c);
+      bucket.l = Math.min(bucket.l, candle.l, candle.o, candle.c);
+      bucket.v = Math.max(0, Number(bucket.v) + Number(candle.v));
+      bucket.lastUpdateMs = Math.max(
+        bucket.lastUpdateMs,
+        Math.min(candle.t + PREVIEW_SOURCE_INTERVAL_MS, referenceMs),
+      );
+    }
+
+    flushBucket();
+
+    const trimmedAggregated =
+      aggregated.length > PREVIEW_MAX_TARGET_CANDLES
+        ? aggregated.slice(aggregated.length - PREVIEW_MAX_TARGET_CANDLES)
+        : aggregated;
+    const lastAgg = trimmedAggregated[trimmedAggregated.length - 1];
+    const lastUpdateMs = lastAgg ? lastAgg._lastUpdateMs : Number.NaN;
+    return {
+      candles: trimmedAggregated.map((item) => ({
+        t: item.t,
+        o: item.o,
+        h: item.h,
+        l: item.l,
+        c: item.c,
+        v: item.v,
+      })),
+      lastUpdateMs,
+    };
+  }
+
   function setJson(pre, data) {
     if (!pre) return;
     pre.textContent = JSON.stringify(data ?? null, null, 2);
@@ -1385,16 +1502,26 @@ def render_inspection_page(
     return cleaned;
   }
 
-  async function fetchCandles(symbol, interval, startMs, endMs) {
+  async function fetchCandles(symbol, interval, startMs, endMs, options = {}) {
     const results = [];
     const url = new URL("https://api.binance.com/api/v3/klines");
     url.searchParams.set("symbol", symbol.toUpperCase());
     url.searchParams.set("interval", interval);
-    url.searchParams.set("startTime", Math.floor(Math.min(startMs, endMs)));
-    url.searchParams.set("endTime", Math.floor(Math.max(startMs, endMs)));
+    if (Number.isFinite(startMs) && Number.isFinite(endMs)) {
+      url.searchParams.set("startTime", Math.floor(Math.min(startMs, endMs)));
+      url.searchParams.set("endTime", Math.floor(Math.max(startMs, endMs)));
+    }
     const intervalMs = TIMEFRAME_TO_MS[interval] || 60000;
-    const span = Math.max(1, Math.ceil(Math.abs(endMs - startMs) / intervalMs) + 3);
-    url.searchParams.set("limit", String(Math.min(1000, Math.max(span, 100))));
+    const span =
+      Number.isFinite(startMs) && Number.isFinite(endMs)
+        ? Math.max(1, Math.ceil(Math.abs(endMs - startMs) / intervalMs) + 3)
+        : 0;
+    const hintedLimit = Number.isFinite(options.limit) ? Math.floor(options.limit) : null;
+    if (Number.isFinite(hintedLimit) && hintedLimit > 0) {
+      url.searchParams.set("limit", String(Math.min(1000, Math.max(1, hintedLimit))));
+    } else if (span > 0) {
+      url.searchParams.set("limit", String(Math.min(1000, Math.max(span, 100))));
+    }
     const resp = await fetch(url.toString());
     if (!resp.ok) {
       throw new Error(`klines ${resp.status}`);
@@ -2363,6 +2490,7 @@ def render_inspection_page(
         candles: [],
         refreshTimer: null,
         lastFetchedAtMs: null,
+        lastUpdateMs: null,
         isFetching: false,
       };
 
@@ -2420,16 +2548,37 @@ def render_inspection_page(
       }
 
       async function requestPreviewCandles(symbol, interval) {
-        const intervalMs = TIMEFRAME_TO_MS[interval] || 60000;
+        const resolvedInterval = interval || PREVIEW_SOURCE_INTERVAL;
+        const intervalMs = TIMEFRAME_TO_MS[resolvedInterval] || PREVIEW_SOURCE_INTERVAL_MS;
         const endMs = Date.now();
-        const startMs = Math.max(0, endMs - intervalMs * 500);
-        const candles = await fetchCandles(symbol, interval, startMs, endMs);
-        return { candles, fetchedAt: Date.now(), intervalMs };
+        const minuteLimit = computePreviewMinuteLimit(resolvedInterval);
+        const startMs = Math.max(0, endMs - PREVIEW_SOURCE_INTERVAL_MS * (minuteLimit + 2));
+        const sourceCandles = await fetchCandles(
+          symbol,
+          PREVIEW_SOURCE_INTERVAL,
+          startMs,
+          endMs,
+          { limit: minuteLimit + 5 },
+        );
+        const fetchedAt = Date.now();
+        const { candles, lastUpdateMs } = aggregateMinuteCandles(
+          sourceCandles,
+          resolvedInterval,
+          fetchedAt,
+        );
+        return { candles, fetchedAt, intervalMs, lastUpdateMs };
       }
 
-      function applyPreviewCandles(candles, fetchedAtMs, intervalMs, { fitContent = false } = {}) {
+      function applyPreviewCandles(
+        candles,
+        fetchedAtMs,
+        intervalMs,
+        { fitContent = false, lastUpdateMs = null } = {},
+      ) {
         previewState.candles = Array.isArray(candles) ? candles.slice() : [];
         previewState.lastFetchedAtMs = fetchedAtMs;
+        const resolvedUpdateMs = Number.isFinite(lastUpdateMs) ? Number(lastUpdateMs) : fetchedAtMs;
+        previewState.lastUpdateMs = resolvedUpdateMs;
         const bars = toChartBars(previewState.candles);
         if (previewState.series) {
           previewState.series.setData(bars);
@@ -2439,7 +2588,7 @@ def render_inspection_page(
         }
         updatePreviewInfo(previewState.candles[previewState.candles.length - 1], {
           intervalMs,
-          lastUpdateMs: fetchedAtMs,
+          lastUpdateMs: resolvedUpdateMs,
         });
       }
 
@@ -2448,11 +2597,14 @@ def render_inspection_page(
         if (!previewState.symbol || !previewState.interval) return;
         previewState.isFetching = true;
         try {
-          const { candles, fetchedAt, intervalMs } = await requestPreviewCandles(
+          const { candles, fetchedAt, intervalMs, lastUpdateMs } = await requestPreviewCandles(
             previewState.symbol,
             previewState.interval,
           );
-          applyPreviewCandles(candles, fetchedAt, intervalMs, { fitContent: false });
+          applyPreviewCandles(candles, fetchedAt, intervalMs, {
+            fitContent: false,
+            lastUpdateMs,
+          });
           if (!silent) {
             setPreviewStatus("", "info");
           }
@@ -2539,11 +2691,14 @@ def render_inspection_page(
         setPreviewStatus("Loading Binance history...", "info");
         try {
           ensurePreviewChart();
-          const { candles, fetchedAt, intervalMs } = await requestPreviewCandles(
+          const { candles, fetchedAt, intervalMs, lastUpdateMs } = await requestPreviewCandles(
             resolvedSymbol,
             resolvedInterval,
           );
-          applyPreviewCandles(candles, fetchedAt, intervalMs, { fitContent: true });
+          applyPreviewCandles(candles, fetchedAt, intervalMs, {
+            fitContent: true,
+            lastUpdateMs,
+          });
           setPreviewStatus("", "info");
           schedulePreviewRefresh();
         } catch (error) {
