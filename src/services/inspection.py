@@ -10,7 +10,20 @@ import re
 from collections import OrderedDict, defaultdict
 from datetime import datetime, timedelta, timezone, time as dtime
 from pathlib import Path
-from typing import Any, DefaultDict, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple
+from typing import (
+    Any,
+    Callable,
+    DefaultDict,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    MutableMapping,
+    Sequence,
+    Tuple,
+)
+
+import httpx
 
 from .ohlc import TIMEFRAME_WINDOWS, TIMEFRAME_TO_MS, normalise_ohlcv
 from .profile import build_profile_package
@@ -30,6 +43,453 @@ SNAPSHOT_STORAGE_DIR = Path(
     os.environ.get("INSPECTION_SNAPSHOT_DIR", str(_DEFAULT_STORAGE_ROOT))
 ).expanduser()
 _SNAPSHOT_ID_SANITISER = re.compile(r"[^A-Za-z0-9._-]")
+
+MS_IN_DAY = 86_400_000
+HTF_TIMEFRAMES: Tuple[str, ...] = ("15m", "1h", "4h", "1d")
+MINUTE_INTERVAL_MS = TIMEFRAME_TO_MS.get("1m", 60_000)
+BINANCE_FAPI_REST = "https://fapi.binance.com/fapi/v1/klines"
+
+
+def _safe_int(value: object | None) -> int | None:
+    try:
+        if isinstance(value, bool):  # Guard against bools masquerading as ints
+            return int(value) if value else 0
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_float(value: object | None) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _align_to_interval(timestamp_ms: int, interval_ms: int) -> int:
+    if interval_ms <= 0:
+        raise ValueError("interval_ms must be positive")
+    return (timestamp_ms // interval_ms) * interval_ms
+
+
+def _extract_frame_candles(
+    frames: Mapping[str, Any], timeframe: str
+) -> Sequence[Mapping[str, object] | Sequence[object]]:
+    frame = frames.get(timeframe)
+    if isinstance(frame, Mapping):
+        candles = frame.get("candles")
+        if isinstance(candles, Sequence):
+            return candles  # type: ignore[return-value]
+        return []
+    if isinstance(frame, Sequence):
+        return frame  # type: ignore[return-value]
+    return []
+
+
+def _parse_minute_row(
+    row: Mapping[str, object] | Sequence[object]
+) -> Dict[str, float] | None:
+    open_time: int | None = None
+    open_price: float | None = None
+    high_price: float | None = None
+    low_price: float | None = None
+    close_price: float | None = None
+    volume: float | None = None
+
+    if isinstance(row, Mapping):
+        open_time = _safe_int(
+            row.get("t")
+            or row.get("time")
+            or row.get("openTime")
+            or row.get("open_time")
+        )
+        open_price = _coerce_float(row.get("o") or row.get("open"))
+        high_price = _coerce_float(row.get("h") or row.get("high"))
+        low_price = _coerce_float(row.get("l") or row.get("low"))
+        close_price = _coerce_float(row.get("c") or row.get("close"))
+        volume = _coerce_float(row.get("v") or row.get("volume"))
+    else:
+        try:
+            open_time = int(row[0])
+            open_price = float(row[1])
+            high_price = float(row[2])
+            low_price = float(row[3])
+            close_price = float(row[4])
+            volume = float(row[5]) if len(row) > 5 else 0.0
+        except (IndexError, TypeError, ValueError):
+            return None
+
+    if (
+        open_time is None
+        or open_price is None
+        or high_price is None
+        or low_price is None
+        or close_price is None
+    ):
+        return None
+
+    return {
+        "t": int(open_time),
+        "o": float(open_price),
+        "h": float(high_price),
+        "l": float(low_price),
+        "c": float(close_price),
+        "v": float(volume or 0.0),
+    }
+
+
+def _normalise_minute_rows(
+    rows: Sequence[Mapping[str, object] | Sequence[object]]
+) -> Dict[int, Dict[str, float]]:
+    minutes: Dict[int, Dict[str, float]] = {}
+    for row in rows:
+        candle = _parse_minute_row(row)
+        if candle is None:
+            continue
+        minutes[candle["t"]] = candle
+    return minutes
+
+
+def _expected_minute_sequence(start_ms: int, end_ms: int) -> List[int]:
+    if end_ms < start_ms:
+        return []
+    steps = ((end_ms - start_ms) // MINUTE_INTERVAL_MS) + 1
+    return [start_ms + index * MINUTE_INTERVAL_MS for index in range(steps)]
+
+
+def _summarise_missing_minutes(
+    expected: Sequence[int],
+    available: Mapping[int, Mapping[str, Any]],
+) -> List[Dict[str, int]]:
+    gaps: List[Dict[str, int]] = []
+    current_start: int | None = None
+    current_count = 0
+
+    for ts in expected:
+        if ts not in available:
+            if current_start is None:
+                current_start = ts
+                current_count = 1
+            else:
+                current_count += 1
+        elif current_start is not None:
+            gaps.append(
+                {"from": current_start, "to": ts - MINUTE_INTERVAL_MS, "count": current_count}
+            )
+            current_start = None
+            current_count = 0
+
+    if current_start is not None and expected:
+        gaps.append({"from": current_start, "to": expected[-1], "count": current_count})
+
+    return gaps
+
+
+def _fetch_binance_minutes(
+    symbol: str,
+    start_ms: int,
+    end_ms: int,
+    limit: int,
+) -> Sequence[Sequence[object]]:
+    params = {
+        "symbol": symbol.upper(),
+        "interval": "1m",
+        "startTime": str(start_ms),
+        "endTime": str(end_ms),
+        "limit": str(limit),
+    }
+    with httpx.Client(timeout=15.0) as client:
+        response = client.get(BINANCE_FAPI_REST, params=params)
+        response.raise_for_status()
+        data = response.json()
+    if isinstance(data, Sequence):
+        return data  # type: ignore[return-value]
+    return []
+
+
+MinuteFetcher = Callable[[str, int, int, int], Sequence[Mapping[str, object] | Sequence[object]]]
+_DEFAULT_MINUTE_FETCHER: MinuteFetcher = _fetch_binance_minutes
+
+
+def _download_missing_minutes(
+    symbol: str,
+    gaps: Sequence[Mapping[str, int]],
+    *,
+    fetcher: MinuteFetcher,
+    target: MutableMapping[int, Dict[str, float]],
+) -> int:
+    downloaded_unique = 0
+
+    for gap in gaps:
+        start = _safe_int(gap.get("from"))
+        end = _safe_int(gap.get("to"))
+        if start is None or end is None or end < start:
+            continue
+        if end < 0:
+            continue
+        cursor = max(start, 0)
+        attempts = 0
+        while cursor <= end and attempts < 2048:
+            request_end = min(end, cursor + MINUTE_INTERVAL_MS * 999)
+            try:
+                raw_rows = fetcher(symbol, cursor, request_end, 1_000)
+            except Exception as exc:  # pragma: no cover - network guard
+                logging.getLogger(__name__).warning(
+                    "Failed to download 1m candles for HTF aggregation",
+                    exc_info=exc,
+                    extra={
+                        "symbol": symbol,
+                        "start_ms": cursor,
+                        "end_ms": request_end,
+                    },
+                )
+                break
+            if not raw_rows:
+                break
+            last_open = None
+            for row in raw_rows:
+                candle = _parse_minute_row(row)
+                if candle is None:
+                    continue
+                ts = candle["t"]
+                if ts < cursor or ts > end:
+                    continue
+                if ts not in target:
+                    downloaded_unique += 1
+                target[ts] = candle
+                if last_open is None or ts > last_open:
+                    last_open = ts
+            if last_open is None:
+                break
+            cursor = last_open + MINUTE_INTERVAL_MS
+            attempts += 1
+
+    return downloaded_unique
+
+
+def _aggregate_from_minutes(
+    minute_index: Mapping[int, Mapping[str, float]],
+    open_time: int,
+    interval_ms: int,
+) -> Dict[str, float] | None:
+    end_exclusive = open_time + interval_ms
+    cursor = open_time
+    bucket: List[Mapping[str, float]] = []
+
+    while cursor < end_exclusive:
+        candle = minute_index.get(cursor)
+        if candle is None:
+            return None
+        bucket.append(candle)
+        cursor += MINUTE_INTERVAL_MS
+
+    if not bucket:
+        return None
+
+    high = max(item["h"] for item in bucket)
+    low = min(item["l"] for item in bucket)
+    return {
+        "t": open_time,
+        "o": bucket[0]["o"],
+        "h": high,
+        "l": low,
+        "c": bucket[-1]["c"],
+        "v": sum(item["v"] for item in bucket),
+    }
+
+
+def build_htf_section(
+    symbol: str,
+    frames: Mapping[str, Any],
+    selection: Mapping[str, Any] | None,
+    *,
+    fetcher: MinuteFetcher | None = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Collect high timeframe candles aggregated from 1m data."""
+
+    minute_rows = _normalise_minute_rows(_extract_frame_candles(frames, "1m"))
+
+    if not minute_rows:
+        htf_payload = {
+            "symbol": symbol,
+            "candles": {tf: [] for tf in HTF_TIMEFRAMES},
+            "window": None,
+            "days": 0,
+        }
+        dq = {
+            "window": None,
+            "days": 0,
+            "minute_missing_before": 0,
+            "minute_missing_after": 0,
+            "downloaded_1m": 0,
+            "timeframes": {tf: {"missing_before": 0, "missing_after": 0, "expected": 0} for tf in HTF_TIMEFRAMES},
+        }
+        return htf_payload, dq
+
+    ordered_minutes = sorted(minute_rows)
+    minute_start = ordered_minutes[0]
+    minute_end = ordered_minutes[-1]
+
+    selection_start = _safe_int(selection.get("start")) if selection else None
+    selection_end = _safe_int(selection.get("end")) if selection else None
+    if selection_start is None:
+        selection_start = minute_start
+    if selection_end is None:
+        selection_end = minute_end
+    if selection_start > selection_end:
+        selection_start, selection_end = selection_end, selection_start
+
+    span_ms = max(0, selection_end - selection_start)
+    days = max(1, math.ceil(span_ms / MS_IN_DAY)) if span_ms else 1
+    total_span_ms = max(days * MS_IN_DAY, MINUTE_INTERVAL_MS)
+
+    fetcher_fn = fetcher or _DEFAULT_MINUTE_FETCHER
+
+    timeframe_ranges: Dict[str, Dict[str, int]] = {}
+    minute_window_start = minute_end
+    minute_window_end = minute_start
+
+    last_close_candidate = minute_end + MINUTE_INTERVAL_MS
+
+    for tf in HTF_TIMEFRAMES:
+        interval_ms = TIMEFRAME_TO_MS.get(tf)
+        if interval_ms is None or interval_ms <= 0:
+            continue
+
+        last_open = _align_to_interval(last_close_candidate - interval_ms, interval_ms)
+        if last_open < 0:
+            last_open = 0
+        bars_required = max(1, math.ceil(total_span_ms / interval_ms))
+        start_open = last_open - (bars_required - 1) * interval_ms
+        if start_open < 0:
+            start_open = 0
+        if last_open < start_open:
+            last_open = start_open
+        effective_bars = ((last_open - start_open) // interval_ms) + 1 if last_open >= start_open else 0
+        if effective_bars <= 0:
+            effective_bars = 0
+
+        timeframe_ranges[tf] = {
+            "start": start_open,
+            "end": last_open,
+            "interval": interval_ms,
+            "bars": effective_bars,
+        }
+
+        window_start_candidate = start_open
+        window_end_candidate = last_open + interval_ms - MINUTE_INTERVAL_MS
+        minute_window_start = min(minute_window_start, window_start_candidate)
+        minute_window_end = max(minute_window_end, window_end_candidate)
+
+    if not timeframe_ranges:
+        empty_htf = {tf: [] for tf in HTF_TIMEFRAMES}
+        empty_quality = {
+            "window": None,
+            "days": days,
+            "minute_missing_before": 0,
+            "minute_missing_after": 0,
+            "downloaded_1m": 0,
+            "timeframes": {tf: {"start_ms": None, "end_ms": None, "expected": 0, "missing_before": 0, "missing_after": 0} for tf in HTF_TIMEFRAMES},
+        }
+        return {
+            "symbol": symbol,
+            "window": None,
+            "days": days,
+            "candles": empty_htf,
+        }, empty_quality
+
+    minute_window_start = max(0, _align_to_interval(minute_window_start, MINUTE_INTERVAL_MS))
+    minute_window_end = max(minute_window_start, _align_to_interval(minute_window_end, MINUTE_INTERVAL_MS))
+    if minute_window_end < minute_window_start:
+        minute_window_end = minute_window_start
+
+    expected_minutes = _expected_minute_sequence(minute_window_start, minute_window_end)
+    gaps_before = _summarise_missing_minutes(expected_minutes, minute_rows)
+    minute_missing_before = sum(gap["count"] for gap in gaps_before)
+
+    minute_rows_initial = dict(minute_rows)
+
+    downloaded_unique = 0
+    if gaps_before:
+        downloaded_unique += _download_missing_minutes(
+            symbol,
+            gaps_before,
+            fetcher=fetcher_fn,
+            target=minute_rows,
+        )
+
+    gaps_after = _summarise_missing_minutes(expected_minutes, minute_rows)
+    minute_missing_after = sum(gap["count"] for gap in gaps_after)
+
+    candles_by_tf: Dict[str, List[Dict[str, float]]] = {}
+    dq_timeframes: Dict[str, Dict[str, Any]] = {}
+
+    for tf, spec in timeframe_ranges.items():
+        start_open = spec["start"]
+        last_open = spec["end"]
+        interval_ms = spec["interval"]
+        expected = spec["bars"]
+
+        candles: List[Dict[str, float]] = []
+        missing_before = 0
+        missing_after = 0
+
+        cursor = start_open
+        while cursor <= last_open:
+            if _aggregate_from_minutes(minute_rows_initial, cursor, interval_ms) is None:
+                missing_before += 1
+            cursor += interval_ms
+
+        cursor = start_open
+        while cursor <= last_open:
+            candle = _aggregate_from_minutes(minute_rows, cursor, interval_ms)
+            if candle is None:
+                missing_after += 1
+            else:
+                candles.append(candle)
+            cursor += interval_ms
+
+        candles.sort(key=lambda item: item["t"])
+        candles_by_tf[tf] = candles
+        dq_timeframes[tf] = {
+            "start_ms": start_open,
+            "end_ms": last_open,
+            "expected": expected,
+            "missing_before": missing_before,
+            "missing_after": missing_after,
+        }
+
+    for tf in HTF_TIMEFRAMES:
+        if tf not in candles_by_tf:
+            candles_by_tf[tf] = []
+        if tf not in dq_timeframes:
+            dq_timeframes[tf] = {
+                "start_ms": None,
+                "end_ms": None,
+                "expected": 0,
+                "missing_before": 0,
+                "missing_after": 0,
+            }
+
+    htf_payload = {
+        "symbol": symbol,
+        "window": {"start_ms": minute_window_start, "end_ms": minute_window_end},
+        "days": days,
+        "candles": candles_by_tf,
+    }
+
+    dq = {
+        "window": {"start_ms": minute_window_start, "end_ms": minute_window_end},
+        "days": days,
+        "minute_missing_before": minute_missing_before,
+        "minute_missing_after": minute_missing_after,
+        "downloaded_1m": downloaded_unique,
+        "timeframes": dq_timeframes,
+    }
+
+    return htf_payload, dq
 
 
 def _ensure_storage_dir() -> None:
@@ -476,6 +936,8 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
     start = int(selection.get("start")) if selection and selection.get("start") else None
     end = int(selection.get("end")) if selection and selection.get("end") else None
 
+    htf_section, htf_quality = build_htf_section(symbol, frames, selection)
+
     normalised_frames: Dict[str, Dict[str, Any]] = {}
     diagnostics_frames: Dict[str, Any] = {}
     delta_frames: Dict[str, List[Dict[str, Any]]] = {}
@@ -630,6 +1092,7 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
         "symbol": symbol,
         "frames": normalised_frames,
         "selection": selection,
+        "htf": htf_section,
         "session_vwap": session_vwap,
         "tpo": {"sessions": tpo_entries, "zones": tpo_zone_items},
         "profile": flattened_profile,
@@ -656,6 +1119,7 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
                 "frames": sorted(normalised_frames),
             },
             "source": snapshot.get("meta", {}),
+            "data_quality_htf": htf_quality,
         },
     }
 
