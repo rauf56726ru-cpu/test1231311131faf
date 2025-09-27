@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timedelta, timezone
+import math
+from datetime import datetime, timedelta, timezone, time as dtime
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence
 
 import httpx
@@ -19,6 +20,7 @@ UTC = timezone.utc
 MS_IN_HOUR = 3_600_000
 MS_IN_DAY = 86_400_000
 VALID_HOUR_WINDOWS = {1, 2, 3, 4}
+VALUE_AREA_PCT = 0.70
 
 try:
     from .ohlc import TIMEFRAME_TO_MS
@@ -570,6 +572,194 @@ def _compute_vwap(candles: Sequence[Mapping[str, Any]]) -> float:
     return total_pv / total_volume
 
 
+def _typical_price(candle: Mapping[str, Any]) -> float:
+    high = float(candle.get("h", 0.0))
+    low = float(candle.get("l", 0.0))
+    close = float(candle.get("c", 0.0))
+    return (high + low + close) / 3.0
+
+
+def _determine_bin_size(prices: Sequence[float], tick_size: float | None) -> float | None:
+    finite_prices = [price for price in prices if math.isfinite(price)]
+    if not finite_prices:
+        return float(tick_size) if tick_size and tick_size > 0 else None
+
+    average_price = sum(finite_prices) / len(finite_prices)
+    adaptive_step = abs(average_price) * 1e-4
+    if adaptive_step <= 0:
+        adaptive_step = max(abs(finite_prices[0]) * 1e-4, 1e-6)
+
+    tick = float(tick_size) if tick_size and tick_size > 0 else None
+    step = adaptive_step if adaptive_step > 0 else None
+    if tick is not None:
+        if step is None:
+            return tick
+        return max(tick, step)
+    return step
+
+
+def _build_volume_profile_stats(
+    candles: Sequence[Mapping[str, Any]],
+    *,
+    start_ms: int,
+    end_ms: int,
+    tick_size: float | None,
+    value_area_pct: float = VALUE_AREA_PCT,
+) -> Dict[str, Any]:
+    window_start_iso = datetime.fromtimestamp(start_ms / 1000.0, tz=UTC).isoformat()
+    window_end_iso = datetime.fromtimestamp(end_ms / 1000.0, tz=UTC).isoformat()
+
+    if end_ms < start_ms:
+        return {
+            "vwap": 0.0,
+            "poc": None,
+            "vah": None,
+            "val": None,
+            "window": {"start": window_start_iso, "end": window_end_iso},
+        }
+
+    scoped = [
+        candle
+        for candle in candles
+        if isinstance(candle, Mapping)
+        and (ts := _safe_int(candle.get("t"))) is not None
+        and start_ms <= ts <= end_ms
+    ]
+
+    if not scoped:
+        return {
+            "vwap": 0.0,
+            "poc": None,
+            "vah": None,
+            "val": None,
+            "window": {"start": window_start_iso, "end": window_end_iso},
+        }
+
+    vwap_value = _compute_vwap(scoped)
+    prices: List[float] = []
+    volumes: List[float] = []
+    for candle in scoped:
+        volume = float(candle.get("v", 0.0))
+        if volume <= 0:
+            continue
+        price = _typical_price(candle)
+        if not math.isfinite(price):
+            continue
+        prices.append(price)
+        volumes.append(volume)
+
+    if not prices or not volumes:
+        return {
+            "vwap": vwap_value,
+            "poc": None,
+            "vah": None,
+            "val": None,
+            "window": {"start": window_start_iso, "end": window_end_iso},
+        }
+
+    bin_size = _determine_bin_size(prices, tick_size)
+    if not bin_size or bin_size <= 0:
+        return {
+            "vwap": vwap_value,
+            "poc": None,
+            "vah": None,
+            "val": None,
+            "window": {"start": window_start_iso, "end": window_end_iso},
+        }
+
+    min_price = min(prices)
+    max_price = max(prices)
+    start_bin = math.floor(min_price / bin_size) * bin_size
+    bins_count = max(1, int(math.floor((max_price - start_bin) / bin_size)) + 1)
+
+    histogram = [0.0 for _ in range(bins_count)]
+    for price, volume in zip(prices, volumes):
+        index = int(math.floor((price - start_bin) / bin_size + 1e-9))
+        if index < 0:
+            index = 0
+        elif index >= bins_count:
+            index = bins_count - 1
+        histogram[index] += volume
+
+    total_volume = sum(histogram)
+    if total_volume <= 0:
+        return {
+            "vwap": vwap_value,
+            "poc": None,
+            "vah": None,
+            "val": None,
+            "window": {"start": window_start_iso, "end": window_end_iso},
+        }
+
+    poc_index = max(range(len(histogram)), key=lambda idx: histogram[idx])
+    poc_price = start_bin + poc_index * bin_size
+
+    threshold = total_volume * max(0.0, min(1.0, value_area_pct))
+    coverage = histogram[poc_index]
+    left = right = poc_index
+
+    while coverage < threshold and (left > 0 or right < len(histogram) - 1):
+        next_left = histogram[left - 1] if left > 0 else -1.0
+        next_right = histogram[right + 1] if right < len(histogram) - 1 else -1.0
+
+        if next_left < 0 and next_right < 0:
+            break
+
+        if next_right > next_left:
+            right += 1
+            coverage += max(0.0, next_right)
+        elif next_left > next_right:
+            left -= 1
+            coverage += max(0.0, next_left)
+        else:
+            if next_left >= 0 and left > 0:
+                left -= 1
+                coverage += max(0.0, next_left)
+            if coverage < threshold and next_right >= 0 and right < len(histogram) - 1:
+                right += 1
+                coverage += max(0.0, next_right)
+
+    val_price = start_bin + left * bin_size
+    vah_price = start_bin + right * bin_size
+
+    return {
+        "vwap": vwap_value,
+        "poc": round(poc_price, 12),
+        "vah": round(vah_price, 12),
+        "val": round(val_price, 12),
+        "window": {"start": window_start_iso, "end": window_end_iso},
+    }
+
+
+def _start_of_day_ms(timestamp_ms: int) -> int:
+    dt = datetime.fromtimestamp(timestamp_ms / 1000.0, tz=UTC)
+    start_dt = datetime(dt.year, dt.month, dt.day, tzinfo=UTC)
+    return int(start_dt.timestamp() * 1000)
+
+
+def _session_window(
+    anchor_ms: int,
+    start_time: dtime,
+    end_time: dtime,
+) -> tuple[int, int]:
+    anchor_aligned = _align_to_interval(anchor_ms, MINUTE_INTERVAL_MS)
+    anchor_dt = datetime.fromtimestamp(anchor_aligned / 1000.0, tz=UTC)
+    day_start = datetime(anchor_dt.year, anchor_dt.month, anchor_dt.day, tzinfo=UTC)
+    session_start_dt = datetime.combine(day_start.date(), start_time, tzinfo=UTC)
+    session_end_dt = datetime.combine(day_start.date(), end_time, tzinfo=UTC)
+
+    if end_time <= start_time:
+        session_end_dt += timedelta(days=1)
+
+    start_ms = int(session_start_dt.timestamp() * 1000)
+    raw_end_ms = int(session_end_dt.timestamp() * 1000) - MINUTE_INTERVAL_MS
+    if raw_end_ms < start_ms:
+        raw_end_ms = start_ms
+
+    end_ms = min(raw_end_ms, anchor_aligned)
+    return start_ms, end_ms
+
+
 def _extract_range(candidate: Mapping[str, Any]) -> tuple[int, int] | None:
     for key in ("t", "time", "timestamp", "ts"):
         ts = _safe_int(candidate.get(key))
@@ -1101,6 +1291,37 @@ def build_check_all_datas(
 
     movement_key = f"movement_datas_for_{movement_days}_days"
 
+    tick_size_value = profile_config.get("tick_size") if isinstance(profile_config, Mapping) else None
+    tick_size_numeric: float | None = None
+    if isinstance(tick_size_value, (int, float)):
+        tick_size_numeric = float(tick_size_value)
+
+    minute_series = frames.get("1m", [])
+    daily_start_ms = _start_of_day_ms(window_end_ms)
+    daily_vwap_profile = _build_volume_profile_stats(
+        minute_series,
+        start_ms=daily_start_ms,
+        end_ms=window_end_ms,
+        tick_size=tick_size_numeric,
+        value_area_pct=VALUE_AREA_PCT,
+    )
+
+    session_profiles: Dict[str, Dict[str, Any]] = {}
+    for session_name, session_start, session_end in sessions:
+        session_start_ms, session_end_ms = _session_window(window_end_ms, session_start, session_end)
+        session_profiles[session_name] = _build_volume_profile_stats(
+            minute_series,
+            start_ms=session_start_ms,
+            end_ms=session_end_ms,
+            tick_size=tick_size_numeric,
+            value_area_pct=VALUE_AREA_PCT,
+        )
+
+    vwap_payload = {
+        "daily": daily_vwap_profile,
+        "sessions": session_profiles,
+    }
+
     latest_candle_payload_source = (
         latest_candle_source
         or (primary_candles[-1] if primary_candles else None)
@@ -1110,6 +1331,19 @@ def build_check_all_datas(
         if isinstance(latest_candle_payload_source, Mapping)
         else {}
     )
+
+    data_quality_public = {
+        key: data_quality[key]
+        for key in (
+            "tf",
+            "window",
+            "minute_missing_before",
+            "minute_missing_after",
+            "tf_missing_before",
+            "tf_missing_after",
+        )
+        if key in data_quality
+    }
 
     return {
         "snapshot_id": snapshot.get("id"),
@@ -1124,9 +1358,9 @@ def build_check_all_datas(
         "tpo": {"sessions": profile_tpo, "zones": profile_zones},
         "profile": profile_flat,
         "zones": detected_zones,
-        "data_quality": data_quality,
+        "data_quality": data_quality_public,
         "htf": htf_section,
         "data_quality_htf": htf_quality,
         "profile_preset": profile_config.get("preset_payload"),
-        "profile_preset_required": bool(profile_config.get("preset_required", False)),
+        "vwap": vwap_payload,
     }

@@ -11,8 +11,8 @@ class Meta:
     VWAP_LOOKBACK_DAYS: int = 5
     _VWAP_SESSIONS: Tuple[Tuple[str, time, time], ...] = (
         ("asia", time(hour=0, minute=0), time(hour=8, minute=0)),
-        ("london", time(hour=8, minute=0), time(hour=16, minute=0)),
-        ("ny", time(hour=13, minute=0), time(hour=21, minute=0)),
+        ("london", time(hour=8, minute=0), time(hour=12, minute=0)),
+        ("ny", time(hour=12, minute=0), time(hour=20, minute=0)),
     )
 
     @classmethod

@@ -45,7 +45,8 @@ def test_session_boundaries_inclusive_start_exclusive_end() -> None:
     base = datetime(2024, 1, 1, tzinfo=timezone.utc)
     candles = [
         make_candle(base.replace(hour=8, minute=0), 110.0, 1.0),
-        make_candle(base.replace(hour=16, minute=0), 150.0, 1.0),
+        make_candle(base.replace(hour=12, minute=0), 150.0, 1.0),
+        make_candle(base.replace(hour=20, minute=0), 190.0, 1.0),
     ]
 
     result = compute_session_vwaps("ethusdt", candles)
@@ -53,7 +54,7 @@ def test_session_boundaries_inclusive_start_exclusive_end() -> None:
 
     assert ("2024-01-01", "london") in mapping
     assert ("2024-01-01", "ny") in mapping
-    # london entry should correspond to price at 08:00, ny to price at 16:00
+    # london entry should correspond to price at 08:00, ny to price at 12:00 (20:00 excluded)
     assert mapping[("2024-01-01", "london")] == pytest.approx(110.0)
     assert mapping[("2024-01-01", "ny")] == pytest.approx(150.0)
 
