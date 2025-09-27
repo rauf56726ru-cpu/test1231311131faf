@@ -25,6 +25,7 @@ from typing import (
 
 import httpx
 
+from .liquidity import build_liquidity_snapshot
 from .ohlc import TIMEFRAME_WINDOWS, TIMEFRAME_TO_MS, normalise_ohlcv
 from .profile import build_profile_package
 from .presets import resolve_profile_config
@@ -1088,6 +1089,16 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
                 "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
             }
 
+    raw_meta = snapshot.get("meta") if isinstance(snapshot.get("meta"), Mapping) else {}
+    liquidity_config = raw_meta.get("liquidity") if isinstance(raw_meta, Mapping) else None
+    tick_size = float(tick_size_value) if isinstance(tick_size_value, (int, float)) and tick_size_value > 0 else None
+    liquidity_payload = build_liquidity_snapshot(
+        normalised_frames,
+        tick_size=tick_size,
+        selection=selection,
+        config=liquidity_config if isinstance(liquidity_config, Mapping) else None,
+    )
+
     data_section = {
         "symbol": symbol,
         "frames": normalised_frames,
@@ -1110,6 +1121,7 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
             "status": "unavailable",
             "detail": "SMT provider is not configured in the snapshot.",
         },
+        "liquidity": liquidity_payload,
         "profile_preset": preset_payload,
         "profile_preset_required": bool(preset_required),
         "profile_defaults": raw_profile_defaults,
