@@ -84,6 +84,15 @@ def _resolve_config(raw: Mapping[str, Any] | None) -> LiquidityConfig:
     return config
 
 
+def _frame_source(frame: Mapping[str, Any] | None) -> str | None:
+    if not isinstance(frame, Mapping):
+        return None
+    source = frame.get("source")
+    if isinstance(source, str):
+        return source
+    return None
+
+
 def _extract_candles(frame: Mapping[str, Any] | None) -> List[Mapping[str, Any]]:
     if not isinstance(frame, Mapping):
         return []
@@ -111,18 +120,27 @@ def _augment_supported_frames(
     minute_candles = _extract_candles(augmented.get("1m"))
     LOGGER.debug(
         "Liquidity minute seed stats",
-        extra={"tf": "1m", "candles": len(minute_candles)},
+        extra={
+            "tf": "1m",
+            "candles": len(minute_candles),
+            "used_source": _frame_source(augmented.get("1m")) or "unknown",
+        },
     )
 
     if not minute_candles:
         return augmented
 
     for target_tf in SUPPORTED_TIMEFRAMES:
-        existing = _extract_candles(augmented.get(target_tf))
+        frame_payload = augmented.get(target_tf)
+        existing = _extract_candles(frame_payload)
         if existing:
             LOGGER.debug(
                 "Liquidity timeframe already present",
-                extra={"tf": target_tf, "candles": len(existing)},
+                extra={
+                    "tf": target_tf,
+                    "candles": len(existing),
+                    "used_source": _frame_source(frame_payload) or "unknown",
+                },
             )
             continue
         interval_ms = TIMEFRAME_TO_MS.get(target_tf)
@@ -131,9 +149,14 @@ def _augment_supported_frames(
         aggregated = resample_ohlcv(minute_candles, interval_ms)
         LOGGER.debug(
             "Liquidity generated higher timeframe",
-            extra={"tf": target_tf, "candles": len(aggregated), "interval_ms": interval_ms},
+            extra={
+                "tf": target_tf,
+                "candles": len(aggregated),
+                "interval_ms": interval_ms,
+                "used_source": "fallback",
+            },
         )
-        augmented[target_tf] = {"candles": aggregated}
+        augmented[target_tf] = {"candles": aggregated, "source": "fallback"}
 
     return augmented
 
@@ -233,10 +256,12 @@ def _cluster_swings(
             LOGGER.debug(
                 "Skipping swing cluster due to size",
                 extra={
-                    "reason": "cluster_too_small",
+                    "reason": "min_points_fail",
                     "tf": timeframe,
                     "level_type": level_type,
                     "swings": swings_ts,
+                    "tolerance": tolerance,
+                    "tick_size": tick_size,
                 },
             )
             continue
@@ -311,16 +336,27 @@ def _prepare_levels(
     )
 
     for timeframe in SUPPORTED_TIMEFRAMES:
-        candles = _extract_candles(frames.get(timeframe))
+        frame_payload = frames.get(timeframe)
+        source_label = _frame_source(frame_payload) or "unknown"
+        candles = _extract_candles(frame_payload)
         candle_count = len(candles)
         LOGGER.debug(
             "Evaluating liquidity swings",
-            extra={"tf": timeframe, "candles": candle_count},
+            extra={
+                "tf": timeframe,
+                "candles": candle_count,
+                "used_source": source_label,
+            },
         )
         if candle_count < 2 * config.swing_window + 1:
             LOGGER.debug(
                 "Skipping liquidity timeframe",
-                extra={"tf": timeframe, "reason": "too_few_bars", "candles": candle_count},
+                extra={
+                    "tf": timeframe,
+                    "reason": "too_few_bars",
+                    "candles": candle_count,
+                    "used_source": source_label,
+                },
             )
             continue
         swings_high = _detect_swings(candles, window=config.swing_window, kind="high")
@@ -334,6 +370,7 @@ def _prepare_levels(
                 "tf": timeframe,
                 "swing_highs": len(swings_high),
                 "swing_lows": len(swings_low),
+                "used_source": source_label,
             },
         )
         eqh_cluster = _cluster_swings(
@@ -363,6 +400,24 @@ def _prepare_levels(
                 extra={"tf": timeframe, "reason": "no_clusters"},
             )
         eql_levels.extend(eql_cluster)
+
+        LOGGER.debug(
+            "Liquidity timeframe summary",
+            extra={
+                "tf": timeframe,
+                "n_bars_total": candle_count,
+                "swing_highs": len(swings_high),
+                "swing_lows": len(swings_low),
+                "eqh_clusters": len(eqh_cluster),
+                "eql_clusters": len(eql_cluster),
+                "tick_size": tick_size,
+                "r_ticks": config.r_ticks,
+                "tolerance": tolerance,
+                "atr_period": config.atr_period,
+                "atr_mult": config.sweep_atr_multiplier,
+                "used_source": source_label,
+            },
+        )
 
     if not eqh_levels:
         LOGGER.debug("No EQH clusters formed", extra={"reason": "no_clusters"})
@@ -438,6 +493,15 @@ def _detect_sweeps(
     sweeps: List[Dict[str, Any]] = []
     tick_min = tick_size if tick_size and tick_size > 0 else 0.0
 
+    LOGGER.debug(
+        "Liquidity sweep detection config",
+        extra={
+            "atr_period": config.atr_period,
+            "atr_mult": config.sweep_atr_multiplier,
+            "tick_size": tick_size,
+        },
+    )
+
     upper_levels_by_tf: Dict[str, List[Mapping[str, Any]]] = {tf: [] for tf in SUPPORTED_TIMEFRAMES}
     lower_levels_by_tf: Dict[str, List[Mapping[str, Any]]] = {tf: [] for tf in SUPPORTED_TIMEFRAMES}
 
@@ -457,9 +521,25 @@ def _detect_sweeps(
             lower_levels_by_tf[tf].append({"type": "pdl", "price": pdl["price"], "t": pdl["t"]})  # type: ignore[index]
 
     for timeframe, levels in upper_levels_by_tf.items():
-        candles = _extract_candles(frames.get(timeframe))
+        frame_payload = frames.get(timeframe)
+        source_label = _frame_source(frame_payload) or "unknown"
+        candles = _extract_candles(frame_payload)
         if not candles:
+            LOGGER.debug(
+                "Skipping sweep evaluation due to empty frame",
+                extra={"tf": timeframe, "reason": "no_candles", "used_source": source_label},
+            )
             continue
+        LOGGER.debug(
+            "Evaluating sweep candidates",
+            extra={
+                "tf": timeframe,
+                "direction": "upper",
+                "candles": len(candles),
+                "levels": len(levels),
+                "used_source": source_label,
+            },
+        )
         atr_values = _compute_atr_series(candles, period=config.atr_period)
         for index, candle in enumerate(candles):
             high = _coerce_float(candle.get("h"))
@@ -499,6 +579,7 @@ def _detect_sweeps(
                             "overshoot": overshoot,
                             "tolerance": min_required,
                             "epsilon": epsilon,
+                            "used_source": source_label,
                         },
                     )
                     continue
@@ -512,6 +593,7 @@ def _detect_sweeps(
                             "overshoot": overshoot,
                             "atr_limit": atr_cap,
                             "epsilon": epsilon,
+                            "used_source": source_label,
                         },
                     )
                     continue
@@ -528,9 +610,25 @@ def _detect_sweeps(
                 )
 
     for timeframe, levels in lower_levels_by_tf.items():
-        candles = _extract_candles(frames.get(timeframe))
+        frame_payload = frames.get(timeframe)
+        source_label = _frame_source(frame_payload) or "unknown"
+        candles = _extract_candles(frame_payload)
         if not candles:
+            LOGGER.debug(
+                "Skipping sweep evaluation due to empty frame",
+                extra={"tf": timeframe, "reason": "no_candles", "used_source": source_label},
+            )
             continue
+        LOGGER.debug(
+            "Evaluating sweep candidates",
+            extra={
+                "tf": timeframe,
+                "direction": "lower",
+                "candles": len(candles),
+                "levels": len(levels),
+                "used_source": source_label,
+            },
+        )
         atr_values = _compute_atr_series(candles, period=config.atr_period)
         for index, candle in enumerate(candles):
             low = _coerce_float(candle.get("l"))
@@ -570,6 +668,7 @@ def _detect_sweeps(
                             "overshoot": overshoot,
                             "tolerance": min_required,
                             "epsilon": epsilon,
+                            "used_source": source_label,
                         },
                     )
                     continue
@@ -583,6 +682,7 @@ def _detect_sweeps(
                             "overshoot": overshoot,
                             "atr_limit": atr_cap,
                             "epsilon": epsilon,
+                            "used_source": source_label,
                         },
                     )
                     continue

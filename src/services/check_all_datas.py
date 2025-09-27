@@ -24,9 +24,12 @@ VALID_HOUR_WINDOWS = {1, 2, 3, 4}
 VALUE_AREA_PCT = 0.70
 
 try:
-    from .ohlc import TIMEFRAME_TO_MS
+    from .ohlc import TIMEFRAME_TO_MS, resample_ohlcv
 except ImportError:  # pragma: no cover - circular import guard
     TIMEFRAME_TO_MS = {"1m": MS_IN_HOUR // 60}
+
+    def resample_ohlcv(*args, **kwargs):  # type: ignore[override]
+        raise ImportError("resample_ohlcv is unavailable")
 
 MINUTE_INTERVAL_MS = TIMEFRAME_TO_MS.get("1m", MS_IN_HOUR // 60)
 
@@ -1300,7 +1303,43 @@ def build_check_all_datas(
     if isinstance(tick_size_value, (int, float)):
         tick_size_numeric = float(tick_size_value)
 
-    liquidity_frames = {tf: {"candles": list(candles)} for tf, candles in frames.items()}
+    liquidity_frames: Dict[str, Dict[str, Any]] = {}
+
+    def _clean_series(series: Sequence[Mapping[str, Any]] | Mapping[str, Any] | None) -> List[Dict[str, Any]]:
+        if not isinstance(series, Sequence):
+            return []
+        return [c for c in series if isinstance(c, Mapping)]  # type: ignore[list-item]
+
+    minute_full = _clean_series(frames.get("1m"))
+    if minute_full:
+        liquidity_frames["1m"] = {"candles": minute_full, "source": "minute"}
+
+    htf_candles = htf_section.get("candles") if isinstance(htf_section, Mapping) else None
+    if isinstance(htf_candles, Mapping):
+        for tf_key in ("15m", "1h", "1d"):
+            series = htf_candles.get(tf_key)
+            cleaned = _clean_series(series)
+            if cleaned:
+                liquidity_frames[tf_key] = {"candles": cleaned, "source": "htf"}
+
+    for tf_key in ("15m", "1h"):
+        if tf_key in liquidity_frames:
+            continue
+        if not minute_full:
+            continue
+        interval_ms = TIMEFRAME_TO_MS.get(tf_key)
+        if not interval_ms:
+            continue
+        aggregated = resample_ohlcv(minute_full, interval_ms)
+        if not aggregated:
+            continue
+        liquidity_frames[tf_key] = {"candles": aggregated, "source": "fallback"}
+
+    if "1d" not in liquidity_frames:
+        daily_series = _clean_series(frames.get("1d"))
+        if daily_series:
+            liquidity_frames["1d"] = {"candles": daily_series, "source": "short_window"}
+
     liquidity_payload = build_liquidity_snapshot(
         liquidity_frames,
         tick_size=tick_size_numeric,

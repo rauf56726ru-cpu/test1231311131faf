@@ -988,6 +988,7 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
     delta_frames: Dict[str, List[Dict[str, Any]]] = {}
     vwap_frames: Dict[str, Dict[str, Any]] = {}
     full_candles_by_tf: Dict[str, List[Mapping[str, Any]]] = {}
+    liquidity_sources: Dict[str, str] = {}
 
     for tf_key, frame in frames.items():
         candles = frame.get("candles", []) if isinstance(frame, Mapping) else []
@@ -1013,6 +1014,12 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
             if isinstance(candle, Mapping)
         ]
         full_candles_by_tf[tf_key] = raw_candles
+        if tf_key == "1m":
+            liquidity_sources[tf_key] = "minute"
+        elif tf_key in {"15m", "1h"}:
+            liquidity_sources.setdefault(tf_key, "short_window")
+        elif tf_key == "1d":
+            liquidity_sources.setdefault(tf_key, "short_window")
 
         filtered_candles = _filter_by_selection(raw_candles, start=start, end=end)
         result["candles"] = filtered_candles
@@ -1034,6 +1041,27 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
             "value": _compute_vwap(filtered_candles),
         }
 
+    for tf_key in ("15m", "1h"):
+        if liquidity_sources.get(tf_key) == "short_window":
+            full_candles_by_tf.pop(tf_key, None)
+            liquidity_sources.pop(tf_key, None)
+
+    htf_candles_map = (
+        htf_section.get("candles")
+        if isinstance(htf_section, Mapping) and isinstance(htf_section.get("candles"), Mapping)
+        else {}
+    )
+    if isinstance(htf_candles_map, Mapping):
+        for tf_key in ("15m", "1h", "1d"):
+            series = htf_candles_map.get(tf_key)
+            if not isinstance(series, Sequence):
+                continue
+            cleaned = [c for c in series if isinstance(c, Mapping)]
+            if not cleaned:
+                continue
+            full_candles_by_tf[tf_key] = cleaned
+            liquidity_sources[tf_key] = "htf"
+
     generated_frames = ensure_higher_timeframes(full_candles_by_tf)
     for tf_key, candles in generated_frames.items():
         filtered_candles = _filter_by_selection(candles, start=start, end=end)
@@ -1054,6 +1082,28 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
             "value": _compute_vwap(filtered_candles),
         }
         full_candles_by_tf[tf_key] = candles
+        liquidity_sources.setdefault(tf_key, "fallback")
+
+    for tf_key in ("15m", "1h"):
+        candles = full_candles_by_tf.get(tf_key)
+        if not candles:
+            continue
+        filtered_candles = _filter_by_selection(candles, start=start, end=end)
+        frame_payload: Dict[str, Any] = {
+            "symbol": symbol,
+            "tf": tf_key,
+            "candles": filtered_candles,
+        }
+        last_candle = candles[-1]
+        frame_payload["last_price"] = _coerce_float(last_candle.get("c")) if isinstance(last_candle, Mapping) else None
+        frame_payload["last_ts"] = last_candle.get("t") if isinstance(last_candle, Mapping) else None
+        normalised_frames[tf_key] = frame_payload
+        diagnostics_frames.setdefault(tf_key, {})
+        delta_frames[tf_key] = _compute_delta_series(filtered_candles)
+        vwap_frames[tf_key] = {
+            "selection": {"start": start, "end": end},
+            "value": _compute_vwap(filtered_candles),
+        }
 
     profile_config = resolve_profile_config(symbol, snapshot.get("meta"))
     preset = profile_config["preset"]
@@ -1166,9 +1216,13 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
     raw_meta = snapshot.get("meta") if isinstance(snapshot.get("meta"), Mapping) else {}
     liquidity_config = raw_meta.get("liquidity") if isinstance(raw_meta, Mapping) else None
     tick_size = float(tick_size_value) if isinstance(tick_size_value, (int, float)) and tick_size_value > 0 else None
-    liquidity_frames = {
-        tf: {"candles": list(candles)} for tf, candles in full_candles_by_tf.items()
-    }
+    liquidity_frames: Dict[str, Dict[str, Any]] = {}
+    for tf, candles in full_candles_by_tf.items():
+        payload: Dict[str, Any] = {"candles": list(candles)}
+        source_label = liquidity_sources.get(tf)
+        if source_label:
+            payload["source"] = source_label
+        liquidity_frames[tf] = payload
     liquidity_payload = build_liquidity_snapshot(
         liquidity_frames,
         tick_size=tick_size,
