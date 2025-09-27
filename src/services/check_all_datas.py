@@ -9,7 +9,8 @@ from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence
 
 import httpx
 
-from .inspection import build_htf_section
+from .inspection import build_htf_section, resolve_liquidity_tick_size
+from .liquidity import build_liquidity_snapshot
 from .presets import resolve_profile_config
 from .profile import build_profile_package
 from .zones import Config as ZonesConfig, detect_zones
@@ -23,9 +24,12 @@ VALID_HOUR_WINDOWS = {1, 2, 3, 4}
 VALUE_AREA_PCT = 0.70
 
 try:
-    from .ohlc import TIMEFRAME_TO_MS
+    from .ohlc import TIMEFRAME_TO_MS, resample_ohlcv
 except ImportError:  # pragma: no cover - circular import guard
     TIMEFRAME_TO_MS = {"1m": MS_IN_HOUR // 60}
+
+    def resample_ohlcv(*args, **kwargs):  # type: ignore[override]
+        raise ImportError("resample_ohlcv is unavailable")
 
 MINUTE_INTERVAL_MS = TIMEFRAME_TO_MS.get("1m", MS_IN_HOUR // 60)
 
@@ -931,7 +935,8 @@ def build_check_all_datas(
     frames["1m"] = minute_candles
 
     symbol = str(snapshot.get("symbol") or snapshot.get("pair") or "UNKNOWN").upper()
-    profile_config = resolve_profile_config(symbol, snapshot.get("meta") if isinstance(snapshot.get("meta"), Mapping) else None)
+    raw_meta = snapshot.get("meta") if isinstance(snapshot.get("meta"), Mapping) else None
+    profile_config = resolve_profile_config(symbol, raw_meta)
     sessions = list(Meta.iter_vwap_sessions())
     profile_tpo: List[Dict[str, Any]] = []
     profile_flat: List[Dict[str, float]] = []
@@ -1131,6 +1136,8 @@ def build_check_all_datas(
     }
     htf_section, htf_quality = build_htf_section(symbol, frames, selection_payload)
 
+    liquidity_config = raw_meta.get("liquidity") if isinstance(raw_meta, Mapping) else None
+
     reference_ts = window_end_ms + MINUTE_INTERVAL_MS
     reference_dt = datetime.fromtimestamp(reference_ts / 1000.0, tz=UTC)
     detailed_start_ts = window_start_ms
@@ -1293,8 +1300,74 @@ def build_check_all_datas(
 
     tick_size_value = profile_config.get("tick_size") if isinstance(profile_config, Mapping) else None
     tick_size_numeric: float | None = None
-    if isinstance(tick_size_value, (int, float)):
+    if isinstance(tick_size_value, (int, float)) and tick_size_value > 0:
         tick_size_numeric = float(tick_size_value)
+
+    liquidity_frames: Dict[str, Dict[str, Any]] = {}
+
+    def _clean_series(series: Sequence[Mapping[str, Any]] | Mapping[str, Any] | None) -> List[Dict[str, Any]]:
+        if not isinstance(series, Sequence):
+            return []
+        return [c for c in series if isinstance(c, Mapping)]  # type: ignore[list-item]
+
+    minute_full = _clean_series(frames.get("1m"))
+    if minute_full:
+        liquidity_frames["1m"] = {"candles": minute_full, "source": "minute"}
+
+    htf_candles = htf_section.get("candles") if isinstance(htf_section, Mapping) else None
+    if isinstance(htf_candles, Mapping):
+        for tf_key in ("15m", "1h", "1d"):
+            series = htf_candles.get(tf_key)
+            cleaned = _clean_series(series)
+            if cleaned:
+                liquidity_frames[tf_key] = {"candles": cleaned, "source": "htf"}
+
+    for tf_key in ("15m", "1h"):
+        if tf_key in liquidity_frames:
+            continue
+        if not minute_full:
+            continue
+        interval_ms = TIMEFRAME_TO_MS.get(tf_key)
+        if not interval_ms:
+            continue
+        aggregated = resample_ohlcv(minute_full, interval_ms)
+        if not aggregated:
+            continue
+        liquidity_frames[tf_key] = {"candles": aggregated, "source": "aggregated"}
+
+    if "1d" not in liquidity_frames:
+        daily_series = _clean_series(frames.get("1d"))
+        if daily_series:
+            liquidity_frames["1d"] = {"candles": daily_series, "source": "short_window"}
+
+    tick_inference_frames: Dict[str, Sequence[Mapping[str, Any]]] = {}
+    for tf_key, payload in liquidity_frames.items():
+        candles = payload.get("candles") if isinstance(payload, Mapping) else None
+        if isinstance(candles, Sequence):
+            tick_inference_frames[tf_key] = [c for c in candles if isinstance(c, Mapping)]  # type: ignore[list-item]
+
+    tick_size_numeric, tick_size_source = resolve_liquidity_tick_size(
+        symbol,
+        tick_size_value,
+        tick_inference_frames,
+        logger=logging.getLogger(__name__),
+    )
+
+    logging.getLogger(__name__).debug(
+        "Liquidity tick size resolved for check-all",  # contextual debug entry
+        extra={
+            "symbol": symbol,
+            "tick_size": tick_size_numeric,
+            "tick_size_source": tick_size_source,
+        },
+    )
+
+    liquidity_payload = build_liquidity_snapshot(
+        liquidity_frames,
+        tick_size=tick_size_numeric,
+        selection=selection_payload,
+        config=liquidity_config if isinstance(liquidity_config, Mapping) else None,
+    )
 
     minute_series = frames.get("1m", [])
     daily_start_ms = _start_of_day_ms(window_end_ms)
@@ -1358,6 +1431,7 @@ def build_check_all_datas(
         "tpo": {"sessions": profile_tpo, "zones": profile_zones},
         "profile": profile_flat,
         "zones": detected_zones,
+        "liquidity": liquidity_payload,
         "data_quality": data_quality_public,
         "htf": htf_section,
         "data_quality_htf": htf_quality,

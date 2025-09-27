@@ -9,6 +9,7 @@ import os
 import re
 from collections import OrderedDict, defaultdict
 from datetime import datetime, timedelta, timezone, time as dtime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import (
     Any,
@@ -25,11 +26,12 @@ from typing import (
 
 import httpx
 
-from .ohlc import TIMEFRAME_WINDOWS, TIMEFRAME_TO_MS, normalise_ohlcv
+from .liquidity import build_liquidity_snapshot
+from .ohlc import TIMEFRAME_WINDOWS, TIMEFRAME_TO_MS, normalise_ohlcv, resample_ohlcv
 from .profile import build_profile_package
 from .presets import resolve_profile_config
 from .zones import Config as ZonesConfig, detect_zones
-from ..meta import Meta
+from ..meta import HARDCODED_TICK_SIZES, Meta
 
 Snapshot = Dict[str, Any]
 
@@ -48,6 +50,9 @@ MS_IN_DAY = 86_400_000
 HTF_TIMEFRAMES: Tuple[str, ...] = ("15m", "1h", "4h", "1d")
 MINUTE_INTERVAL_MS = TIMEFRAME_TO_MS.get("1m", 60_000)
 BINANCE_FAPI_REST = "https://fapi.binance.com/fapi/v1/klines"
+
+_PRICE_FIELDS: Tuple[str, ...] = ("o", "h", "l", "c")
+_MAX_TICK_SAMPLES = 5000
 
 
 def _safe_int(value: object | None) -> int | None:
@@ -150,6 +155,176 @@ def _normalise_minute_rows(
             continue
         minutes[candle["t"]] = candle
     return minutes
+
+
+def ensure_higher_timeframes(
+    candles_by_tf: Mapping[str, Sequence[Mapping[str, Any]]]
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Guarantee 15m and 1h frames by resampling minute candles when missing."""
+
+    logger = logging.getLogger(__name__)
+    minute_seed = candles_by_tf.get("1m")
+    minute_candles: List[Mapping[str, Any]] = (
+        list(minute_seed) if isinstance(minute_seed, Sequence) else []
+    )
+    logger.debug(
+        "Ensuring higher timeframes for liquidity",
+        extra={"seed_tf": "1m", "seed_candles": len(minute_candles)},
+    )
+
+    generated: Dict[str, List[Dict[str, Any]]] = {}
+    if not minute_candles:
+        return generated
+
+    for target_tf in ("15m", "1h"):
+        existing = candles_by_tf.get(target_tf)
+        existing_count = len(existing) if isinstance(existing, Sequence) else 0
+        if existing_count:
+            logger.debug(
+                "Skipping resample for timeframe with existing data",
+                extra={"tf": target_tf, "candles": existing_count},
+            )
+            continue
+        interval_ms = TIMEFRAME_TO_MS.get(target_tf)
+        if not interval_ms:
+            continue
+        aggregated = resample_ohlcv(minute_candles, interval_ms)
+        generated[target_tf] = aggregated
+        logger.debug(
+            "Generated higher timeframe from minute seed",
+            extra={
+                "tf": target_tf,
+                "candles": len(aggregated),
+                "interval_ms": interval_ms,
+            },
+        )
+    return generated
+
+
+def _infer_tick_size_from_frames(
+    frames: Mapping[str, Sequence[Mapping[str, Any]]]
+) -> float | None:
+    """Infer a plausible tick size from OHLCV data when metadata is missing."""
+
+    samples: List[Decimal] = []
+    seen: set[Decimal] = set()
+    for tf_key, candles in frames.items():
+        if not isinstance(candles, Sequence):
+            continue
+        for candle in candles:
+            if not isinstance(candle, Mapping):
+                continue
+            for field in _PRICE_FIELDS:
+                price = _coerce_float(candle.get(field))
+                if price is None:
+                    continue
+                try:
+                    decimal_value = Decimal(str(price))
+                except (InvalidOperation, ValueError):
+                    continue
+                if decimal_value in seen:
+                    continue
+                seen.add(decimal_value)
+                samples.append(decimal_value)
+            if len(samples) >= _MAX_TICK_SAMPLES:
+                break
+        if len(samples) >= _MAX_TICK_SAMPLES:
+            break
+
+    if len(samples) < 2:
+        return None
+
+    samples.sort()
+    min_step: Decimal | None = None
+    previous = samples[0]
+    for current in samples[1:]:
+        diff = current - previous
+        if diff > 0:
+            if min_step is None or diff < min_step:
+                min_step = diff
+                if min_step == 0:
+                    min_step = None
+        previous = current
+
+    if min_step is not None and min_step > 0:
+        return float(min_step)
+
+    max_precision = 0
+    for value in samples:
+        exponent = -value.as_tuple().exponent
+        if exponent > max_precision:
+            max_precision = exponent
+
+    if max_precision > 0:
+        return float(10 ** (-max_precision))
+    return None
+
+
+def resolve_liquidity_tick_size(
+    symbol: str,
+    profile_tick_size: Any,
+    frames: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    logger: logging.Logger | None = None,
+) -> Tuple[float, str]:
+    """Resolve a positive tick size for liquidity detection with fallbacks."""
+
+    log = logger or logging.getLogger(__name__)
+    symbol_key = (symbol or "UNKNOWN").upper()
+
+    profile_numeric: float | None = None
+    if isinstance(profile_tick_size, (int, float)):
+        profile_numeric = float(profile_tick_size)
+    elif isinstance(profile_tick_size, str):
+        try:
+            profile_numeric = float(profile_tick_size)
+        except (TypeError, ValueError):
+            profile_numeric = None
+
+    if profile_numeric is not None and profile_numeric > 0:
+        tick_size = profile_numeric
+        tick_source = "tick_size_from_profile"
+        log.debug(
+            "Resolved liquidity tick size from profile",
+            extra={"symbol": symbol_key, "tick_size": tick_size, "tick_size_source": tick_source},
+        )
+        return tick_size, tick_source
+
+    hardcoded = HARDCODED_TICK_SIZES.get(symbol_key)
+    if isinstance(hardcoded, (int, float)) and hardcoded > 0:
+        tick_size = float(hardcoded)
+        tick_source = "tick_size_from_hardcoded"
+        log.debug(
+            "Using hardcoded liquidity tick size fallback",
+            extra={"symbol": symbol_key, "tick_size": tick_size, "tick_size_source": tick_source},
+        )
+        return tick_size, tick_source
+
+    tick_source = "tick_size_from_auto"
+    log.warning(
+        "Profile tick size missing; attempting auto inference",
+        extra={"symbol": symbol_key, "tick_size_source": tick_source},
+    )
+
+    inferred = _infer_tick_size_from_frames(frames)
+    if inferred is not None and inferred > 0:
+        tick_size = float(inferred)
+        log.debug(
+            "Auto-inferred liquidity tick size",
+            extra={"symbol": symbol_key, "tick_size": tick_size, "tick_size_source": tick_source},
+        )
+        return tick_size, tick_source
+
+    tick_size = 1.0
+    log.warning(
+        "Auto tick size inference failed; defaulting to 1.0",
+        extra={"symbol": symbol_key, "tick_size_source": tick_source},
+    )
+    log.debug(
+        "Using default liquidity tick size after inference failure",
+        extra={"symbol": symbol_key, "tick_size": tick_size, "tick_size_source": tick_source},
+    )
+    return tick_size, tick_source
 
 
 def _expected_minute_sequence(start_ms: int, end_ms: int) -> List[int]:
@@ -942,6 +1117,8 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
     diagnostics_frames: Dict[str, Any] = {}
     delta_frames: Dict[str, List[Dict[str, Any]]] = {}
     vwap_frames: Dict[str, Dict[str, Any]] = {}
+    full_candles_by_tf: Dict[str, List[Mapping[str, Any]]] = {}
+    liquidity_sources: Dict[str, str] = {}
 
     for tf_key, frame in frames.items():
         candles = frame.get("candles", []) if isinstance(frame, Mapping) else []
@@ -960,7 +1137,21 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
         )
         diagnostics = result.pop("diagnostics", {})
 
-        filtered_candles = _filter_by_selection(result.get("candles", []), start=start, end=end)
+        raw_candles_seq = result.get("candles", [])
+        raw_candles = [
+            candle
+            for candle in raw_candles_seq
+            if isinstance(candle, Mapping)
+        ]
+        full_candles_by_tf[tf_key] = raw_candles
+        if tf_key == "1m":
+            liquidity_sources[tf_key] = "minute"
+        elif tf_key in {"15m", "1h"}:
+            liquidity_sources.setdefault(tf_key, "short_window")
+        elif tf_key == "1d":
+            liquidity_sources.setdefault(tf_key, "short_window")
+
+        filtered_candles = _filter_by_selection(raw_candles, start=start, end=end)
         result["candles"] = filtered_candles
 
         if isinstance(diagnostics, Mapping):
@@ -974,6 +1165,70 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
 
         normalised_frames[tf_key] = result
         diagnostics_frames[tf_key] = diagnostics
+        delta_frames[tf_key] = _compute_delta_series(filtered_candles)
+        vwap_frames[tf_key] = {
+            "selection": {"start": start, "end": end},
+            "value": _compute_vwap(filtered_candles),
+        }
+
+    for tf_key in ("15m", "1h"):
+        if liquidity_sources.get(tf_key) == "short_window":
+            full_candles_by_tf.pop(tf_key, None)
+            liquidity_sources.pop(tf_key, None)
+
+    htf_candles_map = (
+        htf_section.get("candles")
+        if isinstance(htf_section, Mapping) and isinstance(htf_section.get("candles"), Mapping)
+        else {}
+    )
+    if isinstance(htf_candles_map, Mapping):
+        for tf_key in ("15m", "1h", "1d"):
+            series = htf_candles_map.get(tf_key)
+            if not isinstance(series, Sequence):
+                continue
+            cleaned = [c for c in series if isinstance(c, Mapping)]
+            if not cleaned:
+                continue
+            full_candles_by_tf[tf_key] = cleaned
+            liquidity_sources[tf_key] = "htf"
+
+    generated_frames = ensure_higher_timeframes(full_candles_by_tf)
+    for tf_key, candles in generated_frames.items():
+        filtered_candles = _filter_by_selection(candles, start=start, end=end)
+        frame_payload: Dict[str, Any] = {
+            "symbol": symbol,
+            "tf": tf_key,
+            "candles": filtered_candles,
+        }
+        if candles:
+            last_candle = candles[-1]
+            frame_payload["last_price"] = _coerce_float(last_candle.get("c"))
+            frame_payload["last_ts"] = last_candle.get("t")
+        normalised_frames[tf_key] = frame_payload
+        diagnostics_frames.setdefault(tf_key, {})
+        delta_frames[tf_key] = _compute_delta_series(filtered_candles)
+        vwap_frames[tf_key] = {
+            "selection": {"start": start, "end": end},
+            "value": _compute_vwap(filtered_candles),
+        }
+        full_candles_by_tf[tf_key] = candles
+        liquidity_sources.setdefault(tf_key, "aggregated")
+
+    for tf_key in ("15m", "1h"):
+        candles = full_candles_by_tf.get(tf_key)
+        if not candles:
+            continue
+        filtered_candles = _filter_by_selection(candles, start=start, end=end)
+        frame_payload: Dict[str, Any] = {
+            "symbol": symbol,
+            "tf": tf_key,
+            "candles": filtered_candles,
+        }
+        last_candle = candles[-1]
+        frame_payload["last_price"] = _coerce_float(last_candle.get("c")) if isinstance(last_candle, Mapping) else None
+        frame_payload["last_ts"] = last_candle.get("t") if isinstance(last_candle, Mapping) else None
+        normalised_frames[tf_key] = frame_payload
+        diagnostics_frames.setdefault(tf_key, {})
         delta_frames[tf_key] = _compute_delta_series(filtered_candles)
         vwap_frames[tf_key] = {
             "selection": {"start": start, "end": end},
@@ -1088,6 +1343,53 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
                 "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
             }
 
+    raw_meta = snapshot.get("meta") if isinstance(snapshot.get("meta"), Mapping) else {}
+    liquidity_config = raw_meta.get("liquidity") if isinstance(raw_meta, Mapping) else None
+    tick_size, tick_size_source = resolve_liquidity_tick_size(
+        symbol,
+        tick_size_value,
+        full_candles_by_tf,
+        logger=logging.getLogger(__name__),
+    )
+    liquidity_frames: Dict[str, Dict[str, Any]] = {}
+    for tf, candles in full_candles_by_tf.items():
+        payload: Dict[str, Any] = {"candles": list(candles)}
+        source_label = liquidity_sources.get(tf)
+        if source_label:
+            payload["source"] = source_label
+        liquidity_frames[tf] = payload
+    liquidity_payload = build_liquidity_snapshot(
+        liquidity_frames,
+        tick_size=tick_size,
+        selection=selection,
+        config=liquidity_config if isinstance(liquidity_config, Mapping) else None,
+    )
+
+    liquidity_diagnostics: Dict[str, Any] = {}
+    if isinstance(liquidity_payload, Mapping):
+        diagnostics_payload = liquidity_payload.get("diagnostics")
+        if isinstance(diagnostics_payload, Mapping):
+            liquidity_diagnostics = diagnostics_payload
+        liquidity_payload = dict(liquidity_payload)
+        liquidity_payload.pop("diagnostics", None)
+    else:
+        liquidity_payload = {
+            "eqh": [],
+            "eql": [],
+            "pdh": None,
+            "pdl": None,
+            "sweeps": [],
+        }
+
+    logging.getLogger(__name__).debug(
+        "Liquidity tick size applied",
+        extra={
+            "symbol": symbol,
+            "tick_size": tick_size,
+            "tick_size_source": tick_size_source,
+        },
+    )
+
     data_section = {
         "symbol": symbol,
         "frames": normalised_frames,
@@ -1110,6 +1412,7 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
             "status": "unavailable",
             "detail": "SMT provider is not configured in the snapshot.",
         },
+        "liquidity": liquidity_payload,
         "profile_preset": preset_payload,
         "profile_preset_required": bool(preset_required),
         "profile_defaults": raw_profile_defaults,
@@ -1128,6 +1431,7 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
         "snapshot_id": snapshot.get("id"),
         "captured_at": snapshot.get("captured_at"),
         "frames": diagnostics_frames,
+        "liquidity": liquidity_diagnostics,
     }
 
     return {"DATA": data_section, "DIAGNOSTICS": diagnostics_section}
@@ -1316,6 +1620,34 @@ def render_inspection_page(
       background: rgba(30, 41, 59, 0.6);
       border: 1px solid rgba(148, 163, 184, 0.18);
       font-size: 0.85rem;
+    }
+    .chart-toolbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+    }
+    .tf-toggle {
+      display: inline-flex;
+      gap: 0.4rem;
+      padding: 0.2rem;
+      border-radius: 999px;
+      background: rgba(30, 41, 59, 0.6);
+      border: 1px solid rgba(148, 163, 184, 0.24);
+    }
+    .tf-toggle button {
+      border-radius: 999px;
+      background: transparent;
+      padding: 0.45rem 0.9rem;
+      color: var(--fg);
+      border: none;
+      font-weight: 600;
+    }
+    .tf-toggle button.active {
+      background: var(--accent);
+      color: #0f172a;
+      box-shadow: 0 12px 26px rgba(14, 165, 233, 0.25);
     }
     .badge {
       display: inline-flex;
@@ -2234,6 +2566,7 @@ def render_inspection_page(
     const buildButton = document.getElementById("build-session");
     const clearSelection = document.getElementById("clear-selection");
     const timeframeCheckboxes = Array.from(document.querySelectorAll("[data-tf-checkbox]"));
+    const timeframeToggle = document.getElementById("chart-tf-toggle");
     const statusEl = document.getElementById("inspection-status");
     const metricButtons = Array.from(document.querySelectorAll("[data-metric]"));
     const symbolInput = document.getElementById("symbol-input");
@@ -2271,11 +2604,41 @@ def render_inspection_page(
       return Math.min(4, Math.max(1, Math.floor(parsed)));
     };
 
+    const PREFERRED_CHART_FRAMES = ["15m", "1h", "1m"];
+
+    function frameHasCandles(frames, tf) {
+      if (!frames || !tf) return false;
+      const entry = frames[tf];
+      if (!entry || typeof entry !== "object") return false;
+      const candles = Array.isArray(entry.candles) ? entry.candles : [];
+      return candles.length > 0;
+    }
+
+    function selectPreferredFrame(frames, desired) {
+      const frameMap = frames || {};
+      if (desired && frameHasCandles(frameMap, desired)) {
+        return desired;
+      }
+      for (const tf of PREFERRED_CHART_FRAMES) {
+        if (frameHasCandles(frameMap, tf)) {
+          return tf;
+        }
+      }
+      const keys = Object.keys(frameMap);
+      if (keys.length) {
+        return keys.sort()[0];
+      }
+      return desired || PREFERRED_CHART_FRAMES[0];
+    }
+
+    const initialFrameMap = initial.payload?.DATA?.frames || {};
+    const defaultFrame = selectPreferredFrame(initialFrameMap, initial.timeframe);
+
     const state = {
       payload: initial.payload || null,
       snapshotId: initial.snapshotId || null,
       selection: initial.payload?.DATA?.selection || null,
-      frame: initial.timeframe || initial.payload?.DATA?.meta?.requested?.frames?.[0] || "1m",
+      frame: defaultFrame,
       chart: null,
       series: null,
       checkAll: null,
@@ -2629,7 +2992,14 @@ def render_inspection_page(
       if (!frameSelect) return;
       frameSelect.innerHTML = "";
       const frames = payload?.DATA?.frames || {};
-      const keys = Object.keys(frames);
+      const keys = Object.keys(frames).sort((a, b) => {
+        const weight = (key) => {
+          const idx = PREFERRED_CHART_FRAMES.indexOf(key);
+          return idx === -1 ? PREFERRED_CHART_FRAMES.length : idx;
+        };
+        const diff = weight(a) - weight(b);
+        return diff !== 0 ? diff : a.localeCompare(b);
+      });
       for (const key of keys) {
         const option = document.createElement("option");
         option.value = key;
@@ -2637,9 +3007,22 @@ def render_inspection_page(
         frameSelect.append(option);
       }
       if (keys.length) {
-        const target = keys.includes(state.frame) ? state.frame : keys[0];
+        const target = selectPreferredFrame(frames, state.frame);
         frameSelect.value = target;
         state.frame = target;
+      }
+      updateTimeframeToggle();
+    }
+
+    function updateTimeframeToggle() {
+      if (!timeframeToggle) return;
+      const frames = state.payload?.DATA?.frames || {};
+      const buttons = Array.from(timeframeToggle.querySelectorAll("[data-tf]"));
+      for (const button of buttons) {
+        const tf = button.dataset.tf;
+        const enabled = frameHasCandles(frames, tf);
+        button.disabled = !enabled;
+        button.classList.toggle("active", enabled && state.frame === tf);
       }
     }
 
@@ -2854,6 +3237,7 @@ def render_inspection_page(
         state.chart.timeScale().fitContent();
       }
       updateSelectionLabel();
+      updateTimeframeToggle();
     }
 
     async function refreshSnapshots() {
@@ -2910,6 +3294,22 @@ def render_inspection_page(
       frameSelect.addEventListener("change", () => {
         state.frame = frameSelect.value;
         renderChart();
+        updateTimeframeToggle();
+      });
+    }
+
+    if (timeframeToggle) {
+      timeframeToggle.addEventListener("click", (event) => {
+        const button = event.target.closest("[data-tf]");
+        if (!button || button.disabled) return;
+        const tf = button.dataset.tf;
+        if (!tf) return;
+        state.frame = tf;
+        if (frameSelect) {
+          frameSelect.value = tf;
+        }
+        renderChart();
+        updateTimeframeToggle();
       });
     }
 
@@ -4077,6 +4477,14 @@ def render_inspection_page(
 
           <section class=\"panel\">
             <h2>Просмотр данных</h2>
+            <div class=\"chart-toolbar\">
+              <span class=\"badge\">Таймфрейм</span>
+              <div class=\"tf-toggle\" id=\"chart-tf-toggle\">
+                <button type=\"button\" data-tf=\"1m\">1m</button>
+                <button type=\"button\" data-tf=\"15m\">15m</button>
+                <button type=\"button\" data-tf=\"1h\">1h</button>
+              </div>
+            </div>
             <div id=\"inspection-chart\" class=\"chart-shell\" data-selection-label=\"—\"></div>
             <div class=\"metrics-bar\">
               <button class=\"secondary\" type=\"button\" data-metric=\"ohlcv\">OHLCV</button>

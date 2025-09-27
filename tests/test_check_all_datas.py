@@ -331,6 +331,9 @@ def test_historical_snapshot_still_populates_window(client: TestClient) -> None:
     assert "profile" in body and isinstance(body["profile"], list)
     assert "zones" in body and isinstance(body["zones"], dict)
     assert body["zones"].get("zones") is not None
+    liquidity_section = body.get("liquidity")
+    assert isinstance(liquidity_section, dict)
+    assert {"eqh", "eql", "pdh", "pdl", "sweeps"}.issubset(liquidity_section)
     assert "htf" in body and isinstance(body["htf"], dict)
     assert set(body["htf"].get("candles", {}).keys()).issuperset({"15m", "1h", "4h", "1d"})
     dq_htf = body.get("data_quality_htf")
@@ -511,6 +514,8 @@ def test_check_all_after_reload_returns_data(client: TestClient) -> None:
         == total_minutes
     )
     assert body["datas_for_last_N_hours"]["hours"] == 3
+    liquidity_section = body.get("liquidity")
+    assert isinstance(liquidity_section, dict)
     detailed_start_ms = window_start_ms
     expected_detailed_start = datetime.fromtimestamp(
         detailed_start_ms / 1000, tz=timezone.utc

@@ -28,6 +28,7 @@ from .presets import (
     save_preset,
     update_preset,
 )
+from .liquidity import build_liquidity_snapshot
 from .ohlc import (
     TIMEFRAME_WINDOWS,
     fetch_ohlcv,
@@ -40,6 +41,7 @@ from .trades import AggTradeCollector
 
 __all__ = [
     "build_inspection_payload",
+    "build_liquidity_snapshot",
     "build_check_all_datas",
     "build_placeholder_snapshot",
     "DEFAULT_SYMBOL",

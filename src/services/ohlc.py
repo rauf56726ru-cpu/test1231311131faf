@@ -6,6 +6,7 @@ import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import (
+    Any,
     Awaitable,
     Callable,
     Dict,
@@ -141,6 +142,62 @@ def _to_candle_mapping(row: Mapping[str, object] | Sequence[object]) -> Candle |
         c=float(close_price),
         v=float(volume),
     )
+
+
+def resample_ohlcv(
+    candles: Sequence[Mapping[str, Any]],
+    interval_ms: int,
+) -> List[Dict[str, float | int]]:
+    """Aggregate minute candles into a higher timeframe bucket."""
+
+    if interval_ms <= 0:
+        raise ValueError("interval_ms must be positive")
+
+    buckets: Dict[int, Dict[str, float]] = {}
+    for candle in candles:
+        if not isinstance(candle, Mapping):
+            continue
+        timestamp = candle.get("t")
+        open_price = candle.get("o")
+        high_price = candle.get("h")
+        low_price = candle.get("l")
+        close_price = candle.get("c")
+        volume_value = candle.get("v", 0.0)
+
+        if not isinstance(timestamp, (int, float)):
+            continue
+
+        try:
+            o_value = float(open_price)
+            h_value = float(high_price)
+            l_value = float(low_price)
+            c_value = float(close_price)
+            v_value = float(volume_value) if volume_value is not None else 0.0
+        except (TypeError, ValueError):
+            continue
+
+        if not math.isfinite(o_value) or not math.isfinite(h_value) or not math.isfinite(l_value) or not math.isfinite(c_value):
+            continue
+
+        bucket_start = _align_to_interval(int(timestamp), interval_ms)
+        bucket = buckets.get(bucket_start)
+        if bucket is None:
+            bucket = {
+                "t": int(bucket_start),
+                "o": o_value,
+                "h": h_value,
+                "l": l_value,
+                "c": c_value,
+                "v": v_value,
+            }
+            buckets[bucket_start] = bucket
+        else:
+            bucket["h"] = max(bucket["h"], h_value)
+            bucket["l"] = min(bucket["l"], l_value)
+            bucket["c"] = c_value
+            bucket["v"] += v_value
+
+    return [buckets[key] for key in sorted(buckets)]
 
 
 def _ensure_cache_entry(symbol: str, timeframe: str) -> CandleCache:
