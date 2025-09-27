@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence
+
+import httpx
 
 from .presets import resolve_profile_config
 from .profile import build_profile_package
@@ -22,6 +25,238 @@ except ImportError:  # pragma: no cover - circular import guard
     TIMEFRAME_TO_MS = {"1m": MS_IN_HOUR // 60}
 
 MINUTE_INTERVAL_MS = TIMEFRAME_TO_MS.get("1m", MS_IN_HOUR // 60)
+
+BINANCE_FAPI_REST = "https://fapi.binance.com/fapi/v1/klines"
+_RETRYABLE_STATUS = {418, 429, 500, 502, 503, 504}
+_MAX_RETRIES = 5
+
+
+class DataQualityError(RuntimeError):
+    """Raised when the inspected snapshot fails deterministic data checks."""
+
+    def __init__(self, detail: Mapping[str, Any]):
+        super().__init__("Market data continuity validation failed")
+        self.detail = dict(detail)
+
+
+class BinanceDownloadError(RuntimeError):
+    """Raised when Binance minute candles could not be fetched fully."""
+
+    def __init__(self, downloaded: int, message: str):
+        super().__init__(message)
+        self.downloaded = int(downloaded)
+
+
+def _align_to_interval(value: int, interval_ms: int) -> int:
+    if interval_ms <= 0:
+        raise ValueError("interval_ms must be positive")
+    return (value // interval_ms) * interval_ms
+
+
+def _deduplicate_sorted(
+    candles: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Return candles sorted by timestamp with the last occurrence kept."""
+
+    seen: Dict[int, Dict[str, Any]] = {}
+    for candle in candles:
+        ts = _safe_int(candle.get("t"))
+        if ts is None:
+            continue
+        seen[ts] = {
+            "t": ts,
+            "o": _coerce_float(candle.get("o")),
+            "h": _coerce_float(candle.get("h")),
+            "l": _coerce_float(candle.get("l")),
+            "c": _coerce_float(candle.get("c")),
+            "v": _coerce_float(candle.get("v")),
+        }
+
+    ordered_times = sorted(seen)
+    return [seen[ts] for ts in ordered_times]
+
+
+def _build_expected_times(start_ms: int, end_ms: int, interval_ms: int) -> List[int]:
+    if end_ms < start_ms:
+        return []
+    steps = ((end_ms - start_ms) // interval_ms) + 1
+    return [start_ms + index * interval_ms for index in range(steps)]
+
+
+def _summarise_missing_times(
+    expected: Sequence[int],
+    available: Mapping[int, Mapping[str, Any]],
+) -> List[Dict[str, int]]:
+    gaps: List[Dict[str, int]] = []
+    current_start: int | None = None
+    current_count = 0
+
+    for ts in expected:
+        if ts not in available:
+            if current_start is None:
+                current_start = ts
+                current_count = 1
+            else:
+                current_count += 1
+        elif current_start is not None:
+            gaps.append({"from": current_start, "to": ts - MINUTE_INTERVAL_MS, "count": current_count})
+            current_start = None
+            current_count = 0
+
+    if current_start is not None:
+        last_missing_ts = expected[-1]
+        gaps.append({"from": current_start, "to": last_missing_ts, "count": current_count})
+
+    return gaps
+
+
+def _normalise_binance_row(row: Sequence[object]) -> Dict[str, Any] | None:
+    try:
+        open_time = int(row[0])
+        open_price = float(row[1])
+        high_price = float(row[2])
+        low_price = float(row[3])
+        close_price = float(row[4])
+        volume = float(row[5])
+    except (IndexError, TypeError, ValueError):
+        return None
+    return {
+        "t": open_time,
+        "o": open_price,
+        "h": high_price,
+        "l": low_price,
+        "c": close_price,
+        "v": volume,
+    }
+
+
+def _request_binance_minutes(
+    client: httpx.Client,
+    symbol: str,
+    start_ms: int,
+    end_ms: int,
+    *,
+    limit: int,
+) -> List[Sequence[object]]:
+    params = {
+        "symbol": symbol.upper(),
+        "interval": "1m",
+        "startTime": str(start_ms),
+        "endTime": str(end_ms),
+        "limit": str(limit),
+    }
+
+    delay = 0.5
+    for attempt in range(_MAX_RETRIES):
+        try:
+            response = client.get(BINANCE_FAPI_REST, params=params)
+            response.raise_for_status()
+            data = response.json()
+            if isinstance(data, list):
+                return data  # type: ignore[return-value]
+            return []
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status in _RETRYABLE_STATUS and attempt < _MAX_RETRIES - 1:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise
+        except httpx.RequestError:
+            if attempt < _MAX_RETRIES - 1:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise
+    return []
+
+
+def _download_missing_minutes(
+    symbol: str,
+    start_ms: int,
+    end_ms: int,
+    gaps: Sequence[Mapping[str, int]],
+) -> List[Dict[str, Any]]:
+    if not gaps:
+        return []
+
+    fetched: List[Dict[str, Any]] = []
+    downloaded = 0
+
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            for gap in gaps:
+                gap_start = int(gap["from"])
+                gap_end = int(gap["to"])
+                cursor = gap_start
+                while cursor <= gap_end:
+                    chunk_end = min(
+                        gap_end,
+                        cursor + (1000 - 1) * MINUTE_INTERVAL_MS,
+                    )
+                    request_end = chunk_end + MINUTE_INTERVAL_MS
+                    raw_rows = _request_binance_minutes(
+                        client,
+                        symbol,
+                        cursor,
+                        request_end,
+                        limit=1000,
+                    )
+                    if not raw_rows:
+                        break
+
+                    last_open = None
+                    for row in raw_rows:
+                        candle = _normalise_binance_row(row)
+                        if candle is None:
+                            continue
+                        ts = candle["t"]
+                        if ts < start_ms or ts > end_ms:
+                            continue
+                        fetched.append(candle)
+                        downloaded += 1
+                        last_open = ts
+
+                    if last_open is None:
+                        break
+                    cursor = last_open + MINUTE_INTERVAL_MS
+                    if cursor > gap_end:
+                        break
+    except (httpx.HTTPError, httpx.TransportError) as exc:  # pragma: no cover - defensive
+        raise BinanceDownloadError(downloaded, str(exc)) from exc
+
+    return fetched
+
+
+def _aggregate_from_minutes(
+    minute_index: Mapping[int, Mapping[str, Any]],
+    open_time: int,
+    interval_ms: int,
+) -> Dict[str, Any] | None:
+    end_exclusive = open_time + interval_ms
+    cursor = open_time
+    bucket: List[Mapping[str, Any]] = []
+
+    while cursor < end_exclusive:
+        candle = minute_index.get(cursor)
+        if candle is None:
+            return None
+        bucket.append(candle)
+        cursor += MINUTE_INTERVAL_MS
+
+    if not bucket:
+        return None
+
+    high = max(item["h"] for item in bucket)
+    low = min(item["l"] for item in bucket)
+    return {
+        "t": open_time,
+        "o": bucket[0]["o"],
+        "h": high,
+        "l": low,
+        "c": bucket[-1]["c"],
+        "v": sum(item["v"] for item in bucket),
+    }
 
 
 def _coerce_float(value: Any) -> float:
@@ -497,13 +732,12 @@ def build_check_all_datas(
     if not primary_candles:
         return None
 
-    _ensure_minute_frame(frames, primary_key=primary_key, primary_candles=primary_candles)
-
     # Drop unused granularities to keep the payload focused on the requested set.
     frames.pop("3m", None)
     frames.pop("5m", None)
 
-    minute_candles = frames.get("1m", [])
+    minute_candles = _deduplicate_sorted(frames.get("1m", []))
+    frames["1m"] = minute_candles
 
     symbol = str(snapshot.get("symbol") or snapshot.get("pair") or "UNKNOWN").upper()
     profile_config = resolve_profile_config(symbol, snapshot.get("meta") if isinstance(snapshot.get("meta"), Mapping) else None)
@@ -517,11 +751,23 @@ def build_check_all_datas(
     }
 
     target_tf_key = profile_config.get("target_tf_key", "1m")
-    base_candles = frames.get(target_tf_key, [])
-    if not base_candles:
-        base_candles = minute_candles
-    if not base_candles and frames:
-        base_candles = next(iter(frames.values()))
+    base_candidates = frames.get(target_tf_key, [])
+    if not base_candidates:
+        base_candidates = minute_candles
+    if not base_candidates and frames:
+        base_candidates = next(iter(frames.values()))
+    base_candles = _deduplicate_sorted(base_candidates)
+    frames[target_tf_key] = base_candles
+
+    if primary_key == "1m":
+        primary_candles = minute_candles
+    elif primary_key == target_tf_key:
+        primary_candles = base_candles
+    else:
+        primary_candles = _deduplicate_sorted(frames.get(primary_key, []))
+        frames[primary_key] = primary_candles
+        if not primary_candles:
+            primary_candles = base_candles
 
     if profile_config.get("preset") and base_candles and sessions:
         cache_token = (
@@ -546,84 +792,158 @@ def build_check_all_datas(
         )
 
     snapshot_selection = snapshot.get("selection") if isinstance(snapshot.get("selection"), Mapping) else None
-    start_ms = selection_start_ms or _safe_int(snapshot_selection.get("start")) if snapshot_selection else None
-    end_ms = selection_end_ms or _safe_int(snapshot_selection.get("end")) if snapshot_selection else None
+    selection_start = selection_start_ms or _safe_int(snapshot_selection.get("start")) if snapshot_selection else None
+    selection_end = selection_end_ms or _safe_int(snapshot_selection.get("end")) if snapshot_selection else None
 
-    if start_ms is None:
-        start_ms = primary_candles[0]["t"]
-    if end_ms is None:
-        end_ms = primary_candles[-1]["t"]
+    if selection_start is None:
+        selection_start = primary_candles[0]["t"]
+    if selection_end is None:
+        selection_end = primary_candles[-1]["t"]
 
-    if start_ms > end_ms:
-        start_ms, end_ms = end_ms, start_ms
-
-    latest_minute_candle = _latest_candle_before(minute_candles, end_ms=end_ms)
-    latest_primary_candle = _latest_candle_before(primary_candles, end_ms=end_ms)
-
-    derived_reference_ts: int | None = None
-    if latest_minute_candle is not None:
-        last_minute_open = _safe_int(latest_minute_candle.get("t"))
-        if last_minute_open is not None:
-            derived_reference_ts = last_minute_open + MINUTE_INTERVAL_MS
-    if derived_reference_ts is None and latest_primary_candle is not None:
-        interval_ms = _timeframe_interval_ms(primary_key) or 0
-        if interval_ms > 0:
-            base_ts = _safe_int(latest_primary_candle.get("t"))
-            if base_ts is not None:
-                derived_reference_ts = base_ts + max(0, interval_ms - MINUTE_INTERVAL_MS)
-    if derived_reference_ts is None:
-        for candles in frames.values():
-            candidate = _latest_candle_before(candles, end_ms=end_ms)
-            if not candidate:
-                continue
-            candidate_ts = _safe_int(candidate.get("t"))
-            if candidate_ts is None:
-                continue
-            if derived_reference_ts is None or candidate_ts > derived_reference_ts:
-                derived_reference_ts = candidate_ts
-    if derived_reference_ts is None and latest_primary_candle is not None:
-        base_ts = _safe_int(latest_primary_candle.get("t"))
-        if base_ts is not None:
-            derived_reference_ts = base_ts
-    if derived_reference_ts is None:
-        fallback_ts = _safe_int(primary_candles[-1].get("t"))
-        derived_reference_ts = fallback_ts if fallback_ts is not None else primary_candles[-1]["t"]
-
-    if end_ms is not None and derived_reference_ts is not None:
-        interval_ms = _timeframe_interval_ms(primary_key) or MINUTE_INTERVAL_MS
-        derived_reference_ts = min(derived_reference_ts, end_ms + interval_ms)
-    if start_ms is not None and derived_reference_ts is not None:
-        derived_reference_ts = max(derived_reference_ts, start_ms)
-
-    effective_end_ms = derived_reference_ts if derived_reference_ts is not None else end_ms
-    if effective_end_ms is not None and effective_end_ms != end_ms:
-        adjusted_minute = _latest_candle_before(minute_candles, end_ms=effective_end_ms)
-        if adjusted_minute is not None:
-            latest_minute_candle = adjusted_minute
-        adjusted_primary = _latest_candle_before(primary_candles, end_ms=effective_end_ms)
-        if adjusted_primary is not None:
-            latest_primary_candle = adjusted_primary
+    if selection_start > selection_end:
+        selection_start, selection_end = selection_end, selection_start
 
     hours_window = hours if hours in VALID_HOUR_WINDOWS else min(VALID_HOUR_WINDOWS)
 
     if now_utc is not None:
         if now_utc.tzinfo is None:
-            reference_dt = now_utc.replace(tzinfo=UTC)
+            now_dt = now_utc.replace(tzinfo=UTC)
         else:
-            reference_dt = now_utc.astimezone(UTC)
-        reference_ts = int(reference_dt.timestamp() * 1000)
+            now_dt = now_utc.astimezone(UTC)
+        now_ms = int(now_dt.timestamp() * 1000)
+        window_end_ms = _align_to_interval(now_ms, MINUTE_INTERVAL_MS) - MINUTE_INTERVAL_MS
     else:
-        reference_ts = derived_reference_ts
-        reference_dt = datetime.fromtimestamp(reference_ts / 1000.0, tz=UTC)
+        window_end_ms = minute_candles[-1]["t"] if minute_candles else None
 
-    detailed_start_ts = reference_ts - hours_window * MS_IN_HOUR
+    target_interval_ms = _timeframe_interval_ms(target_tf_key) or MINUTE_INTERVAL_MS
+
+    if window_end_ms is None and base_candles:
+        window_end_ms = base_candles[-1]["t"] + max(target_interval_ms - MINUTE_INTERVAL_MS, 0)
+
+    if window_end_ms is None and primary_candles:
+        primary_interval = _timeframe_interval_ms(primary_key) or MINUTE_INTERVAL_MS
+        window_end_ms = primary_candles[-1]["t"] + max(primary_interval - MINUTE_INTERVAL_MS, 0)
+
+    if window_end_ms is None:
+        return None
+
+    window_end_ms = max(0, _align_to_interval(window_end_ms, MINUTE_INTERVAL_MS))
+
+    raw_window_start = window_end_ms - hours_window * MS_IN_HOUR
+    window_start_ms = max(0, _align_to_interval(raw_window_start, MINUTE_INTERVAL_MS))
+    if target_interval_ms > MINUTE_INTERVAL_MS:
+        window_start_ms = max(0, _align_to_interval(window_start_ms, target_interval_ms))
+
+    minute_index_all = {candle["t"]: candle for candle in minute_candles}
+    minute_window_index = {
+        ts: candle
+        for ts, candle in minute_index_all.items()
+        if window_start_ms <= ts <= window_end_ms
+    }
+
+    expected_minutes = _build_expected_times(window_start_ms, window_end_ms, MINUTE_INTERVAL_MS)
+    time_gaps = _summarise_missing_times(expected_minutes, minute_window_index)
+    minute_missing_before = sum(gap["count"] for gap in time_gaps)
+
+    fetched_unique = 0
+    if time_gaps:
+        try:
+            downloaded_minutes = _download_missing_minutes(
+                symbol,
+                window_start_ms,
+                window_end_ms,
+                time_gaps,
+            )
+        except BinanceDownloadError as exc:
+            detail = {
+                "tf": target_tf_key,
+                "window": {"start_ms": window_start_ms, "end_ms": window_end_ms},
+                "minute_missing_before": minute_missing_before,
+                "minute_missing_after": minute_missing_before,
+                "fetched_1m_count": exc.downloaded,
+                "tf_missing_before": 0,
+                "tf_missing_after": 0,
+                "time_gaps": time_gaps,
+                "downloaded": exc.downloaded,
+            }
+            raise DataQualityError(detail) from exc
+        for candle in downloaded_minutes:
+            ts = candle["t"]
+            if ts < window_start_ms or ts > window_end_ms:
+                continue
+            if ts not in minute_window_index:
+                fetched_unique += 1
+            minute_window_index[ts] = candle
+            minute_index_all[ts] = candle
+
+    minute_missing_after = sum(1 for ts in expected_minutes if ts not in minute_window_index)
+    data_quality = {
+        "tf": target_tf_key,
+        "window": {"start_ms": window_start_ms, "end_ms": window_end_ms},
+        "minute_missing_before": minute_missing_before,
+        "minute_missing_after": minute_missing_after,
+        "fetched_1m_count": fetched_unique,
+        "tf_missing_before": 0,
+        "tf_missing_after": 0,
+        "time_gaps": time_gaps,
+    }
+
+    if minute_missing_after > 0:
+        data_quality["downloaded"] = fetched_unique
+        raise DataQualityError(data_quality)
+
+    frames["1m"] = [minute_index_all[ts] for ts in sorted(minute_index_all)]
+    minute_candles = frames["1m"]
+
+    base_index_all = {candle["t"]: candle for candle in base_candles}
+
+    if target_interval_ms <= MINUTE_INTERVAL_MS:
+        expected_tf_times = expected_minutes
+    else:
+        expected_tf_times: List[int] = []
+        cursor = window_start_ms
+        while True:
+            last_minute = cursor + target_interval_ms - MINUTE_INTERVAL_MS
+            if last_minute > window_end_ms:
+                break
+            expected_tf_times.append(cursor)
+            cursor += target_interval_ms
+
+    tf_missing_before = sum(1 for ts in expected_tf_times if ts not in base_index_all)
+    aggregated_added = 0
+    if tf_missing_before:
+        for open_ts in expected_tf_times:
+            if open_ts in base_index_all:
+                continue
+            aggregated = _aggregate_from_minutes(minute_window_index, open_ts, target_interval_ms)
+            if aggregated is None:
+                continue
+            base_index_all[open_ts] = aggregated
+            aggregated_added += 1
+
+    tf_missing_after = sum(1 for ts in expected_tf_times if ts not in base_index_all)
+    data_quality["tf_missing_before"] = tf_missing_before
+    data_quality["tf_missing_after"] = tf_missing_after
+
+    if tf_missing_after > 0:
+        data_quality["downloaded"] = fetched_unique
+        raise DataQualityError(data_quality)
+
+    frames[target_tf_key] = [base_index_all[ts] for ts in sorted(base_index_all)]
+    base_candles = frames[target_tf_key]
+    if primary_key == target_tf_key:
+        primary_candles = base_candles
+
+    reference_ts = window_end_ms + MINUTE_INTERVAL_MS
+    reference_dt = datetime.fromtimestamp(reference_ts / 1000.0, tz=UTC)
+    detailed_start_ts = window_start_ms
 
     detection_candles: List[Dict[str, Any]] = []
     if base_candles:
         detection_candles = _filter_candles(
             base_candles,
             start_ms=detailed_start_ts,
-            end_ms=reference_ts,
+            end_ms=window_end_ms,
         )
 
     if detection_candles:
@@ -648,26 +968,30 @@ def build_check_all_datas(
                 "symbol": symbol,
                 "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
             }
+
     movement_anchor_ts = detailed_start_ts
-    movement_start_ts = min(start_ms, movement_anchor_ts)
-    movement_end_ts = max(start_ms, movement_anchor_ts)
-    if movement_end_ts > reference_ts:
-        movement_end_ts = reference_ts
+    movement_start_ts = min(selection_start, movement_anchor_ts)
+    movement_end_ts = max(selection_start, movement_anchor_ts)
+    if movement_end_ts > window_end_ms:
+        movement_end_ts = window_end_ms
+
+    latest_minute_candle = minute_window_index.get(window_end_ms)
+    latest_primary_candle = None
+    if expected_tf_times:
+        latest_primary_candle = base_index_all.get(expected_tf_times[-1])
+    elif base_candles:
+        latest_primary_candle = base_candles[-1]
 
     latest_candle_source = (
         latest_minute_candle
         or latest_primary_candle
-        or (primary_candles[-1] if primary_candles else None)
+        or (base_candles[-1] if base_candles else None)
     )
     latest_candle_ts = _safe_int(latest_candle_source.get("t")) if latest_candle_source else None
-    if latest_candle_ts is None and primary_candles:
-        latest_candle_ts = _safe_int(primary_candles[-1].get("t"))
-    if latest_candle_ts is None and effective_end_ms is not None:
-        latest_candle_ts = effective_end_ms
+    if latest_candle_ts is None and base_candles:
+        latest_candle_ts = base_candles[-1]["t"]
     if latest_candle_ts is None:
-        latest_candle_ts = primary_candles[-1]["t"]
-    if reference_dt is not None:
-        latest_candle_ts = min(latest_candle_ts, int(reference_dt.timestamp() * 1000))
+        latest_candle_ts = window_end_ms
     latest_candle_dt = datetime.fromtimestamp(latest_candle_ts / 1000.0, tz=UTC)
 
     detailed_start_dt = datetime.fromtimestamp(detailed_start_ts / 1000.0, tz=UTC)
@@ -749,8 +1073,8 @@ def build_check_all_datas(
     )
 
     movement_days = 0
-    if start_ms is not None and end_ms is not None:
-        movement_days = max(0, int((end_ms - start_ms) // MS_IN_DAY))
+    if selection_start is not None and selection_end is not None:
+        movement_days = max(0, int((selection_end - selection_start) // MS_IN_DAY))
 
     movement_section = {
         "days": movement_days,
@@ -784,7 +1108,7 @@ def build_check_all_datas(
         "snapshot_id": snapshot.get("id"),
         "symbol": snapshot.get("symbol"),
         "timeframe": snapshot.get("tf"),
-        "selection": {"start": start_ms, "end": end_ms},
+        "selection": {"start": selection_start, "end": selection_end},
         "asof_utc": reference_dt.isoformat(),
         "latest_candle_utc": latest_candle_dt.isoformat(),
         "latest_candle": dict(latest_candle_payload),
@@ -793,6 +1117,7 @@ def build_check_all_datas(
         "tpo": {"sessions": profile_tpo, "zones": profile_zones},
         "profile": profile_flat,
         "zones": detected_zones,
+        "data_quality": data_quality,
         "profile_preset": profile_config.get("preset_payload"),
         "profile_preset_required": bool(profile_config.get("preset_required", False)),
     }

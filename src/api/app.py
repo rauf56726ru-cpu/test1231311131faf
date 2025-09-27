@@ -13,6 +13,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from ..services import (
+    DataQualityError,
     build_check_all_datas,
     build_inspection_payload,
     build_placeholder_snapshot,
@@ -175,13 +176,19 @@ async def inspection_check_all(
             parsed = parsed.astimezone(timezone.utc)
         now_override = parsed
 
-    payload = build_check_all_datas(
-        target_snapshot,
-        now_utc=now_override,
-        selection_start_ms=selection_start,
-        selection_end_ms=selection_end,
-        hours=hours,
-    )
+    try:
+        payload = build_check_all_datas(
+            target_snapshot,
+            now_utc=now_override,
+            selection_start_ms=selection_start,
+            selection_end_ms=selection_end,
+            hours=hours,
+        )
+    except DataQualityError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"message": str(exc), "data_quality": exc.detail},
+        ) from exc
     if payload is None:
         return Response(status_code=204)
 
