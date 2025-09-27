@@ -15,6 +15,7 @@ from typing import Any, DefaultDict, Dict, Iterable, List, Mapping, MutableMappi
 from .ohlc import TIMEFRAME_WINDOWS, TIMEFRAME_TO_MS, normalise_ohlcv
 from .profile import build_profile_package
 from .presets import resolve_profile_config
+from .zones import Config as ZonesConfig, detect_zones
 from ..meta import Meta
 
 Snapshot = Dict[str, Any]
@@ -537,6 +538,11 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
     tpo_entries: List[Dict[str, object]] = []
     flattened_profile: List[Dict[str, float]] = []
     zone_items: List[Dict[str, Any]] = []
+    zones_structured: Dict[str, Any] = {
+        "symbol": symbol,
+        "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
+    }
+    profile_candles: List[Dict[str, Any]] = []
 
     tick_size_value = profile_config.get("tick_size")
     adaptive_bins_flag = bool(profile_config.get("adaptive_bins", True))
@@ -547,7 +553,7 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
     clip_threshold = float(profile_config.get("clip_threshold", 0.0))
     smooth_window = int(profile_config.get("smooth_window", 1))
 
-    if preset and base_candles and sessions:
+    if base_candles:
         closed_candles = [
             candle
             for candle in base_candles
@@ -555,6 +561,9 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
         ]
         profile_candles = closed_candles or list(base_candles)
 
+    profile_ready = bool(profile_candles)
+
+    if preset and profile_candles and sessions:
         cache_token = (
             "inspection",
             snapshot.get("id"),
@@ -588,6 +597,34 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
             tpo_entries = []
             flattened_profile = []
             zone_items = []
+            zones_structured = {
+                "symbol": symbol,
+                "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
+            }
+            profile_ready = False
+
+    if profile_ready and profile_candles:
+        try:
+            zone_cfg = ZonesConfig(tick_size=tick_size_value)
+            zones_structured = detect_zones(
+                profile_candles,
+                target_tf_key,
+                symbol,
+                zone_cfg,
+            )
+        except Exception:  # pragma: no cover - defensive guard
+            logging.getLogger(__name__).exception(
+                "Failed to detect zones for inspection payload",
+                extra={
+                    "snapshot_id": snapshot.get("id"),
+                    "symbol": symbol,
+                    "timeframe": target_tf_key,
+                },
+            )
+            zones_structured = {
+                "symbol": symbol,
+                "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
+            }
 
     data_section = {
         "symbol": symbol,
@@ -597,6 +634,7 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
         "tpo": tpo_entries,
         "profile": flattened_profile,
         "zones": zone_items,
+        "zones_structured": zones_structured,
         "zones_raw": snapshot.get("zones"),
         "agg_trades": snapshot.get("agg_trades")
         or {

@@ -584,7 +584,8 @@ def build_check_all_datas(
         derived_reference_ts = fallback_ts if fallback_ts is not None else primary_candles[-1]["t"]
 
     if end_ms is not None and derived_reference_ts is not None:
-        derived_reference_ts = min(derived_reference_ts, end_ms)
+        interval_ms = _timeframe_interval_ms(primary_key) or MINUTE_INTERVAL_MS
+        derived_reference_ts = min(derived_reference_ts, end_ms + interval_ms)
     if start_ms is not None and derived_reference_ts is not None:
         derived_reference_ts = max(derived_reference_ts, start_ms)
 
