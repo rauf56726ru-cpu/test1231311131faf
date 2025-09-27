@@ -22,11 +22,11 @@ LOGGER = logging.getLogger(__name__)
 class LiquidityConfig:
     """Runtime configuration for liquidity detection."""
 
-    swing_window: int = 2
+    swing_window: int = 3
     lookback_swings: int = 30
-    r_ticks: int = 2
+    r_ticks: int = 4
     atr_period: int = 14
-    sweep_atr_multiplier: float = 0.5
+    sweep_atr_multiplier: float = 0.3
 
 
 def _coerce_float(value: Any) -> float | None:
@@ -100,6 +100,13 @@ def _augment_supported_frames(
         key: dict(value) if isinstance(value, Mapping) else {"candles": []}
         for key, value in frames.items()
     }
+
+    for timeframe in frames:
+        if timeframe not in SUPPORTED_TIMEFRAMES and timeframe != "1m":
+            LOGGER.debug(
+                "Skipping unsupported timeframe for liquidity",
+                extra={"tf": timeframe, "reason": "tf_skipped"},
+            )
 
     minute_candles = _extract_candles(augmented.get("1m"))
     LOGGER.debug(
@@ -184,6 +191,14 @@ def _cluster_swings(
     timeframe: str,
 ) -> List[Dict[str, Any]]:
     if not swings:
+        LOGGER.debug(
+            "Skipping swing clustering",
+            extra={
+                "tf": timeframe,
+                "level_type": level_type,
+                "reason": "no_swings",
+            },
+        )
         return []
 
     ordered = sorted(swings, key=lambda item: item.get("t", 0))
@@ -228,12 +243,15 @@ def _cluster_swings(
         prices = cluster["prices"]
         if not prices:
             continue
+        level_price = statistics.fmean(prices)
+        level_price = _quantise(level_price, tick_size)
         payload.append(
             {
                 "type": level_type,
                 "tf": timeframe,
-                "price": statistics.fmean(prices),
+                "price": level_price,
                 "swings": swings_ts,
+                "tolerance": tolerance,
             }
         )
     return payload
@@ -281,38 +299,75 @@ def _prepare_levels(
 
     tolerance = (config.r_ticks * tick_size) if tick_size and tick_size > 0 else 0.0
 
+    LOGGER.debug(
+        "Liquidity swing detection config",
+        extra={
+            "tick_size": tick_size,
+            "r_ticks": config.r_ticks,
+            "tolerance": tolerance,
+            "swing_window": config.swing_window,
+            "lookback": config.lookback_swings,
+        },
+    )
+
     for timeframe in SUPPORTED_TIMEFRAMES:
         candles = _extract_candles(frames.get(timeframe))
-        if len(candles) < 2 * config.swing_window + 1:
+        candle_count = len(candles)
+        LOGGER.debug(
+            "Evaluating liquidity swings",
+            extra={"tf": timeframe, "candles": candle_count},
+        )
+        if candle_count < 2 * config.swing_window + 1:
+            LOGGER.debug(
+                "Skipping liquidity timeframe",
+                extra={"tf": timeframe, "reason": "too_few_bars", "candles": candle_count},
+            )
             continue
         swings_high = _detect_swings(candles, window=config.swing_window, kind="high")
         swings_low = _detect_swings(candles, window=config.swing_window, kind="low")
         if config.lookback_swings > 0:
             swings_high = swings_high[-config.lookback_swings :]
             swings_low = swings_low[-config.lookback_swings :]
-        eqh_levels.extend(
-            _cluster_swings(
-                swings_high,
-                tolerance=tolerance,
-                tick_size=tick_size,
-                level_type="eqh",
-                timeframe=timeframe,
-            )
+        LOGGER.debug(
+            "Liquidity swings detected",
+            extra={
+                "tf": timeframe,
+                "swing_highs": len(swings_high),
+                "swing_lows": len(swings_low),
+            },
         )
-        eql_levels.extend(
-            _cluster_swings(
-                swings_low,
-                tolerance=tolerance,
-                tick_size=tick_size,
-                level_type="eql",
-                timeframe=timeframe,
-            )
+        eqh_cluster = _cluster_swings(
+            swings_high,
+            tolerance=tolerance,
+            tick_size=tick_size,
+            level_type="eqh",
+            timeframe=timeframe,
         )
+        if not eqh_cluster:
+            LOGGER.debug(
+                "No EQH clusters on timeframe",
+                extra={"tf": timeframe, "reason": "no_clusters"},
+            )
+        eqh_levels.extend(eqh_cluster)
 
-    for level in eqh_levels:
-        level["tolerance"] = tolerance
-    for level in eql_levels:
-        level["tolerance"] = tolerance
+        eql_cluster = _cluster_swings(
+            swings_low,
+            tolerance=tolerance,
+            tick_size=tick_size,
+            level_type="eql",
+            timeframe=timeframe,
+        )
+        if not eql_cluster:
+            LOGGER.debug(
+                "No EQL clusters on timeframe",
+                extra={"tf": timeframe, "reason": "no_clusters"},
+            )
+        eql_levels.extend(eql_cluster)
+
+    if not eqh_levels:
+        LOGGER.debug("No EQH clusters formed", extra={"reason": "no_clusters"})
+    if not eql_levels:
+        LOGGER.debug("No EQL clusters formed", extra={"reason": "no_clusters"})
 
     return {"eqh": eqh_levels, "eql": eql_levels}
 
@@ -323,6 +378,10 @@ def _resolve_previous_day(
     reference_end_ms: int | None,
 ) -> Dict[str, Dict[str, Any] | None]:
     if not candles:
+        LOGGER.debug(
+            "Unable to resolve previous day levels",
+            extra={"reason": "no_daily_candles"},
+        )
         return {"pdh": None, "pdl": None}
 
     if reference_end_ms is None:
@@ -330,6 +389,10 @@ def _resolve_previous_day(
         reference_end_ms = int(last_ts) + MS_IN_DAY if isinstance(last_ts, (int, float)) else None
 
     if reference_end_ms is None:
+        LOGGER.debug(
+            "Unable to resolve previous day levels",
+            extra={"reason": "no_reference_time"},
+        )
         return {"pdh": None, "pdl": None}
 
     reference_day = datetime.fromtimestamp(reference_end_ms / 1000, tz=timezone.utc).date()
@@ -352,6 +415,12 @@ def _resolve_previous_day(
         target_high = {"t": int(day_start.timestamp() * 1000), "price": high}
         target_low = {"t": int(day_start.timestamp() * 1000), "price": low}
         break
+
+    if target_high is None or target_low is None:
+        LOGGER.debug(
+            "Previous day levels unavailable",
+            extra={"reason": "no_daily_candle_prev_utc", "day": str(previous_day)},
+        )
 
     return {"pdh": target_high, "pdl": target_low}
 
@@ -399,6 +468,9 @@ def _detect_sweeps(
             if high is None or close is None or not isinstance(ts, (int, float)):
                 continue
             atr_component = atr_values[index] * config.sweep_atr_multiplier
+            epsilon = max(tick_min, atr_component)
+            min_required = tick_min if tick_min and tick_min > 0 else epsilon
+            atr_cap = atr_component if atr_component > 0 else None
             for level in levels:
                 level_price = _coerce_float(level.get("price"))
                 if level_price is None:
@@ -417,7 +489,7 @@ def _detect_sweeps(
                 overshoot = high - level_price
                 if overshoot <= 0:
                     continue
-                if tick_min > 0 and overshoot < tick_min:
+                if min_required > 0 and overshoot < min_required:
                     LOGGER.debug(
                         "Skipping sweep candidate due to tolerance",
                         extra={
@@ -425,11 +497,12 @@ def _detect_sweeps(
                             "tf": timeframe,
                             "level_type": level_type,
                             "overshoot": overshoot,
-                            "tolerance": tick_min,
+                            "tolerance": min_required,
+                            "epsilon": epsilon,
                         },
                     )
                     continue
-                if atr_component > 0 and overshoot > atr_component:
+                if atr_cap is not None and overshoot > atr_cap + 1e-9:
                     LOGGER.debug(
                         "Skipping sweep candidate due to ATR breach",
                         extra={
@@ -437,7 +510,8 @@ def _detect_sweeps(
                             "tf": timeframe,
                             "level_type": level_type,
                             "overshoot": overshoot,
-                            "atr_limit": atr_component,
+                            "atr_limit": atr_cap,
+                            "epsilon": epsilon,
                         },
                     )
                     continue
@@ -449,7 +523,7 @@ def _detect_sweeps(
                         "level_type": level_type,
                         "level_price": level_price,
                         "t": int(ts),
-                        "atr_tolerance": atr_component,
+                        "atr_tolerance": epsilon,
                     }
                 )
 
@@ -465,6 +539,9 @@ def _detect_sweeps(
             if low is None or close is None or not isinstance(ts, (int, float)):
                 continue
             atr_component = atr_values[index] * config.sweep_atr_multiplier
+            epsilon = max(tick_min, atr_component)
+            min_required = tick_min if tick_min and tick_min > 0 else epsilon
+            atr_cap = atr_component if atr_component > 0 else None
             for level in levels:
                 level_price = _coerce_float(level.get("price"))
                 if level_price is None:
@@ -483,7 +560,7 @@ def _detect_sweeps(
                 overshoot = level_price - low
                 if overshoot <= 0:
                     continue
-                if tick_min > 0 and overshoot < tick_min:
+                if min_required > 0 and overshoot < min_required:
                     LOGGER.debug(
                         "Skipping sweep candidate due to tolerance",
                         extra={
@@ -491,11 +568,12 @@ def _detect_sweeps(
                             "tf": timeframe,
                             "level_type": level_type,
                             "overshoot": overshoot,
-                            "tolerance": tick_min,
+                            "tolerance": min_required,
+                            "epsilon": epsilon,
                         },
                     )
                     continue
-                if atr_component > 0 and overshoot > atr_component:
+                if atr_cap is not None and overshoot > atr_cap + 1e-9:
                     LOGGER.debug(
                         "Skipping sweep candidate due to ATR breach",
                         extra={
@@ -503,7 +581,8 @@ def _detect_sweeps(
                             "tf": timeframe,
                             "level_type": level_type,
                             "overshoot": overshoot,
-                            "atr_limit": atr_component,
+                            "atr_limit": atr_cap,
+                            "epsilon": epsilon,
                         },
                     )
                     continue
@@ -515,7 +594,7 @@ def _detect_sweeps(
                         "level_type": level_type,
                         "level_price": level_price,
                         "t": int(ts),
-                        "atr_tolerance": atr_component,
+                        "atr_tolerance": epsilon,
                     }
                 )
 

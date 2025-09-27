@@ -1166,8 +1166,11 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
     raw_meta = snapshot.get("meta") if isinstance(snapshot.get("meta"), Mapping) else {}
     liquidity_config = raw_meta.get("liquidity") if isinstance(raw_meta, Mapping) else None
     tick_size = float(tick_size_value) if isinstance(tick_size_value, (int, float)) and tick_size_value > 0 else None
+    liquidity_frames = {
+        tf: {"candles": list(candles)} for tf, candles in full_candles_by_tf.items()
+    }
     liquidity_payload = build_liquidity_snapshot(
-        normalised_frames,
+        liquidity_frames,
         tick_size=tick_size,
         selection=selection,
         config=liquidity_config if isinstance(liquidity_config, Mapping) else None,
