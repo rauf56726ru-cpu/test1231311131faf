@@ -20,6 +20,8 @@ class Config:
     w_swing: int = 3
     r_zone_pct: float = 0.15
     m_wick_atr: float = 0.5
+    ob_lookback: int = 8
+    ob_min_body_ratio: float | None = 0.1
 
 
 def _default_min_gap_pct(tf: str) -> float:
@@ -111,6 +113,50 @@ def compute_atr(candles: Sequence[Mapping[str, Any]], period: int) -> List[float
         atr[i] = (prev_atr * (period - 1) + true_ranges[i]) / period
 
     return atr
+
+
+def _candle_direction(candle: Mapping[str, Any], tick_size: float | None) -> str:
+    """Classify candle direction as bull, bear or doji."""
+
+    open_raw = candle.get("o", 0.0)
+    close_raw = candle.get("c", 0.0)
+    try:
+        open_price = float(open_raw)
+        close_price = float(close_raw)
+    except (TypeError, ValueError):
+        return "doji"
+    diff = close_price - open_price
+    if tick_size is not None and tick_size > 0:
+        tolerance = tick_size * 0.1
+    else:
+        tolerance = 1e-9
+    if diff > tolerance:
+        return "bull"
+    if diff < -tolerance:
+        return "bear"
+    return "doji"
+
+
+def _locate_ob_base(
+    candles: Sequence[Mapping[str, Any]],
+    *,
+    impulse_idx: int,
+    lookback: int,
+    zone_type: str,
+    tick_size: float | None,
+) -> int | None:
+    """Find the last opposite candle preceding the impulse within a lookback window."""
+
+    if impulse_idx <= 0:
+        return None
+
+    required_direction = "bull" if zone_type == "supply" else "bear"
+    limit = max(0, impulse_idx - (lookback if lookback and lookback > 0 else impulse_idx))
+    for idx in range(impulse_idx - 1, limit - 1, -1):
+        direction = _candle_direction(candles[idx], tick_size)
+        if direction == required_direction:
+            return idx
+    return None
 
 
 def _calc_gap_pct(bot: float, top: float) -> float:
@@ -285,7 +331,9 @@ def _detect_fvg_internal(
 
 def detect_ob(candles: Sequence[Mapping[str, Any]], cfg: Config, tf: str) -> List[Dict[str, Any]]:
     normalised = list(candles)
-    zones, _ = _detect_ob_internal(normalised, cfg, tf)
+    inferred_tick = _infer_tick_size(normalised)
+    effective_cfg = replace(cfg, tick_size=cfg.tick_size or inferred_tick)
+    zones, _ = _detect_ob_internal(normalised, effective_cfg, tf)
     return zones
 
 
@@ -296,45 +344,96 @@ def _detect_ob_internal(
         return [], []
 
     atr = compute_atr(candles, cfg.atr_period)
-    tick = cfg.tick_size
+    tick = cfg.tick_size or _infer_tick_size(candles)
     zones: List[Dict[str, Any]] = []
     metadata: List[Dict[str, Any]] = []
+    seen: Dict[tuple[str, int], int] = {}
 
-    for i in range(len(candles) - 1):
-        base = candles[i]
-        impulse = candles[i + 1]
-        atr_value = atr[i + 1]
-        if math.isnan(atr_value) or atr_value == 0:
+    for impulse_idx in range(1, len(candles)):
+        impulse = candles[impulse_idx]
+        atr_value = atr[impulse_idx] if impulse_idx < len(atr) else math.nan
+        if not atr_value or math.isnan(atr_value) or atr_value <= 0:
             continue
 
+        prev_candle = candles[impulse_idx - 1]
+        prev_low = prev_candle.get("l")
+        prev_high = prev_candle.get("h")
         impulse_range = impulse["h"] - impulse["l"]
-        gap_down = impulse["o"] < base["l"]
-        gap_up = impulse["o"] > base["h"]
-
-        if base["c"] > base["o"] and (
-            (impulse["c"] < impulse["o"] and impulse_range > cfg.k_impulse * atr_value)
-            or gap_down
-        ):
-            zone_type = "supply"
-        elif base["c"] < base["o"] and (
-            (impulse["c"] > impulse["o"] and impulse_range > cfg.k_impulse * atr_value)
-            or gap_up
-        ):
-            zone_type = "demand"
-        else:
+        if impulse_range <= 0:
             continue
 
-        zone_low = _round_tick(base["l"], tick)
-        zone_high = _round_tick(base["h"], tick)
+        bearish_confirmed = (
+            impulse_range > cfg.k_impulse * atr_value
+            and (
+                impulse["c"] < impulse["o"]
+                or (prev_low is not None and impulse["o"] < prev_low)
+            )
+        )
+        bullish_confirmed = (
+            impulse_range > cfg.k_impulse * atr_value
+            and (
+                impulse["c"] > impulse["o"]
+                or (prev_high is not None and impulse["o"] > prev_high)
+            )
+        )
 
-        status = _ob_status(
+        if not bearish_confirmed and not bullish_confirmed:
+            continue
+
+        if bearish_confirmed:
+            zone_type = "supply"
+        else:
+            zone_type = "demand"
+
+        base_idx = _locate_ob_base(
             candles,
-            start_index=i,
+            impulse_idx=impulse_idx,
+            lookback=cfg.ob_lookback,
+            zone_type=zone_type,
+            tick_size=tick,
+        )
+        if base_idx is None:
+            continue
+
+        base = candles[base_idx]
+        zone_low_raw = min(base["l"], base["h"])
+        zone_high_raw = max(base["l"], base["h"])
+        zone_height = zone_high_raw - zone_low_raw
+        if zone_height <= 0:
+            continue
+        if tick is not None and zone_height + 1e-12 < tick:
+            continue
+
+        if cfg.ob_min_body_ratio is not None:
+            body = abs(base["c"] - base["o"])
+            if zone_height == 0 or body / zone_height < cfg.ob_min_body_ratio:
+                continue
+
+        zone_low = _round_tick(zone_low_raw, tick)
+        zone_high = _round_tick(zone_high_raw, tick)
+        if zone_low > zone_high:
+            zone_low, zone_high = zone_high, zone_low
+
+        status, touches = _ob_status(
+            candles,
+            start_index=base_idx,
             low=zone_low,
             high=zone_high,
             zone_type=zone_type,
             tick_size=tick,
         )
+
+        key = (zone_type, base["t"])
+        if key in seen:
+            existing_idx = seen[key]
+            current_status = zones[existing_idx]["status"]
+            # Preserve the most severe status according to priority inverted > tapped > open
+            status_priority = {"inverted": 2, "tapped": 1, "open": 0}
+            if status_priority.get(status, 0) > status_priority.get(current_status, 0):
+                zones[existing_idx]["status"] = status
+            if touches:
+                zones[existing_idx]["touches"] = touches
+            continue
 
         zone_dict = {
             "tf": tf,
@@ -343,15 +442,19 @@ def _detect_ob_internal(
             "status": status,
             "created_at": base["t"],
         }
+        if touches:
+            zone_dict["touches"] = touches
         zones.append(zone_dict)
+        seen[key] = len(zones) - 1
         metadata.append(
             {
                 "type": zone_type,
                 "low": zone_low,
                 "high": zone_high,
                 "created_at": base["t"],
-                "created_idx": i,
+                "created_idx": base_idx,
                 "status": status,
+                "touches": touches,
             }
         )
 
@@ -366,21 +469,24 @@ def _ob_status(
     high: float,
     zone_type: str,
     tick_size: float | None,
-) -> str:
-    touched = False
+) -> tuple[str, int]:
+    touches = 0
     for j in range(start_index + 1, len(candles)):
         candle = candles[j]
         high_j = candle["h"]
         low_j = candle["l"]
+        touched = max(low_j, low) <= min(high_j, high)
+        if touched:
+            touches += 1
         if zone_type == "supply":
             invert_trigger = _breaks_above(candle["c"], high, tick_size)
         else:
             invert_trigger = _breaks_below(candle["c"], low, tick_size)
         if invert_trigger:
-            return "inverted"
-        if min(high_j, high) >= max(low_j, low):
-            touched = True
-    return "tapped" if touched else "open"
+            return "inverted", touches
+    if touches > 0:
+        return "tapped", touches
+    return "open", touches
 
 
 def _breaks_above(close: float, boundary: float, tick: float | None) -> bool:
