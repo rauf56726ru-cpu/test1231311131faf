@@ -1,6 +1,6 @@
 """Service layer exports for the chart backend."""
 
-from .check_all_datas import build_check_all_datas
+from .check_all_datas import build_check_all_datas, DataQualityError
 from .inspection import (
     build_inspection_payload,
     build_placeholder_snapshot,
@@ -69,4 +69,5 @@ __all__ = [
     "resolve_or_prompt",
     "save_preset",
     "update_preset",
+    "DataQualityError",
 ]

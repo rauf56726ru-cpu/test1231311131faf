@@ -50,7 +50,12 @@ DEFAULT_PRESETS: Dict[str, TPOPreset] = {
         tf="1m",
         last_n=3,
         value_area_pct=0.7,
-        binning=ProfileBinning(mode="adaptive", tick_size=None, atr_multiplier=0.5, target_bins=80),
+        binning=ProfileBinning(
+            mode="adaptive",
+            tick_size=0.01,
+            atr_multiplier=0.5,
+            target_bins=80,
+        ),
         extras=ProfileExtras(clip_low_volume_tail=0.005, smooth_window=1),
         builtin=True,
     ),
@@ -59,7 +64,12 @@ DEFAULT_PRESETS: Dict[str, TPOPreset] = {
         tf="1m",
         last_n=3,
         value_area_pct=0.7,
-        binning=ProfileBinning(mode="adaptive", tick_size=None, atr_multiplier=0.5, target_bins=90),
+        binning=ProfileBinning(
+            mode="adaptive",
+            tick_size=0.01,
+            atr_multiplier=0.5,
+            target_bins=90,
+        ),
         extras=ProfileExtras(clip_low_volume_tail=0.005, smooth_window=1),
         builtin=True,
     ),
@@ -68,7 +78,12 @@ DEFAULT_PRESETS: Dict[str, TPOPreset] = {
         tf="1m",
         last_n=3,
         value_area_pct=0.7,
-        binning=ProfileBinning(mode="adaptive", tick_size=None, atr_multiplier=0.5, target_bins=100),
+        binning=ProfileBinning(
+            mode="adaptive",
+            tick_size=0.001,
+            atr_multiplier=0.5,
+            target_bins=100,
+        ),
         extras=ProfileExtras(clip_low_volume_tail=0.005, smooth_window=1),
         builtin=True,
     ),
@@ -416,7 +431,11 @@ def resolve_profile_config(symbol: str, meta: Mapping[str, Any] | None) -> Dict[
         config["last_n"] = max(1, min(5, last_n))
         binning = preset.binning
         config["adaptive_bins"] = binning.mode != "tick"
-        config["tick_size"] = binning.tick_size if binning.mode == "tick" else None
+        tick_value = binning.tick_size
+        if isinstance(tick_value, (int, float)) and float(tick_value) > 0:
+            config["tick_size"] = float(tick_value)
+        else:
+            config["tick_size"] = None
         config["atr_multiplier"] = float(binning.atr_multiplier or 0.5)
         config["target_bins"] = int(binning.target_bins or 80)
         config["clip_threshold"] = float(preset.extras.clip_low_volume_tail)

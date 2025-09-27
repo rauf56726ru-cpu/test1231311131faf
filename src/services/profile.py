@@ -415,12 +415,17 @@ def compute_session_profiles(
                 payload["VAH"] = float(profile.vah)
             if profile.val is not None and math.isfinite(float(profile.val)):
                 payload["VAL"] = float(profile.val)
-        if profile.prices and profile.volumes and math.isfinite(profile.poc):
-            payload["POC"] = profile.poc
-            if math.isfinite(profile.vah):
-                payload["VAH"] = profile.vah
-            if math.isfinite(profile.val):
-                payload["VAL"] = profile.val
+        if (
+            profile.prices
+            and profile.volumes
+            and profile.poc is not None
+            and math.isfinite(float(profile.poc))
+        ):
+            payload["POC"] = float(profile.poc)
+            if profile.vah is not None and math.isfinite(float(profile.vah)):
+                payload["VAH"] = float(profile.vah)
+            if profile.val is not None and math.isfinite(float(profile.val)):
+                payload["VAL"] = float(profile.val)
         return payload
 
     summaries: List[Dict[str, object]] = []

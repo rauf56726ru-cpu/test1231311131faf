@@ -66,25 +66,31 @@ GET /profile?snapshot=<SNAPSHOT_ID>&tf=1m&last_n=3&adaptive_bins=false&value_are
 {
   "symbol": "BTCUSDT",
   "tf": "1m",
-  "tpo": [
-    {"date": "2024-05-12", "session": "asia", "POC": 61050.0, "VAL": 60920.0, "VAH": 61200.0},
-    {"date": "2024-05-12", "session": "london", "POC": 61310.0, "VAH": 61420.0, "VAL": 61210.0}
-  ],
+  "tpo": {
+    "sessions": [
+      {"date": "2024-05-12", "session": "asia", "POC": 61050.0, "VAL": 60920.0, "VAH": 61200.0},
+      {"date": "2024-05-12", "session": "london", "POC": 61310.0, "VAH": 61420.0, "VAL": 61210.0}
+    ],
+    "zones": [
+      {"type": "tpo_poc", "price": 61310.0, "date": "2024-05-12", "session": "london", "tf": "1m", "meta": {"value_area_pct": 0.7, "source": "tpo"}},
+      {"type": "tpo_vah", "price": 61420.0, "date": "2024-05-12", "session": "london", "tf": "1m", "meta": {"value_area_pct": 0.7, "source": "tpo"}}
+    ]
+  },
   "profile": [
     {"price": 61200.0, "volume": 15.2},
     {"price": 61250.0, "volume": 18.7}
   ],
-  "zones": [
-    {
-      "type": "tpo_poc",
-      "price": 61310.0,
-      "date": "2024-05-12",
-      "session": "london",
-      "tf": "1m",
-      "meta": {"value_area_pct": 0.7, "source": "tpo"}
-    },
-    {"type": "tpo_vah", "price": 61420.0, "date": "2024-05-12", "session": "london", "tf": "1m", "meta": {"value_area_pct": 0.7, "source": "tpo"}}
-  ],
+  "zones": {
+    "symbol": "BTCUSDT",
+    "zones": {
+      "fvg": [
+        {"tf": "1m", "dir": "up", "top": 61350.0, "bot": 61280.0, "fvl": 61315.0, "created_at": 1715515200000, "status": "open"}
+      ],
+      "ob": [],
+      "inducement": [],
+      "cisd": []
+    }
+  },
   "preset": {
     "symbol": "BTCUSDT",
     "tf": "1m",
@@ -98,7 +104,7 @@ GET /profile?snapshot=<SNAPSHOT_ID>&tf=1m&last_n=3&adaptive_bins=false&value_are
 }
 ```
 
-Секция `tpo` содержит сводку по последним сессиям, `profile` — дискретный профиль объёма для самой свежей сессии, а `zones` включает уровни POC/VAH/VAL в формате, совместимом с остальными провайдерами зон.
+Секция `tpo.sessions` содержит сводку по последним сессиям, `tpo.zones` — уровни POC/VAH/VAL в формате, совместимом с остальными провайдерами зон, `profile` — дискретный профиль объёма для самой свежей сессии, а объект `zones` содержит структурированные зоны FVG/OB/inducement/CISD.
 
 ### Система пресетов TPO
 

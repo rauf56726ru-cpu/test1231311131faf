@@ -259,19 +259,22 @@ def test_profile_endpoint_returns_payload(client: TestClient) -> None:
     body = profile_response.json()
     assert body["symbol"] == "BTCUSDT"
     assert body["tf"] == "1m"
-    assert "tpo" in body and isinstance(body["tpo"], list)
+    assert "tpo" in body and isinstance(body["tpo"], dict)
+    assert isinstance(body["tpo"].get("sessions"), list)
+    assert isinstance(body["tpo"].get("zones"), list)
     assert "profile" in body and isinstance(body["profile"], list)
-    assert "zones" in body and isinstance(body["zones"], list)
+    assert "zones" in body and isinstance(body["zones"], dict)
+    assert isinstance(body["zones"].get("zones"), dict)
     preset = body.get("preset")
     assert preset is not None
     assert preset["symbol"] == "BTCUSDT"
     assert preset["builtin"] is True
     assert body.get("preset_required") is False
-    if body["zones"]:
-        zone_types = {item["type"] for item in body["zones"]}
+    if body["tpo"]["zones"]:
+        zone_types = {item["type"] for item in body["tpo"]["zones"] if isinstance(item, Mapping)}
         assert {"tpo_poc", "tpo_vah", "tpo_val"}.issubset(zone_types)
-    if body["tpo"]:
-        latest = body["tpo"][-1]
+    if body["tpo"]["sessions"]:
+        latest = body["tpo"]["sessions"][-1]
         assert "session" in latest
         assert "date" in latest
 
@@ -295,7 +298,9 @@ def test_profile_endpoint_includes_all_snapshot_days(client: TestClient) -> None
     assert profile_response.status_code == 200
     body = profile_response.json()
 
-    tpo_entries = body.get("tpo", [])
+    tpo_payload = body.get("tpo", {})
+    assert isinstance(tpo_payload, dict)
+    tpo_entries = tpo_payload.get("sessions", [])
     assert tpo_entries, "Expected TPO entries to be present"
     daily_entries = [entry for entry in tpo_entries if entry.get("session") == "daily"]
     assert len(daily_entries) == 5
@@ -306,11 +311,19 @@ def test_profile_endpoint_includes_all_snapshot_days(client: TestClient) -> None
     observed_dates = {entry.get("date") for entry in daily_entries}
     assert observed_dates == expected_dates
 
-    zone_dates = {zone.get("date") for zone in body.get("zones", [])}
+    zone_dates = {
+        zone.get("date")
+        for zone in body.get("tpo", {}).get("zones", [])
+        if isinstance(zone, Mapping)
+    }
     assert expected_dates.issubset(zone_dates)
 
-    zone_keys = {(zone.get("type"), zone.get("date"), zone.get("session")) for zone in body.get("zones", [])}
-    assert len(zone_keys) == len(body.get("zones", []))
+    zone_keys = {
+        (zone.get("type"), zone.get("date"), zone.get("session"))
+        for zone in body.get("tpo", {}).get("zones", [])
+        if isinstance(zone, Mapping)
+    }
+    assert len(zone_keys) == len(body.get("tpo", {}).get("zones", []))
 
 
 def test_profile_package_skips_zones_for_sparse_days() -> None:
