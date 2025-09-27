@@ -1320,25 +1320,30 @@ def render_inspection_page(
     ui_script = """
 (function () {
   const TIMEFRAME_TO_MS = {
+    "1s": 1000,
+    "3s": 3000,
+    "5s": 5000,
+    "15s": 15000,
+    "30s": 30000,
     "1m": 60000,
     "3m": 180000,
     "5m": 300000,
     "15m": 900000,
     "30m": 1800000,
     "1h": 3600000,
+    "2h": 7200000,
     "4h": 14400000,
+    "6h": 21600000,
+    "8h": 28800000,
+    "12h": 43200000,
     "1d": 86400000,
   };
   const DEFAULT_TEST_TIMEFRAMES = ["1m", "3m", "5m", "15m", "1h", "4h", "1d"];
   const PREVIEW_REFRESH_INTERVAL_MS = 10_000;
-  const PREVIEW_SOURCE_INTERVAL = "1m";
-  const PREVIEW_SOURCE_INTERVAL_MS = TIMEFRAME_TO_MS[PREVIEW_SOURCE_INTERVAL];
-  const PREVIEW_SOURCE_MIN_LIMIT = 120;
-  const PREVIEW_SOURCE_MAX_LIMIT = 1000;
-  const PREVIEW_TARGET_BARS = 10;
-  const PREVIEW_MAX_TARGET_CANDLES = 500;
-  const PREVIEW_SHARED_MAX_BARS = 1200;
+  const PREVIEW_SHARED_MAX_BARS = 2000;
 
+  const LightweightCharts = window.LightweightCharts || null;
+  const BinanceCandles = window.BinanceCandles || null;
   const ChartGapWatcher = window.ChartGapWatcher || null;
   const SharedCandles = window.SharedCandles || null;
 
@@ -1397,115 +1402,71 @@ def render_inspection_page(
     return Math.min(closingMs, alignedReference);
   }
 
-  function computePreviewMinuteLimit(targetInterval) {
-    const targetMs = TIMEFRAME_TO_MS[targetInterval] || PREVIEW_SOURCE_INTERVAL_MS;
-    const ratio = Math.max(1, Math.round(targetMs / PREVIEW_SOURCE_INTERVAL_MS));
-    const projected = ratio * PREVIEW_TARGET_BARS;
-    const minimum = Math.max(PREVIEW_SOURCE_MIN_LIMIT, ratio * 2);
-    return Math.min(PREVIEW_SOURCE_MAX_LIMIT, Math.max(minimum, projected));
+  function intervalToMs(value) {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric)) {
+      return Math.max(1, numeric) * 60000;
+    }
+    return TIMEFRAME_TO_MS[value] || 60000;
   }
 
-  function normalisePreviewCandle(raw) {
-    const openTime = Number(raw?.t ?? raw?.time ?? 0);
-    if (!Number.isFinite(openTime)) {
+  function normaliseBar(bar) {
+    if (!bar) return null;
+    const open = Number(bar.open ?? bar.o ?? 0);
+    const high = Number(bar.high ?? bar.h ?? open);
+    const low = Number(bar.low ?? bar.l ?? open);
+    const close = Number(bar.close ?? bar.c ?? open);
+    const time = Number(bar.time ?? bar.t ?? 0);
+    if (
+      !Number.isFinite(time) ||
+      !Number.isFinite(open) ||
+      !Number.isFinite(high) ||
+      !Number.isFinite(low) ||
+      !Number.isFinite(close)
+    ) {
       return null;
     }
-    const open = Number(raw?.o ?? raw?.open ?? 0);
-    const high = Number(raw?.h ?? raw?.high ?? open);
-    const low = Number(raw?.l ?? raw?.low ?? open);
-    const close = Number(raw?.c ?? raw?.close ?? open);
-    const volume = Number(raw?.v ?? raw?.volume ?? 0);
-    return { t: openTime, o: open, h: high, l: low, c: close, v: volume };
+    const ts = Number(bar.ts_ms_utc ?? time * 1000);
+    return {
+      time: Math.floor(time),
+      open,
+      high,
+      low,
+      close,
+      ts_ms_utc: Number.isFinite(ts) ? Math.floor(ts) : Math.floor(time * 1000),
+    };
   }
 
-  function aggregateMinuteCandles(sourceCandles, targetInterval, fetchedAtMs) {
-    const targetMs = TIMEFRAME_TO_MS[targetInterval] || PREVIEW_SOURCE_INTERVAL_MS;
-    const cleanedSource = (sourceCandles || [])
-      .map((item) => normalisePreviewCandle(item))
-      .filter((item) => item !== null)
-      .sort((a, b) => a.t - b.t);
-
-    const referenceMs = Number.isFinite(fetchedAtMs) ? Number(fetchedAtMs) : Date.now();
-
-    if (targetMs <= PREVIEW_SOURCE_INTERVAL_MS) {
-      const trimmed =
-        cleanedSource.length > PREVIEW_MAX_TARGET_CANDLES
-          ? cleanedSource.slice(cleanedSource.length - PREVIEW_MAX_TARGET_CANDLES)
-          : cleanedSource;
-      const last = trimmed[trimmed.length - 1];
-      if (!last) {
-        return { candles: [], lastUpdateMs: Number.NaN };
-      }
-      const theoreticalClose = last.t + PREVIEW_SOURCE_INTERVAL_MS;
-      const lastUpdateMs = Math.min(theoreticalClose, Math.max(last.t, referenceMs));
-      return { candles: trimmed, lastUpdateMs };
+  async function fetchHistory(symbol, interval, limit = 1000) {
+    if (!BinanceCandles || typeof BinanceCandles.fetchHistory !== "function") {
+      throw new Error("Binance helper is unavailable");
     }
+    const rows = await BinanceCandles.fetchHistory(symbol, interval, limit);
+    return rows.map((bar) => normaliseBar(bar)).filter((bar) => bar !== null);
+  }
 
-    const aggregated = [];
-    let bucket = null;
-
-    const flushBucket = () => {
-      if (!bucket) return;
-      const closing = bucket.t + targetMs;
-      const aligned = Math.max(bucket.t, bucket.lastUpdateMs ?? bucket.t);
-      const lastUpdateMs = Math.min(closing, aligned);
-      aggregated.push({
-        t: bucket.t,
-        o: bucket.o,
-        h: bucket.h,
-        l: bucket.l,
-        c: bucket.c,
-        v: bucket.v,
-        _lastUpdateMs: lastUpdateMs,
-      });
-      bucket = null;
-    };
-
-    for (const candle of cleanedSource) {
-      const bucketStart = Math.floor(candle.t / targetMs) * targetMs;
-      if (!bucket || bucket.t !== bucketStart) {
-        flushBucket();
-        bucket = {
-          t: bucketStart,
-          o: candle.o,
-          h: candle.h,
-          l: candle.l,
-          c: candle.c,
-          v: Math.max(0, candle.v),
-          lastUpdateMs: Math.min(candle.t + PREVIEW_SOURCE_INTERVAL_MS, referenceMs),
-        };
-        continue;
-      }
-
-      bucket.c = candle.c;
-      bucket.h = Math.max(bucket.h, candle.h, candle.o, candle.c);
-      bucket.l = Math.min(bucket.l, candle.l, candle.o, candle.c);
-      bucket.v = Math.max(0, Number(bucket.v) + Number(candle.v));
-      bucket.lastUpdateMs = Math.max(
-        bucket.lastUpdateMs,
-        Math.min(candle.t + PREVIEW_SOURCE_INTERVAL_MS, referenceMs),
-      );
+  async function fetchRange(symbol, interval, startMs, endMs, limit = 1000) {
+    const url = new URL("https://api.binance.com/api/v3/klines");
+    url.searchParams.set("symbol", symbol);
+    url.searchParams.set("interval", interval);
+    if (Number.isFinite(startMs)) {
+      url.searchParams.set("startTime", Math.floor(startMs));
     }
-
-    flushBucket();
-
-    const trimmedAggregated =
-      aggregated.length > PREVIEW_MAX_TARGET_CANDLES
-        ? aggregated.slice(aggregated.length - PREVIEW_MAX_TARGET_CANDLES)
-        : aggregated;
-    const lastAgg = trimmedAggregated[trimmedAggregated.length - 1];
-    const lastUpdateMs = lastAgg ? lastAgg._lastUpdateMs : Number.NaN;
-    return {
-      candles: trimmedAggregated.map((item) => ({
-        t: item.t,
-        o: item.o,
-        h: item.h,
-        l: item.l,
-        c: item.c,
-        v: item.v,
-      })),
-      lastUpdateMs,
-    };
+    if (Number.isFinite(endMs)) {
+      url.searchParams.set("endTime", Math.floor(endMs));
+    }
+    url.searchParams.set("limit", String(Math.max(1, Math.min(limit, 1000))));
+    const response = await fetch(url.toString());
+    if (!response.ok) {
+      throw new Error(`Failed to fetch range: ${response.status}`);
+    }
+    const data = await response.json();
+    if (!BinanceCandles || typeof BinanceCandles.transformKlines !== "function") {
+      throw new Error("Binance helper is unavailable");
+    }
+    return BinanceCandles.transformKlines(data)
+      .map((bar) => normaliseBar(bar))
+      .filter((bar) => bar !== null);
   }
 
   function ensurePreviewBar(input) {
@@ -1535,15 +1496,15 @@ def render_inspection_page(
         ts_ms_utc: Math.floor(candidateTs),
       };
     }
-    const normalized = normalisePreviewCandle(input);
+    const normalized = normaliseBar(input);
     if (!normalized) return null;
     return {
-      time: Math.floor(normalized.t / 1000),
-      open: normalized.o,
-      high: normalized.h,
-      low: normalized.l,
-      close: normalized.c,
-      ts_ms_utc: normalized.t,
+      time: Math.floor(normalized.time),
+      open: normalized.open,
+      high: normalized.high,
+      low: normalized.low,
+      close: normalized.close,
+      ts_ms_utc: normalized.ts_ms_utc,
     };
   }
 
@@ -2555,8 +2516,7 @@ def render_inspection_page(
         lastFetchedAtMs: null,
         lastUpdateMs: null,
         isFetching: false,
-        intervalMs:
-          TIMEFRAME_TO_MS[(intervalField && intervalField.value) || "1m"] || PREVIEW_SOURCE_INTERVAL_MS,
+        intervalMs: intervalToMs((intervalField && intervalField.value) || "1m"),
         gapWatcher: null,
       };
 
@@ -2567,7 +2527,10 @@ def render_inspection_page(
         statusEl.hidden = !message;
       }
 
-      function mergePreviewBars(bars, { reset = false, maxBars = PREVIEW_SHARED_MAX_BARS } = {}) {
+      function mergePreviewBars(
+        bars,
+        { reset = false, maxBars = PREVIEW_SHARED_MAX_BARS, lastUpdateMs = null } = {},
+      ) {
         if (reset) previewState.candles = [];
         if (!Array.isArray(bars) || !bars.length) return false;
         const index = new Map();
@@ -2588,29 +2551,67 @@ def render_inspection_page(
           }
           changed = true;
         });
-        if (changed) {
-          previewState.candles.sort((a, b) => Number(a.time) - Number(b.time));
-          const limit = Math.max(1, Number(maxBars) || PREVIEW_SHARED_MAX_BARS);
-          if (previewState.candles.length > limit) {
-            previewState.candles = previewState.candles.slice(previewState.candles.length - limit);
-          }
+        if (!changed) return false;
+
+        previewState.candles.sort((a, b) => Number(a.time) - Number(b.time));
+        const limit = Math.max(1, Number(maxBars) || PREVIEW_SHARED_MAX_BARS);
+        if (previewState.candles.length > limit) {
+          previewState.candles = previewState.candles.slice(previewState.candles.length - limit);
         }
+        const effectiveUpdate = Number.isFinite(lastUpdateMs) ? Number(lastUpdateMs) : Date.now();
+        previewState.lastUpdateMs = effectiveUpdate;
+        persistPreviewCandles({ bars, reset, lastUpdateMs: effectiveUpdate });
         return changed;
       }
 
-      function persistPreviewCandles({ bars = null, reset = false } = {}) {
+      function persistPreviewCandles({ bars = null, reset = false, lastUpdateMs = null } = {}) {
         if (!SharedCandles || typeof SharedCandles.merge !== "function") return;
         const payload = Array.isArray(bars) && bars.length ? bars : previewState.candles;
         if (!payload.length) return;
+        const effectiveUpdate = Number.isFinite(lastUpdateMs)
+          ? Number(lastUpdateMs)
+          : Number.isFinite(previewState.lastUpdateMs)
+          ? Number(previewState.lastUpdateMs)
+          : Date.now();
         try {
           SharedCandles.merge(previewState.symbol, previewState.interval, payload, {
             intervalMs: previewState.intervalMs,
-            lastUpdateMs: previewState.lastUpdateMs,
+            lastUpdateMs: effectiveUpdate,
             maxBars: PREVIEW_SHARED_MAX_BARS,
             reset,
           });
         } catch (error) {
           console.warn("preview shared store failed", error);
+        }
+      }
+
+      function restorePreviewFromShared(symbol, interval) {
+        if (!SharedCandles || typeof SharedCandles.get !== "function") {
+          return false;
+        }
+        try {
+          const stored = SharedCandles.get(symbol, interval);
+          if (!stored || !Array.isArray(stored.candles) || !stored.candles.length) {
+            return false;
+          }
+          const bars = stored.candles.map((bar) => ensurePreviewBar(bar)).filter((bar) => bar !== null);
+          if (!bars.length) {
+            return false;
+          }
+          const storedInterval = Number(stored.intervalMs);
+          if (Number.isFinite(storedInterval)) {
+            previewState.intervalMs = storedInterval;
+          }
+          const lastUpdate = Number(stored.lastUpdateMs) || Number(stored.updatedAt) || Date.now();
+          const changed = mergePreviewBars(bars, { reset: true, lastUpdateMs: lastUpdate });
+          if (changed) {
+            applyPreviewCandles({ fitContent: true });
+            return true;
+          }
+          return false;
+        } catch (error) {
+          console.warn("preview shared restore failed", error);
+          return false;
         }
       }
 
@@ -2624,33 +2625,27 @@ def render_inspection_page(
         if (!gap) return false;
         if (!previewState.symbol || !previewState.interval) return false;
         try {
-          const intervalMs = previewState.intervalMs || TIMEFRAME_TO_MS[previewState.interval] || PREVIEW_SOURCE_INTERVAL_MS;
-          const buffer = intervalMs * 2;
-          const startMs = Math.max(0, Math.floor(Number(gap.startMs) || 0) - buffer);
-          const endMs = Math.max(startMs + intervalMs, Math.floor(Number(gap.endMs) || 0) + buffer);
-          const approxMinutes = Math.ceil((endMs - startMs) / PREVIEW_SOURCE_INTERVAL_MS) + 4;
-          const minuteLimit = Math.min(
-            PREVIEW_SOURCE_MAX_LIMIT,
-            Math.max(computePreviewMinuteLimit(previewState.interval), approxMinutes),
-          );
-          const sourceCandles = await fetchCandles(
+          const intervalMs = previewState.intervalMs || intervalToMs(previewState.interval);
+          const startBound = Number(gap.startMs);
+          const endBound = Number(gap.endMs);
+          if (!Number.isFinite(startBound) || !Number.isFinite(endBound)) {
+            return false;
+          }
+          const rangeWidth = Math.max(intervalMs, endBound - startBound);
+          const approxBars = Math.ceil(rangeWidth / intervalMs) + 2;
+          const buffer = intervalMs;
+          const bars = await fetchRange(
             previewState.symbol,
-            PREVIEW_SOURCE_INTERVAL,
-            startMs,
-            endMs,
-            { limit: minuteLimit },
-          );
-          const fetchedAt = Date.now();
-          const { candles, lastUpdateMs } = aggregateMinuteCandles(
-            sourceCandles,
             previewState.interval,
-            fetchedAt,
+            Math.max(0, startBound - buffer),
+            endBound + buffer,
+            Math.min(1000, Math.max(approxBars, 50)),
           );
-          applyPreviewCandles(candles, fetchedAt, intervalMs, {
-            fitContent: false,
-            lastUpdateMs,
-            reset: false,
-          });
+          const changed = mergePreviewBars(bars, { lastUpdateMs: Date.now() });
+          if (changed) {
+            applyPreviewCandles({ fitContent: false });
+            catch_gap();
+          }
           return true;
         } catch (error) {
           console.error("preview gap fill failed", error);
@@ -2666,12 +2661,11 @@ def render_inspection_page(
         if (selectionLabelEl) selectionLabelEl.textContent = label;
       }
 
-      function updatePreviewInfo(bar, options = {}) {
-        const intervalMs =
-          Number.isFinite(options.intervalMs) && options.intervalMs
-            ? Number(options.intervalMs)
-            : previewState.intervalMs || TIMEFRAME_TO_MS[previewState.interval] || 60000;
-        const lastUpdateMs = Number(options.lastUpdateMs);
+      function updatePreviewInfo(bar) {
+        const intervalMs = previewState.intervalMs || intervalToMs(previewState.interval);
+        const lastUpdateMs = Number.isFinite(previewState.lastUpdateMs)
+          ? Number(previewState.lastUpdateMs)
+          : Date.now();
         if (!bar) {
           if (lastTimeEl) lastTimeEl.textContent = "-";
           if (lastPriceEl) lastPriceEl.textContent = "-";
@@ -2706,77 +2700,41 @@ def render_inspection_page(
         }, PREVIEW_REFRESH_INTERVAL_MS);
       }
 
-      async function requestPreviewCandles(symbol, interval) {
-        const resolvedInterval = interval || PREVIEW_SOURCE_INTERVAL;
-        const intervalMs = TIMEFRAME_TO_MS[resolvedInterval] || PREVIEW_SOURCE_INTERVAL_MS;
-        const endMs = Date.now();
-        const minuteLimit = computePreviewMinuteLimit(resolvedInterval);
-        const startMs = Math.max(0, endMs - PREVIEW_SOURCE_INTERVAL_MS * (minuteLimit + 2));
-        const sourceCandles = await fetchCandles(
-          symbol,
-          PREVIEW_SOURCE_INTERVAL,
-          startMs,
-          endMs,
-          { limit: minuteLimit + 5 },
-        );
-        const fetchedAt = Date.now();
-        const { candles, lastUpdateMs } = aggregateMinuteCandles(
-          sourceCandles,
-          resolvedInterval,
-          fetchedAt,
-        );
-        return { candles, fetchedAt, intervalMs, lastUpdateMs };
+      async function loadPreviewCandles({ reset = false, fitContent = false, limit = 1000 } = {}) {
+        if (!previewState.symbol || !previewState.interval) return false;
+        const intervalMs = intervalToMs(previewState.interval);
+        previewState.intervalMs = intervalMs;
+        const history = await fetchHistory(previewState.symbol, previewState.interval, limit);
+        const changed = mergePreviewBars(history, { reset, lastUpdateMs: Date.now() });
+        if (changed || reset) {
+          applyPreviewCandles({ fitContent });
+          catch_gap();
+        } else {
+          updatePreviewInfo(previewState.candles[previewState.candles.length - 1] || null);
+        }
+        return changed;
       }
 
-      function applyPreviewCandles(
-        candles,
-        fetchedAtMs,
-        intervalMs,
-        { fitContent = false, lastUpdateMs = null, reset = true } = {},
-      ) {
-        const merged = mergePreviewBars(Array.isArray(candles) ? candles : [], {
-          reset,
-          maxBars: PREVIEW_SHARED_MAX_BARS,
-        });
-        previewState.lastFetchedAtMs = fetchedAtMs;
-        previewState.intervalMs = Number.isFinite(intervalMs)
-          ? Number(intervalMs)
-          : previewState.intervalMs || TIMEFRAME_TO_MS[previewState.interval] || PREVIEW_SOURCE_INTERVAL_MS;
-        const resolvedUpdateMs = Number.isFinite(lastUpdateMs) ? Number(lastUpdateMs) : fetchedAtMs;
-        previewState.lastUpdateMs = resolvedUpdateMs;
+      function applyPreviewCandles({ fitContent = false } = {}) {
         if (previewState.series) {
           previewState.series.setData(previewState.candles);
         }
         if (fitContent && previewState.chart && previewState.candles.length) {
           previewState.chart.timeScale().fitContent();
         }
-        updatePreviewInfo(previewState.candles[previewState.candles.length - 1] || null, {
-          intervalMs: previewState.intervalMs,
-          lastUpdateMs: resolvedUpdateMs,
-        });
-        if (merged) {
-          persistPreviewCandles({ bars: candles, reset });
-        }
-        catch_gap();
+        const lastBar = previewState.candles[previewState.candles.length - 1] || null;
+        updatePreviewInfo(lastBar);
       }
 
       async function refreshPreviewCandles({ silent = false } = {}) {
         if (previewState.isFetching) return;
         if (!previewState.symbol || !previewState.interval) return;
         previewState.isFetching = true;
-      try {
-        const { candles, fetchedAt, intervalMs, lastUpdateMs } = await requestPreviewCandles(
-          previewState.symbol,
-          previewState.interval,
-        );
-        applyPreviewCandles(candles, fetchedAt, intervalMs, {
-          fitContent: false,
-          lastUpdateMs,
-          reset: false,
-        });
-        if (!silent) {
-          setPreviewStatus("", "info");
-        }
+        try {
+          await loadPreviewCandles({ reset: false, fitContent: false, limit: 600 });
+          if (!silent) {
+            setPreviewStatus("", "info");
+          }
         } catch (error) {
           console.error("Failed to refresh preview candles", error);
           if (!silent) {
@@ -2788,7 +2746,7 @@ def render_inspection_page(
       }
 
       function ensurePreviewChart() {
-        if (previewState.chart || !chartEl || !window.LightweightCharts) return;
+        if (previewState.chart || !chartEl || !LightweightCharts) return;
         previewState.chart = LightweightCharts.createChart(chartEl, {
           autoSize: true,
           layout: { background: { color: "#0f172a" }, textColor: "#e2e8f0" },
@@ -2862,7 +2820,7 @@ def render_inspection_page(
         const resolvedInterval = intervalRaw || "1m";
         previewState.symbol = resolvedSymbol;
         previewState.interval = resolvedInterval;
-        previewState.intervalMs = TIMEFRAME_TO_MS[resolvedInterval] || PREVIEW_SOURCE_INTERVAL_MS;
+        previewState.intervalMs = intervalToMs(resolvedInterval);
         previewState.selection = null;
         stopPreviewRefresh();
         if (symbolField) symbolField.value = resolvedSymbol;
@@ -2880,37 +2838,14 @@ def render_inspection_page(
           });
         }
 
-        let restoredFromShared = false;
-        if (SharedCandles && typeof SharedCandles.get === "function") {
-          try {
-            const stored = SharedCandles.get(resolvedSymbol, resolvedInterval);
-            if (stored && Array.isArray(stored.candles) && stored.candles.length) {
-              const storedFetchedAt = Number(stored.updatedAt) || Date.now();
-              const storedIntervalMs = Number(stored.intervalMs) || previewState.intervalMs;
-              const storedUpdate = Number(stored.lastUpdateMs) || storedFetchedAt;
-              applyPreviewCandles(stored.candles, storedFetchedAt, storedIntervalMs, {
-                fitContent: true,
-                lastUpdateMs: storedUpdate,
-                reset: true,
-              });
-              restoredFromShared = true;
-            }
-          } catch (error) {
-            console.warn("preview shared restore failed", error);
-          }
+        const restoredFromShared = restorePreviewFromShared(resolvedSymbol, resolvedInterval);
+        if (restoredFromShared && previewState.gapWatcher && typeof previewState.gapWatcher.notifyData === "function") {
+          previewState.gapWatcher.notifyData();
         }
 
         setPreviewStatus("Loading Binance history...", "info");
         try {
-          const { candles, fetchedAt, intervalMs, lastUpdateMs } = await requestPreviewCandles(
-            resolvedSymbol,
-            resolvedInterval,
-          );
-          applyPreviewCandles(candles, fetchedAt, intervalMs, {
-            fitContent: !restoredFromShared,
-            lastUpdateMs,
-            reset: true,
-          });
+          await loadPreviewCandles({ reset: true, fitContent: !restoredFromShared, limit: 1000 });
           setPreviewStatus("", "info");
           schedulePreviewRefresh();
         } catch (error) {
