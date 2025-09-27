@@ -85,13 +85,12 @@ async def inspection(
                 "selection": None,
                 "delta_cvd": {},
                 "vwap_tpo": {},
-                "zones": [],
-                "zones_structured": {
+                "zones": {
                     "symbol": DEFAULT_SYMBOL,
                     "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
                 },
+                "tpo": {"sessions": [], "zones": []},
                 "zones_raw": None,
-                "tpo": [],
                 "profile": [],
                 "profile_preset": profile_config.get("preset_payload"),
                 "profile_preset_required": bool(profile_config.get("preset_required", False)),
@@ -300,17 +299,17 @@ async def profile_endpoint(
 
     sessions = list(Meta.iter_vwap_sessions())
     tpo_entries: list[dict[str, object]] = []
+    tpo_zones: list[dict[str, Any]] = []
     flattened_profile: list[dict[str, float]] = []
-    zones: list[dict[str, Any]] = []
 
-    zones_structured = {
+    detected_zones = {
         "symbol": symbol,
         "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
     }
 
     if candles and sessions:
         cache_token = ("profile", snapshot, symbol, target_tf_key)
-        (tpo_entries, flattened_profile, zones) = build_profile_package(
+        (tpo_entries, flattened_profile, tpo_zones) = build_profile_package(
             candles,
             sessions=sessions,
             last_n=last_n_value,
@@ -326,7 +325,7 @@ async def profile_endpoint(
         )
         try:
             zone_cfg = ZonesConfig(tick_size=tick_size_value)
-            zones_structured = detect_zones(
+            detected_zones = detect_zones(
                 candles,
                 target_tf_key,
                 symbol,
@@ -342,13 +341,17 @@ async def profile_endpoint(
                 },
             )
 
+            detected_zones = {
+                "symbol": symbol,
+                "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
+            }
+
     payload = {
         "symbol": symbol,
         "tf": target_tf_key,
-        "tpo": tpo_entries,
+        "tpo": {"sessions": tpo_entries, "zones": tpo_zones},
         "profile": flattened_profile,
-        "zones": zones,
-        "zones_structured": zones_structured,
+        "zones": detected_zones,
         "preset": profile_config.get("preset_payload"),
         "preset_required": bool(profile_config.get("preset_required", False)),
     }

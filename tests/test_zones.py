@@ -263,10 +263,10 @@ def test_profile_and_inspection_include_structured_zones(client: TestClient) -> 
     profile_response = client.get("/profile", params={"snapshot": snapshot_id, "tf": "1m"})
     assert profile_response.status_code == 200
     profile_payload = profile_response.json()
-    assert "zones_structured" in profile_payload
-    assert profile_payload["zones_structured"]["zones"]["fvg"]
+    assert "zones" in profile_payload
+    assert profile_payload["zones"]["zones"]["fvg"]
 
     snapshot = inspection.get_snapshot(snapshot_id)
     inspection_payload = inspection.build_inspection_payload(snapshot)
-    zones_structured = inspection_payload["DATA"]["zones_structured"]
+    zones_structured = inspection_payload["DATA"]["zones"]
     assert zones_structured["zones"]["fvg"]

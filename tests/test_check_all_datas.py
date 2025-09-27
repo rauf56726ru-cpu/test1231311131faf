@@ -163,16 +163,19 @@ def test_historical_snapshot_still_populates_window(client: TestClient) -> None:
         expected_movement_end_ms / 1000, tz=timezone.utc
     ).isoformat()
     assert body[movement_key]["range"]["end_utc"].startswith(expected_movement_end)
-    assert "tpo" in body and isinstance(body["tpo"], list)
+    assert "tpo" in body and isinstance(body["tpo"], dict)
+    assert isinstance(body["tpo"].get("sessions"), list)
+    assert isinstance(body["tpo"].get("zones"), list)
     assert "profile" in body and isinstance(body["profile"], list)
-    assert "zones" in body and isinstance(body["zones"], list)
+    assert "zones" in body and isinstance(body["zones"], dict)
+    assert body["zones"].get("zones") is not None
     preset_payload = body.get("profile_preset")
     assert preset_payload is not None
     assert preset_payload["symbol"] == "BTCUSDT"
     assert preset_payload["builtin"] is True
     assert body.get("profile_preset_required") is False
-    if body["zones"]:
-        zone_types = {zone["type"] for zone in body["zones"]}
+    if body["tpo"]["zones"]:
+        zone_types = {zone["type"] for zone in body["tpo"]["zones"]}
         assert {"tpo_poc", "tpo_vah", "tpo_val"}.issubset(zone_types)
 
 

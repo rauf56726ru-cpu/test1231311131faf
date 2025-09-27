@@ -1,11 +1,13 @@
 """Snapshot diagnostics builder for the inspection check-all endpoint."""
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence
 
 from .presets import resolve_profile_config
 from .profile import build_profile_package
+from .zones import Config as ZonesConfig, detect_zones
 from ..meta import Meta
 
 
@@ -509,6 +511,10 @@ def build_check_all_datas(
     profile_tpo: List[Dict[str, Any]] = []
     profile_flat: List[Dict[str, float]] = []
     profile_zones: List[Dict[str, Any]] = []
+    detected_zones: Dict[str, Any] = {
+        "symbol": symbol,
+        "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
+    }
 
     target_tf_key = profile_config.get("target_tf_key", "1m")
     base_candles = frames.get(target_tf_key, [])
@@ -538,6 +544,29 @@ def build_check_all_datas(
             cache_token=cache_token,
             tf_key=target_tf_key,
         )
+
+    if base_candles:
+        try:
+            zone_cfg = ZonesConfig(tick_size=profile_config.get("tick_size"))
+            detected_zones = detect_zones(
+                base_candles,
+                target_tf_key,
+                symbol,
+                zone_cfg,
+            )
+        except Exception:  # pragma: no cover - defensive logging guard
+            logging.getLogger(__name__).exception(
+                "Failed to detect zones for check-all payload",
+                extra={
+                    "snapshot_id": snapshot.get("id"),
+                    "symbol": symbol,
+                    "timeframe": target_tf_key,
+                },
+            )
+            detected_zones = {
+                "symbol": symbol,
+                "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
+            }
 
     snapshot_selection = snapshot.get("selection") if isinstance(snapshot.get("selection"), Mapping) else None
     start_ms = selection_start_ms or _safe_int(snapshot_selection.get("start")) if snapshot_selection else None
@@ -753,9 +782,9 @@ def build_check_all_datas(
         "latest_candle": dict(latest_candle_payload),
         "datas_for_last_N_hours": detailed_section,
         movement_key: movement_section,
-        "tpo": profile_tpo,
+        "tpo": {"sessions": profile_tpo, "zones": profile_zones},
         "profile": profile_flat,
-        "zones": profile_zones,
+        "zones": detected_zones,
         "profile_preset": profile_config.get("preset_payload"),
         "profile_preset_required": bool(profile_config.get("preset_required", False)),
     }

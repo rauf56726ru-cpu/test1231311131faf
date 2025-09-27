@@ -536,9 +536,9 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
 
     sessions = list(Meta.iter_vwap_sessions())
     tpo_entries: List[Dict[str, object]] = []
+    tpo_zone_items: List[Dict[str, Any]] = []
     flattened_profile: List[Dict[str, float]] = []
-    zone_items: List[Dict[str, Any]] = []
-    zones_structured: Dict[str, Any] = {
+    detected_zones: Dict[str, Any] = {
         "symbol": symbol,
         "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
     }
@@ -571,7 +571,7 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
             target_tf_key,
         )
         try:
-            (tpo_entries, flattened_profile, zone_items) = build_profile_package(
+            (tpo_entries, flattened_profile, tpo_zone_items) = build_profile_package(
                 profile_candles,
                 sessions=sessions,
                 last_n=profile_last_n,
@@ -596,8 +596,8 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
             )
             tpo_entries = []
             flattened_profile = []
-            zone_items = []
-            zones_structured = {
+            tpo_zone_items = []
+            detected_zones = {
                 "symbol": symbol,
                 "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
             }
@@ -606,7 +606,7 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
     if profile_ready and profile_candles:
         try:
             zone_cfg = ZonesConfig(tick_size=tick_size_value)
-            zones_structured = detect_zones(
+            detected_zones = detect_zones(
                 profile_candles,
                 target_tf_key,
                 symbol,
@@ -621,7 +621,7 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
                     "timeframe": target_tf_key,
                 },
             )
-            zones_structured = {
+            detected_zones = {
                 "symbol": symbol,
                 "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
             }
@@ -631,10 +631,9 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
         "frames": normalised_frames,
         "selection": selection,
         "session_vwap": session_vwap,
-        "tpo": tpo_entries,
+        "tpo": {"sessions": tpo_entries, "zones": tpo_zone_items},
         "profile": flattened_profile,
-        "zones": zone_items,
-        "zones_structured": zones_structured,
+        "zones": detected_zones,
         "zones_raw": snapshot.get("zones"),
         "agg_trades": snapshot.get("agg_trades")
         or {
