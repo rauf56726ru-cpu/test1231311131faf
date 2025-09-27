@@ -1341,6 +1341,10 @@ def render_inspection_page(
   const DEFAULT_TEST_TIMEFRAMES = ["1m", "3m", "5m", "15m", "1h", "4h", "1d"];
   const PREVIEW_REFRESH_INTERVAL_MS = 10_000;
   const PREVIEW_SHARED_MAX_BARS = 2000;
+  const MINUTE_INTERVAL_KEY = "1m";
+  const MINUTE_INTERVAL_MS = TIMEFRAME_TO_MS[MINUTE_INTERVAL_KEY] || 60_000;
+  const PREVIEW_MINUTE_LOOKBACK_MS = MINUTE_INTERVAL_MS * 120;
+  const PREVIEW_MINUTE_MAX_BARS = 5000;
 
   const LightweightCharts = window.LightweightCharts || null;
   const BinanceCandles = window.BinanceCandles || null;
@@ -1393,11 +1397,17 @@ def render_inspection_page(
 
   function computeCandleDisplayTime(candle, intervalMs, lastUpdateMs) {
     if (!candle) return Number.NaN;
-    const openMs = Number(candle.t ?? candle.time ?? 0);
+    const openMs = Number(
+      candle.ts_ms_utc ?? candle.t ?? candle.time ?? (candle.openTime ?? candle.open_time ?? 0),
+    );
     if (!Number.isFinite(openMs)) return Number.NaN;
     const safeInterval = Math.max(1, Number(intervalMs) || 0);
     const closingMs = openMs + safeInterval;
-    const reference = Number.isFinite(lastUpdateMs) ? Number(lastUpdateMs) : Date.now();
+    const specificUpdate = Number(
+      candle.last_update_ms ?? candle.lastUpdateMs ?? candle.last_update ?? candle.updated_at ?? 0,
+    );
+    const referenceSource = Number.isFinite(specificUpdate) ? specificUpdate : lastUpdateMs;
+    const reference = Number.isFinite(referenceSource) ? Number(referenceSource) : Date.now();
     const alignedReference = Math.max(openMs, reference);
     return Math.min(closingMs, alignedReference);
   }
@@ -1505,8 +1515,12 @@ def render_inspection_page(
       low: normalized.low,
       close: normalized.close,
       ts_ms_utc: normalized.ts_ms_utc,
+      ...(Number.isFinite(normalized.last_update_ms)
+        ? { last_update_ms: Number(normalized.last_update_ms) }
+        : {}),
     };
   }
+
 
   function setJson(pre, data) {
     if (!pre) return;
@@ -2463,8 +2477,13 @@ def render_inspection_page(
       if (!resolvedSymbol) {
         throw new Error('symbol-invalid');
       }
-      const selectionStart = Math.floor(Number(selection.start));
-      const selectionEnd = Math.floor(Number(selection.end));
+      const rawStart = Number(selection.start);
+      const rawEnd = Number(selection.end);
+      if (!Number.isFinite(rawStart) || !Number.isFinite(rawEnd)) {
+        throw new Error('selection-invalid');
+      }
+      const selectionStart = Math.floor(Math.min(rawStart, rawEnd));
+      const selectionEnd = Math.floor(Math.max(rawStart, rawEnd));
       const framesPayload = {};
       for (const tf of uniqueFrames) {
         const candles = await fetchCandles(resolvedSymbol, tf, selectionStart, selectionEnd);
@@ -2576,6 +2595,7 @@ def render_inspection_page(
         interval: (intervalField && intervalField.value) || "1m",
         selection: null,
         candles: [],
+        minuteCandles: [],
         refreshTimer: null,
         lastFetchedAtMs: null,
         lastUpdateMs: null,
@@ -2583,6 +2603,272 @@ def render_inspection_page(
         intervalMs: intervalToMs((intervalField && intervalField.value) || "1m"),
         gapWatcher: null,
       };
+
+      function normaliseMinuteBar(bar) {
+        if (!bar) return null;
+        const open = Number(bar.open ?? bar.o ?? 0);
+        const high = Number(bar.high ?? bar.h ?? open);
+        const low = Number(bar.low ?? bar.l ?? open);
+        const close = Number(bar.close ?? bar.c ?? open);
+        const volume = Number(bar.volume ?? bar.v ?? 0);
+        const ts = Number(bar.ts_ms_utc ?? bar.t ?? bar.time ?? 0);
+        if (
+          !Number.isFinite(ts) ||
+          !Number.isFinite(open) ||
+          !Number.isFinite(high) ||
+          !Number.isFinite(low) ||
+          !Number.isFinite(close)
+        ) {
+          return null;
+        }
+        const openMs = Math.floor(ts);
+        const lastUpdate = openMs + MINUTE_INTERVAL_MS;
+        return {
+          time: Math.floor(openMs / 1000),
+          open,
+          high,
+          low,
+          close,
+          ts_ms_utc: openMs,
+          last_update_ms: lastUpdate,
+          volume: Number.isFinite(volume) ? volume : 0,
+        };
+      }
+
+      function mergeMinuteBars(bars, { reset = false } = {}) {
+        if (reset) previewState.minuteCandles = [];
+        if (!Array.isArray(bars) || !bars.length) return false;
+        const index = new Map();
+        previewState.minuteCandles.forEach((bar, idx) => {
+          const key = Number(bar?.ts_ms_utc ?? (bar?.time ?? 0) * 1000);
+          if (Number.isFinite(key)) {
+            index.set(key, idx);
+          }
+        });
+        let changed = false;
+        bars.forEach((entry) => {
+          const normalised = normaliseMinuteBar(entry);
+          if (!normalised) return;
+          const key = Number(normalised.ts_ms_utc);
+          if (!Number.isFinite(key)) return;
+          if (index.has(key)) {
+            previewState.minuteCandles[index.get(key)] = normalised;
+          } else {
+            index.set(key, previewState.minuteCandles.length);
+            previewState.minuteCandles.push(normalised);
+          }
+          changed = true;
+        });
+        if (!changed) return false;
+        previewState.minuteCandles.sort((a, b) => Number(a.ts_ms_utc) - Number(b.ts_ms_utc));
+        if (previewState.minuteCandles.length > PREVIEW_MINUTE_MAX_BARS) {
+          previewState.minuteCandles = previewState.minuteCandles.slice(
+            previewState.minuteCandles.length - PREVIEW_MINUTE_MAX_BARS,
+          );
+        }
+        return true;
+      }
+
+      function aggregateMinuteBuckets(minuteBars, intervalMs) {
+        if (!Array.isArray(minuteBars) || !minuteBars.length) return [];
+        const safeInterval = Math.max(1, Number(intervalMs) || MINUTE_INTERVAL_MS);
+        const buckets = new Map();
+        minuteBars.forEach((bar) => {
+          if (!bar) return;
+          const openMs = Number(bar.ts_ms_utc ?? bar.t ?? bar.time ?? 0);
+          if (!Number.isFinite(openMs)) return;
+          const bucketStart = Math.floor(openMs / safeInterval) * safeInterval;
+          const high = Number(bar.high ?? bar.h ?? bar.open ?? bar.o ?? 0);
+          const low = Number(bar.low ?? bar.l ?? bar.open ?? bar.o ?? 0);
+          const close = Number(bar.close ?? bar.c ?? bar.open ?? bar.o ?? 0);
+          const open = Number(bar.open ?? bar.o ?? close);
+          const volume = Number(bar.volume ?? bar.v ?? 0);
+          if (!Number.isFinite(bucketStart)) return;
+          let bucket = buckets.get(bucketStart);
+          if (!bucket) {
+            bucket = {
+              start: bucketStart,
+              open,
+              high,
+              low,
+              close,
+              volume: Number.isFinite(volume) ? volume : 0,
+              firstTs: openMs,
+              lastUpdate: openMs + MINUTE_INTERVAL_MS,
+            };
+            buckets.set(bucketStart, bucket);
+          } else {
+            if (openMs < bucket.firstTs) {
+              bucket.firstTs = openMs;
+              bucket.open = open;
+            }
+            bucket.high = Math.max(bucket.high, high);
+            bucket.low = Math.min(bucket.low, low);
+            bucket.close = close;
+            if (Number.isFinite(volume)) {
+              bucket.volume += volume;
+            }
+            bucket.lastUpdate = Math.max(bucket.lastUpdate, openMs + MINUTE_INTERVAL_MS);
+          }
+        });
+        return Array.from(buckets.values())
+          .map((bucket) => ({
+            start: bucket.start,
+            open: bucket.open,
+            high: bucket.high,
+            low: bucket.low,
+            close: bucket.close,
+            volume: bucket.volume,
+            lastUpdate: bucket.lastUpdate,
+          }))
+          .sort((a, b) => a.start - b.start);
+      }
+
+      function applyMinuteAggregation({ persist = true } = {}) {
+        if (!previewState.minuteCandles.length) return false;
+        const intervalMs = previewState.intervalMs || intervalToMs(previewState.interval);
+        const buckets = aggregateMinuteBuckets(previewState.minuteCandles, intervalMs);
+        if (!buckets.length) return false;
+        let changed = false;
+        const previousUpdate = Number(previewState.lastUpdateMs) || 0;
+        let maxUpdate = previousUpdate;
+        buckets.forEach((bucket) => {
+          const startMs = Number(bucket.start);
+          if (!Number.isFinite(startMs)) return;
+          const idx = previewState.candles.findIndex((bar) => {
+            const barTs = Number(bar?.ts_ms_utc ?? (bar?.time ?? 0) * 1000);
+            return Number.isFinite(barTs) && Math.floor(barTs) === startMs;
+          });
+          const baseBar = idx >= 0 ? previewState.candles[idx] : null;
+          const normalised = {
+            time: Math.floor(startMs / 1000),
+            open: Number.isFinite(baseBar?.open) ? Number(baseBar.open) : Number(bucket.open),
+            high: Math.max(
+              Number.isFinite(baseBar?.high) ? Number(baseBar.high) : Number(bucket.high),
+              Number(bucket.high),
+            ),
+            low: Math.min(
+              Number.isFinite(baseBar?.low) ? Number(baseBar.low) : Number(bucket.low),
+              Number(bucket.low),
+            ),
+            close: Number(bucket.close),
+            ts_ms_utc: startMs,
+            last_update_ms: Number(bucket.lastUpdate),
+          };
+          if (baseBar) {
+            const updated = {
+              ...baseBar,
+              open: normalised.open,
+              high: normalised.high,
+              low: normalised.low,
+              close: normalised.close,
+              ts_ms_utc: normalised.ts_ms_utc,
+              last_update_ms: normalised.last_update_ms,
+            };
+            const baseVolume = Number(baseBar.volume ?? baseBar.v ?? 0);
+            const bucketVolume = Number(bucket.volume ?? 0);
+            if (Number.isFinite(baseVolume) || Number.isFinite(bucketVolume)) {
+              updated.volume = (Number.isFinite(baseVolume) ? baseVolume : 0) +
+                (Number.isFinite(bucketVolume) ? bucketVolume : 0);
+            }
+            const diff =
+              Number(baseBar.open) !== updated.open ||
+              Number(baseBar.high) !== updated.high ||
+              Number(baseBar.low) !== updated.low ||
+              Number(baseBar.close) !== updated.close ||
+              Number(baseBar.last_update_ms) !== updated.last_update_ms;
+            if (diff) {
+              previewState.candles[idx] = updated;
+              changed = true;
+            } else {
+              previewState.candles[idx] = updated;
+            }
+          } else {
+            previewState.candles.push({
+              time: normalised.time,
+              open: normalised.open,
+              high: normalised.high,
+              low: normalised.low,
+              close: normalised.close,
+              ts_ms_utc: normalised.ts_ms_utc,
+              last_update_ms: normalised.last_update_ms,
+            });
+            changed = true;
+          }
+          if (Number.isFinite(normalised.last_update_ms)) {
+            maxUpdate = Math.max(maxUpdate, Number(normalised.last_update_ms));
+          }
+        });
+        if (changed) {
+          previewState.candles.sort((a, b) => Number(a.time) - Number(b.time));
+        }
+        if (Number.isFinite(maxUpdate) && maxUpdate > 0) {
+          previewState.lastUpdateMs = maxUpdate;
+        }
+        if ((changed || previewState.lastUpdateMs !== previousUpdate) && persist) {
+          persistPreviewCandles({ bars: previewState.candles, lastUpdateMs: previewState.lastUpdateMs });
+        }
+        return changed;
+      }
+
+      async function fetchMinuteWindow({ force = false } = {}) {
+        if (!previewState.symbol) return [];
+        const nowMs = Date.now();
+        const intervalMs = previewState.intervalMs || intervalToMs(previewState.interval);
+        let startMs = null;
+        if (force || !previewState.minuteCandles.length) {
+          const lookback = Math.max(intervalMs, PREVIEW_MINUTE_LOOKBACK_MS);
+          startMs = Math.max(0, nowMs - lookback);
+        } else {
+          const last = previewState.minuteCandles[previewState.minuteCandles.length - 1];
+          const lastTs = Number(last?.ts_ms_utc ?? last?.t ?? 0);
+          if (Number.isFinite(lastTs)) {
+            startMs = Math.max(0, lastTs - MINUTE_INTERVAL_MS);
+          }
+        }
+        return fetchCandles(previewState.symbol, MINUTE_INTERVAL_KEY, startMs, nowMs);
+      }
+
+      function findBarAtOrBefore(targetMs) {
+        if (!Number.isFinite(targetMs)) return null;
+        for (let idx = previewState.candles.length - 1; idx >= 0; idx -= 1) {
+          const bar = previewState.candles[idx];
+          if (!bar) continue;
+          const barTs = Number(bar.ts_ms_utc ?? (bar.time ?? 0) * 1000);
+          if (!Number.isFinite(barTs)) continue;
+          if (barTs <= targetMs) {
+            return bar;
+          }
+        }
+        return null;
+      }
+
+      function normaliseSelectionRange(rawStart, rawEnd) {
+        let start = Number(rawStart);
+        let end = Number(rawEnd);
+        if (!Number.isFinite(start) || !Number.isFinite(end)) {
+          return null;
+        }
+        if (end < start) {
+          const tmp = start;
+          start = end;
+          end = tmp;
+        }
+        start = Math.floor(start);
+        end = Math.floor(end);
+        const intervalMs = previewState.intervalMs || intervalToMs(previewState.interval);
+        const lastBar = findBarAtOrBefore(end);
+        if (lastBar) {
+          const barUpdate = Number.isFinite(lastBar.last_update_ms)
+            ? Number(lastBar.last_update_ms)
+            : Number(previewState.lastUpdateMs);
+          const displayEnd = computeCandleDisplayTime(lastBar, intervalMs, barUpdate);
+          if (Number.isFinite(displayEnd)) {
+            end = Math.max(start, Number(displayEnd));
+          }
+        }
+        return { start, end };
+      }
 
       function setPreviewStatus(message, tone = "info") {
         if (!statusEl) return;
@@ -2727,10 +3013,12 @@ def render_inspection_page(
 
       function updatePreviewInfo(bar) {
         const intervalMs = previewState.intervalMs || intervalToMs(previewState.interval);
-        let lastUpdateMs = Number.isFinite(previewState.lastUpdateMs)
+        let lastUpdateMs = Number.isFinite(bar?.last_update_ms)
+          ? Number(bar.last_update_ms)
+          : Number.isFinite(previewState.lastUpdateMs)
           ? Number(previewState.lastUpdateMs)
           : Date.now();
-        const selectionEnd = previewState.selection && previewState.selection.end;
+        const selectionEnd = Number(previewState.selection && previewState.selection.end);
         if (Number.isFinite(selectionEnd)) {
           lastUpdateMs = Math.min(lastUpdateMs, Number(selectionEnd));
         }
@@ -2740,7 +3028,7 @@ def render_inspection_page(
           if (lastRangeEl) lastRangeEl.textContent = "-";
           return;
         }
-        const displayTs = computeCandleDisplayTime({ t: bar.ts_ms_utc ?? bar.time * 1000 }, intervalMs, lastUpdateMs);
+        const displayTs = computeCandleDisplayTime(bar, intervalMs, lastUpdateMs);
         if (lastTimeEl) lastTimeEl.textContent = formatTs(displayTs);
         const close = Number(bar.close ?? bar.c ?? 0);
         if (lastPriceEl) lastPriceEl.textContent = Number.isFinite(close) ? close.toFixed(2) : "-";
@@ -2772,15 +3060,49 @@ def render_inspection_page(
         if (!previewState.symbol || !previewState.interval) return false;
         const intervalMs = intervalToMs(previewState.interval);
         previewState.intervalMs = intervalMs;
+        if (reset) {
+          previewState.minuteCandles = [];
+        }
         const history = await fetchHistory(previewState.symbol, previewState.interval, limit);
-        const changed = mergePreviewBars(history, { reset, lastUpdateMs: Date.now() });
-        if (changed || reset) {
+        const historyChanged = mergePreviewBars(history, {
+          reset,
+          lastUpdateMs: Number.isFinite(previewState.lastUpdateMs) ? previewState.lastUpdateMs : Date.now(),
+        });
+        if (historyChanged || reset || !previewState.candles.length) {
           applyPreviewCandles({ fitContent });
           catch_gap();
-        } else {
-          updatePreviewInfo(previewState.candles[previewState.candles.length - 1] || null);
         }
-        return changed;
+
+        try {
+          const minuteBars = await fetchMinuteWindow({ force: true });
+          const previousUpdate = Number(previewState.lastUpdateMs) || 0;
+          const minuteChanged = mergeMinuteBars(minuteBars, { reset });
+          const aggregatedChanged = minuteChanged ? applyMinuteAggregation({ persist: true }) : false;
+          if (aggregatedChanged) {
+            applyPreviewCandles({ fitContent: false });
+            catch_gap();
+          } else if (minuteChanged || Number(previewState.lastUpdateMs || 0) !== previousUpdate) {
+            const targetBar =
+              findBarAtOrBefore(Number(previewState.selection?.end)) ||
+              previewState.candles[previewState.candles.length - 1] ||
+              null;
+            updatePreviewInfo(targetBar);
+          }
+          if (previewState.selection && previewState.selection.start && previewState.selection.end) {
+            const adjustedRange = normaliseSelectionRange(
+              previewState.selection.start,
+              previewState.selection.end,
+            );
+            if (adjustedRange) {
+              previewState.selection = adjustedRange;
+              updatePreviewSelectionLabel();
+            }
+          }
+        } catch (error) {
+          console.warn("preview minute fetch failed", error);
+        }
+
+        return historyChanged;
       }
 
       function applyPreviewCandles({ fitContent = false } = {}) {
@@ -2815,7 +3137,30 @@ def render_inspection_page(
         if (!previewState.symbol || !previewState.interval) return;
         previewState.isFetching = true;
         try {
-          await loadPreviewCandles({ reset: false, fitContent: false, limit: 600 });
+          const minuteBars = await fetchMinuteWindow({ force: false });
+          const previousUpdate = Number(previewState.lastUpdateMs) || 0;
+          const minuteChanged = mergeMinuteBars(minuteBars, { reset: false });
+          const aggregatedChanged = minuteChanged ? applyMinuteAggregation({ persist: true }) : false;
+          if (aggregatedChanged) {
+            applyPreviewCandles({ fitContent: false });
+            catch_gap();
+          } else if (minuteChanged || Number(previewState.lastUpdateMs || 0) !== previousUpdate) {
+            const targetBar =
+              findBarAtOrBefore(Number(previewState.selection?.end)) ||
+              previewState.candles[previewState.candles.length - 1] ||
+              null;
+            updatePreviewInfo(targetBar);
+          }
+          if (previewState.selection && previewState.selection.start && previewState.selection.end) {
+            const adjustedRange = normaliseSelectionRange(
+              previewState.selection.start,
+              previewState.selection.end,
+            );
+            if (adjustedRange) {
+              previewState.selection = adjustedRange;
+              updatePreviewSelectionLabel();
+            }
+          }
           if (!silent) {
             setPreviewStatus("", "info");
           }
@@ -2884,17 +3229,25 @@ def render_inspection_page(
         previewState.chart.subscribeClick((param) => {
           if (!param || typeof param.time === "undefined") return;
           const ts = Math.floor(Number(param.time) * 1000);
+          if (!Number.isFinite(ts)) return;
           if (!previewState.selection || !previewState.selection.start || previewState.selection.end) {
             previewState.selection = { start: ts, end: null };
           } else {
-            previewState.selection.end = ts;
-            if (previewState.selection.end < previewState.selection.start) {
-              const tmp = previewState.selection.start;
-              previewState.selection.start = previewState.selection.end;
-              previewState.selection.end = tmp;
+            const range = normaliseSelectionRange(previewState.selection.start, ts);
+            if (range) {
+              previewState.selection = range;
+            } else {
+              previewState.selection = { start: ts, end: ts };
             }
           }
           updatePreviewSelectionLabel();
+          const targetBar =
+            previewState.selection && previewState.selection.end
+              ? findBarAtOrBefore(Number(previewState.selection.end)) ||
+                previewState.candles[previewState.candles.length - 1] ||
+                null
+              : previewState.candles[previewState.candles.length - 1] || null;
+          updatePreviewInfo(targetBar);
         });
       }
 
@@ -2905,6 +3258,9 @@ def render_inspection_page(
         previewState.symbol = resolvedSymbol;
         previewState.interval = resolvedInterval;
         previewState.intervalMs = intervalToMs(resolvedInterval);
+        previewState.minuteCandles = [];
+        previewState.lastUpdateMs = null;
+        previewState.lastFetchedAtMs = null;
         previewState.selection = null;
         stopPreviewRefresh();
         if (symbolField) symbolField.value = resolvedSymbol;
@@ -2944,6 +3300,8 @@ def render_inspection_page(
           previewState.selection = null;
           updatePreviewSelectionLabel();
           setPreviewStatus("", "info");
+          const lastBar = previewState.candles[previewState.candles.length - 1] || null;
+          updatePreviewInfo(lastBar);
         });
       }
 

@@ -588,6 +588,15 @@ def build_check_all_datas(
     if start_ms is not None and derived_reference_ts is not None:
         derived_reference_ts = max(derived_reference_ts, start_ms)
 
+    effective_end_ms = derived_reference_ts if derived_reference_ts is not None else end_ms
+    if effective_end_ms is not None and effective_end_ms != end_ms:
+        adjusted_minute = _latest_candle_before(minute_candles, end_ms=effective_end_ms)
+        if adjusted_minute is not None:
+            latest_minute_candle = adjusted_minute
+        adjusted_primary = _latest_candle_before(primary_candles, end_ms=effective_end_ms)
+        if adjusted_primary is not None:
+            latest_primary_candle = adjusted_primary
+
     hours_window = hours if hours in VALID_HOUR_WINDOWS else min(VALID_HOUR_WINDOWS)
 
     if now_utc is not None:
@@ -613,8 +622,14 @@ def build_check_all_datas(
         or (primary_candles[-1] if primary_candles else None)
     )
     latest_candle_ts = _safe_int(latest_candle_source.get("t")) if latest_candle_source else None
+    if latest_candle_ts is None and primary_candles:
+        latest_candle_ts = _safe_int(primary_candles[-1].get("t"))
+    if latest_candle_ts is None and effective_end_ms is not None:
+        latest_candle_ts = effective_end_ms
     if latest_candle_ts is None:
         latest_candle_ts = primary_candles[-1]["t"]
+    if reference_dt is not None:
+        latest_candle_ts = min(latest_candle_ts, int(reference_dt.timestamp() * 1000))
     latest_candle_dt = datetime.fromtimestamp(latest_candle_ts / 1000.0, tz=UTC)
 
     detailed_start_dt = datetime.fromtimestamp(detailed_start_ts / 1000.0, tz=UTC)

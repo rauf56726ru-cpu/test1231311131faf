@@ -69,6 +69,7 @@
     if (!Number.isFinite(tsMs)) {
       tsMs = Number.isFinite(timeSeconds) ? timeSeconds * 1000 : NaN;
     }
+    const lastUpdate = Number(bar.last_update_ms ?? bar.lastUpdateMs ?? bar.last_update ?? bar.lastupdate);
     if (
       !Number.isFinite(timeSeconds) ||
       !Number.isFinite(open) ||
@@ -85,6 +86,7 @@
       low,
       close,
       ts_ms_utc: Math.floor(tsMs),
+      ...(Number.isFinite(lastUpdate) ? { last_update_ms: Math.floor(lastUpdate) } : {}),
     };
   }
 
