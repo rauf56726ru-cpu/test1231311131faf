@@ -40,33 +40,40 @@ def _round_tick(value: float, tick_size: float | None) -> float:
 
 
 def _infer_tick_size(candles: Sequence[Mapping[str, Any]]) -> float | None:
-    min_diff = math.inf
-    prev_close: float | None = None
+    """Infer the minimal price increment from the candle series."""
+
+    prices: List[float] = []
     for candle in candles:
-        close = candle.get("c")
-        if close is None:
-            continue
-        try:
-            close_value = float(close)
-        except (TypeError, ValueError):
-            continue
-        if not math.isfinite(close_value):
-            continue
-        if prev_close is not None:
-            diff = abs(close_value - prev_close)
-            if diff > 0 and diff < min_diff:
-                min_diff = diff
-        prev_close = close_value
+        for key in ("o", "h", "l", "c"):
+            value = candle.get(key)
+            if value is None:
+                continue
+            try:
+                price = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(price):
+                prices.append(price)
 
-    if not math.isfinite(min_diff) or min_diff == math.inf:
+    if len(prices) < 2:
         return None
 
-    exponent = math.floor(math.log10(min_diff)) if min_diff > 0 else None
-    if exponent is None:
+    prices = sorted(set(prices))
+    min_diff = math.inf
+    for left, right in zip(prices, prices[1:]):
+        diff = right - left
+        if diff <= 0:
+            continue
+        if diff < min_diff:
+            min_diff = diff
+
+    if not math.isfinite(min_diff) or min_diff <= 0:
         return None
-    exponent = min(0, exponent)
-    tick = 10 ** exponent
-    return tick
+
+    tick = round(min_diff, 12)
+    if tick <= 0:
+        tick = float(min_diff)
+    return float(tick)
 
 
 def _true_range(current: Mapping[str, float], previous: Mapping[str, float]) -> float:
@@ -162,8 +169,15 @@ def _detect_fvg_internal(
             bot = prev_candle["h"]
             top = next_candle["l"]
             gap_pct = _calc_gap_pct(bot, top)
-            too_small = effective_tick is not None and (top - bot) < effective_tick
-            if gap_pct < min_gap_pct and too_small:
+            width = top - bot
+            if width <= 0:
+                continue
+            passes_pct = gap_pct >= min_gap_pct if min_gap_pct is not None else True
+            passes_tick = (
+                effective_tick is not None
+                and width + 1e-12 >= max(effective_tick, 0.0)
+            )
+            if not passes_pct and not passes_tick:
                 continue
             raw.append(
                 {
@@ -179,8 +193,15 @@ def _detect_fvg_internal(
             bot = next_candle["h"]
             top = prev_candle["l"]
             gap_pct = _calc_gap_pct(bot, top)
-            too_small = effective_tick is not None and (top - bot) < effective_tick
-            if gap_pct < min_gap_pct and too_small:
+            width = top - bot
+            if width <= 0:
+                continue
+            passes_pct = gap_pct >= min_gap_pct if min_gap_pct is not None else True
+            passes_tick = (
+                effective_tick is not None
+                and width + 1e-12 >= max(effective_tick, 0.0)
+            )
+            if not passes_pct and not passes_tick:
                 continue
             raw.append(
                 {
