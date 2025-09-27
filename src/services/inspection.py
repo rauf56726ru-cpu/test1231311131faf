@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import html as html_utils
 import json
+import logging
 import math
 import os
 import re
@@ -547,26 +548,46 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
     smooth_window = int(profile_config.get("smooth_window", 1))
 
     if preset and base_candles and sessions:
+        closed_candles = [
+            candle
+            for candle in base_candles
+            if bool(candle.get("closed", True))
+        ]
+        profile_candles = closed_candles or list(base_candles)
+
         cache_token = (
             "inspection",
             snapshot.get("id"),
             symbol,
             target_tf_key,
         )
-        (tpo_entries, flattened_profile, zone_items) = build_profile_package(
-            base_candles,
-            sessions=sessions,
-            last_n=profile_last_n,
-            tick_size=tick_size_value,
-            adaptive_bins=adaptive_bins_flag,
-            value_area_pct=value_area_pct,
-            atr_multiplier=atr_multiplier,
-            target_bins=target_bins,
-            clip_threshold=clip_threshold,
-            smooth_window=smooth_window,
-            cache_token=cache_token,
-            tf_key=target_tf_key,
-        )
+        try:
+            (tpo_entries, flattened_profile, zone_items) = build_profile_package(
+                profile_candles,
+                sessions=sessions,
+                last_n=profile_last_n,
+                tick_size=tick_size_value,
+                adaptive_bins=adaptive_bins_flag,
+                value_area_pct=value_area_pct,
+                atr_multiplier=atr_multiplier,
+                target_bins=target_bins,
+                clip_threshold=clip_threshold,
+                smooth_window=smooth_window,
+                cache_token=cache_token,
+                tf_key=target_tf_key,
+            )
+        except Exception:  # pragma: no cover - defensive guard against upstream errors
+            logging.getLogger(__name__).exception(
+                "Failed to build profile package for inspection payload",
+                extra={
+                    "snapshot_id": snapshot.get("id"),
+                    "symbol": symbol,
+                    "timeframe": target_tf_key,
+                },
+            )
+            tpo_entries = []
+            flattened_profile = []
+            zone_items = []
 
     data_section = {
         "symbol": symbol,
