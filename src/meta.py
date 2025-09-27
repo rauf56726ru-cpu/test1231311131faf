@@ -2,7 +2,15 @@
 from __future__ import annotations
 
 from datetime import time
-from typing import Iterable, Tuple
+from typing import Dict, Iterable, Tuple
+
+
+# Hardcoded tick sizes for popular perpetual pairs used as liquidity fallbacks.
+HARDCODED_TICK_SIZES: Dict[str, float] = {
+    "BTCUSDT": 0.1,
+    "ETHUSDT": 0.01,
+    "SOLUSDT": 0.001,
+}
 
 
 class Meta:

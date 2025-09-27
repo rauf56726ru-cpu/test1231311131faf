@@ -9,6 +9,7 @@ import os
 import re
 from collections import OrderedDict, defaultdict
 from datetime import datetime, timedelta, timezone, time as dtime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import (
     Any,
@@ -30,7 +31,7 @@ from .ohlc import TIMEFRAME_WINDOWS, TIMEFRAME_TO_MS, normalise_ohlcv, resample_
 from .profile import build_profile_package
 from .presets import resolve_profile_config
 from .zones import Config as ZonesConfig, detect_zones
-from ..meta import Meta
+from ..meta import HARDCODED_TICK_SIZES, Meta
 
 Snapshot = Dict[str, Any]
 
@@ -49,6 +50,9 @@ MS_IN_DAY = 86_400_000
 HTF_TIMEFRAMES: Tuple[str, ...] = ("15m", "1h", "4h", "1d")
 MINUTE_INTERVAL_MS = TIMEFRAME_TO_MS.get("1m", 60_000)
 BINANCE_FAPI_REST = "https://fapi.binance.com/fapi/v1/klines"
+
+_PRICE_FIELDS: Tuple[str, ...] = ("o", "h", "l", "c")
+_MAX_TICK_SAMPLES = 5000
 
 
 def _safe_int(value: object | None) -> int | None:
@@ -195,6 +199,132 @@ def ensure_higher_timeframes(
             },
         )
     return generated
+
+
+def _infer_tick_size_from_frames(
+    frames: Mapping[str, Sequence[Mapping[str, Any]]]
+) -> float | None:
+    """Infer a plausible tick size from OHLCV data when metadata is missing."""
+
+    samples: List[Decimal] = []
+    seen: set[Decimal] = set()
+    for tf_key, candles in frames.items():
+        if not isinstance(candles, Sequence):
+            continue
+        for candle in candles:
+            if not isinstance(candle, Mapping):
+                continue
+            for field in _PRICE_FIELDS:
+                price = _coerce_float(candle.get(field))
+                if price is None:
+                    continue
+                try:
+                    decimal_value = Decimal(str(price))
+                except (InvalidOperation, ValueError):
+                    continue
+                if decimal_value in seen:
+                    continue
+                seen.add(decimal_value)
+                samples.append(decimal_value)
+            if len(samples) >= _MAX_TICK_SAMPLES:
+                break
+        if len(samples) >= _MAX_TICK_SAMPLES:
+            break
+
+    if len(samples) < 2:
+        return None
+
+    samples.sort()
+    min_step: Decimal | None = None
+    previous = samples[0]
+    for current in samples[1:]:
+        diff = current - previous
+        if diff > 0:
+            if min_step is None or diff < min_step:
+                min_step = diff
+                if min_step == 0:
+                    min_step = None
+        previous = current
+
+    if min_step is not None and min_step > 0:
+        return float(min_step)
+
+    max_precision = 0
+    for value in samples:
+        exponent = -value.as_tuple().exponent
+        if exponent > max_precision:
+            max_precision = exponent
+
+    if max_precision > 0:
+        return float(10 ** (-max_precision))
+    return None
+
+
+def resolve_liquidity_tick_size(
+    symbol: str,
+    profile_tick_size: Any,
+    frames: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    logger: logging.Logger | None = None,
+) -> Tuple[float, str]:
+    """Resolve a positive tick size for liquidity detection with fallbacks."""
+
+    log = logger or logging.getLogger(__name__)
+    symbol_key = (symbol or "UNKNOWN").upper()
+
+    profile_numeric: float | None = None
+    if isinstance(profile_tick_size, (int, float)):
+        profile_numeric = float(profile_tick_size)
+    elif isinstance(profile_tick_size, str):
+        try:
+            profile_numeric = float(profile_tick_size)
+        except (TypeError, ValueError):
+            profile_numeric = None
+
+    if profile_numeric is not None and profile_numeric > 0:
+        tick_size = profile_numeric
+        tick_source = "tick_size_from_profile"
+        log.debug(
+            "Resolved liquidity tick size from profile",
+            extra={"symbol": symbol_key, "tick_size": tick_size, "tick_size_source": tick_source},
+        )
+        return tick_size, tick_source
+
+    hardcoded = HARDCODED_TICK_SIZES.get(symbol_key)
+    if isinstance(hardcoded, (int, float)) and hardcoded > 0:
+        tick_size = float(hardcoded)
+        tick_source = "tick_size_from_hardcoded"
+        log.debug(
+            "Using hardcoded liquidity tick size fallback",
+            extra={"symbol": symbol_key, "tick_size": tick_size, "tick_size_source": tick_source},
+        )
+        return tick_size, tick_source
+
+    tick_source = "tick_size_from_auto"
+    log.warning(
+        "Profile tick size missing; attempting auto inference",
+        extra={"symbol": symbol_key, "tick_size_source": tick_source},
+    )
+
+    inferred = _infer_tick_size_from_frames(frames)
+    if inferred is not None and inferred > 0:
+        tick_size = float(inferred)
+        log.debug(
+            "Auto-inferred liquidity tick size",
+            extra={"symbol": symbol_key, "tick_size": tick_size, "tick_size_source": tick_source},
+        )
+        return tick_size, tick_source
+
+    tick_size = 1.0
+    log.warning(
+        "Auto tick size inference failed; defaulting to 1.0",
+        extra={"symbol": symbol_key, "tick_size_source": tick_source},
+    )
+    log.debug(
+        "Using default liquidity tick size after inference failure",
+        extra={"symbol": symbol_key, "tick_size": tick_size, "tick_size_source": tick_source},
+    )
+    return tick_size, tick_source
 
 
 def _expected_minute_sequence(start_ms: int, end_ms: int) -> List[int]:
@@ -1215,7 +1345,12 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
 
     raw_meta = snapshot.get("meta") if isinstance(snapshot.get("meta"), Mapping) else {}
     liquidity_config = raw_meta.get("liquidity") if isinstance(raw_meta, Mapping) else None
-    tick_size = float(tick_size_value) if isinstance(tick_size_value, (int, float)) and tick_size_value > 0 else None
+    tick_size, tick_size_source = resolve_liquidity_tick_size(
+        symbol,
+        tick_size_value,
+        full_candles_by_tf,
+        logger=logging.getLogger(__name__),
+    )
     liquidity_frames: Dict[str, Dict[str, Any]] = {}
     for tf, candles in full_candles_by_tf.items():
         payload: Dict[str, Any] = {"candles": list(candles)}
@@ -1228,6 +1363,15 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
         tick_size=tick_size,
         selection=selection,
         config=liquidity_config if isinstance(liquidity_config, Mapping) else None,
+    )
+
+    logging.getLogger(__name__).debug(
+        "Liquidity tick size applied",
+        extra={
+            "symbol": symbol,
+            "tick_size": tick_size,
+            "tick_size_source": tick_size_source,
+        },
     )
 
     data_section = {
