@@ -205,6 +205,26 @@ def _ensure_minute_frame(
     ]
 
 
+def _latest_candle_before(
+    candles: Sequence[Mapping[str, Any]],
+    *,
+    end_ms: int | None,
+) -> Mapping[str, Any] | None:
+    if not candles:
+        return None
+    if end_ms is None:
+        return candles[-1]
+    for entry in reversed(candles):
+        if not isinstance(entry, Mapping):
+            continue
+        ts = _safe_int(entry.get("t"))
+        if ts is None:
+            continue
+        if ts <= end_ms:
+            return entry
+    return candles[-1]
+
+
 def _primary_frame_key(snapshot: Mapping[str, Any], frames: Mapping[str, Sequence[Mapping[str, Any]]]) -> str | None:
     preferred = str(snapshot.get("tf") or snapshot.get("timeframe") or "").lower()
     if preferred and preferred in frames:
@@ -519,25 +539,6 @@ def build_check_all_datas(
             tf_key=target_tf_key,
         )
 
-    derived_reference_ts: int | None = (
-        minute_candles[-1]["t"] + MINUTE_INTERVAL_MS if minute_candles else None
-    )
-    if derived_reference_ts is None:
-        interval_ms = _timeframe_interval_ms(primary_key) or 0
-        if interval_ms > 0:
-            derived_reference_ts = primary_candles[-1]["t"] + max(
-                0, interval_ms - MINUTE_INTERVAL_MS
-            )
-    if derived_reference_ts is None:
-        for candles in frames.values():
-            if not candles:
-                continue
-            candidate_ts = candles[-1]["t"]
-            if derived_reference_ts is None or candidate_ts > derived_reference_ts:
-                derived_reference_ts = candidate_ts
-    if derived_reference_ts is None:
-        derived_reference_ts = primary_candles[-1]["t"]
-
     snapshot_selection = snapshot.get("selection") if isinstance(snapshot.get("selection"), Mapping) else None
     start_ms = selection_start_ms or _safe_int(snapshot_selection.get("start")) if snapshot_selection else None
     end_ms = selection_end_ms or _safe_int(snapshot_selection.get("end")) if snapshot_selection else None
@@ -549,6 +550,43 @@ def build_check_all_datas(
 
     if start_ms > end_ms:
         start_ms, end_ms = end_ms, start_ms
+
+    latest_minute_candle = _latest_candle_before(minute_candles, end_ms=end_ms)
+    latest_primary_candle = _latest_candle_before(primary_candles, end_ms=end_ms)
+
+    derived_reference_ts: int | None = None
+    if latest_minute_candle is not None:
+        last_minute_open = _safe_int(latest_minute_candle.get("t"))
+        if last_minute_open is not None:
+            derived_reference_ts = last_minute_open + MINUTE_INTERVAL_MS
+    if derived_reference_ts is None and latest_primary_candle is not None:
+        interval_ms = _timeframe_interval_ms(primary_key) or 0
+        if interval_ms > 0:
+            base_ts = _safe_int(latest_primary_candle.get("t"))
+            if base_ts is not None:
+                derived_reference_ts = base_ts + max(0, interval_ms - MINUTE_INTERVAL_MS)
+    if derived_reference_ts is None:
+        for candles in frames.values():
+            candidate = _latest_candle_before(candles, end_ms=end_ms)
+            if not candidate:
+                continue
+            candidate_ts = _safe_int(candidate.get("t"))
+            if candidate_ts is None:
+                continue
+            if derived_reference_ts is None or candidate_ts > derived_reference_ts:
+                derived_reference_ts = candidate_ts
+    if derived_reference_ts is None and latest_primary_candle is not None:
+        base_ts = _safe_int(latest_primary_candle.get("t"))
+        if base_ts is not None:
+            derived_reference_ts = base_ts
+    if derived_reference_ts is None:
+        fallback_ts = _safe_int(primary_candles[-1].get("t"))
+        derived_reference_ts = fallback_ts if fallback_ts is not None else primary_candles[-1]["t"]
+
+    if end_ms is not None and derived_reference_ts is not None:
+        derived_reference_ts = min(derived_reference_ts, end_ms)
+    if start_ms is not None and derived_reference_ts is not None:
+        derived_reference_ts = max(derived_reference_ts, start_ms)
 
     hours_window = hours if hours in VALID_HOUR_WINDOWS else min(VALID_HOUR_WINDOWS)
 
@@ -569,7 +607,14 @@ def build_check_all_datas(
     if movement_end_ts > reference_ts:
         movement_end_ts = reference_ts
 
-    latest_candle_ts = minute_candles[-1]["t"] if minute_candles else primary_candles[-1]["t"]
+    latest_candle_source = (
+        latest_minute_candle
+        or latest_primary_candle
+        or (primary_candles[-1] if primary_candles else None)
+    )
+    latest_candle_ts = _safe_int(latest_candle_source.get("t")) if latest_candle_source else None
+    if latest_candle_ts is None:
+        latest_candle_ts = primary_candles[-1]["t"]
     latest_candle_dt = datetime.fromtimestamp(latest_candle_ts / 1000.0, tz=UTC)
 
     detailed_start_dt = datetime.fromtimestamp(detailed_start_ts / 1000.0, tz=UTC)
@@ -672,8 +717,14 @@ def build_check_all_datas(
 
     movement_key = f"movement_datas_for_{movement_days}_days"
 
+    latest_candle_payload_source = (
+        latest_candle_source
+        or (primary_candles[-1] if primary_candles else None)
+    )
     latest_candle_payload = (
-        dict(minute_candles[-1]) if minute_candles else dict(primary_candles[-1])
+        dict(latest_candle_payload_source)
+        if isinstance(latest_candle_payload_source, Mapping)
+        else {}
     )
 
     return {

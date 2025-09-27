@@ -1527,44 +1527,108 @@ def render_inspection_page(
   }
 
   async function fetchCandles(symbol, interval, startMs, endMs, options = {}) {
-    const results = [];
-    const url = new URL("https://api.binance.com/api/v3/klines");
-    url.searchParams.set("symbol", symbol.toUpperCase());
-    url.searchParams.set("interval", interval);
-    if (Number.isFinite(startMs) && Number.isFinite(endMs)) {
-      url.searchParams.set("startTime", Math.floor(Math.min(startMs, endMs)));
-      url.searchParams.set("endTime", Math.floor(Math.max(startMs, endMs)));
-    }
+    const collected = [];
+    const seen = new Set();
     const intervalMs = TIMEFRAME_TO_MS[interval] || 60000;
-    const span =
-      Number.isFinite(startMs) && Number.isFinite(endMs)
-        ? Math.max(1, Math.ceil(Math.abs(endMs - startMs) / intervalMs) + 3)
-        : 0;
     const hintedLimit = Number.isFinite(options.limit) ? Math.floor(options.limit) : null;
-    if (Number.isFinite(hintedLimit) && hintedLimit > 0) {
-      url.searchParams.set("limit", String(Math.min(1000, Math.max(1, hintedLimit))));
-    } else if (span > 0) {
-      url.searchParams.set("limit", String(Math.min(1000, Math.max(span, 100))));
+    const batchLimit = Math.max(1, Math.min(1000, hintedLimit || 1000));
+    const hasStart = Number.isFinite(startMs);
+    const hasEnd = Number.isFinite(endMs);
+    let startBound = null;
+    if (hasStart && hasEnd) {
+      startBound = Math.floor(Math.min(startMs, endMs));
+    } else if (hasStart) {
+      startBound = Math.floor(startMs);
     }
-    const resp = await fetch(url.toString());
-    if (!resp.ok) {
-      throw new Error(`klines ${resp.status}`);
+    let endBound = null;
+    if (hasStart && hasEnd) {
+      endBound = Math.floor(Math.max(startMs, endMs));
+    } else if (hasEnd) {
+      endBound = Math.floor(endMs);
     }
-    const rows = await resp.json();
-    if (!Array.isArray(rows)) return [];
-    for (const row of rows) {
-      if (!row) continue;
-      const openMs = Number(row[0]);
-      const open = Number(row[1]);
-      const high = Number(row[2]);
-      const low = Number(row[3]);
-      const close = Number(row[4]);
-      const volume = Number(row[5]);
-      if (!Number.isFinite(openMs)) continue;
-      results.push({ t: openMs, o: open, h: high, l: low, c: close, v: volume });
+    let cursor = startBound;
+    let guard = 0;
+    const guardLimit = 4096;
+
+    while (true) {
+      const url = new URL("https://api.binance.com/api/v3/klines");
+      url.searchParams.set("symbol", symbol.toUpperCase());
+      url.searchParams.set("interval", interval);
+      if (Number.isFinite(cursor)) {
+        url.searchParams.set("startTime", String(cursor));
+      } else if (Number.isFinite(startBound)) {
+        url.searchParams.set("startTime", String(startBound));
+      }
+      if (Number.isFinite(endBound)) {
+        url.searchParams.set("endTime", String(endBound));
+      }
+      url.searchParams.set("limit", String(batchLimit));
+
+      const resp = await fetch(url.toString());
+      if (!resp.ok) {
+        throw new Error(`klines ${resp.status}`);
+      }
+      const rows = await resp.json();
+      if (!Array.isArray(rows) || !rows.length) {
+        break;
+      }
+
+      let lastOpen = null;
+      for (const row of rows) {
+        if (!row) continue;
+        const openMs = Number(row[0]);
+        const open = Number(row[1]);
+        const high = Number(row[2]);
+        const low = Number(row[3]);
+        const close = Number(row[4]);
+        const volume = Number(row[5]);
+        if (!Number.isFinite(openMs)) continue;
+        lastOpen = openMs;
+        if (Number.isFinite(endBound) && openMs > endBound) {
+          continue;
+        }
+        if (seen.has(openMs)) continue;
+        seen.add(openMs);
+        collected.push({ t: openMs, o: open, h: high, l: low, c: close, v: volume });
+      }
+
+      if (!hasStart || !Number.isFinite(cursor)) {
+        break;
+      }
+      if (!Number.isFinite(lastOpen)) {
+        break;
+      }
+      const nextCursor = lastOpen + intervalMs;
+      if (!Number.isFinite(nextCursor)) {
+        break;
+      }
+      if (Number.isFinite(endBound) && nextCursor > endBound) {
+        break;
+      }
+      if (nextCursor <= cursor) {
+        break;
+      }
+      cursor = nextCursor;
+      guard += 1;
+      if (guard >= guardLimit) {
+        break;
+      }
+      if (rows.length < batchLimit) {
+        break;
+      }
     }
-    results.sort((a, b) => a.t - b.t);
-    return results;
+
+    collected.sort((a, b) => a.t - b.t);
+    if (Number.isFinite(startBound) || Number.isFinite(endBound)) {
+      return collected.filter((candle) => {
+        const ts = Number(candle?.t ?? 0);
+        if (!Number.isFinite(ts)) return false;
+        if (Number.isFinite(startBound) && ts < startBound) return false;
+        if (Number.isFinite(endBound) && ts > endBound) return false;
+        return true;
+      });
+    }
+    return collected;
   }
 
   async function postSnapshot(payload) {
@@ -2663,9 +2727,13 @@ def render_inspection_page(
 
       function updatePreviewInfo(bar) {
         const intervalMs = previewState.intervalMs || intervalToMs(previewState.interval);
-        const lastUpdateMs = Number.isFinite(previewState.lastUpdateMs)
+        let lastUpdateMs = Number.isFinite(previewState.lastUpdateMs)
           ? Number(previewState.lastUpdateMs)
           : Date.now();
+        const selectionEnd = previewState.selection && previewState.selection.end;
+        if (Number.isFinite(selectionEnd)) {
+          lastUpdateMs = Math.min(lastUpdateMs, Number(selectionEnd));
+        }
         if (!bar) {
           if (lastTimeEl) lastTimeEl.textContent = "-";
           if (lastPriceEl) lastPriceEl.textContent = "-";
@@ -2722,7 +2790,23 @@ def render_inspection_page(
         if (fitContent && previewState.chart && previewState.candles.length) {
           previewState.chart.timeScale().fitContent();
         }
-        const lastBar = previewState.candles[previewState.candles.length - 1] || null;
+        let lastBar = previewState.candles[previewState.candles.length - 1] || null;
+        const selectionEnd = previewState.selection && previewState.selection.end;
+        if (Number.isFinite(selectionEnd)) {
+          const endMs = Number(selectionEnd);
+          for (let idx = previewState.candles.length - 1; idx >= 0; idx -= 1) {
+            const candidate = previewState.candles[idx];
+            if (!candidate) continue;
+            const candidateTs = Number.isFinite(candidate.ts_ms_utc)
+              ? Number(candidate.ts_ms_utc)
+              : Number(candidate.time) * 1000;
+            if (!Number.isFinite(candidateTs)) continue;
+            if (candidateTs <= endMs) {
+              lastBar = candidate;
+              break;
+            }
+          }
+        }
         updatePreviewInfo(lastBar);
       }
 
