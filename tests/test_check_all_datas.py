@@ -341,7 +341,7 @@ def test_historical_snapshot_still_populates_window(client: TestClient) -> None:
     assert preset_payload is not None
     assert preset_payload["symbol"] == "BTCUSDT"
     assert preset_payload["builtin"] is True
-    assert body.get("profile_preset_required") is False
+    assert "profile_preset_required" not in body
     if body["tpo"]["zones"]:
         zone_types = {zone["type"] for zone in body["tpo"]["zones"]}
         assert {"tpo_poc", "tpo_vah", "tpo_val"}.issubset(zone_types)
@@ -352,7 +352,7 @@ def test_historical_snapshot_still_populates_window(client: TestClient) -> None:
     assert dq["minute_missing_after"] == 0
     assert dq["tf_missing_after"] == 0
     assert dq["minute_missing_before"] == total_minutes - len(payload["candles"])
-    assert dq["fetched_1m_count"] == dq["minute_missing_before"]
+    assert "fetched_1m_count" not in dq
     assert dq["tf_missing_before"] == dq["minute_missing_before"]
 
 

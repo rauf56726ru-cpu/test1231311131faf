@@ -1332,6 +1332,19 @@ def build_check_all_datas(
         else {}
     )
 
+    data_quality_public = {
+        key: data_quality[key]
+        for key in (
+            "tf",
+            "window",
+            "minute_missing_before",
+            "minute_missing_after",
+            "tf_missing_before",
+            "tf_missing_after",
+        )
+        if key in data_quality
+    }
+
     return {
         "snapshot_id": snapshot.get("id"),
         "symbol": snapshot.get("symbol"),
@@ -1345,10 +1358,9 @@ def build_check_all_datas(
         "tpo": {"sessions": profile_tpo, "zones": profile_zones},
         "profile": profile_flat,
         "zones": detected_zones,
-        "data_quality": data_quality,
+        "data_quality": data_quality_public,
         "htf": htf_section,
         "data_quality_htf": htf_quality,
         "profile_preset": profile_config.get("preset_payload"),
-        "profile_preset_required": bool(profile_config.get("preset_required", False)),
         "vwap": vwap_payload,
     }
