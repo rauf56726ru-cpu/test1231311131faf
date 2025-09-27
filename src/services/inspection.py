@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import html as html_utils
 import json
+import logging
 import math
 import os
 import re
@@ -547,26 +548,46 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
     smooth_window = int(profile_config.get("smooth_window", 1))
 
     if preset and base_candles and sessions:
+        closed_candles = [
+            candle
+            for candle in base_candles
+            if bool(candle.get("closed", True))
+        ]
+        profile_candles = closed_candles or list(base_candles)
+
         cache_token = (
             "inspection",
             snapshot.get("id"),
             symbol,
             target_tf_key,
         )
-        (tpo_entries, flattened_profile, zone_items) = build_profile_package(
-            base_candles,
-            sessions=sessions,
-            last_n=profile_last_n,
-            tick_size=tick_size_value,
-            adaptive_bins=adaptive_bins_flag,
-            value_area_pct=value_area_pct,
-            atr_multiplier=atr_multiplier,
-            target_bins=target_bins,
-            clip_threshold=clip_threshold,
-            smooth_window=smooth_window,
-            cache_token=cache_token,
-            tf_key=target_tf_key,
-        )
+        try:
+            (tpo_entries, flattened_profile, zone_items) = build_profile_package(
+                profile_candles,
+                sessions=sessions,
+                last_n=profile_last_n,
+                tick_size=tick_size_value,
+                adaptive_bins=adaptive_bins_flag,
+                value_area_pct=value_area_pct,
+                atr_multiplier=atr_multiplier,
+                target_bins=target_bins,
+                clip_threshold=clip_threshold,
+                smooth_window=smooth_window,
+                cache_token=cache_token,
+                tf_key=target_tf_key,
+            )
+        except Exception:  # pragma: no cover - defensive guard against upstream errors
+            logging.getLogger(__name__).exception(
+                "Failed to build profile package for inspection payload",
+                extra={
+                    "snapshot_id": snapshot.get("id"),
+                    "symbol": symbol,
+                    "timeframe": target_tf_key,
+                },
+            )
+            tpo_entries = []
+            flattened_profile = []
+            zone_items = []
 
     data_section = {
         "symbol": symbol,
@@ -1320,26 +1341,66 @@ def render_inspection_page(
     ui_script = """
 (function () {
   const TIMEFRAME_TO_MS = {
+    "1s": 1000,
+    "3s": 3000,
+    "5s": 5000,
+    "15s": 15000,
+    "30s": 30000,
     "1m": 60000,
     "3m": 180000,
     "5m": 300000,
     "15m": 900000,
     "30m": 1800000,
     "1h": 3600000,
+    "2h": 7200000,
     "4h": 14400000,
+    "6h": 21600000,
+    "8h": 28800000,
+    "12h": 43200000,
     "1d": 86400000,
   };
   const DEFAULT_TEST_TIMEFRAMES = ["1m", "3m", "5m", "15m", "1h", "4h", "1d"];
+  const PREVIEW_REFRESH_INTERVAL_MS = 10_000;
+  const PREVIEW_SHARED_MAX_BARS = 2000;
+  const MINUTE_INTERVAL_KEY = "1m";
+  const MINUTE_INTERVAL_MS = TIMEFRAME_TO_MS[MINUTE_INTERVAL_KEY] || 60_000;
+  const PREVIEW_MINUTE_LOOKBACK_MS = MINUTE_INTERVAL_MS * 120;
+  const PREVIEW_MINUTE_MAX_BARS = 5000;
+
+  const LightweightCharts = window.LightweightCharts || null;
+  const BinanceCandles = window.BinanceCandles || null;
+  const ChartGapWatcher = window.ChartGapWatcher || null;
+  const SharedCandles = window.SharedCandles || null;
 
 
   function toChartBars(candles) {
-    return (candles || []).map((candle) => ({
-      time: Math.floor(Number(candle.t || candle.time || 0) / 1000),
-      open: Number(candle.o ?? candle.open ?? 0),
-      high: Number(candle.h ?? candle.high ?? 0),
-      low: Number(candle.l ?? candle.low ?? 0),
-      close: Number(candle.c ?? candle.close ?? 0),
-    }));
+    return (candles || [])
+      .map((candle) => {
+        const rawTs = Number(candle?.ts_ms_utc ?? candle?.t ?? candle?.time ?? 0);
+        const open = Number(candle?.o ?? candle?.open ?? 0);
+        const high = Number(candle?.h ?? candle?.high ?? open);
+        const low = Number(candle?.l ?? candle?.low ?? open);
+        const close = Number(candle?.c ?? candle?.close ?? open);
+        if (
+          !Number.isFinite(rawTs) ||
+          !Number.isFinite(open) ||
+          !Number.isFinite(high) ||
+          !Number.isFinite(low) ||
+          !Number.isFinite(close)
+        ) {
+          return null;
+        }
+        const time = Math.floor(rawTs / 1000);
+        return {
+          time,
+          open,
+          high,
+          low,
+          close,
+          ts_ms_utc: Math.floor(rawTs),
+        };
+      })
+      .filter((bar) => bar !== null);
   }
 
   async function fetchSnapshots() {
@@ -1354,6 +1415,133 @@ def render_inspection_page(
     if (Number.isNaN(date.getTime())) return "—";
     return date.toISOString().replace("T", " ").replace(".000Z", "Z");
   }
+
+  function computeCandleDisplayTime(candle, intervalMs, lastUpdateMs) {
+    if (!candle) return Number.NaN;
+    const openMs = Number(
+      candle.ts_ms_utc ?? candle.t ?? candle.time ?? (candle.openTime ?? candle.open_time ?? 0),
+    );
+    if (!Number.isFinite(openMs)) return Number.NaN;
+    const safeInterval = Math.max(1, Number(intervalMs) || 0);
+    const closingMs = openMs + safeInterval;
+    const specificUpdate = Number(
+      candle.last_update_ms ?? candle.lastUpdateMs ?? candle.last_update ?? candle.updated_at ?? 0,
+    );
+    const referenceSource = Number.isFinite(specificUpdate) ? specificUpdate : lastUpdateMs;
+    const reference = Number.isFinite(referenceSource) ? Number(referenceSource) : Date.now();
+    const alignedReference = Math.max(openMs, reference);
+    return Math.min(closingMs, alignedReference);
+  }
+
+  function intervalToMs(value) {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric)) {
+      return Math.max(1, numeric) * 60000;
+    }
+    return TIMEFRAME_TO_MS[value] || 60000;
+  }
+
+  function normaliseBar(bar) {
+    if (!bar) return null;
+    const open = Number(bar.open ?? bar.o ?? 0);
+    const high = Number(bar.high ?? bar.h ?? open);
+    const low = Number(bar.low ?? bar.l ?? open);
+    const close = Number(bar.close ?? bar.c ?? open);
+    const time = Number(bar.time ?? bar.t ?? 0);
+    if (
+      !Number.isFinite(time) ||
+      !Number.isFinite(open) ||
+      !Number.isFinite(high) ||
+      !Number.isFinite(low) ||
+      !Number.isFinite(close)
+    ) {
+      return null;
+    }
+    const ts = Number(bar.ts_ms_utc ?? time * 1000);
+    return {
+      time: Math.floor(time),
+      open,
+      high,
+      low,
+      close,
+      ts_ms_utc: Number.isFinite(ts) ? Math.floor(ts) : Math.floor(time * 1000),
+    };
+  }
+
+  async function fetchHistory(symbol, interval, limit = 1000) {
+    if (!BinanceCandles || typeof BinanceCandles.fetchHistory !== "function") {
+      throw new Error("Binance helper is unavailable");
+    }
+    const rows = await BinanceCandles.fetchHistory(symbol, interval, limit);
+    return rows.map((bar) => normaliseBar(bar)).filter((bar) => bar !== null);
+  }
+
+  async function fetchRange(symbol, interval, startMs, endMs, limit = 1000) {
+    const url = new URL("https://api.binance.com/api/v3/klines");
+    url.searchParams.set("symbol", symbol);
+    url.searchParams.set("interval", interval);
+    if (Number.isFinite(startMs)) {
+      url.searchParams.set("startTime", Math.floor(startMs));
+    }
+    if (Number.isFinite(endMs)) {
+      url.searchParams.set("endTime", Math.floor(endMs));
+    }
+    url.searchParams.set("limit", String(Math.max(1, Math.min(limit, 1000))));
+    const response = await fetch(url.toString());
+    if (!response.ok) {
+      throw new Error(`Failed to fetch range: ${response.status}`);
+    }
+    const data = await response.json();
+    if (!BinanceCandles || typeof BinanceCandles.transformKlines !== "function") {
+      throw new Error("Binance helper is unavailable");
+    }
+    return BinanceCandles.transformKlines(data)
+      .map((bar) => normaliseBar(bar))
+      .filter((bar) => bar !== null);
+  }
+
+  function ensurePreviewBar(input) {
+    if (!input) return null;
+    const candidateTime = Number(input.time);
+    const candidateOpen = Number(input.open);
+    const candidateHigh = Number(input.high ?? candidateOpen);
+    const candidateLow = Number(input.low ?? candidateOpen);
+    const candidateClose = Number(input.close ?? candidateOpen);
+    let candidateTs = Number(input.ts_ms_utc ?? input.t ?? 0);
+    if (
+      Number.isFinite(candidateTime) &&
+      Number.isFinite(candidateOpen) &&
+      Number.isFinite(candidateHigh) &&
+      Number.isFinite(candidateLow) &&
+      Number.isFinite(candidateClose)
+    ) {
+      if (!Number.isFinite(candidateTs)) {
+        candidateTs = candidateTime * 1000;
+      }
+      return {
+        time: Math.floor(candidateTime),
+        open: candidateOpen,
+        high: candidateHigh,
+        low: candidateLow,
+        close: candidateClose,
+        ts_ms_utc: Math.floor(candidateTs),
+      };
+    }
+    const normalized = normaliseBar(input);
+    if (!normalized) return null;
+    return {
+      time: Math.floor(normalized.time),
+      open: normalized.open,
+      high: normalized.high,
+      low: normalized.low,
+      close: normalized.close,
+      ts_ms_utc: normalized.ts_ms_utc,
+      ...(Number.isFinite(normalized.last_update_ms)
+        ? { last_update_ms: Number(normalized.last_update_ms) }
+        : {}),
+    };
+  }
+
 
   function setJson(pre, data) {
     if (!pre) return;
@@ -1373,35 +1561,109 @@ def render_inspection_page(
     return cleaned;
   }
 
-  async function fetchCandles(symbol, interval, startMs, endMs) {
-    const results = [];
-    const url = new URL("https://api.binance.com/api/v3/klines");
-    url.searchParams.set("symbol", symbol.toUpperCase());
-    url.searchParams.set("interval", interval);
-    url.searchParams.set("startTime", Math.floor(Math.min(startMs, endMs)));
-    url.searchParams.set("endTime", Math.floor(Math.max(startMs, endMs)));
+  async function fetchCandles(symbol, interval, startMs, endMs, options = {}) {
+    const collected = [];
+    const seen = new Set();
     const intervalMs = TIMEFRAME_TO_MS[interval] || 60000;
-    const span = Math.max(1, Math.ceil(Math.abs(endMs - startMs) / intervalMs) + 3);
-    url.searchParams.set("limit", String(Math.min(1000, Math.max(span, 100))));
-    const resp = await fetch(url.toString());
-    if (!resp.ok) {
-      throw new Error(`klines ${resp.status}`);
+    const hintedLimit = Number.isFinite(options.limit) ? Math.floor(options.limit) : null;
+    const batchLimit = Math.max(1, Math.min(1000, hintedLimit || 1000));
+    const hasStart = Number.isFinite(startMs);
+    const hasEnd = Number.isFinite(endMs);
+    let startBound = null;
+    if (hasStart && hasEnd) {
+      startBound = Math.floor(Math.min(startMs, endMs));
+    } else if (hasStart) {
+      startBound = Math.floor(startMs);
     }
-    const rows = await resp.json();
-    if (!Array.isArray(rows)) return [];
-    for (const row of rows) {
-      if (!row) continue;
-      const openMs = Number(row[0]);
-      const open = Number(row[1]);
-      const high = Number(row[2]);
-      const low = Number(row[3]);
-      const close = Number(row[4]);
-      const volume = Number(row[5]);
-      if (!Number.isFinite(openMs)) continue;
-      results.push({ t: openMs, o: open, h: high, l: low, c: close, v: volume });
+    let endBound = null;
+    if (hasStart && hasEnd) {
+      endBound = Math.floor(Math.max(startMs, endMs));
+    } else if (hasEnd) {
+      endBound = Math.floor(endMs);
     }
-    results.sort((a, b) => a.t - b.t);
-    return results;
+    let cursor = startBound;
+    let guard = 0;
+    const guardLimit = 4096;
+
+    while (true) {
+      const url = new URL("https://api.binance.com/api/v3/klines");
+      url.searchParams.set("symbol", symbol.toUpperCase());
+      url.searchParams.set("interval", interval);
+      if (Number.isFinite(cursor)) {
+        url.searchParams.set("startTime", String(cursor));
+      } else if (Number.isFinite(startBound)) {
+        url.searchParams.set("startTime", String(startBound));
+      }
+      if (Number.isFinite(endBound)) {
+        url.searchParams.set("endTime", String(endBound));
+      }
+      url.searchParams.set("limit", String(batchLimit));
+
+      const resp = await fetch(url.toString());
+      if (!resp.ok) {
+        throw new Error(`klines ${resp.status}`);
+      }
+      const rows = await resp.json();
+      if (!Array.isArray(rows) || !rows.length) {
+        break;
+      }
+
+      let lastOpen = null;
+      for (const row of rows) {
+        if (!row) continue;
+        const openMs = Number(row[0]);
+        const open = Number(row[1]);
+        const high = Number(row[2]);
+        const low = Number(row[3]);
+        const close = Number(row[4]);
+        const volume = Number(row[5]);
+        if (!Number.isFinite(openMs)) continue;
+        lastOpen = openMs;
+        if (Number.isFinite(endBound) && openMs > endBound) {
+          continue;
+        }
+        if (seen.has(openMs)) continue;
+        seen.add(openMs);
+        collected.push({ t: openMs, o: open, h: high, l: low, c: close, v: volume });
+      }
+
+      if (!hasStart || !Number.isFinite(cursor)) {
+        break;
+      }
+      if (!Number.isFinite(lastOpen)) {
+        break;
+      }
+      const nextCursor = lastOpen + intervalMs;
+      if (!Number.isFinite(nextCursor)) {
+        break;
+      }
+      if (Number.isFinite(endBound) && nextCursor > endBound) {
+        break;
+      }
+      if (nextCursor <= cursor) {
+        break;
+      }
+      cursor = nextCursor;
+      guard += 1;
+      if (guard >= guardLimit) {
+        break;
+      }
+      if (rows.length < batchLimit) {
+        break;
+      }
+    }
+
+    collected.sort((a, b) => a.t - b.t);
+    if (Number.isFinite(startBound) || Number.isFinite(endBound)) {
+      return collected.filter((candle) => {
+        const ts = Number(candle?.t ?? 0);
+        if (!Number.isFinite(ts)) return false;
+        if (Number.isFinite(startBound) && ts < startBound) return false;
+        if (Number.isFinite(endBound) && ts > endBound) return false;
+        return true;
+      });
+    }
+    return collected;
   }
 
   async function postSnapshot(payload) {
@@ -2236,8 +2498,13 @@ def render_inspection_page(
       if (!resolvedSymbol) {
         throw new Error('symbol-invalid');
       }
-      const selectionStart = Math.floor(Number(selection.start));
-      const selectionEnd = Math.floor(Number(selection.end));
+      const rawStart = Number(selection.start);
+      const rawEnd = Number(selection.end);
+      if (!Number.isFinite(rawStart) || !Number.isFinite(rawEnd)) {
+        throw new Error('selection-invalid');
+      }
+      const selectionStart = Math.floor(Math.min(rawStart, rawEnd));
+      const selectionEnd = Math.floor(Math.max(rawStart, rawEnd));
       const framesPayload = {};
       for (const tf of uniqueFrames) {
         const candles = await fetchCandles(resolvedSymbol, tf, selectionStart, selectionEnd);
@@ -2348,13 +2615,414 @@ def render_inspection_page(
         symbol: normaliseSymbol(symbolField ? symbolField.value : initial.symbol) || defaultSymbol,
         interval: (intervalField && intervalField.value) || "1m",
         selection: null,
+        candles: [],
+        minuteCandles: [],
+        refreshTimer: null,
+        lastFetchedAtMs: null,
+        lastUpdateMs: null,
+        isFetching: false,
+        intervalMs: intervalToMs((intervalField && intervalField.value) || "1m"),
+        gapWatcher: null,
       };
+
+      function normaliseMinuteBar(bar) {
+        if (!bar) return null;
+        const open = Number(bar.open ?? bar.o ?? 0);
+        const high = Number(bar.high ?? bar.h ?? open);
+        const low = Number(bar.low ?? bar.l ?? open);
+        const close = Number(bar.close ?? bar.c ?? open);
+        const volume = Number(bar.volume ?? bar.v ?? 0);
+        const ts = Number(bar.ts_ms_utc ?? bar.t ?? bar.time ?? 0);
+        if (
+          !Number.isFinite(ts) ||
+          !Number.isFinite(open) ||
+          !Number.isFinite(high) ||
+          !Number.isFinite(low) ||
+          !Number.isFinite(close)
+        ) {
+          return null;
+        }
+        const openMs = Math.floor(ts);
+        const lastUpdate = openMs + MINUTE_INTERVAL_MS;
+        return {
+          time: Math.floor(openMs / 1000),
+          open,
+          high,
+          low,
+          close,
+          ts_ms_utc: openMs,
+          last_update_ms: lastUpdate,
+          volume: Number.isFinite(volume) ? volume : 0,
+        };
+      }
+
+      function mergeMinuteBars(bars, { reset = false } = {}) {
+        if (reset) previewState.minuteCandles = [];
+        if (!Array.isArray(bars) || !bars.length) return false;
+        const index = new Map();
+        previewState.minuteCandles.forEach((bar, idx) => {
+          const key = Number(bar?.ts_ms_utc ?? (bar?.time ?? 0) * 1000);
+          if (Number.isFinite(key)) {
+            index.set(key, idx);
+          }
+        });
+        let changed = false;
+        bars.forEach((entry) => {
+          const normalised = normaliseMinuteBar(entry);
+          if (!normalised) return;
+          const key = Number(normalised.ts_ms_utc);
+          if (!Number.isFinite(key)) return;
+          if (index.has(key)) {
+            previewState.minuteCandles[index.get(key)] = normalised;
+          } else {
+            index.set(key, previewState.minuteCandles.length);
+            previewState.minuteCandles.push(normalised);
+          }
+          changed = true;
+        });
+        if (!changed) return false;
+        previewState.minuteCandles.sort((a, b) => Number(a.ts_ms_utc) - Number(b.ts_ms_utc));
+        if (previewState.minuteCandles.length > PREVIEW_MINUTE_MAX_BARS) {
+          previewState.minuteCandles = previewState.minuteCandles.slice(
+            previewState.minuteCandles.length - PREVIEW_MINUTE_MAX_BARS,
+          );
+        }
+        return true;
+      }
+
+      function aggregateMinuteBuckets(minuteBars, intervalMs) {
+        if (!Array.isArray(minuteBars) || !minuteBars.length) return [];
+        const safeInterval = Math.max(1, Number(intervalMs) || MINUTE_INTERVAL_MS);
+        const buckets = new Map();
+        minuteBars.forEach((bar) => {
+          if (!bar) return;
+          const openMs = Number(bar.ts_ms_utc ?? bar.t ?? bar.time ?? 0);
+          if (!Number.isFinite(openMs)) return;
+          const bucketStart = Math.floor(openMs / safeInterval) * safeInterval;
+          const high = Number(bar.high ?? bar.h ?? bar.open ?? bar.o ?? 0);
+          const low = Number(bar.low ?? bar.l ?? bar.open ?? bar.o ?? 0);
+          const close = Number(bar.close ?? bar.c ?? bar.open ?? bar.o ?? 0);
+          const open = Number(bar.open ?? bar.o ?? close);
+          const volume = Number(bar.volume ?? bar.v ?? 0);
+          if (!Number.isFinite(bucketStart)) return;
+          let bucket = buckets.get(bucketStart);
+          if (!bucket) {
+            bucket = {
+              start: bucketStart,
+              open,
+              high,
+              low,
+              close,
+              volume: Number.isFinite(volume) ? volume : 0,
+              firstTs: openMs,
+              lastUpdate: openMs + MINUTE_INTERVAL_MS,
+            };
+            buckets.set(bucketStart, bucket);
+          } else {
+            if (openMs < bucket.firstTs) {
+              bucket.firstTs = openMs;
+              bucket.open = open;
+            }
+            bucket.high = Math.max(bucket.high, high);
+            bucket.low = Math.min(bucket.low, low);
+            bucket.close = close;
+            if (Number.isFinite(volume)) {
+              bucket.volume += volume;
+            }
+            bucket.lastUpdate = Math.max(bucket.lastUpdate, openMs + MINUTE_INTERVAL_MS);
+          }
+        });
+        return Array.from(buckets.values())
+          .map((bucket) => ({
+            start: bucket.start,
+            open: bucket.open,
+            high: bucket.high,
+            low: bucket.low,
+            close: bucket.close,
+            volume: bucket.volume,
+            lastUpdate: bucket.lastUpdate,
+          }))
+          .sort((a, b) => a.start - b.start);
+      }
+
+      function applyMinuteAggregation({ persist = true } = {}) {
+        if (!previewState.minuteCandles.length) return false;
+        const intervalMs = previewState.intervalMs || intervalToMs(previewState.interval);
+        const buckets = aggregateMinuteBuckets(previewState.minuteCandles, intervalMs);
+        if (!buckets.length) return false;
+        let changed = false;
+        const previousUpdate = Number(previewState.lastUpdateMs) || 0;
+        let maxUpdate = previousUpdate;
+        buckets.forEach((bucket) => {
+          const startMs = Number(bucket.start);
+          if (!Number.isFinite(startMs)) return;
+          const idx = previewState.candles.findIndex((bar) => {
+            const barTs = Number(bar?.ts_ms_utc ?? (bar?.time ?? 0) * 1000);
+            return Number.isFinite(barTs) && Math.floor(barTs) === startMs;
+          });
+          const baseBar = idx >= 0 ? previewState.candles[idx] : null;
+          const normalised = {
+            time: Math.floor(startMs / 1000),
+            open: Number.isFinite(baseBar?.open) ? Number(baseBar.open) : Number(bucket.open),
+            high: Math.max(
+              Number.isFinite(baseBar?.high) ? Number(baseBar.high) : Number(bucket.high),
+              Number(bucket.high),
+            ),
+            low: Math.min(
+              Number.isFinite(baseBar?.low) ? Number(baseBar.low) : Number(bucket.low),
+              Number(bucket.low),
+            ),
+            close: Number(bucket.close),
+            ts_ms_utc: startMs,
+            last_update_ms: Number(bucket.lastUpdate),
+          };
+          if (baseBar) {
+            const updated = {
+              ...baseBar,
+              open: normalised.open,
+              high: normalised.high,
+              low: normalised.low,
+              close: normalised.close,
+              ts_ms_utc: normalised.ts_ms_utc,
+              last_update_ms: normalised.last_update_ms,
+            };
+            const baseVolume = Number(baseBar.volume ?? baseBar.v ?? 0);
+            const bucketVolume = Number(bucket.volume ?? 0);
+            if (Number.isFinite(baseVolume) || Number.isFinite(bucketVolume)) {
+              updated.volume = (Number.isFinite(baseVolume) ? baseVolume : 0) +
+                (Number.isFinite(bucketVolume) ? bucketVolume : 0);
+            }
+            const diff =
+              Number(baseBar.open) !== updated.open ||
+              Number(baseBar.high) !== updated.high ||
+              Number(baseBar.low) !== updated.low ||
+              Number(baseBar.close) !== updated.close ||
+              Number(baseBar.last_update_ms) !== updated.last_update_ms;
+            if (diff) {
+              previewState.candles[idx] = updated;
+              changed = true;
+            } else {
+              previewState.candles[idx] = updated;
+            }
+          } else {
+            previewState.candles.push({
+              time: normalised.time,
+              open: normalised.open,
+              high: normalised.high,
+              low: normalised.low,
+              close: normalised.close,
+              ts_ms_utc: normalised.ts_ms_utc,
+              last_update_ms: normalised.last_update_ms,
+            });
+            changed = true;
+          }
+          if (Number.isFinite(normalised.last_update_ms)) {
+            maxUpdate = Math.max(maxUpdate, Number(normalised.last_update_ms));
+          }
+        });
+        if (changed) {
+          previewState.candles.sort((a, b) => Number(a.time) - Number(b.time));
+        }
+        if (Number.isFinite(maxUpdate) && maxUpdate > 0) {
+          previewState.lastUpdateMs = maxUpdate;
+        }
+        if ((changed || previewState.lastUpdateMs !== previousUpdate) && persist) {
+          persistPreviewCandles({ bars: previewState.candles, lastUpdateMs: previewState.lastUpdateMs });
+        }
+        return changed;
+      }
+
+      async function fetchMinuteWindow({ force = false } = {}) {
+        if (!previewState.symbol) return [];
+        const nowMs = Date.now();
+        const intervalMs = previewState.intervalMs || intervalToMs(previewState.interval);
+        let startMs = null;
+        if (force || !previewState.minuteCandles.length) {
+          const lookback = Math.max(intervalMs, PREVIEW_MINUTE_LOOKBACK_MS);
+          startMs = Math.max(0, nowMs - lookback);
+        } else {
+          const last = previewState.minuteCandles[previewState.minuteCandles.length - 1];
+          const lastTs = Number(last?.ts_ms_utc ?? last?.t ?? 0);
+          if (Number.isFinite(lastTs)) {
+            startMs = Math.max(0, lastTs - MINUTE_INTERVAL_MS);
+          }
+        }
+        return fetchCandles(previewState.symbol, MINUTE_INTERVAL_KEY, startMs, nowMs);
+      }
+
+      function findBarAtOrBefore(targetMs) {
+        if (!Number.isFinite(targetMs)) return null;
+        for (let idx = previewState.candles.length - 1; idx >= 0; idx -= 1) {
+          const bar = previewState.candles[idx];
+          if (!bar) continue;
+          const barTs = Number(bar.ts_ms_utc ?? (bar.time ?? 0) * 1000);
+          if (!Number.isFinite(barTs)) continue;
+          if (barTs <= targetMs) {
+            return bar;
+          }
+        }
+        return null;
+      }
+
+      function normaliseSelectionRange(rawStart, rawEnd) {
+        let start = Number(rawStart);
+        let end = Number(rawEnd);
+        if (!Number.isFinite(start) || !Number.isFinite(end)) {
+          return null;
+        }
+        if (end < start) {
+          const tmp = start;
+          start = end;
+          end = tmp;
+        }
+        start = Math.floor(start);
+        end = Math.floor(end);
+        const intervalMs = previewState.intervalMs || intervalToMs(previewState.interval);
+        const lastBar = findBarAtOrBefore(end);
+        if (lastBar) {
+          const barUpdate = Number.isFinite(lastBar.last_update_ms)
+            ? Number(lastBar.last_update_ms)
+            : Number(previewState.lastUpdateMs);
+          const displayEnd = computeCandleDisplayTime(lastBar, intervalMs, barUpdate);
+          if (Number.isFinite(displayEnd)) {
+            end = Math.max(start, Number(displayEnd));
+          }
+        }
+        return { start, end };
+      }
 
       function setPreviewStatus(message, tone = "info") {
         if (!statusEl) return;
         statusEl.textContent = message || "";
         statusEl.dataset.tone = tone;
         statusEl.hidden = !message;
+      }
+
+      function mergePreviewBars(
+        bars,
+        { reset = false, maxBars = PREVIEW_SHARED_MAX_BARS, lastUpdateMs = null } = {},
+      ) {
+        if (reset) previewState.candles = [];
+        if (!Array.isArray(bars) || !bars.length) return false;
+        const index = new Map();
+        previewState.candles.forEach((bar, idx) => {
+          index.set(Number(bar.time), idx);
+        });
+        let changed = false;
+        bars.forEach((candidate) => {
+          const bar = ensurePreviewBar(candidate);
+          if (!bar) return;
+          const time = Number(bar.time);
+          if (!Number.isFinite(time)) return;
+          if (index.has(time)) {
+            previewState.candles[index.get(time)] = bar;
+          } else {
+            index.set(time, previewState.candles.length);
+            previewState.candles.push(bar);
+          }
+          changed = true;
+        });
+        if (!changed) return false;
+
+        previewState.candles.sort((a, b) => Number(a.time) - Number(b.time));
+        const limit = Math.max(1, Number(maxBars) || PREVIEW_SHARED_MAX_BARS);
+        if (previewState.candles.length > limit) {
+          previewState.candles = previewState.candles.slice(previewState.candles.length - limit);
+        }
+        const effectiveUpdate = Number.isFinite(lastUpdateMs) ? Number(lastUpdateMs) : Date.now();
+        previewState.lastUpdateMs = effectiveUpdate;
+        persistPreviewCandles({ bars, reset, lastUpdateMs: effectiveUpdate });
+        return changed;
+      }
+
+      function persistPreviewCandles({ bars = null, reset = false, lastUpdateMs = null } = {}) {
+        if (!SharedCandles || typeof SharedCandles.merge !== "function") return;
+        const payload = Array.isArray(bars) && bars.length ? bars : previewState.candles;
+        if (!payload.length) return;
+        const effectiveUpdate = Number.isFinite(lastUpdateMs)
+          ? Number(lastUpdateMs)
+          : Number.isFinite(previewState.lastUpdateMs)
+          ? Number(previewState.lastUpdateMs)
+          : Date.now();
+        try {
+          SharedCandles.merge(previewState.symbol, previewState.interval, payload, {
+            intervalMs: previewState.intervalMs,
+            lastUpdateMs: effectiveUpdate,
+            maxBars: PREVIEW_SHARED_MAX_BARS,
+            reset,
+          });
+        } catch (error) {
+          console.warn("preview shared store failed", error);
+        }
+      }
+
+      function restorePreviewFromShared(symbol, interval) {
+        if (!SharedCandles || typeof SharedCandles.get !== "function") {
+          return false;
+        }
+        try {
+          const stored = SharedCandles.get(symbol, interval);
+          if (!stored || !Array.isArray(stored.candles) || !stored.candles.length) {
+            return false;
+          }
+          const bars = stored.candles.map((bar) => ensurePreviewBar(bar)).filter((bar) => bar !== null);
+          if (!bars.length) {
+            return false;
+          }
+          const storedInterval = Number(stored.intervalMs);
+          if (Number.isFinite(storedInterval)) {
+            previewState.intervalMs = storedInterval;
+          }
+          const lastUpdate = Number(stored.lastUpdateMs) || Number(stored.updatedAt) || Date.now();
+          const changed = mergePreviewBars(bars, { reset: true, lastUpdateMs: lastUpdate });
+          if (changed) {
+            applyPreviewCandles({ fitContent: true });
+            return true;
+          }
+          return false;
+        } catch (error) {
+          console.warn("preview shared restore failed", error);
+          return false;
+        }
+      }
+
+      function catch_gap() {
+        if (previewState.gapWatcher && typeof previewState.gapWatcher.notifyData === "function") {
+          previewState.gapWatcher.notifyData();
+        }
+      }
+
+      async function fill_gap(gap) {
+        if (!gap) return false;
+        if (!previewState.symbol || !previewState.interval) return false;
+        try {
+          const intervalMs = previewState.intervalMs || intervalToMs(previewState.interval);
+          const startBound = Number(gap.startMs);
+          const endBound = Number(gap.endMs);
+          if (!Number.isFinite(startBound) || !Number.isFinite(endBound)) {
+            return false;
+          }
+          const rangeWidth = Math.max(intervalMs, endBound - startBound);
+          const approxBars = Math.ceil(rangeWidth / intervalMs) + 2;
+          const buffer = intervalMs;
+          const bars = await fetchRange(
+            previewState.symbol,
+            previewState.interval,
+            Math.max(0, startBound - buffer),
+            endBound + buffer,
+            Math.min(1000, Math.max(approxBars, 50)),
+          );
+          const changed = mergePreviewBars(bars, { lastUpdateMs: Date.now() });
+          if (changed) {
+            applyPreviewCandles({ fitContent: false });
+            catch_gap();
+          }
+          return true;
+        } catch (error) {
+          console.error("preview gap fill failed", error);
+          setPreviewStatus("Failed to fetch missing candles", "error");
+          return false;
+        }
       }
 
       function updatePreviewSelectionLabel() {
@@ -2364,25 +3032,171 @@ def render_inspection_page(
         if (selectionLabelEl) selectionLabelEl.textContent = label;
       }
 
-      function updatePreviewInfo(candle) {
-        if (!candle) {
+      function updatePreviewInfo(bar) {
+        const intervalMs = previewState.intervalMs || intervalToMs(previewState.interval);
+        let lastUpdateMs = Number.isFinite(bar?.last_update_ms)
+          ? Number(bar.last_update_ms)
+          : Number.isFinite(previewState.lastUpdateMs)
+          ? Number(previewState.lastUpdateMs)
+          : Date.now();
+        const selectionEnd = Number(previewState.selection && previewState.selection.end);
+        if (Number.isFinite(selectionEnd)) {
+          lastUpdateMs = Math.min(lastUpdateMs, Number(selectionEnd));
+        }
+        if (!bar) {
           if (lastTimeEl) lastTimeEl.textContent = "-";
           if (lastPriceEl) lastPriceEl.textContent = "-";
           if (lastRangeEl) lastRangeEl.textContent = "-";
           return;
         }
-        if (lastTimeEl) lastTimeEl.textContent = formatTs(Number(candle.t));
-        if (lastPriceEl) lastPriceEl.textContent = Number(candle.c ?? candle.close ?? 0).toFixed(2);
-        const high = Number(candle.h ?? candle.high ?? 0);
-        const low = Number(candle.l ?? candle.low ?? 0);
-        const base = Number(candle.c ?? candle.close ?? 0) || 1;
+        const displayTs = computeCandleDisplayTime(bar, intervalMs, lastUpdateMs);
+        if (lastTimeEl) lastTimeEl.textContent = formatTs(displayTs);
+        const close = Number(bar.close ?? bar.c ?? 0);
+        if (lastPriceEl) lastPriceEl.textContent = Number.isFinite(close) ? close.toFixed(2) : "-";
+        const high = Number(bar.high ?? bar.h ?? close);
+        const low = Number(bar.low ?? bar.l ?? close);
+        const base = close || 1;
         const rangeValue = Math.max(0, high - low);
         const percent = base ? (rangeValue / base) * 100 : 0;
         if (lastRangeEl) lastRangeEl.textContent = `${rangeValue.toFixed(2)} (${percent.toFixed(2)}%)`;
       }
 
+      function stopPreviewRefresh() {
+        if (previewState.refreshTimer) {
+          clearTimeout(previewState.refreshTimer);
+          previewState.refreshTimer = null;
+        }
+      }
+
+      function schedulePreviewRefresh() {
+        stopPreviewRefresh();
+        previewState.refreshTimer = setTimeout(async () => {
+          previewState.refreshTimer = null;
+          await refreshPreviewCandles({ silent: true });
+          schedulePreviewRefresh();
+        }, PREVIEW_REFRESH_INTERVAL_MS);
+      }
+
+      async function loadPreviewCandles({ reset = false, fitContent = false, limit = 1000 } = {}) {
+        if (!previewState.symbol || !previewState.interval) return false;
+        const intervalMs = intervalToMs(previewState.interval);
+        previewState.intervalMs = intervalMs;
+        if (reset) {
+          previewState.minuteCandles = [];
+        }
+        const history = await fetchHistory(previewState.symbol, previewState.interval, limit);
+        const historyChanged = mergePreviewBars(history, {
+          reset,
+          lastUpdateMs: Number.isFinite(previewState.lastUpdateMs) ? previewState.lastUpdateMs : Date.now(),
+        });
+        if (historyChanged || reset || !previewState.candles.length) {
+          applyPreviewCandles({ fitContent });
+          catch_gap();
+        }
+
+        try {
+          const minuteBars = await fetchMinuteWindow({ force: true });
+          const previousUpdate = Number(previewState.lastUpdateMs) || 0;
+          const minuteChanged = mergeMinuteBars(minuteBars, { reset });
+          const aggregatedChanged = minuteChanged ? applyMinuteAggregation({ persist: true }) : false;
+          if (aggregatedChanged) {
+            applyPreviewCandles({ fitContent: false });
+            catch_gap();
+          } else if (minuteChanged || Number(previewState.lastUpdateMs || 0) !== previousUpdate) {
+            const targetBar =
+              findBarAtOrBefore(Number(previewState.selection?.end)) ||
+              previewState.candles[previewState.candles.length - 1] ||
+              null;
+            updatePreviewInfo(targetBar);
+          }
+          if (previewState.selection && previewState.selection.start && previewState.selection.end) {
+            const adjustedRange = normaliseSelectionRange(
+              previewState.selection.start,
+              previewState.selection.end,
+            );
+            if (adjustedRange) {
+              previewState.selection = adjustedRange;
+              updatePreviewSelectionLabel();
+            }
+          }
+        } catch (error) {
+          console.warn("preview minute fetch failed", error);
+        }
+
+        return historyChanged;
+      }
+
+      function applyPreviewCandles({ fitContent = false } = {}) {
+        if (previewState.series) {
+          previewState.series.setData(previewState.candles);
+        }
+        if (fitContent && previewState.chart && previewState.candles.length) {
+          previewState.chart.timeScale().fitContent();
+        }
+        let lastBar = previewState.candles[previewState.candles.length - 1] || null;
+        const selectionEnd = previewState.selection && previewState.selection.end;
+        if (Number.isFinite(selectionEnd)) {
+          const endMs = Number(selectionEnd);
+          for (let idx = previewState.candles.length - 1; idx >= 0; idx -= 1) {
+            const candidate = previewState.candles[idx];
+            if (!candidate) continue;
+            const candidateTs = Number.isFinite(candidate.ts_ms_utc)
+              ? Number(candidate.ts_ms_utc)
+              : Number(candidate.time) * 1000;
+            if (!Number.isFinite(candidateTs)) continue;
+            if (candidateTs <= endMs) {
+              lastBar = candidate;
+              break;
+            }
+          }
+        }
+        updatePreviewInfo(lastBar);
+      }
+
+      async function refreshPreviewCandles({ silent = false } = {}) {
+        if (previewState.isFetching) return;
+        if (!previewState.symbol || !previewState.interval) return;
+        previewState.isFetching = true;
+        try {
+          const minuteBars = await fetchMinuteWindow({ force: false });
+          const previousUpdate = Number(previewState.lastUpdateMs) || 0;
+          const minuteChanged = mergeMinuteBars(minuteBars, { reset: false });
+          const aggregatedChanged = minuteChanged ? applyMinuteAggregation({ persist: true }) : false;
+          if (aggregatedChanged) {
+            applyPreviewCandles({ fitContent: false });
+            catch_gap();
+          } else if (minuteChanged || Number(previewState.lastUpdateMs || 0) !== previousUpdate) {
+            const targetBar =
+              findBarAtOrBefore(Number(previewState.selection?.end)) ||
+              previewState.candles[previewState.candles.length - 1] ||
+              null;
+            updatePreviewInfo(targetBar);
+          }
+          if (previewState.selection && previewState.selection.start && previewState.selection.end) {
+            const adjustedRange = normaliseSelectionRange(
+              previewState.selection.start,
+              previewState.selection.end,
+            );
+            if (adjustedRange) {
+              previewState.selection = adjustedRange;
+              updatePreviewSelectionLabel();
+            }
+          }
+          if (!silent) {
+            setPreviewStatus("", "info");
+          }
+        } catch (error) {
+          console.error("Failed to refresh preview candles", error);
+          if (!silent) {
+            setPreviewStatus("Failed to load Binance history", "error");
+          }
+        } finally {
+          previewState.isFetching = false;
+        }
+      }
+
       function ensurePreviewChart() {
-        if (previewState.chart || !chartEl || !window.LightweightCharts) return;
+        if (previewState.chart || !chartEl || !LightweightCharts) return;
         previewState.chart = LightweightCharts.createChart(chartEl, {
           autoSize: true,
           layout: { background: { color: "#0f172a" }, textColor: "#e2e8f0" },
@@ -2403,6 +3217,16 @@ def render_inspection_page(
           borderDownColor: "#ef4444",
           borderVisible: true,
         });
+
+        if (ChartGapWatcher && typeof ChartGapWatcher.attach === "function") {
+          previewState.gapWatcher = ChartGapWatcher.attach({
+            chart: previewState.chart,
+            interval: previewState.interval,
+            intervalMs: previewState.intervalMs,
+            getCandles: () => previewState.candles,
+            requestGap: fill_gap,
+          });
+        }
 
         const resize = () => {
           if (!previewState.chart) return;
@@ -2426,17 +3250,25 @@ def render_inspection_page(
         previewState.chart.subscribeClick((param) => {
           if (!param || typeof param.time === "undefined") return;
           const ts = Math.floor(Number(param.time) * 1000);
+          if (!Number.isFinite(ts)) return;
           if (!previewState.selection || !previewState.selection.start || previewState.selection.end) {
             previewState.selection = { start: ts, end: null };
           } else {
-            previewState.selection.end = ts;
-            if (previewState.selection.end < previewState.selection.start) {
-              const tmp = previewState.selection.start;
-              previewState.selection.start = previewState.selection.end;
-              previewState.selection.end = tmp;
+            const range = normaliseSelectionRange(previewState.selection.start, ts);
+            if (range) {
+              previewState.selection = range;
+            } else {
+              previewState.selection = { start: ts, end: ts };
             }
           }
           updatePreviewSelectionLabel();
+          const targetBar =
+            previewState.selection && previewState.selection.end
+              ? findBarAtOrBefore(Number(previewState.selection.end)) ||
+                previewState.candles[previewState.candles.length - 1] ||
+                null
+              : previewState.candles[previewState.candles.length - 1] || null;
+          updatePreviewInfo(targetBar);
         });
       }
 
@@ -2446,35 +3278,41 @@ def render_inspection_page(
         const resolvedInterval = intervalRaw || "1m";
         previewState.symbol = resolvedSymbol;
         previewState.interval = resolvedInterval;
+        previewState.intervalMs = intervalToMs(resolvedInterval);
+        previewState.minuteCandles = [];
+        previewState.lastUpdateMs = null;
+        previewState.lastFetchedAtMs = null;
         previewState.selection = null;
+        stopPreviewRefresh();
         if (symbolField) symbolField.value = resolvedSymbol;
         if (intervalField) intervalField.value = resolvedInterval;
         updatePreviewSelectionLabel();
+        ensurePreviewChart();
+        if (previewState.gapWatcher && typeof previewState.gapWatcher.updateContext === "function") {
+          previewState.gapWatcher.updateContext({
+            symbol: previewState.symbol,
+            interval: previewState.interval,
+            intervalMs: previewState.intervalMs,
+            getCandles: () => previewState.candles,
+            requestGap: fill_gap,
+            resetRequestedKeys: true,
+          });
+        }
+
+        const restoredFromShared = restorePreviewFromShared(resolvedSymbol, resolvedInterval);
+        if (restoredFromShared && previewState.gapWatcher && typeof previewState.gapWatcher.notifyData === "function") {
+          previewState.gapWatcher.notifyData();
+        }
+
         setPreviewStatus("Loading Binance history...", "info");
         try {
-          ensurePreviewChart();
-          const intervalMs = TIMEFRAME_TO_MS[resolvedInterval] || 60000;
-          const endMs = Date.now();
-          const startMs = Math.max(0, endMs - intervalMs * 500);
-          const candles = await fetchCandles(resolvedSymbol, resolvedInterval, startMs, endMs);
-          const bars = candles.map((candle) => ({
-            time: Math.floor(Number(candle.t) / 1000),
-            open: Number(candle.o ?? candle.open ?? 0),
-            high: Number(candle.h ?? candle.high ?? 0),
-            low: Number(candle.l ?? candle.low ?? 0),
-            close: Number(candle.c ?? candle.close ?? 0),
-          }));
-          if (previewState.series) {
-            previewState.series.setData(bars);
-          }
-          if (previewState.chart && bars.length) {
-            previewState.chart.timeScale().fitContent();
-          }
-          updatePreviewInfo(candles[candles.length - 1]);
+          await loadPreviewCandles({ reset: true, fitContent: !restoredFromShared, limit: 1000 });
           setPreviewStatus("", "info");
+          schedulePreviewRefresh();
         } catch (error) {
           console.error(error);
           setPreviewStatus("Failed to load Binance history", "error");
+          stopPreviewRefresh();
         }
       }
 
@@ -2483,6 +3321,8 @@ def render_inspection_page(
           previewState.selection = null;
           updatePreviewSelectionLabel();
           setPreviewStatus("", "info");
+          const lastBar = previewState.candles[previewState.candles.length - 1] || null;
+          updatePreviewInfo(lastBar);
         });
       }
 
@@ -2495,6 +3335,10 @@ def render_inspection_page(
           );
         });
       }
+
+      window.addEventListener("beforeunload", () => {
+        stopPreviewRefresh();
+      });
 
       if (createSessionBtn) {
         createSessionBtn.addEventListener("click", async () => {
@@ -2935,6 +3779,8 @@ def render_inspection_page(
         <script>{script_block}</script>
         <script src=\"https://unpkg.com/lightweight-charts@4.0.0/dist/lightweight-charts.standalone.production.js\"></script>
         <script src="/public/binanceCandles.js"></script>
+        <script src="/public/chart-gap-watcher.js"></script>
+        <script src="/public/shared-candles.js"></script>
         <script>{ui_script}</script>
       </body>
     </html>
