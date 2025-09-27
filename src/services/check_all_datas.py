@@ -545,29 +545,6 @@ def build_check_all_datas(
             tf_key=target_tf_key,
         )
 
-    if base_candles:
-        try:
-            zone_cfg = ZonesConfig(tick_size=profile_config.get("tick_size"))
-            detected_zones = detect_zones(
-                base_candles,
-                target_tf_key,
-                symbol,
-                zone_cfg,
-            )
-        except Exception:  # pragma: no cover - defensive logging guard
-            logging.getLogger(__name__).exception(
-                "Failed to detect zones for check-all payload",
-                extra={
-                    "snapshot_id": snapshot.get("id"),
-                    "symbol": symbol,
-                    "timeframe": target_tf_key,
-                },
-            )
-            detected_zones = {
-                "symbol": symbol,
-                "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
-            }
-
     snapshot_selection = snapshot.get("selection") if isinstance(snapshot.get("selection"), Mapping) else None
     start_ms = selection_start_ms or _safe_int(snapshot_selection.get("start")) if snapshot_selection else None
     end_ms = selection_end_ms or _safe_int(snapshot_selection.get("end")) if snapshot_selection else None
@@ -640,6 +617,37 @@ def build_check_all_datas(
         reference_dt = datetime.fromtimestamp(reference_ts / 1000.0, tz=UTC)
 
     detailed_start_ts = reference_ts - hours_window * MS_IN_HOUR
+
+    detection_candles: List[Dict[str, Any]] = []
+    if base_candles:
+        detection_candles = _filter_candles(
+            base_candles,
+            start_ms=detailed_start_ts,
+            end_ms=reference_ts,
+        )
+
+    if detection_candles:
+        try:
+            zone_cfg = ZonesConfig(tick_size=profile_config.get("tick_size"))
+            detected_zones = detect_zones(
+                detection_candles,
+                target_tf_key,
+                symbol,
+                zone_cfg,
+            )
+        except Exception:  # pragma: no cover - defensive logging guard
+            logging.getLogger(__name__).exception(
+                "Failed to detect zones for check-all payload",
+                extra={
+                    "snapshot_id": snapshot.get("id"),
+                    "symbol": symbol,
+                    "timeframe": target_tf_key,
+                },
+            )
+            detected_zones = {
+                "symbol": symbol,
+                "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
+            }
     movement_anchor_ts = detailed_start_ts
     movement_start_ts = min(start_ms, movement_anchor_ts)
     movement_end_ts = max(start_ms, movement_anchor_ts)
