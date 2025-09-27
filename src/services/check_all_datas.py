@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence
 import httpx
 
 from .inspection import build_htf_section
+from .liquidity import build_liquidity_snapshot
 from .presets import resolve_profile_config
 from .profile import build_profile_package
 from .zones import Config as ZonesConfig, detect_zones
@@ -931,7 +932,8 @@ def build_check_all_datas(
     frames["1m"] = minute_candles
 
     symbol = str(snapshot.get("symbol") or snapshot.get("pair") or "UNKNOWN").upper()
-    profile_config = resolve_profile_config(symbol, snapshot.get("meta") if isinstance(snapshot.get("meta"), Mapping) else None)
+    raw_meta = snapshot.get("meta") if isinstance(snapshot.get("meta"), Mapping) else None
+    profile_config = resolve_profile_config(symbol, raw_meta)
     sessions = list(Meta.iter_vwap_sessions())
     profile_tpo: List[Dict[str, Any]] = []
     profile_flat: List[Dict[str, float]] = []
@@ -1131,6 +1133,8 @@ def build_check_all_datas(
     }
     htf_section, htf_quality = build_htf_section(symbol, frames, selection_payload)
 
+    liquidity_config = raw_meta.get("liquidity") if isinstance(raw_meta, Mapping) else None
+
     reference_ts = window_end_ms + MINUTE_INTERVAL_MS
     reference_dt = datetime.fromtimestamp(reference_ts / 1000.0, tz=UTC)
     detailed_start_ts = window_start_ms
@@ -1296,6 +1300,14 @@ def build_check_all_datas(
     if isinstance(tick_size_value, (int, float)):
         tick_size_numeric = float(tick_size_value)
 
+    liquidity_frames = {tf: {"candles": list(candles)} for tf, candles in frames.items()}
+    liquidity_payload = build_liquidity_snapshot(
+        liquidity_frames,
+        tick_size=tick_size_numeric,
+        selection=selection_payload,
+        config=liquidity_config if isinstance(liquidity_config, Mapping) else None,
+    )
+
     minute_series = frames.get("1m", [])
     daily_start_ms = _start_of_day_ms(window_end_ms)
     daily_vwap_profile = _build_volume_profile_stats(
@@ -1358,6 +1370,7 @@ def build_check_all_datas(
         "tpo": {"sessions": profile_tpo, "zones": profile_zones},
         "profile": profile_flat,
         "zones": detected_zones,
+        "liquidity": liquidity_payload,
         "data_quality": data_quality_public,
         "htf": htf_section,
         "data_quality_htf": htf_quality,
