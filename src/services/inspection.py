@@ -1337,16 +1337,40 @@ def render_inspection_page(
   const PREVIEW_SOURCE_MAX_LIMIT = 1000;
   const PREVIEW_TARGET_BARS = 10;
   const PREVIEW_MAX_TARGET_CANDLES = 500;
+  const PREVIEW_SHARED_MAX_BARS = 1200;
+
+  const ChartGapWatcher = window.ChartGapWatcher || null;
+  const SharedCandles = window.SharedCandles || null;
 
 
   function toChartBars(candles) {
-    return (candles || []).map((candle) => ({
-      time: Math.floor(Number(candle.t || candle.time || 0) / 1000),
-      open: Number(candle.o ?? candle.open ?? 0),
-      high: Number(candle.h ?? candle.high ?? 0),
-      low: Number(candle.l ?? candle.low ?? 0),
-      close: Number(candle.c ?? candle.close ?? 0),
-    }));
+    return (candles || [])
+      .map((candle) => {
+        const rawTs = Number(candle?.ts_ms_utc ?? candle?.t ?? candle?.time ?? 0);
+        const open = Number(candle?.o ?? candle?.open ?? 0);
+        const high = Number(candle?.h ?? candle?.high ?? open);
+        const low = Number(candle?.l ?? candle?.low ?? open);
+        const close = Number(candle?.c ?? candle?.close ?? open);
+        if (
+          !Number.isFinite(rawTs) ||
+          !Number.isFinite(open) ||
+          !Number.isFinite(high) ||
+          !Number.isFinite(low) ||
+          !Number.isFinite(close)
+        ) {
+          return null;
+        }
+        const time = Math.floor(rawTs / 1000);
+        return {
+          time,
+          open,
+          high,
+          low,
+          close,
+          ts_ms_utc: Math.floor(rawTs),
+        };
+      })
+      .filter((bar) => bar !== null);
   }
 
   async function fetchSnapshots() {
@@ -1481,6 +1505,45 @@ def render_inspection_page(
         v: item.v,
       })),
       lastUpdateMs,
+    };
+  }
+
+  function ensurePreviewBar(input) {
+    if (!input) return null;
+    const candidateTime = Number(input.time);
+    const candidateOpen = Number(input.open);
+    const candidateHigh = Number(input.high ?? candidateOpen);
+    const candidateLow = Number(input.low ?? candidateOpen);
+    const candidateClose = Number(input.close ?? candidateOpen);
+    let candidateTs = Number(input.ts_ms_utc ?? input.t ?? 0);
+    if (
+      Number.isFinite(candidateTime) &&
+      Number.isFinite(candidateOpen) &&
+      Number.isFinite(candidateHigh) &&
+      Number.isFinite(candidateLow) &&
+      Number.isFinite(candidateClose)
+    ) {
+      if (!Number.isFinite(candidateTs)) {
+        candidateTs = candidateTime * 1000;
+      }
+      return {
+        time: Math.floor(candidateTime),
+        open: candidateOpen,
+        high: candidateHigh,
+        low: candidateLow,
+        close: candidateClose,
+        ts_ms_utc: Math.floor(candidateTs),
+      };
+    }
+    const normalized = normalisePreviewCandle(input);
+    if (!normalized) return null;
+    return {
+      time: Math.floor(normalized.t / 1000),
+      open: normalized.o,
+      high: normalized.h,
+      low: normalized.l,
+      close: normalized.c,
+      ts_ms_utc: normalized.t,
     };
   }
 
@@ -2492,6 +2555,9 @@ def render_inspection_page(
         lastFetchedAtMs: null,
         lastUpdateMs: null,
         isFetching: false,
+        intervalMs:
+          TIMEFRAME_TO_MS[(intervalField && intervalField.value) || "1m"] || PREVIEW_SOURCE_INTERVAL_MS,
+        gapWatcher: null,
       };
 
       function setPreviewStatus(message, tone = "info") {
@@ -2501,6 +2567,98 @@ def render_inspection_page(
         statusEl.hidden = !message;
       }
 
+      function mergePreviewBars(bars, { reset = false, maxBars = PREVIEW_SHARED_MAX_BARS } = {}) {
+        if (reset) previewState.candles = [];
+        if (!Array.isArray(bars) || !bars.length) return false;
+        const index = new Map();
+        previewState.candles.forEach((bar, idx) => {
+          index.set(Number(bar.time), idx);
+        });
+        let changed = false;
+        bars.forEach((candidate) => {
+          const bar = ensurePreviewBar(candidate);
+          if (!bar) return;
+          const time = Number(bar.time);
+          if (!Number.isFinite(time)) return;
+          if (index.has(time)) {
+            previewState.candles[index.get(time)] = bar;
+          } else {
+            index.set(time, previewState.candles.length);
+            previewState.candles.push(bar);
+          }
+          changed = true;
+        });
+        if (changed) {
+          previewState.candles.sort((a, b) => Number(a.time) - Number(b.time));
+          const limit = Math.max(1, Number(maxBars) || PREVIEW_SHARED_MAX_BARS);
+          if (previewState.candles.length > limit) {
+            previewState.candles = previewState.candles.slice(previewState.candles.length - limit);
+          }
+        }
+        return changed;
+      }
+
+      function persistPreviewCandles({ bars = null, reset = false } = {}) {
+        if (!SharedCandles || typeof SharedCandles.merge !== "function") return;
+        const payload = Array.isArray(bars) && bars.length ? bars : previewState.candles;
+        if (!payload.length) return;
+        try {
+          SharedCandles.merge(previewState.symbol, previewState.interval, payload, {
+            intervalMs: previewState.intervalMs,
+            lastUpdateMs: previewState.lastUpdateMs,
+            maxBars: PREVIEW_SHARED_MAX_BARS,
+            reset,
+          });
+        } catch (error) {
+          console.warn("preview shared store failed", error);
+        }
+      }
+
+      function catch_gap() {
+        if (previewState.gapWatcher && typeof previewState.gapWatcher.notifyData === "function") {
+          previewState.gapWatcher.notifyData();
+        }
+      }
+
+      async function fill_gap(gap) {
+        if (!gap) return false;
+        if (!previewState.symbol || !previewState.interval) return false;
+        try {
+          const intervalMs = previewState.intervalMs || TIMEFRAME_TO_MS[previewState.interval] || PREVIEW_SOURCE_INTERVAL_MS;
+          const buffer = intervalMs * 2;
+          const startMs = Math.max(0, Math.floor(Number(gap.startMs) || 0) - buffer);
+          const endMs = Math.max(startMs + intervalMs, Math.floor(Number(gap.endMs) || 0) + buffer);
+          const approxMinutes = Math.ceil((endMs - startMs) / PREVIEW_SOURCE_INTERVAL_MS) + 4;
+          const minuteLimit = Math.min(
+            PREVIEW_SOURCE_MAX_LIMIT,
+            Math.max(computePreviewMinuteLimit(previewState.interval), approxMinutes),
+          );
+          const sourceCandles = await fetchCandles(
+            previewState.symbol,
+            PREVIEW_SOURCE_INTERVAL,
+            startMs,
+            endMs,
+            { limit: minuteLimit },
+          );
+          const fetchedAt = Date.now();
+          const { candles, lastUpdateMs } = aggregateMinuteCandles(
+            sourceCandles,
+            previewState.interval,
+            fetchedAt,
+          );
+          applyPreviewCandles(candles, fetchedAt, intervalMs, {
+            fitContent: false,
+            lastUpdateMs,
+            reset: false,
+          });
+          return true;
+        } catch (error) {
+          console.error("preview gap fill failed", error);
+          setPreviewStatus("Failed to fetch missing candles", "error");
+          return false;
+        }
+      }
+
       function updatePreviewSelectionLabel() {
         const start = previewState.selection && previewState.selection.start;
         const end = previewState.selection && previewState.selection.end;
@@ -2508,24 +2666,25 @@ def render_inspection_page(
         if (selectionLabelEl) selectionLabelEl.textContent = label;
       }
 
-      function updatePreviewInfo(candle, options = {}) {
+      function updatePreviewInfo(bar, options = {}) {
         const intervalMs =
           Number.isFinite(options.intervalMs) && options.intervalMs
             ? Number(options.intervalMs)
-            : TIMEFRAME_TO_MS[previewState.interval] || 60000;
+            : previewState.intervalMs || TIMEFRAME_TO_MS[previewState.interval] || 60000;
         const lastUpdateMs = Number(options.lastUpdateMs);
-        if (!candle) {
+        if (!bar) {
           if (lastTimeEl) lastTimeEl.textContent = "-";
           if (lastPriceEl) lastPriceEl.textContent = "-";
           if (lastRangeEl) lastRangeEl.textContent = "-";
           return;
         }
-        const displayTs = computeCandleDisplayTime(candle, intervalMs, lastUpdateMs);
+        const displayTs = computeCandleDisplayTime({ t: bar.ts_ms_utc ?? bar.time * 1000 }, intervalMs, lastUpdateMs);
         if (lastTimeEl) lastTimeEl.textContent = formatTs(displayTs);
-        if (lastPriceEl) lastPriceEl.textContent = Number(candle.c ?? candle.close ?? 0).toFixed(2);
-        const high = Number(candle.h ?? candle.high ?? 0);
-        const low = Number(candle.l ?? candle.low ?? 0);
-        const base = Number(candle.c ?? candle.close ?? 0) || 1;
+        const close = Number(bar.close ?? bar.c ?? 0);
+        if (lastPriceEl) lastPriceEl.textContent = Number.isFinite(close) ? close.toFixed(2) : "-";
+        const high = Number(bar.high ?? bar.h ?? close);
+        const low = Number(bar.low ?? bar.l ?? close);
+        const base = close || 1;
         const rangeValue = Math.max(0, high - low);
         const percent = base ? (rangeValue / base) * 100 : 0;
         if (lastRangeEl) lastRangeEl.textContent = `${rangeValue.toFixed(2)} (${percent.toFixed(2)}%)`;
@@ -2573,41 +2732,51 @@ def render_inspection_page(
         candles,
         fetchedAtMs,
         intervalMs,
-        { fitContent = false, lastUpdateMs = null } = {},
+        { fitContent = false, lastUpdateMs = null, reset = true } = {},
       ) {
-        previewState.candles = Array.isArray(candles) ? candles.slice() : [];
+        const merged = mergePreviewBars(Array.isArray(candles) ? candles : [], {
+          reset,
+          maxBars: PREVIEW_SHARED_MAX_BARS,
+        });
         previewState.lastFetchedAtMs = fetchedAtMs;
+        previewState.intervalMs = Number.isFinite(intervalMs)
+          ? Number(intervalMs)
+          : previewState.intervalMs || TIMEFRAME_TO_MS[previewState.interval] || PREVIEW_SOURCE_INTERVAL_MS;
         const resolvedUpdateMs = Number.isFinite(lastUpdateMs) ? Number(lastUpdateMs) : fetchedAtMs;
         previewState.lastUpdateMs = resolvedUpdateMs;
-        const bars = toChartBars(previewState.candles);
         if (previewState.series) {
-          previewState.series.setData(bars);
+          previewState.series.setData(previewState.candles);
         }
-        if (fitContent && previewState.chart && bars.length) {
+        if (fitContent && previewState.chart && previewState.candles.length) {
           previewState.chart.timeScale().fitContent();
         }
-        updatePreviewInfo(previewState.candles[previewState.candles.length - 1], {
-          intervalMs,
+        updatePreviewInfo(previewState.candles[previewState.candles.length - 1] || null, {
+          intervalMs: previewState.intervalMs,
           lastUpdateMs: resolvedUpdateMs,
         });
+        if (merged) {
+          persistPreviewCandles({ bars: candles, reset });
+        }
+        catch_gap();
       }
 
       async function refreshPreviewCandles({ silent = false } = {}) {
         if (previewState.isFetching) return;
         if (!previewState.symbol || !previewState.interval) return;
         previewState.isFetching = true;
-        try {
-          const { candles, fetchedAt, intervalMs, lastUpdateMs } = await requestPreviewCandles(
-            previewState.symbol,
-            previewState.interval,
-          );
-          applyPreviewCandles(candles, fetchedAt, intervalMs, {
-            fitContent: false,
-            lastUpdateMs,
-          });
-          if (!silent) {
-            setPreviewStatus("", "info");
-          }
+      try {
+        const { candles, fetchedAt, intervalMs, lastUpdateMs } = await requestPreviewCandles(
+          previewState.symbol,
+          previewState.interval,
+        );
+        applyPreviewCandles(candles, fetchedAt, intervalMs, {
+          fitContent: false,
+          lastUpdateMs,
+          reset: false,
+        });
+        if (!silent) {
+          setPreviewStatus("", "info");
+        }
         } catch (error) {
           console.error("Failed to refresh preview candles", error);
           if (!silent) {
@@ -2640,6 +2809,16 @@ def render_inspection_page(
           borderDownColor: "#ef4444",
           borderVisible: true,
         });
+
+        if (ChartGapWatcher && typeof ChartGapWatcher.attach === "function") {
+          previewState.gapWatcher = ChartGapWatcher.attach({
+            chart: previewState.chart,
+            interval: previewState.interval,
+            intervalMs: previewState.intervalMs,
+            getCandles: () => previewState.candles,
+            requestGap: fill_gap,
+          });
+        }
 
         const resize = () => {
           if (!previewState.chart) return;
@@ -2683,21 +2862,54 @@ def render_inspection_page(
         const resolvedInterval = intervalRaw || "1m";
         previewState.symbol = resolvedSymbol;
         previewState.interval = resolvedInterval;
+        previewState.intervalMs = TIMEFRAME_TO_MS[resolvedInterval] || PREVIEW_SOURCE_INTERVAL_MS;
         previewState.selection = null;
         stopPreviewRefresh();
         if (symbolField) symbolField.value = resolvedSymbol;
         if (intervalField) intervalField.value = resolvedInterval;
         updatePreviewSelectionLabel();
+        ensurePreviewChart();
+        if (previewState.gapWatcher && typeof previewState.gapWatcher.updateContext === "function") {
+          previewState.gapWatcher.updateContext({
+            symbol: previewState.symbol,
+            interval: previewState.interval,
+            intervalMs: previewState.intervalMs,
+            getCandles: () => previewState.candles,
+            requestGap: fill_gap,
+            resetRequestedKeys: true,
+          });
+        }
+
+        let restoredFromShared = false;
+        if (SharedCandles && typeof SharedCandles.get === "function") {
+          try {
+            const stored = SharedCandles.get(resolvedSymbol, resolvedInterval);
+            if (stored && Array.isArray(stored.candles) && stored.candles.length) {
+              const storedFetchedAt = Number(stored.updatedAt) || Date.now();
+              const storedIntervalMs = Number(stored.intervalMs) || previewState.intervalMs;
+              const storedUpdate = Number(stored.lastUpdateMs) || storedFetchedAt;
+              applyPreviewCandles(stored.candles, storedFetchedAt, storedIntervalMs, {
+                fitContent: true,
+                lastUpdateMs: storedUpdate,
+                reset: true,
+              });
+              restoredFromShared = true;
+            }
+          } catch (error) {
+            console.warn("preview shared restore failed", error);
+          }
+        }
+
         setPreviewStatus("Loading Binance history...", "info");
         try {
-          ensurePreviewChart();
           const { candles, fetchedAt, intervalMs, lastUpdateMs } = await requestPreviewCandles(
             resolvedSymbol,
             resolvedInterval,
           );
           applyPreviewCandles(candles, fetchedAt, intervalMs, {
-            fitContent: true,
+            fitContent: !restoredFromShared,
             lastUpdateMs,
+            reset: true,
           });
           setPreviewStatus("", "info");
           schedulePreviewRefresh();
@@ -3169,6 +3381,8 @@ def render_inspection_page(
         <script>{script_block}</script>
         <script src=\"https://unpkg.com/lightweight-charts@4.0.0/dist/lightweight-charts.standalone.production.js\"></script>
         <script src="/public/binanceCandles.js"></script>
+        <script src="/public/chart-gap-watcher.js"></script>
+        <script src="/public/shared-candles.js"></script>
         <script>{ui_script}</script>
       </body>
     </html>

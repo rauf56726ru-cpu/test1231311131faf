@@ -4,6 +4,7 @@
   const LightweightCharts = window.LightweightCharts;
   const BinanceCandles = window.BinanceCandles;
   const ChartGapWatcher = window.ChartGapWatcher;
+  const SharedCandles = window.SharedCandles;
 
   if (!LightweightCharts || !BinanceCandles) {
     console.error("Chart dependencies are missing");
@@ -36,6 +37,7 @@
     ws: null,
     reconnectTimer: null,
     gapWatcher: null,
+    lastUpdateMs: null,
   };
 
   function intervalToMs(value) {
@@ -196,7 +198,25 @@
     };
   }
 
-  function mergeCandles(bars, { reset = false } = {}) {
+  function persistSharedCandles({ bars = null, reset = false, lastUpdateMs = null } = {}) {
+    if (!SharedCandles || typeof SharedCandles.merge !== "function") return;
+    const payload = Array.isArray(bars) && bars.length ? bars : state.candles;
+    if (!Array.isArray(payload) || !payload.length) return;
+    const intervalMs = intervalToMs(state.interval);
+    const effectiveUpdate = Number.isFinite(lastUpdateMs) ? Number(lastUpdateMs) : state.lastUpdateMs;
+    try {
+      SharedCandles.merge(state.symbol, state.interval, payload, {
+        intervalMs,
+        lastUpdateMs: effectiveUpdate,
+        maxBars: 2000,
+        reset,
+      });
+    } catch (error) {
+      console.warn("SharedCandles merge failed", error);
+    }
+  }
+
+  function mergeCandles(bars, { reset = false, lastUpdateMs = null } = {}) {
     if (reset) state.candles = [];
     if (!Array.isArray(bars) || !bars.length) return false;
     const index = new Map();
@@ -219,8 +239,37 @@
     });
     if (changed) {
       state.candles.sort((a, b) => Number(a.time) - Number(b.time));
+      if (state.candles.length > 2000) {
+        state.candles = state.candles.slice(state.candles.length - 2000);
+      }
+      const effectiveUpdate = Number.isFinite(lastUpdateMs) ? Number(lastUpdateMs) : Date.now();
+      state.lastUpdateMs = effectiveUpdate;
+      persistSharedCandles({ reset, lastUpdateMs: effectiveUpdate });
     }
     return changed;
+  }
+
+  function restoreFromSharedStore(symbol, interval) {
+    if (!SharedCandles || typeof SharedCandles.get !== "function") {
+      return false;
+    }
+    try {
+      const stored = SharedCandles.get(symbol, interval);
+      if (!stored || !Array.isArray(stored.candles) || !stored.candles.length) {
+        return false;
+      }
+      const bars = stored.candles.map((bar) => normaliseBar(bar)).filter(Boolean);
+      if (!bars.length) {
+        return false;
+      }
+      const lastUpdate = Number(stored.lastUpdateMs) || Number(stored.updatedAt) || Date.now();
+      mergeCandles(bars, { reset: true, lastUpdateMs: lastUpdate });
+      applyCandles();
+      return true;
+    } catch (error) {
+      console.warn("SharedCandles restore failed", error);
+      return false;
+    }
   }
 
   function updateInfo(lastBar) {
@@ -317,14 +366,19 @@
       const normalised = normaliseBar(bar);
       if (!normalised) return;
       const last = state.candles[state.candles.length - 1];
+      const nowMs = Date.now();
       if (last && Number(last.time) === Number(normalised.time)) {
         state.candles[state.candles.length - 1] = normalised;
         state.candleSeries.update(normalised);
+        state.lastUpdateMs = nowMs;
+        persistSharedCandles({ bars: [normalised], lastUpdateMs: nowMs });
       } else if (!last || Number(normalised.time) > Number(last.time)) {
         state.candles.push(normalised);
         state.candleSeries.update(normalised);
+        state.lastUpdateMs = nowMs;
+        persistSharedCandles({ bars: [normalised], lastUpdateMs: nowMs });
       } else {
-        mergeCandles([normalised]);
+        mergeCandles([normalised], { lastUpdateMs: nowMs });
         state.candleSeries.setData(state.candles);
       }
       updatePriceLine(normalised);
@@ -397,7 +451,7 @@
         Number(gap.endMs) + intervalMs,
         Math.min(1000, Math.max(approxBars, 50))
       );
-      const changed = mergeCandles(bars);
+      const changed = mergeCandles(bars, { lastUpdateMs: Date.now() });
       if (changed) {
         applyCandles();
         if (state.gapWatcher && typeof state.gapWatcher.notifyData === "function") {
@@ -476,9 +530,13 @@
     state.symbol = normalizedSymbol;
     state.interval = normalizedInterval;
     initChart();
+    const restored = restoreFromSharedStore(normalizedSymbol, normalizedInterval);
+    if (restored && state.gapWatcher && typeof state.gapWatcher.notifyData === "function") {
+      state.gapWatcher.notifyData();
+    }
     try {
       const history = await fetchHistory(normalizedSymbol, normalizedInterval, 1000);
-      mergeCandles(history, { reset: true });
+      mergeCandles(history, { reset: true, lastUpdateMs: Date.now() });
       applyCandles();
       focusOnLastCandle({ preserveSpan: false });
       if (state.gapWatcher && typeof state.gapWatcher.updateContext === "function") {
@@ -490,6 +548,7 @@
           requestGap: handleGapRequest,
           resetRequestedKeys: true,
         });
+        state.gapWatcher.notifyData();
       }
       notifyStatus("История загружена", "success");
       connectWs();
