@@ -156,6 +156,117 @@ def _build_timeframe_candles(
     return payload
 
 
+def test_check_all_includes_vwap_profiles(client: TestClient) -> None:
+    base = datetime(2024, 1, 1, 7, 55, tzinfo=timezone.utc)
+    candles = []
+    total_minutes = int(((datetime(2024, 1, 1, 12, 5, tzinfo=timezone.utc) - base).total_seconds() // 60)) + 1
+    for index in range(total_minutes):
+        moment = base + timedelta(minutes=index)
+        timestamp_ms = int(moment.timestamp() * 1000)
+        price = 100.0 + (index % 5) * 0.25
+        volume = 2.0 + (index % 3) * 0.5
+        candles.append(
+            {
+                "t": timestamp_ms,
+                "o": price,
+                "h": price + 0.2,
+                "l": price - 0.2,
+                "c": price + 0.1,
+                "v": volume,
+            }
+        )
+
+    payload = {"symbol": "BTCUSDT", "tf": "1m", "candles": candles}
+    create_response = client.post("/inspection/snapshot", json=payload)
+    assert create_response.status_code == 200
+    snapshot_id = create_response.json()["snapshot_id"]
+
+    response = client.get("/inspection/check-all", params={"snapshot": snapshot_id, "hours": 4})
+    assert response.status_code == 200
+    body = response.json()
+
+    vwap_block = body.get("vwap")
+    assert isinstance(vwap_block, dict)
+    assert set(vwap_block.get("sessions", {}).keys()) == {"asia", "london", "ny"}
+
+    daily_window = vwap_block["daily"]["window"]
+    assert daily_window["start"].startswith("2024-01-01T00:00:00")
+    assert daily_window["end"].startswith("2024-01-01T12:05:00")
+    assert vwap_block["daily"]["vwap"] > 0
+
+    asia_window = vwap_block["sessions"]["asia"]["window"]
+    assert asia_window["start"].startswith("2024-01-01T00:00:00")
+    assert asia_window["end"].startswith("2024-01-01T07:59:00")
+    assert vwap_block["sessions"]["asia"]["vwap"] > 0
+
+    london_window = vwap_block["sessions"]["london"]["window"]
+    assert london_window["start"].startswith("2024-01-01T08:00:00")
+    assert london_window["end"].startswith("2024-01-01T11:59:00")
+    assert vwap_block["sessions"]["london"]["poc"] is not None
+    assert vwap_block["sessions"]["london"]["vah"] is not None
+    assert vwap_block["sessions"]["london"]["val"] is not None
+
+    ny_window = vwap_block["sessions"]["ny"]["window"]
+    assert ny_window["start"].startswith("2024-01-01T12:00:00")
+    assert ny_window["end"].startswith("2024-01-01T12:05:00")
+    assert vwap_block["sessions"]["ny"]["vwap"] > 0
+
+
+def test_vwap_profile_tick_size_stability(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    base = datetime(2024, 1, 2, 10, 0, tzinfo=timezone.utc)
+    candles = []
+    for index in range(180):
+        moment = base + timedelta(minutes=index)
+        timestamp_ms = int(moment.timestamp() * 1000)
+        price = 50.0 + (index % 4) * 0.05
+        volume = 3.0 + (index % 2) * 0.2
+        candles.append(
+            {
+                "t": timestamp_ms,
+                "o": price,
+                "h": price + 0.03,
+                "l": price - 0.03,
+                "c": price + 0.01,
+                "v": volume,
+            }
+        )
+
+    payload = {"symbol": "ETHUSDT", "tf": "1m", "candles": candles}
+    create_response = client.post("/inspection/snapshot", json=payload)
+    assert create_response.status_code == 200
+    snapshot_id = create_response.json()["snapshot_id"]
+
+    original_resolve = check_all_datas.resolve_profile_config
+    tick_holder = {"value": 0.5}
+
+    def stub_resolve(symbol, meta):
+        config = original_resolve(symbol, meta)
+        config["tick_size"] = tick_holder["value"]
+        config["adaptive_bins"] = False
+        return config
+
+    monkeypatch.setattr(check_all_datas, "resolve_profile_config", stub_resolve)
+
+    def fetch_with_tick(tick_value: float) -> dict:
+        tick_holder["value"] = tick_value
+        response = client.get(
+            "/inspection/check-all",
+            params={"snapshot": snapshot_id, "hours": 4},
+        )
+        assert response.status_code == 200
+        return response.json()["vwap"]
+
+    coarse_tick = 0.5
+    fine_tick = 0.05
+    coarse = fetch_with_tick(coarse_tick)
+    fine = fetch_with_tick(fine_tick)
+
+    tolerance = max(coarse_tick, fine_tick)
+    assert abs(coarse["daily"]["poc"] - fine["daily"]["poc"]) <= tolerance
+    assert abs(coarse["daily"]["vah"] - fine["daily"]["vah"]) <= tolerance
+    assert abs(coarse["daily"]["val"] - fine["daily"]["val"]) <= tolerance
+
+
 def test_historical_snapshot_still_populates_window(client: TestClient) -> None:
     base = (
         datetime.now(timezone.utc)
