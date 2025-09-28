@@ -95,6 +95,27 @@ def round_floats(obj: Any, ndigits: int = 3) -> Any:
     return obj
 
 
+def _filter_profile_entries(profile: Sequence[Any]) -> List[Any]:
+    """Filter profile rows to drop entries with zero volume while keeping order."""
+
+    filtered: List[Any] = []
+    for entry in profile:
+        if isinstance(entry, Mapping):
+            volume = entry.get("volume")
+            try:
+                volume_value = float(volume)
+            except (TypeError, ValueError):
+                filtered.append(entry)
+                continue
+
+            if math.isfinite(volume_value) and volume_value == 0.0:
+                continue
+
+        filtered.append(entry)
+
+    return filtered
+
+
 def _align_to_interval(value: int, interval_ms: int) -> int:
     if interval_ms <= 0:
         raise ValueError("interval_ms must be positive")
@@ -1463,6 +1484,8 @@ def build_check_all_datas(
         if key in data_quality
     }
 
+    profile_public = _filter_profile_entries(profile_flat)
+
     response_payload = {
         "snapshot_id": snapshot.get("id"),
         "symbol": snapshot.get("symbol"),
@@ -1474,7 +1497,7 @@ def build_check_all_datas(
         "datas_for_last_N_hours": detailed_section,
         movement_key: movement_section,
         "tpo": {"sessions": profile_tpo, "zones": profile_zones},
-        "profile": profile_flat,
+        "profile": profile_public,
         "zones": detected_zones,
         "liquidity": liquidity_payload,
         "data_quality": data_quality_public,
