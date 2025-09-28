@@ -141,18 +141,13 @@ def test_check_all_sessions_include_extrema(client: TestClient) -> None:
     assert response.status_code == 200
     body = response.json()
 
-    vwap_sessions = body["vwap"]["sessions"]
+    vwap_sessions = body["vwap_tpo"]["sessions"]
     for session_name, session_payload in vwap_sessions.items():
-        assert "session_high" in session_payload
-        assert "session_low" in session_payload
+        assert session_payload["high"] is not None
+        assert session_payload["low"] is not None
 
-    tpo_sessions = [
-        entry for entry in body["tpo"]["sessions"] if entry.get("session") != "daily"
-    ]
-    assert tpo_sessions, "expected per-session TPO entries"
-    for entry in tpo_sessions:
-        assert "session_high" in entry
-        assert "session_low" in entry
+    composite_day = body["tpo"]["composite_day"]
+    assert set(composite_day.keys()) == {"poc", "vah", "val"}
 
 
 def test_profile_sessions_include_extrema(client: TestClient) -> None:

@@ -290,6 +290,14 @@ async def analyze_from_inspection(payload: Dict[str, Any] = Body(...)) -> JSONRe
     if check_payload is None:
         raise HTTPException(status_code=400, detail="Snapshot does not contain analyzable data")
 
+    if not isinstance(check_payload, Mapping):
+        raise HTTPException(status_code=400, detail="Snapshot payload is invalid")
+
+    check_payload = dict(check_payload)
+    check_payload.setdefault("symbol", target_snapshot.get("symbol"))
+    check_payload["snapshot_id"] = snapshot_id
+    check_payload["selection"] = {"start": selection_start, "end": selection_end}
+
     symbol = str(
         check_payload.get("symbol")
         or target_snapshot.get("symbol")
@@ -310,40 +318,25 @@ async def analyze_from_inspection(payload: Dict[str, Any] = Body(...)) -> JSONRe
                 if isinstance(label, str) and label.strip():
                     period = label.strip()
     if period is None:
-        requested_meta = (
-            check_payload.get("profile_preset")
-            if isinstance(check_payload, Mapping)
-            else None
-        )
-        if isinstance(requested_meta, Mapping):
-            key = requested_meta.get("preset_key") or requested_meta.get("period")
-            if isinstance(key, str) and key.strip():
-                period = key.strip()
-    if period is None:
         period = "custom_range"
 
-    latest_candle = check_payload.get("latest_candle") if isinstance(check_payload, Mapping) else None
-    price_candidates = []
-    if isinstance(latest_candle, Mapping):
-        for key in ("c", "close", "price", "close_price", "last_price"):
-            value = latest_candle.get(key)
-            if isinstance(value, (int, float)):
-                price_candidates.append(float(value))
-    if not price_candidates:
-        maybe_series = check_payload.get("datas_for_last_N_hours") if isinstance(check_payload, Mapping) else None
-        if isinstance(maybe_series, Mapping):
-            frame = maybe_series.get("frames")
-            if isinstance(frame, Mapping):
-                minute_frame = frame.get("1m")
-                if isinstance(minute_frame, Mapping):
-                    candles = minute_frame.get("candles")
-                    if isinstance(candles, Sequence) and candles:
-                        tail = candles[-1]
-                        if isinstance(tail, Mapping):
-                            value = tail.get("c") or tail.get("close")
+    def _extract_last_price(payload: Mapping[str, Any]) -> float | None:
+        ohlcv_block = payload.get("ohlcv")
+        if isinstance(ohlcv_block, Mapping):
+            minute_block = ohlcv_block.get("1m")
+            if isinstance(minute_block, Mapping):
+                candles = minute_block.get("candles")
+                if isinstance(candles, Sequence) and candles:
+                    tail = candles[-1]
+                    if isinstance(tail, Mapping):
+                        for key in ("c", "close", "price"):
+                            value = tail.get(key)
                             if isinstance(value, (int, float)):
-                                price_candidates.append(float(value))
-    last_price = price_candidates[0] if price_candidates else 0.0
+                                return float(value)
+        return None
+
+    last_price_value = _extract_last_price(check_payload)
+    last_price = last_price_value if last_price_value is not None else 0.0
 
     api_key: str | None = None
     api_key_raw = payload.get("api_key")

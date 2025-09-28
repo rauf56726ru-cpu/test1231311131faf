@@ -1476,6 +1476,46 @@ def _build_volume_profile_stats(
     )
 
 
+def _build_prev_day_block(
+    candles: Sequence[Mapping[str, Any]],
+    *,
+    daily_start_ms: int,
+    tick_size: float | None,
+) -> Dict[str, float | None]:
+    """Compute previous-day reference levels from minute candles."""
+
+    prev_end_ms = daily_start_ms - MINUTE_INTERVAL_MS
+    prev_start_ms = daily_start_ms - MS_IN_DAY
+    if prev_end_ms < prev_start_ms:
+        prev_end_ms = prev_start_ms
+
+    scoped = _filter_candles(candles, start_ms=prev_start_ms, end_ms=prev_end_ms)
+    summary = _summarise(scoped)
+    profile = _build_volume_profile_stats(
+        candles,
+        start_ms=prev_start_ms,
+        end_ms=prev_end_ms,
+        tick_size=tick_size,
+        value_area_pct=VALUE_AREA_PCT,
+    )
+
+    def _float_or_none(value: Any) -> float | None:
+        return _safe_float(value)
+
+    close_value: float | None = None
+    if scoped:
+        close_value = _safe_float(scoped[-1].get("c"))
+
+    return {
+        "pdh": _float_or_none(summary.get("high")),
+        "pdl": _float_or_none(summary.get("low")),
+        "close": close_value,
+        "poc": _float_or_none((profile or {}).get("poc")),
+        "vah": _float_or_none((profile or {}).get("vah")),
+        "val": _float_or_none((profile or {}).get("val")),
+    }
+
+
 def _start_of_day_ms(timestamp_ms: int) -> int:
     dt = datetime.fromtimestamp(timestamp_ms / 1000.0, tz=UTC)
     start_dt = datetime(dt.year, dt.month, dt.day, tzinfo=UTC)
@@ -2223,8 +2263,6 @@ def build_check_all_datas(
         },
     }
 
-    movement_key = f"movement_datas_for_{movement_days}_days"
-
     tick_size_value = profile_config.get("tick_size") if isinstance(profile_config, Mapping) else None
     tick_size_numeric: float | None = None
     if isinstance(tick_size_value, (int, float)) and tick_size_value > 0:
@@ -2572,60 +2610,144 @@ def build_check_all_datas(
         "sessions": vwap_tpo_sessions,
     }
 
-    latest_candle_payload_source = (
-        latest_candle_source
-        or (primary_candles[-1] if primary_candles else None)
-    )
-    latest_candle_payload = (
-        dict(latest_candle_payload_source)
-        if isinstance(latest_candle_payload_source, Mapping)
-        else {}
+    prev_day_block = _build_prev_day_block(
+        minute_series,
+        daily_start_ms=daily_start_ms,
+        tick_size=tick_size_numeric,
     )
 
-    data_quality_public = {
-        key: data_quality[key]
-        for key in (
-            "tf",
-            "window",
-            "minute_missing_before",
-            "minute_missing_after",
-            "tf_missing_before",
-            "tf_missing_after",
-        )
-        if key in data_quality
+    def _float_or_none(value: Any) -> float | None:
+        return _safe_float(value)
+
+    composite_day_public = {
+        "poc": _float_or_none((composite_day_payload or {}).get("poc")),
+        "vah": _float_or_none((composite_day_payload or {}).get("vah")),
+        "val": _float_or_none((composite_day_payload or {}).get("val")),
     }
 
-    profile_public = _filter_profile_entries(profile_flat)
+    def _normalise_sd(sd_block: Mapping[str, Any] | None) -> Dict[str, float | None]:
+        if not isinstance(sd_block, Mapping):
+            return {"minus": None, "plus": None}
+        return {
+            "minus": _float_or_none(sd_block.get("minus")),
+            "plus": _float_or_none(sd_block.get("plus")),
+        }
+
+    daily_sd1 = _normalise_sd((vwap_tpo_daily or {}).get("sd1") if isinstance(vwap_tpo_daily, Mapping) else None)
+    daily_sd2 = _normalise_sd((vwap_tpo_daily or {}).get("sd2") if isinstance(vwap_tpo_daily, Mapping) else None)
+    daily_open = None
+    daily_vwap_value = None
+    if isinstance(vwap_tpo_daily, Mapping):
+        daily_open = vwap_tpo_daily.get("open_utc")
+        daily_vwap_value = _float_or_none(vwap_tpo_daily.get("vwap"))
+    if daily_open is None:
+        daily_open = _isoformat_utc(daily_start_ms)
+
+    vwap_tpo_daily_public = {
+        "open_utc": daily_open,
+        "vwap": daily_vwap_value,
+        "sd1": daily_sd1,
+        "sd2": daily_sd2,
+    }
+
+    ordered_sessions: Dict[str, Dict[str, Any]] = {}
+    for session_name, _, _ in sessions:
+        raw_payload = vwap_tpo_sessions.get(session_name, {})
+        open_utc = raw_payload.get("open_utc") if isinstance(raw_payload, Mapping) else None
+        close_utc = raw_payload.get("close_utc") if isinstance(raw_payload, Mapping) else None
+        ordered_sessions[session_name] = {
+            "open_utc": open_utc,
+            "close_utc": close_utc,
+            "vwap": _float_or_none(raw_payload.get("vwap")) if isinstance(raw_payload, Mapping) else None,
+            "sd1": _normalise_sd(raw_payload.get("sd1") if isinstance(raw_payload, Mapping) else None),
+            "sd2": _normalise_sd(raw_payload.get("sd2") if isinstance(raw_payload, Mapping) else None),
+            "poc": _float_or_none(raw_payload.get("poc")) if isinstance(raw_payload, Mapping) else None,
+            "vah": _float_or_none(raw_payload.get("vah")) if isinstance(raw_payload, Mapping) else None,
+            "val": _float_or_none(raw_payload.get("val")) if isinstance(raw_payload, Mapping) else None,
+            "ib_high": _float_or_none(raw_payload.get("ib_high")) if isinstance(raw_payload, Mapping) else None,
+            "ib_low": _float_or_none(raw_payload.get("ib_low")) if isinstance(raw_payload, Mapping) else None,
+            "high": _float_or_none(raw_payload.get("high")) if isinstance(raw_payload, Mapping) else None,
+            "low": _float_or_none(raw_payload.get("low")) if isinstance(raw_payload, Mapping) else None,
+        }
+
+    vwap_tpo_public = {
+        "daily": vwap_tpo_daily_public,
+        "sessions": ordered_sessions,
+    }
+
+    ohlcv_public: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+    for tf in ("1m", "3m", "5m", "15m", "1h", "4h", "1d"):
+        tf_payload = ohlcv_block.get(tf) if isinstance(ohlcv_block, Mapping) else None
+        candles: List[Dict[str, Any]] = []
+        if isinstance(tf_payload, Mapping):
+            raw_candles = tf_payload.get("candles")
+            if isinstance(raw_candles, Sequence):
+                candles = [dict(candle) for candle in raw_candles if isinstance(candle, Mapping)]
+        ohlcv_public[tf] = {"candles": candles}
+
+    orderflow_public: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+    for tf in ("1m", "3m", "5m", "15m"):
+        tf_payload = orderflow_block.get(tf) if isinstance(orderflow_block, Mapping) else None
+        per_bar: List[Dict[str, Any]] = []
+        if isinstance(tf_payload, Mapping):
+            raw_series = tf_payload.get("per_bar")
+            if isinstance(raw_series, Sequence):
+                per_bar = [dict(entry) for entry in raw_series if isinstance(entry, Mapping)]
+        orderflow_public[tf] = {"per_bar": per_bar}
+
+    zones_container = detected_zones.get("zones") if isinstance(detected_zones, Mapping) else None
+    zone_keys = ("fvg", "ob", "mb", "bb", "rb", "pb", "sr", "profile_levels")
+    zones_public: Dict[str, List[Dict[str, Any]]] = {key: [] for key in zone_keys}
+    if isinstance(zones_container, Mapping):
+        for key in zone_keys:
+            raw_zone = zones_container.get(key)
+            if isinstance(raw_zone, Sequence):
+                zones_public[key] = [
+                    dict(item) for item in raw_zone if isinstance(item, Mapping)
+                ]
+
+    liquidity_public = {
+        "eqh": list(liquidity_equal_levels.get("eqh", [])),
+        "eql": list(liquidity_equal_levels.get("eql", [])),
+    }
+
+    risk_prefs_public = {"rr_min": 2.5, "risk_per_trade_pct": 1.0}
+
+    context_meta = raw_meta.get("context") if isinstance(raw_meta, Mapping) else None
+    raw_bias: str | None = None
+    raw_narrative: str | None = None
+    raw_open_opposite: Any = None
+    if isinstance(context_meta, Mapping):
+        for key in ("globalBias", "global_bias"):
+            value = context_meta.get(key)
+            if isinstance(value, str):
+                raw_bias = value.lower()
+                break
+        narrative_value = context_meta.get("narrative")
+        if isinstance(narrative_value, str):
+            raw_narrative = narrative_value
+        raw_open_opposite = context_meta.get("openOppositeZones")
+        if raw_open_opposite is None:
+            raw_open_opposite = context_meta.get("open_opposite_zones")
+
+    allowed_bias = {"bull", "bear", "neutral"}
+    context_public = {
+        "globalBias": raw_bias if raw_bias in allowed_bias else "neutral",
+        "narrative": raw_narrative or "",
+        "openOppositeZones": bool(raw_open_opposite) if isinstance(raw_open_opposite, bool) else False,
+    }
 
     response_payload = {
-        "snapshot_id": snapshot.get("id"),
-        "symbol": snapshot.get("symbol"),
-        "timeframe": snapshot.get("tf"),
-        "selection": {"start": selection_start, "end": selection_end},
-        "asof_utc": reference_dt.isoformat(),
-        "latest_candle_utc": latest_candle_dt.isoformat(),
-        "latest_candle": dict(latest_candle_payload),
-        "datas_for_last_N_hours": detailed_section,
-        movement_key: movement_section,
-        "tpo": {
-            "sessions": profile_tpo,
-            "zones": profile_zones,
-            "composite_day": composite_day_payload,
-        },
-        "profile": profile_public,
-        "zones": detected_zones,
-        "liquidity": liquidity_payload,
-        "liquidity_levels": liquidity_equal_levels,
-        "data_quality": data_quality_public,
-        "ohlcv": ohlcv_block,
-        "orderflow": orderflow_block,
-        "htf": htf_blocks,
-        "htf_details": htf_section,
-        "data_quality_htf": htf_quality,
-        "profile_preset": profile_config.get("preset_payload"),
-        "vwap": vwap_payload,
-        "vwap_sigma": vwap_sigma_payload,
-        "vwap_tpo": vwap_tpo_block,
+        "symbol": symbol,
+        "ohlcv": ohlcv_public,
+        "orderflow": orderflow_public,
+        "vwap_tpo": vwap_tpo_public,
+        "tpo": {"composite_day": composite_day_public},
+        "prev_day": prev_day_block,
+        "zones": zones_public,
+        "liquidity": liquidity_public,
+        "risk_prefs": risk_prefs_public,
+        "context": context_public,
     }
 
     return round_floats(response_payload)
