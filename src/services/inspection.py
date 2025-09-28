@@ -33,7 +33,9 @@ from .liquidity import (
 from .ohlc import (
     TIMEFRAME_WINDOWS,
     TIMEFRAME_TO_MS,
+    OhlcvValidationError,
     aggregate_1m_to_1h,
+    ensure_complete_ohlcv,
     normalise_ohlcv,
     resample_ohlcv,
 )
@@ -1198,6 +1200,20 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
         "symbol": symbol,
         "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
     }
+
+    try:
+        minute_for_ohlcv = full_candles_by_tf.get("1m", [])
+        ohlcv_bundle, ohlcv_diagnostics = ensure_complete_ohlcv(
+            minute_for_ohlcv,
+            selection_start=start,
+            selection_end=end,
+            existing_frames=full_candles_by_tf,
+            logger=logging.getLogger(__name__),
+        )
+    except OhlcvValidationError as exc:
+        raise RuntimeError(
+            f"Failed to assemble inspection OHLCV block: {exc.detail}",
+        ) from exc
     profile_candles: List[Dict[str, Any]] = []
 
     tick_size_value = profile_config.get("tick_size")
@@ -1356,6 +1372,7 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
         "selection": selection,
         "htf": htf_blocks,
         "htf_details": htf_section,
+        "ohlcv": ohlcv_bundle,
         "session_vwap": session_vwap,
         "tpo": {"sessions": tpo_entries, "zones": tpo_zone_items},
         "profile": flattened_profile,
@@ -1393,6 +1410,7 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
         "captured_at": snapshot.get("captured_at"),
         "frames": diagnostics_frames,
         "liquidity": liquidity_diagnostics,
+        "ohlcv": ohlcv_diagnostics,
     }
 
     return {"DATA": data_section, "DIAGNOSTICS": diagnostics_section}

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -41,6 +42,39 @@ TIMEFRAME_TO_MS: Dict[str, int] = {
     "4h": 14_400_000,
     "1d": 86_400_000,
 }
+
+MINUTE_INTERVAL_MS = TIMEFRAME_TO_MS["1m"]
+MS_IN_DAY = 86_400_000
+
+TARGET_TIMEFRAMES: Tuple[str, ...] = ("1m", "3m", "5m", "15m", "1h", "4h", "1d")
+
+DEFAULT_WINDOW_MS: Dict[str, int] = {
+    "1m": 4 * 3_600_000,
+    "3m": 4 * 3_600_000,
+    "5m": 4 * 3_600_000,
+    "15m": 3 * MS_IN_DAY,
+    "1h": 3 * MS_IN_DAY,
+    "4h": 3 * MS_IN_DAY,
+    "1d": 3 * MS_IN_DAY,
+}
+
+MINIMUM_BARS: Dict[str, int] = {
+    "1m": 4 * 60,  # 4 hours of minute candles
+    "3m": 4 * 60 // 3,
+    "5m": 4 * 60 // 5,
+    "15m": (3 * 24 * 60) // 15,
+    "1h": (3 * 24 * 60) // 60,
+    "4h": (3 * 24 * 60) // 240,
+    "1d": 3,
+}
+
+
+class OhlcvValidationError(RuntimeError):
+    """Raised when required OHLCV timeframes cannot be produced."""
+
+    def __init__(self, message: str, *, detail: Mapping[str, Any] | None = None):
+        super().__init__(message)
+        self.detail = dict(detail or {})
 
 
 @dataclass(slots=True)
@@ -198,6 +232,312 @@ def resample_ohlcv(
             bucket["v"] += v_value
 
     return [buckets[key] for key in sorted(buckets)]
+
+
+def _safe_int(value: object | None) -> int | None:
+    try:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return int(value)
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_float(value: object | None) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalise_series(
+    candles: Sequence[Mapping[str, Any]] | None,
+) -> List[Dict[str, float]]:
+    if not candles:
+        return []
+    normalised: Dict[int, Dict[str, float]] = {}
+    for candle in candles:
+        if not isinstance(candle, Mapping):
+            continue
+        ts = _safe_int(candle.get("t"))
+        if ts is None:
+            continue
+        open_price = _safe_float(candle.get("o"))
+        high_price = _safe_float(candle.get("h"))
+        low_price = _safe_float(candle.get("l"))
+        close_price = _safe_float(candle.get("c"))
+        volume = _safe_float(candle.get("v"))
+        if None in (open_price, high_price, low_price, close_price):
+            continue
+        normalised[ts] = {
+            "t": ts,
+            "o": float(open_price),
+            "h": float(high_price),
+            "l": float(low_price),
+            "c": float(close_price),
+            "v": float(volume or 0.0),
+        }
+    return [normalised[key] for key in sorted(normalised)]
+
+
+def _validate_series(
+    series: Sequence[Mapping[str, Any]],
+    interval_ms: int,
+) -> Tuple[bool, Dict[str, Any]]:
+    """Validate that a series is aligned and monotonic for the given interval."""
+
+    diagnostics: Dict[str, Any] = {
+        "interval_ms": interval_ms,
+        "count": 0,
+        "first_ts": None,
+        "last_ts": None,
+        "issues": [],
+    }
+
+    if not series:
+        diagnostics["issues"].append("empty")
+        return False, diagnostics
+
+    last_ts: int | None = None
+    seen: set[int] = set()
+    for candle in series:
+        ts = _safe_int(candle.get("t"))
+        o_val = _safe_float(candle.get("o"))
+        h_val = _safe_float(candle.get("h"))
+        l_val = _safe_float(candle.get("l"))
+        c_val = _safe_float(candle.get("c"))
+        v_val = _safe_float(candle.get("v"))
+        if None in (ts, o_val, h_val, l_val, c_val):
+            diagnostics["issues"].append({"ts": ts, "reason": "non_numeric"})
+            return False, diagnostics
+        if ts in seen:
+            diagnostics["issues"].append({"ts": ts, "reason": "duplicate"})
+            return False, diagnostics
+        seen.add(ts)
+        if ts % interval_ms != 0:
+            diagnostics["issues"].append({"ts": ts, "reason": "misaligned"})
+            return False, diagnostics
+        if last_ts is not None and ts <= last_ts:
+            diagnostics["issues"].append({"ts": ts, "reason": "non_monotonic"})
+            return False, diagnostics
+        if last_ts is not None and ts - last_ts != interval_ms:
+            diagnostics["issues"].append({"ts": ts, "reason": "gap", "delta": ts - last_ts})
+            return False, diagnostics
+        last_ts = ts
+    diagnostics["count"] = len(series)
+    diagnostics["first_ts"] = series[0]["t"]
+    diagnostics["last_ts"] = series[-1]["t"]
+    return True, diagnostics
+
+
+def _aggregate_bucket(
+    minute_index: Mapping[int, Mapping[str, Any]],
+    start_ms: int,
+    interval_ms: int,
+) -> Dict[str, float]:
+    end_ms = start_ms + interval_ms - MINUTE_INTERVAL_MS
+    cursor = start_ms
+    high = float("-inf")
+    low = float("inf")
+    volume_sum = 0.0
+    open_price: float | None = None
+    close_price: float | None = None
+
+    while cursor <= end_ms:
+        candle = minute_index.get(cursor)
+        if candle is None:
+            raise OhlcvValidationError(
+                "Missing 1m candle required for aggregation",
+                detail={"missing_ts": cursor, "start_ms": start_ms, "interval_ms": interval_ms},
+            )
+        o_val = _safe_float(candle.get("o"))
+        h_val = _safe_float(candle.get("h"))
+        l_val = _safe_float(candle.get("l"))
+        c_val = _safe_float(candle.get("c"))
+        v_val = _safe_float(candle.get("v")) or 0.0
+        if None in (o_val, h_val, l_val, c_val):
+            raise OhlcvValidationError(
+                "Non numeric 1m candle encountered during aggregation",
+                detail={"ts": cursor},
+            )
+        if open_price is None:
+            open_price = float(o_val)
+        high = max(high, float(h_val))
+        low = min(low, float(l_val))
+        close_price = float(c_val)
+        volume_sum += float(v_val)
+        cursor += MINUTE_INTERVAL_MS
+
+    if open_price is None or close_price is None:
+        raise OhlcvValidationError(
+            "Aggregation failed due to incomplete bucket",
+            detail={"start_ms": start_ms, "interval_ms": interval_ms},
+        )
+
+    return {
+        "t": start_ms,
+        "o": open_price,
+        "h": high,
+        "l": low,
+        "c": close_price,
+        "v": volume_sum,
+    }
+
+
+def ensure_complete_ohlcv(
+    minute_candles: Sequence[Mapping[str, Any]],
+    *,
+    selection_start: int | None = None,
+    selection_end: int | None = None,
+    existing_frames: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
+    logger: logging.Logger | None = None,
+) -> Tuple[Dict[str, List[Dict[str, float]]], Dict[str, Any]]:
+    """Build a complete OHLCV matrix for all target timeframes."""
+
+    if logger is None:
+        logger = logging.getLogger(__name__)
+
+    minute_series = _normalise_series(minute_candles)
+    if not minute_series:
+        raise OhlcvValidationError("Minute candles are required to build OHLCV")
+
+    valid, minute_diag = _validate_series(minute_series, MINUTE_INTERVAL_MS)
+    if not valid:
+        raise OhlcvValidationError(
+            "Minute series failed validation",
+            detail={"series": "1m", "diagnostics": minute_diag},
+        )
+
+    minute_index = {candle["t"]: candle for candle in minute_series}
+    first_minute = minute_series[0]["t"]
+    last_minute = minute_series[-1]["t"]
+
+    if selection_start is not None and selection_end is not None and selection_start > selection_end:
+        selection_start, selection_end = selection_end, selection_start
+
+    effective_end = last_minute
+    if selection_end is not None:
+        selection_end_aligned = _align_to_interval(selection_end, MINUTE_INTERVAL_MS)
+        effective_end = min(effective_end, selection_end_aligned)
+        if effective_end < first_minute:
+            raise OhlcvValidationError(
+                "Selection end precedes available minute data",
+                detail={"selection_end": selection_end, "first_minute": first_minute},
+            )
+
+    diagnostics: Dict[str, Any] = {}
+    ohlcv_bundle: Dict[str, List[Dict[str, float]]] = {}
+    existing_map = existing_frames or {}
+    selection_start_aligned = (
+        _align_to_interval(selection_start, MINUTE_INTERVAL_MS)
+        if selection_start is not None
+        else None
+    )
+
+    for tf in TARGET_TIMEFRAMES:
+        interval_ms = TIMEFRAME_TO_MS[tf]
+        default_window = DEFAULT_WINDOW_MS[tf]
+        min_bars = max(1, MINIMUM_BARS.get(tf, 1))
+
+        last_start = _align_to_interval(effective_end, interval_ms)
+        while last_start + interval_ms - MINUTE_INTERVAL_MS > effective_end:
+            last_start -= interval_ms
+        if last_start < first_minute:
+            raise OhlcvValidationError(
+                "Insufficient minute data to build timeframe",
+                detail={"timeframe": tf, "required_start": last_start, "available_start": first_minute},
+            )
+
+        selection_bars = 0
+        if selection_start_aligned is not None:
+            if selection_start_aligned > last_start:
+                selection_bars = 1
+            else:
+                selection_bars = ((last_start - selection_start_aligned) // interval_ms) + 1
+
+        default_bars = max(min_bars, max(1, default_window // interval_ms))
+        required_bars = max(default_bars, selection_bars, min_bars)
+        start_candidate = last_start - (required_bars - 1) * interval_ms
+        start_aligned = _align_to_interval(start_candidate, interval_ms)
+
+        first_boundary = _align_to_interval(first_minute, interval_ms)
+        while first_boundary < first_minute:
+            first_boundary += interval_ms
+
+        if start_aligned < first_boundary:
+            detail = {
+                "timeframe": tf,
+                "required_start": start_aligned,
+                "first_available": first_boundary,
+                "required_bars": required_bars,
+            }
+            raise OhlcvValidationError("Not enough 1m data for timeframe window", detail=detail)
+
+        bars: List[Dict[str, float]] = []
+        cursor = start_aligned
+        while cursor <= last_start:
+            bucket = _aggregate_bucket(minute_index, cursor, interval_ms)
+            bars.append(bucket)
+            cursor += interval_ms
+
+        valid_tf, tf_diag = _validate_series(bars, interval_ms)
+        if not valid_tf:
+            raise OhlcvValidationError(
+                "Generated timeframe failed validation",
+                detail={"timeframe": tf, "diagnostics": tf_diag},
+            )
+
+        existing_series = _normalise_series(existing_map.get(tf)) if existing_map else []
+        status = "rebuilt"
+        if existing_series and len(existing_series) == len(bars):
+            mismatch = False
+            for lhs, rhs in zip(existing_series, bars):
+                if lhs["t"] != rhs["t"]:
+                    mismatch = True
+                    break
+                if not math.isclose(lhs["o"], rhs["o"], rel_tol=1e-6, abs_tol=1e-9):
+                    mismatch = True
+                    break
+                if not math.isclose(lhs["h"], rhs["h"], rel_tol=1e-6, abs_tol=1e-9):
+                    mismatch = True
+                    break
+                if not math.isclose(lhs["l"], rhs["l"], rel_tol=1e-6, abs_tol=1e-9):
+                    mismatch = True
+                    break
+                if not math.isclose(lhs["c"], rhs["c"], rel_tol=1e-6, abs_tol=1e-9):
+                    mismatch = True
+                    break
+                if not math.isclose(lhs["v"], rhs["v"], rel_tol=1e-6, abs_tol=1e-9):
+                    mismatch = True
+                    break
+            if not mismatch:
+                status = "existing"
+
+        diagnostics[tf] = {
+            "status": status,
+            "bars": len(bars),
+            "expected_bars": required_bars,
+            "start_ms": bars[0]["t"] if bars else None,
+            "end_ms": bars[-1]["t"] if bars else None,
+            "interval_ms": interval_ms,
+        }
+
+        ohlcv_bundle[tf] = bars
+
+    missing = [tf for tf, item in diagnostics.items() if item.get("status") != "existing"]
+    if missing:
+        logger.debug(
+            "OHLCV frames rebuilt from 1m",
+            extra={"timeframes": missing, "diagnostics": diagnostics},
+        )
+    else:
+        logger.debug("OHLCV frames validated without rebuild", extra={"diagnostics": diagnostics})
+
+    return ohlcv_bundle, diagnostics
 
 
 def aggregate_1m_to_1h(

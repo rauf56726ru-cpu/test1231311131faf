@@ -30,7 +30,13 @@ VALID_HOUR_WINDOWS = {1, 2, 3, 4}
 VALUE_AREA_PCT = 0.70
 
 try:
-    from .ohlc import TIMEFRAME_TO_MS, aggregate_1m_to_1h, resample_ohlcv
+    from .ohlc import (
+        TIMEFRAME_TO_MS,
+        OhlcvValidationError,
+        aggregate_1m_to_1h,
+        ensure_complete_ohlcv,
+        resample_ohlcv,
+    )
 except ImportError:  # pragma: no cover - circular import guard
     TIMEFRAME_TO_MS = {"1m": MS_IN_HOUR // 60}
 
@@ -39,6 +45,12 @@ except ImportError:  # pragma: no cover - circular import guard
 
     def aggregate_1m_to_1h(*args, **kwargs):  # type: ignore[override]
         raise ImportError("aggregate_1m_to_1h is unavailable")
+
+    def ensure_complete_ohlcv(*args, **kwargs):  # type: ignore[override]
+        raise ImportError("ensure_complete_ohlcv is unavailable")
+
+    class OhlcvValidationError(RuntimeError):
+        pass
 
 MINUTE_INTERVAL_MS = TIMEFRAME_TO_MS.get("1m", MS_IN_HOUR // 60)
 
@@ -1164,6 +1176,10 @@ def build_check_all_datas(
     """Create an enriched payload for the snapshot health endpoint."""
 
     frames = _normalise_frames(snapshot)
+    original_frames_for_ohlcv = {
+        key: [dict(candle) for candle in candles]
+        for key, candles in frames.items()
+    }
     if not frames:
         return None
 
@@ -1739,6 +1755,23 @@ def build_check_all_datas(
         else {}
     )
 
+    try:
+        minute_frame_for_ohlcv = frames.get("1m", [])
+        ohlcv_bundle, ohlcv_diagnostics = ensure_complete_ohlcv(
+            minute_frame_for_ohlcv,
+            selection_start=selection_start,
+            selection_end=selection_end,
+            existing_frames=original_frames_for_ohlcv,
+            logger=logging.getLogger(__name__),
+        )
+    except OhlcvValidationError as exc:
+        detail = {
+            "error": "ohlcv_validation_failed",
+            "timeframe": exc.detail.get("timeframe") if isinstance(exc.detail, Mapping) else None,
+            "detail": exc.detail,
+        }
+        raise DataQualityError(detail) from exc
+
     data_quality_public = {
         key: data_quality[key]
         for key in (
@@ -1769,6 +1802,8 @@ def build_check_all_datas(
         "zones": detected_zones,
         "liquidity": liquidity_payload,
         "data_quality": data_quality_public,
+        "ohlcv": ohlcv_bundle,
+        "ohlcv_diagnostics": ohlcv_diagnostics,
         "htf": htf_blocks,
         "htf_details": htf_section,
         "data_quality_htf": htf_quality,
