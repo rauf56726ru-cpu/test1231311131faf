@@ -1,9 +1,9 @@
-"""Snapshot diagnostics builder for the inspection check-all endpoint."""
+"""Snapshot builder for the inspection check-all endpoint."""
 from __future__ import annotations
 
 import logging
-import time
 import math
+import time
 from datetime import datetime, timedelta, timezone, time as dtime
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence
 
@@ -57,6 +57,42 @@ class BinanceDownloadError(RuntimeError):
     def __init__(self, downloaded: int, message: str):
         super().__init__(message)
         self.downloaded = int(downloaded)
+
+
+def _round_float_value(value: float, ndigits: int = 3) -> float:
+    """Round a floating-point value to a stable number of decimal places."""
+
+    if not math.isfinite(value):
+        return value
+
+    digits = max(0, int(ndigits))
+    rounded = round(value, digits)
+
+    if digits > 2:
+        magnitude = abs(rounded)
+        integer_digits = 1
+        if magnitude >= 1:
+            integer_digits = len(str(int(magnitude)))
+        if integer_digits > 6:
+            rounded = round(value, 2)
+
+    return rounded
+
+
+def round_floats(obj: Any, ndigits: int = 3) -> Any:
+    """Recursively round floats within mappings and sequences."""
+
+    if isinstance(obj, Mapping):
+        return {key: round_floats(val, ndigits) for key, val in obj.items()}
+    if isinstance(obj, list):
+        return [round_floats(item, ndigits) for item in obj]
+    if isinstance(obj, tuple):
+        return tuple(round_floats(item, ndigits) for item in obj)
+    if isinstance(obj, set):
+        return {round_floats(item, ndigits) for item in obj}
+    if isinstance(obj, float):
+        return _round_float_value(obj, ndigits)
+    return obj
 
 
 def _align_to_interval(value: int, interval_ms: int) -> int:
@@ -918,7 +954,7 @@ def build_check_all_datas(
     selection_end_ms: int | None = None,
     hours: int | None = None,
 ) -> Dict[str, Any] | None:
-    """Create an enriched diagnostics payload for the snapshot health endpoint."""
+    """Create an enriched payload for the snapshot health endpoint."""
 
     frames = _normalise_frames(snapshot)
     if not frames:
@@ -1427,7 +1463,7 @@ def build_check_all_datas(
         if key in data_quality
     }
 
-    return {
+    response_payload = {
         "snapshot_id": snapshot.get("id"),
         "symbol": snapshot.get("symbol"),
         "timeframe": snapshot.get("tf"),
@@ -1447,3 +1483,5 @@ def build_check_all_datas(
         "profile_preset": profile_config.get("preset_payload"),
         "vwap": vwap_payload,
     }
+
+    return round_floats(response_payload)
