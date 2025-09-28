@@ -378,6 +378,12 @@ def detect_smc_blocks(
 
     blocks: List[MutableMapping[str, object]] = []
 
+    block_type_labels = {
+        "bb": "breaker block",
+        "mb": "mitigation block",
+        "rb": "reversal block",
+    }
+
     def _append_block(
         *,
         kind: str,
@@ -397,6 +403,7 @@ def detect_smc_blocks(
             "created_at": created_at,
             "type": direction,
             "tf": timeframe,
+            "block_type": block_type_labels.get(kind, kind),
             "_created_idx": created_idx,
         }
         _deduplicate_blocks(blocks, block)

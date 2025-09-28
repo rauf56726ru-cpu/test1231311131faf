@@ -54,6 +54,7 @@ def test_breaker_block_detected_after_bos_retest() -> None:
     assert len(blocks) == 1
     block = blocks[0]
     assert block["kind"] == "bb"
+    assert block["block_type"] == "breaker block"
     assert block["type"] == "demand"
     assert block["status"] == "tapped"
     assert block["range"][0] == pytest.approx(99.0)
@@ -91,6 +92,7 @@ def test_mitigation_block_uses_unfilled_body() -> None:
     assert len(blocks) == 1
     block = blocks[0]
     assert block["kind"] == "mb"
+    assert block["block_type"] == "mitigation block"
     assert block["type"] == "demand"
     assert block["status"] == "tapped"
     assert block["range"][0] == pytest.approx(100.0)
@@ -125,6 +127,7 @@ def test_reversal_block_after_liquidity_grab() -> None:
     assert len(blocks) == 1
     block = blocks[0]
     assert block["kind"] == "rb"
+    assert block["block_type"] == "reversal block"
     assert block["type"] == "demand"
     assert block["status"] == "tapped"
     assert block["range"][0] == pytest.approx(99.0, rel=1e-3)
