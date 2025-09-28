@@ -55,6 +55,52 @@ if PUBLIC_DIR.is_dir():
     app.mount("/public", StaticFiles(directory=PUBLIC_DIR), name="public")
 
 
+def _extract_openai_error(response: httpx.Response) -> Any | None:
+    """Return a sanitised representation of an OpenAI error payload."""
+
+    if response is None:
+        return None
+
+    try:
+        payload = response.json()
+    except ValueError:
+        text = response.text
+        if not text:
+            return None
+        stripped = text.strip()
+        return stripped[:500] if len(stripped) > 500 else stripped
+
+    if isinstance(payload, Mapping):
+        error_node = payload.get("error")
+        if isinstance(error_node, Mapping):
+            cleaned: Dict[str, Any] = {}
+            for key in ("message", "type", "code", "param"):
+                value = error_node.get(key)
+                if isinstance(value, str):
+                    trimmed = value.strip()
+                    if trimmed:
+                        cleaned[key] = trimmed[:500] if len(trimmed) > 500 else trimmed
+                elif value is not None:
+                    cleaned[key] = value
+            if cleaned:
+                return cleaned
+            return {
+                key: error_node[key]
+                for key in error_node.keys()
+                if key in {"message", "type", "code", "param"} and error_node[key] is not None
+            } or str(error_node)[:500]
+        message = payload.get("message")
+        if isinstance(message, str) and message.strip():
+            trimmed = message.strip()
+            return trimmed[:500] if len(trimmed) > 500 else trimmed
+        return str(payload)[:500]
+
+    if isinstance(payload, Sequence) and not isinstance(payload, (str, bytes, bytearray)):
+        return [payload[index] for index in range(min(len(payload), 5))]
+
+    return payload
+
+
 @app.post("/inspection/snapshot")
 async def register_inspection_snapshot(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
     try:
@@ -346,11 +392,13 @@ async def analyze_from_inspection(payload: Dict[str, Any] = Body(...)) -> JSONRe
             api_base=api_base,
         )
     except httpx.HTTPStatusError as exc:
+        openai_error_details = _extract_openai_error(exc.response)
         logging.getLogger(__name__).exception(
             "OpenAI request returned an error",
             extra={
                 "snapshot_id": snapshot_id,
                 "status_code": exc.response.status_code,
+                "openai_error": openai_error_details,
             },
         )
         raise HTTPException(
@@ -358,6 +406,7 @@ async def analyze_from_inspection(payload: Dict[str, Any] = Body(...)) -> JSONRe
             detail={
                 "message": "OpenAI returned an error",
                 "status_code": exc.response.status_code,
+                "openai_error": openai_error_details,
             },
         ) from exc
     except httpx.RequestError as exc:

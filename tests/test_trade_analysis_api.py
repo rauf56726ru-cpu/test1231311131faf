@@ -6,7 +6,10 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+import httpx
+
 from src.api.app import app
+import src.api.app as app_module
 import src.services.analysis as analysis
 import src.services.check_all_datas as check_all_datas
 import src.services.inspection as inspection
@@ -308,3 +311,51 @@ def test_analyze_from_inspection_requires_api_key_when_missing(
     response = client.post("/api/analyze-from-inspection", json=body)
     assert response.status_code == 400
     assert response.json()["detail"] == "OpenAI API key is required"
+
+
+def test_analyze_from_inspection_surfaces_openai_error(
+    client: TestClient,
+    analysis_env: Path,
+    monkeypatch,
+) -> None:
+    base = datetime(2024, 6, 5, 11, tzinfo=UTC)
+    payload = _build_snapshot_payload(base)
+
+    create_response = client.post("/inspection/snapshot", json=payload)
+    assert create_response.status_code == 200
+    snapshot_id = create_response.json()["snapshot_id"]
+
+    async def failing_dispatch(*args, **kwargs):
+        request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+        error_payload = {
+            "error": {
+                "message": "Attachment validation failed",
+                "type": "invalid_request_error",
+                "code": "attachment_invalid",
+            }
+        }
+        response = httpx.Response(
+            status_code=400,
+            request=request,
+            content=json.dumps(error_payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        raise httpx.HTTPStatusError("Bad Request", request=request, response=response)
+
+    monkeypatch.setattr(app_module, "dispatch_trade_analysis", failing_dispatch)
+
+    selection = payload["selection"]
+    body = {
+        "snapshot_id": snapshot_id,
+        "selection_start": selection["start"],
+        "selection_end": selection["end"],
+        "hours": 1,
+        "period": "error_case",
+    }
+
+    response = client.post("/api/analyze-from-inspection", json=body)
+    assert response.status_code == 502
+    detail = response.json()["detail"]
+    assert detail["status_code"] == 400
+    assert detail["openai_error"]["message"] == "Attachment validation failed"
+    assert detail["openai_error"]["type"] == "invalid_request_error"
