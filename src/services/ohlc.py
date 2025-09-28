@@ -268,6 +268,134 @@ def aggregate_1m_to_1h(
     return ordered
 
 
+def _aggregate_bucket(
+    minutes: Mapping[int, Candle],
+    *,
+    bucket_start: int,
+    interval_ms: int,
+    minute_interval: int,
+    max_timestamp: int,
+) -> Dict[str, float | int] | None:
+    """Aggregate a contiguous block of minute candles into a single bucket."""
+
+    expected_count = max(1, interval_ms // minute_interval)
+    bucket_end = bucket_start + (expected_count - 1) * minute_interval
+    if bucket_end > max_timestamp:
+        return None
+
+    candles: List[Candle] = []
+    for index in range(expected_count):
+        minute_ts = bucket_start + index * minute_interval
+        candle = minutes.get(minute_ts)
+        if candle is None:
+            return None
+        candles.append(candle)
+
+    if not candles:
+        return None
+
+    open_price = float(candles[0].o)
+    high_price = max(float(item.h) for item in candles)
+    low_price = min(float(item.l) for item in candles)
+    close_price = float(candles[-1].c)
+    volume = sum(float(item.v) for item in candles)
+
+    return {
+        "t": int(bucket_start),
+        "o": open_price,
+        "h": high_price,
+        "l": low_price,
+        "c": close_price,
+        "v": volume,
+    }
+
+
+def build_multi_timeframe_ohlcv(
+    minute_rows: Sequence[Mapping[str, Any] | Sequence[object] | Candle],
+) -> Dict[str, Dict[str, List[Dict[str, float | int]]]]:
+    """Build OHLCV series for supported timeframes using minute candles as seed.
+
+    The function enforces strict alignment to timeframe windows and skips
+    partially-formed buckets ensuring that each aggregated candle is backed by
+    a complete set of one-minute bars.
+    """
+
+    minute_interval = TIMEFRAME_TO_MS.get("1m")
+    if not minute_interval:
+        raise ValueError("1m timeframe is not defined")
+
+    minutes: Dict[int, Candle] = {}
+    for row in minute_rows:
+        candle: Candle | None
+        if isinstance(row, Candle):
+            candle = row
+        elif isinstance(row, Mapping) or isinstance(row, Sequence):
+            candle = _to_candle_mapping(row)  # type: ignore[arg-type]
+        else:
+            candle = None
+        if candle is None:
+            continue
+
+        aligned_ts = _align_to_interval(int(candle.t), minute_interval)
+        if aligned_ts != candle.t:
+            candle = Candle(
+                t=aligned_ts,
+                o=float(candle.o),
+                h=float(candle.h),
+                l=float(candle.l),
+                c=float(candle.c),
+                v=float(candle.v),
+            )
+        minutes[aligned_ts] = candle
+
+    result: Dict[str, Dict[str, List[Dict[str, float | int]]]] = {}
+    if not minutes:
+        for tf in TIMEFRAME_TO_MS:
+            result[tf] = {"candles": []}
+        return result
+
+    sorted_minutes = sorted(minutes)
+    max_timestamp = sorted_minutes[-1]
+
+    result["1m"] = {
+        "candles": [minutes[ts].as_dict() for ts in sorted_minutes],
+    }
+
+    bucket_cache: Dict[str, List[int]] = {}
+    for tf, interval_ms in TIMEFRAME_TO_MS.items():
+        if tf == "1m":
+            continue
+        if interval_ms <= 0:
+            result[tf] = {"candles": []}
+            continue
+
+        bucket_candidates = bucket_cache.get(tf)
+        if bucket_candidates is None:
+            bucket_set = {
+                _align_to_interval(ts, interval_ms)
+                for ts in sorted_minutes
+            }
+            bucket_candidates = sorted(bucket_set)
+            bucket_cache[tf] = bucket_candidates
+
+        aggregated: List[Dict[str, float | int]] = []
+        for bucket_start in bucket_candidates:
+            aggregated_candle = _aggregate_bucket(
+                minutes,
+                bucket_start=bucket_start,
+                interval_ms=interval_ms,
+                minute_interval=minute_interval,
+                max_timestamp=max_timestamp,
+            )
+            if aggregated_candle is None:
+                continue
+            aggregated.append(aggregated_candle)
+
+        result[tf] = {"candles": aggregated}
+
+    return result
+
+
 def _ensure_cache_entry(symbol: str, timeframe: str) -> CandleCache:
     key = (symbol.upper(), timeframe)
     entry = _CANDLE_CACHE.get(key)

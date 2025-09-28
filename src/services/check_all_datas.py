@@ -30,7 +30,12 @@ VALID_HOUR_WINDOWS = {1, 2, 3, 4}
 VALUE_AREA_PCT = 0.70
 
 try:
-    from .ohlc import TIMEFRAME_TO_MS, aggregate_1m_to_1h, resample_ohlcv
+    from .ohlc import (
+        TIMEFRAME_TO_MS,
+        aggregate_1m_to_1h,
+        build_multi_timeframe_ohlcv,
+        resample_ohlcv,
+    )
 except ImportError:  # pragma: no cover - circular import guard
     TIMEFRAME_TO_MS = {"1m": MS_IN_HOUR // 60}
 
@@ -39,6 +44,9 @@ except ImportError:  # pragma: no cover - circular import guard
 
     def aggregate_1m_to_1h(*args, **kwargs):  # type: ignore[override]
         raise ImportError("aggregate_1m_to_1h is unavailable")
+
+    def build_multi_timeframe_ohlcv(*args, **kwargs):  # type: ignore[override]
+        raise ImportError("build_multi_timeframe_ohlcv is unavailable")
 
 MINUTE_INTERVAL_MS = TIMEFRAME_TO_MS.get("1m", MS_IN_HOUR // 60)
 
@@ -1647,6 +1655,7 @@ def build_check_all_datas(
             if ts in minute_window_index
         ]
 
+    ohlcv_block = build_multi_timeframe_ohlcv(minute_htf_source)
     hourly_htf = aggregate_1m_to_1h(minute_htf_source) if minute_frame_present else []
     htf_blocks: List[Dict[str, Any]] = []
     if minute_frame_present:
@@ -1769,6 +1778,7 @@ def build_check_all_datas(
         "zones": detected_zones,
         "liquidity": liquidity_payload,
         "data_quality": data_quality_public,
+        "ohlcv": ohlcv_block,
         "htf": htf_blocks,
         "htf_details": htf_section,
         "data_quality_htf": htf_quality,

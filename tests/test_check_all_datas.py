@@ -283,6 +283,54 @@ def test_vwap_profile_tick_size_stability(client: TestClient, monkeypatch: pytes
     assert abs(coarse["daily"]["val"] - fine["daily"]["val"]) <= tolerance
 
 
+def test_check_all_payload_includes_multi_tf_ohlcv_block(client: TestClient) -> None:
+    base = datetime(2024, 2, 1, tzinfo=timezone.utc)
+    payload = _build_snapshot_payload(base, count=8 * 60)
+
+    create_response = client.post("/inspection/snapshot", json=payload)
+    assert create_response.status_code == 200
+    snapshot_id = create_response.json()["snapshot_id"]
+
+    response = client.get(
+        "/inspection/check-all",
+        params={"snapshot": snapshot_id, "hours": 4},
+    )
+    assert response.status_code == 200
+    body = response.json()
+
+    ohlcv_block = body.get("ohlcv")
+    assert isinstance(ohlcv_block, dict)
+    assert set(ohlcv_block.keys()) == {"1m", "3m", "5m", "15m", "1h", "4h", "1d"}
+
+    minute_series = ohlcv_block["1m"].get("candles", [])
+    assert minute_series
+    total_minutes = len(minute_series)
+    minute_map = {candle["t"]: candle for candle in minute_series}
+
+    minute_interval = 60_000
+    for tf in ("3m", "5m", "15m", "1h", "4h", "1d"):
+        candles = ohlcv_block[tf].get("candles", [])
+        interval_ms = check_all_datas.TIMEFRAME_TO_MS[tf]
+        expected = total_minutes // max(1, interval_ms // minute_interval)
+        assert len(candles) == expected
+        for candle in candles:
+            assert candle["t"] % interval_ms == 0
+
+    hourly = ohlcv_block["1h"]["candles"]
+    if hourly:
+        first_hour = hourly[0]
+        step_count = check_all_datas.TIMEFRAME_TO_MS["1h"] // minute_interval
+        expected_minutes = [first_hour["t"] + index * minute_interval for index in range(step_count)]
+        assert all(ts in minute_map for ts in expected_minutes)
+        assert pytest.approx(first_hour["o"]) == minute_map[first_hour["t"]]["o"]
+        assert pytest.approx(first_hour["c"]) == minute_map[expected_minutes[-1]]["c"]
+        assert pytest.approx(first_hour["h"]) == max(minute_map[ts]["h"] for ts in expected_minutes)
+        assert pytest.approx(first_hour["l"]) == min(minute_map[ts]["l"] for ts in expected_minutes)
+        assert pytest.approx(first_hour["v"]) == sum(minute_map[ts]["v"] for ts in expected_minutes)
+
+    assert ohlcv_block["1d"]["candles"] == []
+
+
 def test_historical_snapshot_still_populates_window(client: TestClient) -> None:
     base = (
         datetime.now(timezone.utc)

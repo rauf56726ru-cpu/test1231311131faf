@@ -2,7 +2,11 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from src.services.ohlc import TIMEFRAME_TO_MS, resample_ohlcv
+from src.services.ohlc import (
+    TIMEFRAME_TO_MS,
+    build_multi_timeframe_ohlcv,
+    resample_ohlcv,
+)
 
 UTC = timezone.utc
 
@@ -58,3 +62,69 @@ def test_resample_builds_expected_15m_and_1h_buckets():
     assert pytest.approx(hourly["l"]) == 99.5
     assert pytest.approx(hourly["c"]) == 111.0
     assert pytest.approx(hourly["v"]) == 60.0
+
+
+def test_build_multi_timeframe_ohlcv_respects_complete_windows():
+    base = datetime(2024, 5, 1, tzinfo=UTC)
+    total_minutes = (24 * 60) + 30
+    candles = []
+    for index in range(total_minutes):
+        ts = int((base + timedelta(minutes=index)).timestamp() * 1000)
+        open_price = 100.0 + index * 0.5
+        close_price = open_price + 0.2
+        high_price = close_price + 0.1
+        low_price = open_price - 0.1
+        volume = float(1 + (index % 5))
+        candles.append(
+            {
+                "t": ts,
+                "o": open_price,
+                "h": high_price,
+                "l": low_price,
+                "c": close_price,
+                "v": volume,
+            }
+        )
+
+    block = build_multi_timeframe_ohlcv(candles)
+
+    assert set(block) == set(TIMEFRAME_TO_MS)
+    assert len(block["1m"]["candles"]) == total_minutes
+
+    for tf, payload in block.items():
+        series = payload.get("candles", [])
+        times = [candle["t"] for candle in series]
+        assert times == sorted(times)
+        interval_ms = TIMEFRAME_TO_MS[tf]
+        if times:
+            assert all((ts % interval_ms) == 0 for ts in times)
+
+    candles_3m = block["3m"]["candles"]
+    assert len(candles_3m) == total_minutes // 3
+    first_3m = candles_3m[0]
+    assert first_3m["t"] == int(base.timestamp() * 1000)
+    assert pytest.approx(first_3m["o"]) == candles[0]["o"]
+    assert pytest.approx(first_3m["c"]) == candles[2]["c"]
+    assert pytest.approx(first_3m["h"]) == candles[2]["h"]
+    assert pytest.approx(first_3m["l"]) == candles[0]["l"]
+    assert pytest.approx(first_3m["v"]) == sum(c["v"] for c in candles[:3])
+
+    candles_5m = block["5m"]["candles"]
+    assert len(candles_5m) == total_minutes // 5
+    assert candles_5m[0]["t"] == int(base.timestamp() * 1000)
+
+    hourly = block["1h"]["candles"]
+    assert len(hourly) == 24
+    assert hourly[-1]["t"] == int((base + timedelta(hours=23)).timestamp() * 1000)
+    assert pytest.approx(hourly[-1]["c"]) == candles[(24 * 60) - 1]["c"]
+    assert all((bar["t"] % TIMEFRAME_TO_MS["1h"]) == 0 for bar in hourly)
+
+    four_hour = block["4h"]["candles"]
+    assert len(four_hour) == 6
+    assert four_hour[-1]["t"] == int((base + timedelta(hours=20)).timestamp() * 1000)
+
+    daily = block["1d"]["candles"]
+    assert len(daily) == 1
+    assert daily[0]["t"] == int(base.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+    assert pytest.approx(daily[0]["c"]) == candles[1440 - 1]["c"]
+    assert pytest.approx(daily[0]["v"]) == sum(c["v"] for c in candles[:1440])
