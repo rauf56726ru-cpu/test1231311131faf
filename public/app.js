@@ -797,6 +797,7 @@
     loadingCheckAll: false,
     loadingTrade: false,
     selection: null,
+    checkAllPayload: null,
   };
 
   function showToast(message, variant = "info") {
@@ -1054,15 +1055,42 @@
   }
 
   async function refreshCheckAll() {
-    if (state.loadingCheckAll) return;
+    if (state.loadingCheckAll) return null;
     state.loadingCheckAll = true;
     setLoading("refreshCheckAll", true);
     try {
-      const data = await fetchJSON("/api/check-all");
-      const formatted = formatJson(data?.check_all);
+      const symbolInputEl = document.getElementById("input-symbol");
+      const intervalInputEl = document.getElementById("input-interval");
+      const symbol = symbolInputEl?.value?.trim()?.toUpperCase() || "BTCUSDT";
+      const timeframe = intervalInputEl?.value || "1m";
+      const payload = { symbol, timeframe };
+      const selection = state.selection;
+      const hasStart = selection && Number.isFinite(selection.start);
+      const hasEnd = selection && Number.isFinite(selection.end);
+      if (hasStart && hasEnd) {
+        const startMs = Math.min(Number(selection.start), Number(selection.end));
+        const endMs = Math.max(Number(selection.start), Number(selection.end));
+        const startIso = toIsoString(startMs);
+        const endIso = toIsoString(endMs);
+        if (startIso && endIso) {
+          payload.start = startIso;
+          payload.end = endIso;
+        }
+      }
+
+      const data = await fetchJSON("/api/check-all", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      state.checkAllPayload = data?.check_all || null;
+      const formatted = formatJson(state.checkAllPayload);
       elements.checkAllOutput.textContent = formatted || "Нет данных";
+      return state.checkAllPayload;
     } catch (error) {
+      state.checkAllPayload = null;
       elements.checkAllOutput.textContent = `Ошибка: ${error.message || error}`;
+      throw error;
     } finally {
       state.loadingCheckAll = false;
       setLoading("refreshCheckAll", false);
@@ -1104,7 +1132,8 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
-      const formatted = formatJson(data?.check_all);
+      state.checkAllPayload = data?.check_all || null;
+      const formatted = formatJson(state.checkAllPayload);
       elements.checkAllOutput.textContent = formatted || "Нет данных";
       if (data?.rendered_html) {
         const popup = window.open("", "_blank", "noopener");
@@ -1116,6 +1145,7 @@
         }
       }
     } catch (error) {
+      state.checkAllPayload = null;
       elements.checkAllOutput.textContent = `Ошибка: ${error.message || error}`;
     } finally {
       state.loadingCheckAll = false;
@@ -1129,14 +1159,31 @@
       showToast("Укажите OpenAI API key в настройках", "warning");
       return;
     }
+    if (!state.checkAllPayload) {
+      try {
+        await refreshCheckAll();
+      } catch (error) {
+        showToast("Не удалось обновить check_all_datas", "error");
+        return;
+      }
+    }
+    if (!state.checkAllPayload) {
+      showToast("Нет данных check_all_datas для анализа", "error");
+      return;
+    }
     state.loadingTrade = true;
     setLoading("requestTrade", true);
     try {
+      const symbolInputEl = document.getElementById("input-symbol");
+      const intervalInputEl = document.getElementById("input-interval");
       const payload = {
         api_key: state.settings.api_key,
         model: state.settings.model,
         system_prompt: state.systemPrompt,
         api_base: state.settings.api_base,
+        symbol: symbolInputEl?.value?.trim()?.toUpperCase() || "BTCUSDT",
+        timeframe: intervalInputEl?.value || "1m",
+        check_all: state.checkAllPayload,
       };
       const data = await fetchJSON("/api/trade-analysis", {
         method: "POST",
@@ -1174,7 +1221,11 @@
     renderPrompt();
     renderSettingsForm();
     renderChat();
-    refreshCheckAll();
+    try {
+      await refreshCheckAll();
+    } catch (error) {
+      console.warn("Не удалось построить check_all_datas при инициализации", error);
+    }
   }
 
   if (elements.savePrompt) {
@@ -1235,7 +1286,11 @@
   }
 
   if (elements.refreshCheckAll) {
-    elements.refreshCheckAll.addEventListener("click", refreshCheckAll);
+    elements.refreshCheckAll.addEventListener("click", () => {
+      refreshCheckAll().catch(() => {
+        /* Ошибка уже отображена в интерфейсе */
+      });
+    });
   }
 
   if (elements.createTestEnv) {
