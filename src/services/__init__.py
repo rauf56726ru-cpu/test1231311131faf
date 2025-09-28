@@ -33,6 +33,7 @@ from .ohlc import (
     TIMEFRAME_WINDOWS,
     fetch_ohlcv,
     fetch_ohlcv_sync,
+    aggregate_1m_to_1h,
     normalise_ohlcv,
     normalise_ohlcv_sync,
 )
@@ -72,4 +73,5 @@ __all__ = [
     "save_preset",
     "update_preset",
     "DataQualityError",
+    "aggregate_1m_to_1h",
 ]

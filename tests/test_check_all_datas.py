@@ -336,8 +336,13 @@ def test_historical_snapshot_still_populates_window(client: TestClient) -> None:
     liquidity_section = body.get("liquidity")
     assert isinstance(liquidity_section, dict)
     assert {"eqh", "eql", "pdh", "pdl", "sweeps"}.issubset(liquidity_section)
-    assert "htf" in body and isinstance(body["htf"], dict)
-    assert set(body["htf"].get("candles", {}).keys()).issuperset({"15m", "1h", "4h", "1d"})
+    assert "htf" in body and isinstance(body["htf"], list)
+    hourly_entry = next((block for block in body["htf"] if block.get("tf") == "1h"), None)
+    assert hourly_entry is not None
+    assert isinstance(hourly_entry["candles"], list)
+    htf_details = body.get("htf_details")
+    assert isinstance(htf_details, dict)
+    assert set(htf_details.get("candles", {}).keys()).issuperset({"15m", "1h", "4h", "1d"})
     dq_htf = body.get("data_quality_htf")
     assert isinstance(dq_htf, dict)
     assert dq_htf.get("minute_missing_before") >= 0

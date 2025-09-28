@@ -200,6 +200,74 @@ def resample_ohlcv(
     return [buckets[key] for key in sorted(buckets)]
 
 
+def aggregate_1m_to_1h(
+    candles: Sequence[Mapping[str, Any] | Sequence[object] | Candle],
+) -> List[Dict[str, float | int]]:
+    """Aggregate one-minute OHLCV candles into one-hour buckets.
+
+    The function aligns candle timestamps to UTC hour boundaries and produces
+    standard OHLCV fields for each one-hour bar. Invalid rows are ignored.
+    """
+
+    hour_ms = TIMEFRAME_TO_MS.get("1h")
+    if not hour_ms:
+        raise ValueError("1h timeframe is not defined in TIMEFRAME_TO_MS")
+
+    parsed: List[Candle] = []
+    for row in candles:
+        candle: Candle | None
+        if isinstance(row, Candle):
+            candle = row
+        elif isinstance(row, Mapping) or isinstance(row, Sequence):
+            candle = _to_candle_mapping(row)  # type: ignore[arg-type]
+        else:
+            candle = None
+        if candle is None:
+            continue
+        parsed.append(candle)
+
+    if not parsed:
+        return []
+
+    parsed.sort(key=lambda item: item.t)
+
+    buckets: Dict[int, Dict[str, float]] = {}
+    for candle in parsed:
+        bucket_start = _align_to_interval(int(candle.t), hour_ms)
+        bucket = buckets.get(bucket_start)
+        if bucket is None:
+            buckets[bucket_start] = {
+                "t": float(bucket_start),
+                "o": float(candle.o),
+                "h": float(candle.h),
+                "l": float(candle.l),
+                "c": float(candle.c),
+                "v": float(candle.v),
+            }
+            continue
+
+        bucket["h"] = max(bucket["h"], float(candle.h))
+        bucket["l"] = min(bucket["l"], float(candle.l))
+        bucket["c"] = float(candle.c)
+        bucket["v"] += float(candle.v)
+
+    ordered: List[Dict[str, float | int]] = []
+    for ts in sorted(buckets):
+        bucket = buckets[ts]
+        ordered.append(
+            {
+                "t": int(ts),
+                "o": float(bucket["o"]),
+                "h": float(bucket["h"]),
+                "l": float(bucket["l"]),
+                "c": float(bucket["c"]),
+                "v": float(bucket["v"]),
+            }
+        )
+
+    return ordered
+
+
 def _ensure_cache_entry(symbol: str, timeframe: str) -> CandleCache:
     key = (symbol.upper(), timeframe)
     entry = _CANDLE_CACHE.get(key)

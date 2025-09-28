@@ -157,10 +157,15 @@ def test_build_inspection_payload_includes_htf(monkeypatch) -> None:
 
     payload = inspection.build_inspection_payload(snapshot)
 
-    htf_payload = payload["DATA"]["htf"]
+    htf_series = payload["DATA"]["htf"]
+    htf_details = payload["DATA"].get("htf_details")
     dq_htf = payload["DATA"]["meta"]["data_quality_htf"]
 
-    assert set(htf_payload["candles"]).issuperset({"15m", "1h", "4h", "1d"})
+    assert isinstance(htf_series, list)
+    hourly_block = next((block for block in htf_series if block.get("tf") == "1h"), None)
+    assert hourly_block is not None
+    assert isinstance(hourly_block["candles"], list)
+    assert htf_details and set(htf_details["candles"]).issuperset({"15m", "1h", "4h", "1d"})
     assert dq_htf["minute_missing_before"] == 0
     assert dq_htf["minute_missing_after"] == 0
-    assert all(isinstance(series, list) for series in htf_payload["candles"].values())
+    assert all(isinstance(series, list) for series in htf_details["candles"].values())

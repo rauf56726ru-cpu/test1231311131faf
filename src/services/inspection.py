@@ -30,7 +30,13 @@ from .liquidity import (
     normalise_symbol_for_tick,
     resolve_liquidity_tick_size,
 )
-from .ohlc import TIMEFRAME_WINDOWS, TIMEFRAME_TO_MS, normalise_ohlcv, resample_ohlcv
+from .ohlc import (
+    TIMEFRAME_WINDOWS,
+    TIMEFRAME_TO_MS,
+    aggregate_1m_to_1h,
+    normalise_ohlcv,
+    resample_ohlcv,
+)
 from .profile import build_profile_package
 from .presets import resolve_profile_config
 from .zones import Config as ZonesConfig, detect_zones
@@ -1305,11 +1311,29 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
         },
     )
 
+    minute_htf_source: Sequence[Mapping[str, Any]] = []
+    minute_frame_payload = normalised_frames.get("1m")
+    has_minute_frame = isinstance(minute_frame_payload, Mapping)
+    if has_minute_frame:
+        minute_series = minute_frame_payload.get("candles")
+        if isinstance(minute_series, Sequence):
+            minute_htf_source = [
+                candle
+                for candle in minute_series
+                if isinstance(candle, Mapping)
+            ]  # type: ignore[list-item]
+
+    hourly_htf = aggregate_1m_to_1h(minute_htf_source) if has_minute_frame else []
+    htf_blocks = []
+    if has_minute_frame:
+        htf_blocks.append({"tf": "1h", "candles": hourly_htf})
+
     data_section = {
         "symbol": symbol,
         "frames": normalised_frames,
         "selection": selection,
-        "htf": htf_section,
+        "htf": htf_blocks,
+        "htf_details": htf_section,
         "session_vwap": session_vwap,
         "tpo": {"sessions": tpo_entries, "zones": tpo_zone_items},
         "profile": flattened_profile,

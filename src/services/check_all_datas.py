@@ -18,6 +18,7 @@ from .liquidity import (
 )
 from .presets import resolve_profile_config
 from .profile import build_profile_package
+from .smc import SMCConfig, detect_smc_blocks
 from .zones import Config as ZonesConfig, detect_zones
 from ..meta import Meta
 
@@ -29,12 +30,15 @@ VALID_HOUR_WINDOWS = {1, 2, 3, 4}
 VALUE_AREA_PCT = 0.70
 
 try:
-    from .ohlc import TIMEFRAME_TO_MS, resample_ohlcv
+    from .ohlc import TIMEFRAME_TO_MS, aggregate_1m_to_1h, resample_ohlcv
 except ImportError:  # pragma: no cover - circular import guard
     TIMEFRAME_TO_MS = {"1m": MS_IN_HOUR // 60}
 
     def resample_ohlcv(*args, **kwargs):  # type: ignore[override]
         raise ImportError("resample_ohlcv is unavailable")
+
+    def aggregate_1m_to_1h(*args, **kwargs):  # type: ignore[override]
+        raise ImportError("aggregate_1m_to_1h is unavailable")
 
 MINUTE_INTERVAL_MS = TIMEFRAME_TO_MS.get("1m", MS_IN_HOUR // 60)
 
@@ -937,6 +941,94 @@ def _filter_indicator_block(value: Any, start_ms: int | None, end_ms: int | None
     return value
 
 
+def _collect_nested_events(source: Any, events: List[Mapping[str, Any]]) -> None:
+    if isinstance(source, Mapping):
+        for key in ("events", "flags", "signals"):
+            value = source.get(key)
+            if isinstance(value, Sequence):
+                for entry in value:
+                    if isinstance(entry, Mapping):
+                        events.append(entry)
+        for key in ("structure", "data", "payload"):
+            nested = source.get(key)
+            if nested is not None:
+                _collect_nested_events(nested, events)
+    elif isinstance(source, Sequence) and not isinstance(source, (str, bytes, bytearray)):
+        for item in source:
+            _collect_nested_events(item, events)
+
+
+def _extract_structure_events(snapshot: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+    events: List[Mapping[str, Any]] = []
+    for key in ("smt", "zones", "structure", "indicators"):
+        candidate = snapshot.get(key)
+        if candidate is not None:
+            _collect_nested_events(candidate, events)
+    return events
+
+
+def _collect_ob_candidates(source: Any, accumulator: List[Mapping[str, Any]]) -> None:
+    if isinstance(source, Mapping):
+        ob_payload = source.get("ob")
+        if isinstance(ob_payload, Sequence):
+            for entry in ob_payload:
+                if isinstance(entry, Mapping):
+                    accumulator.append(entry)
+        for key in ("zones", "data", "payload"):
+            nested = source.get(key)
+            if nested is not None:
+                _collect_ob_candidates(nested, accumulator)
+    elif isinstance(source, Sequence) and not isinstance(source, (str, bytes, bytearray)):
+        for item in source:
+            _collect_ob_candidates(item, accumulator)
+
+
+def _resolve_smc_config(meta: Mapping[str, Any] | None) -> SMCConfig:
+    if not isinstance(meta, Mapping):
+        return SMCConfig()
+    config_source = meta.get("smc") or meta.get("SMC")
+    if not isinstance(config_source, Mapping):
+        return SMCConfig()
+    kwargs: Dict[str, Any] = {}
+    if "min_block_size" in config_source:
+        try:
+            kwargs["min_block_size"] = float(config_source["min_block_size"])
+        except (TypeError, ValueError):
+            pass
+    if "displacement_factor" in config_source:
+        try:
+            kwargs["displacement_factor"] = float(config_source["displacement_factor"])
+        except (TypeError, ValueError):
+            pass
+    if "displacement_lookback" in config_source:
+        try:
+            kwargs["displacement_lookback"] = int(config_source["displacement_lookback"])
+        except (TypeError, ValueError):
+            pass
+    if "ttl_bars" in config_source:
+        try:
+            kwargs["ttl_bars"] = int(config_source["ttl_bars"])
+        except (TypeError, ValueError):
+            pass
+    return SMCConfig(**kwargs)
+
+
+def _inject_smc_blocks(target: MutableMapping[str, Any] | None, blocks: Sequence[Mapping[str, Any]]) -> None:
+    if not blocks or not isinstance(target, MutableMapping):
+        return
+    zones = target.get("zones")
+    if isinstance(zones, MutableMapping):
+        existing = zones.get("ob")
+        if isinstance(existing, list):
+            existing.extend(dict(block) for block in blocks)
+        else:
+            zones["ob"] = [dict(block) for block in blocks]
+    elif isinstance(zones, list):
+        zones.append({"ob": [dict(block) for block in blocks]})
+    else:
+        target["zones"] = {"ob": [dict(block) for block in blocks]}
+
+
 def _select_indicator_timeframes(data: Any, targets: Sequence[str]) -> Any:
     if not isinstance(data, Mapping):
         return data
@@ -1510,6 +1602,56 @@ def build_check_all_datas(
     if isinstance(liquidity_config_payload, Mapping):
         liquidity_payload["config"] = dict(liquidity_config_payload)
 
+    minute_htf_source: List[Mapping[str, Any]] = []
+    minute_frame_present = "1m" in frames
+    if minute_frame_present:
+        minute_htf_source = [
+            minute_window_index[ts]
+            for ts in sorted(minute_window_index)
+            if ts in minute_window_index
+        ]
+
+    hourly_htf = aggregate_1m_to_1h(minute_htf_source) if minute_frame_present else []
+    htf_blocks: List[Dict[str, Any]] = []
+    if minute_frame_present:
+        htf_blocks.append({"tf": "1h", "candles": hourly_htf})
+
+    smc_blocks: List[Mapping[str, Any]] = []
+    smc_config = _resolve_smc_config(raw_meta if isinstance(raw_meta, Mapping) else None)
+    structure_events = _extract_structure_events(snapshot)
+    ob_candidates: List[Mapping[str, Any]] = []
+    zones_payload = detected_zones.get("zones") if isinstance(detected_zones, Mapping) else None
+    if isinstance(zones_payload, Mapping):
+        existing_ob = zones_payload.get("ob")
+        if isinstance(existing_ob, Sequence):
+            for entry in existing_ob:
+                if isinstance(entry, Mapping):
+                    ob_candidates.append(entry)
+    _collect_ob_candidates(snapshot.get("zones"), ob_candidates)
+    _collect_ob_candidates(snapshot.get("smt"), ob_candidates)
+    liquidity_source: Mapping[str, Any] | None = None
+    if isinstance(liquidity_payload, Mapping):
+        liquidity_source = liquidity_payload
+    elif isinstance(snapshot.get("liquidity"), Mapping):
+        liquidity_source = snapshot.get("liquidity")  # type: ignore[assignment]
+    smc_blocks = detect_smc_blocks(
+        hourly_htf,
+        timeframe="1h",
+        structure_flags=structure_events,
+        ob_zones=ob_candidates,
+        liquidity_levels=liquidity_source,
+        config=smc_config,
+    )
+    if smc_blocks and isinstance(zones_payload, MutableMapping):
+        existing_ob = zones_payload.get("ob")
+        merged = [dict(item) for item in existing_ob] if isinstance(existing_ob, list) else []
+        merged.extend(dict(block) for block in smc_blocks)
+        zones_payload["ob"] = merged
+
+    if smc_blocks:
+        _inject_smc_blocks(detailed_section.get("indicators"), smc_blocks)
+        _inject_smc_blocks(movement_section.get("indicators"), smc_blocks)
+
     minute_series = frames.get("1m", [])
     daily_start_ms = _start_of_day_ms(window_end_ms)
     daily_filtered_minutes = _filter_candles(
@@ -1591,7 +1733,8 @@ def build_check_all_datas(
         "zones": detected_zones,
         "liquidity": liquidity_payload,
         "data_quality": data_quality_public,
-        "htf": htf_section,
+        "htf": htf_blocks,
+        "htf_details": htf_section,
         "data_quality_htf": htf_quality,
         "profile_preset": profile_config.get("preset_payload"),
         "vwap": vwap_payload,
