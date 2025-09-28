@@ -338,6 +338,16 @@ def _coerce_float(value: Any) -> float:
         return 0.0
 
 
+def _safe_float(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(result):
+        return None
+    return result
+
+
 def _safe_int(value: Any) -> int | None:
     try:
         if value is None:
@@ -755,10 +765,28 @@ def _build_volume_profile_stats(
             "window": {"start": window_start_iso, "end": window_end_iso},
         }
 
+    session_high: float | None = None
+    session_low: float | None = None
+
+    def _attach_extrema(payload: Dict[str, Any]) -> Dict[str, Any]:
+        if session_high is not None and session_low is not None:
+            payload["session_high"] = session_high
+            payload["session_low"] = session_low
+        return payload
+
     vwap_value = _compute_vwap(scoped)
     prices: List[float] = []
     volumes: List[float] = []
     for candle in scoped:
+        high_value = _safe_float(candle.get("h") or candle.get("high"))
+        low_value = _safe_float(candle.get("l") or candle.get("low"))
+        if high_value is not None:
+            session_high = (
+                high_value if session_high is None else max(session_high, high_value)
+            )
+        if low_value is not None:
+            session_low = low_value if session_low is None else min(session_low, low_value)
+
         volume = float(candle.get("v", 0.0))
         if volume <= 0:
             continue
@@ -769,23 +797,27 @@ def _build_volume_profile_stats(
         volumes.append(volume)
 
     if not prices or not volumes:
-        return {
-            "vwap": vwap_value,
-            "poc": None,
-            "vah": None,
-            "val": None,
-            "window": {"start": window_start_iso, "end": window_end_iso},
-        }
+        return _attach_extrema(
+            {
+                "vwap": vwap_value,
+                "poc": None,
+                "vah": None,
+                "val": None,
+                "window": {"start": window_start_iso, "end": window_end_iso},
+            }
+        )
 
     bin_size = _determine_bin_size(prices, tick_size)
     if not bin_size or bin_size <= 0:
-        return {
-            "vwap": vwap_value,
-            "poc": None,
-            "vah": None,
-            "val": None,
-            "window": {"start": window_start_iso, "end": window_end_iso},
-        }
+        return _attach_extrema(
+            {
+                "vwap": vwap_value,
+                "poc": None,
+                "vah": None,
+                "val": None,
+                "window": {"start": window_start_iso, "end": window_end_iso},
+            }
+        )
 
     min_price = min(prices)
     max_price = max(prices)
@@ -803,13 +835,15 @@ def _build_volume_profile_stats(
 
     total_volume = sum(histogram)
     if total_volume <= 0:
-        return {
-            "vwap": vwap_value,
-            "poc": None,
-            "vah": None,
-            "val": None,
-            "window": {"start": window_start_iso, "end": window_end_iso},
-        }
+        return _attach_extrema(
+            {
+                "vwap": vwap_value,
+                "poc": None,
+                "vah": None,
+                "val": None,
+                "window": {"start": window_start_iso, "end": window_end_iso},
+            }
+        )
 
     poc_index = max(range(len(histogram)), key=lambda idx: histogram[idx])
     poc_price = start_bin + poc_index * bin_size
@@ -842,13 +876,15 @@ def _build_volume_profile_stats(
     val_price = start_bin + left * bin_size
     vah_price = start_bin + right * bin_size
 
-    return {
-        "vwap": vwap_value,
-        "poc": round(poc_price, 12),
-        "vah": round(vah_price, 12),
-        "val": round(val_price, 12),
-        "window": {"start": window_start_iso, "end": window_end_iso},
-    }
+    return _attach_extrema(
+        {
+            "vwap": vwap_value,
+            "poc": round(poc_price, 12),
+            "vah": round(vah_price, 12),
+            "val": round(val_price, 12),
+            "window": {"start": window_start_iso, "end": window_end_iso},
+        }
+    )
 
 
 def _start_of_day_ms(timestamp_ms: int) -> int:

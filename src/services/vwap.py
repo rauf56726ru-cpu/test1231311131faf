@@ -296,6 +296,7 @@ async def fetch_session_vwap(symbol: str) -> Dict[str, object]:
     sessions = list(Meta.iter_vwap_sessions())
     daily_buckets: DefaultDict[str, List[MinuteBar]] = defaultdict(list)
     session_buckets: DefaultDict[Tuple[str, str], List[MinuteBar]] = defaultdict(list)
+    session_extrema: Dict[Tuple[str, str], Tuple[float, float]] = {}
 
     for bar in bars:
         dt = datetime.fromtimestamp(bar.open_ms / 1000.0, tz=timezone.utc)
@@ -305,8 +306,17 @@ async def fetch_session_vwap(symbol: str) -> Dict[str, object]:
         daily_buckets[date_key].append(bar)
         moment = dt.time()
         for session_name, start_time, end_time in sessions:
-            if _in_session(moment, start_time, end_time):
-                session_buckets[(date_key, session_name)].append(bar)
+            if not _in_session(moment, start_time, end_time):
+                continue
+            bucket_key = (date_key, session_name)
+            session_buckets[bucket_key].append(bar)
+            high_value = bar.high
+            low_value = bar.low
+            if bucket_key in session_extrema:
+                prev_high, prev_low = session_extrema[bucket_key]
+                high_value = max(prev_high, high_value)
+                low_value = min(prev_low, low_value)
+            session_extrema[bucket_key] = (high_value, low_value)
 
     ordered_dates = sorted(daily_buckets.keys())[-lookback_days:]
     results: List[Dict[str, object]] = []
@@ -343,7 +353,13 @@ async def fetch_session_vwap(symbol: str) -> Dict[str, object]:
             else:
                 value = 0.0
                 sigma_value = 0.0
-            results.append({"date": date_key, "session": session_name, "value": value})
+            result_entry = {"date": date_key, "session": session_name, "value": value}
+            extrema = session_extrema.get((date_key, session_name))
+            if extrema is not None:
+                session_high, session_low = extrema
+                result_entry["session_high"] = session_high
+                result_entry["session_low"] = session_low
+            results.append(result_entry)
             sigma_results.append(
                 {
                     "date": date_key,

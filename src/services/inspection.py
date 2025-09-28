@@ -792,7 +792,10 @@ def compute_session_vwaps(symbol: str, candles: Sequence[Mapping[str, Any]]) -> 
     sessions = list(Meta.iter_vwap_sessions())
 
     daily_buckets: defaultdict = defaultdict(list)  # type: ignore[var-annotated]
-    session_buckets: DefaultDict[Tuple[datetime.date, str], List[Mapping[str, Any]]] = defaultdict(list)
+    session_buckets: DefaultDict[
+        Tuple[datetime.date, str], List[Mapping[str, Any]]
+    ] = defaultdict(list)
+    session_extrema: Dict[Tuple[datetime.date, str], Tuple[float, float]] = {}
 
     for open_ms, high, low, close, volume in bars:
         dt = datetime.fromtimestamp(open_ms / 1000.0, tz=timezone.utc)
@@ -802,8 +805,17 @@ def compute_session_vwaps(symbol: str, candles: Sequence[Mapping[str, Any]]) -> 
         daily_buckets[dt.date()].append(entry)
         moment = dt.time()
         for session_name, start_time, end_time in sessions:
-            if _in_session(moment, start_time, end_time):
-                session_buckets[(dt.date(), session_name)].append(entry)
+            if not _in_session(moment, start_time, end_time):
+                continue
+            bucket_key = (dt.date(), session_name)
+            session_buckets[bucket_key].append(entry)
+            high_value = float(entry["h"])
+            low_value = float(entry["l"])
+            if bucket_key in session_extrema:
+                prev_high, prev_low = session_extrema[bucket_key]
+                high_value = max(prev_high, high_value)
+                low_value = min(prev_low, low_value)
+            session_extrema[bucket_key] = (high_value, low_value)
 
     ordered_dates = sorted(daily_buckets.keys())
     if len(ordered_dates) > lookback:
@@ -834,7 +846,17 @@ def compute_session_vwaps(symbol: str, candles: Sequence[Mapping[str, Any]]) -> 
             if session_stats is None:
                 continue
             session_value, session_sigma = session_stats
-            results.append({"date": date_str, "session": session_name, "value": session_value})
+            result_entry = {
+                "date": date_str,
+                "session": session_name,
+                "value": session_value,
+            }
+            extrema = session_extrema.get((date_key, session_name))
+            if extrema is not None:
+                session_high, session_low = extrema
+                result_entry["session_high"] = session_high
+                result_entry["session_low"] = session_low
+            results.append(result_entry)
             sigma_results.append(
                 {
                     "date": date_str,

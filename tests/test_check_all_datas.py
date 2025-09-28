@@ -159,9 +159,17 @@ def _build_timeframe_candles(
 
 
 def test_check_all_includes_vwap_profiles(client: TestClient) -> None:
-    base = datetime(2024, 1, 1, 7, 55, tzinfo=timezone.utc)
+    base = datetime(2024, 1, 1, 6, 55, tzinfo=timezone.utc)
     candles = []
-    total_minutes = int(((datetime(2024, 1, 1, 12, 5, tzinfo=timezone.utc) - base).total_seconds() // 60)) + 1
+    total_minutes = (
+        int(
+            (
+                datetime(2024, 1, 1, 14, 5, tzinfo=timezone.utc) - base
+            ).total_seconds()
+            // 60
+        )
+        + 1
+    )
     for index in range(total_minutes):
         moment = base + timedelta(minutes=index)
         timestamp_ms = int(moment.timestamp() * 1000)
@@ -193,25 +201,31 @@ def test_check_all_includes_vwap_profiles(client: TestClient) -> None:
 
     daily_window = vwap_block["daily"]["window"]
     assert daily_window["start"].startswith("2024-01-01T00:00:00")
-    assert daily_window["end"].startswith("2024-01-01T12:05:00")
+    assert daily_window["end"].startswith("2024-01-01T14:05:00")
     assert vwap_block["daily"]["vwap"] > 0
 
     asia_window = vwap_block["sessions"]["asia"]["window"]
     assert asia_window["start"].startswith("2024-01-01T00:00:00")
-    assert asia_window["end"].startswith("2024-01-01T07:59:00")
+    assert asia_window["end"].startswith("2024-01-01T06:59:00")
     assert vwap_block["sessions"]["asia"]["vwap"] > 0
+    assert "session_high" in vwap_block["sessions"]["asia"]
+    assert "session_low" in vwap_block["sessions"]["asia"]
 
     london_window = vwap_block["sessions"]["london"]["window"]
-    assert london_window["start"].startswith("2024-01-01T08:00:00")
-    assert london_window["end"].startswith("2024-01-01T11:59:00")
+    assert london_window["start"].startswith("2024-01-01T07:00:00")
+    assert london_window["end"].startswith("2024-01-01T12:59:00")
     assert vwap_block["sessions"]["london"]["poc"] is not None
     assert vwap_block["sessions"]["london"]["vah"] is not None
     assert vwap_block["sessions"]["london"]["val"] is not None
+    assert "session_high" in vwap_block["sessions"]["london"]
+    assert "session_low" in vwap_block["sessions"]["london"]
 
     ny_window = vwap_block["sessions"]["ny"]["window"]
-    assert ny_window["start"].startswith("2024-01-01T12:00:00")
-    assert ny_window["end"].startswith("2024-01-01T12:05:00")
+    assert ny_window["start"].startswith("2024-01-01T13:30:00")
+    assert ny_window["end"].startswith("2024-01-01T14:05:00")
     assert vwap_block["sessions"]["ny"]["vwap"] > 0
+    assert "session_high" in vwap_block["sessions"]["ny"]
+    assert "session_low" in vwap_block["sessions"]["ny"]
 
 
 def test_vwap_profile_tick_size_stability(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
