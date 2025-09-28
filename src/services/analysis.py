@@ -17,6 +17,9 @@ from typing import Any, Mapping, MutableMapping
 import httpx
 
 
+logger = logging.getLogger(__name__)
+
+
 SYSTEM_PROMPT = (
     "SYSTEM — SMC Swing/Intraday Executor (Crypto)\n\n"
     "Роль: SMC/ICT-аналитик по крипте. Инструмент: {{SYMBOL}}. TZ: Europe/Berlin.\n"
@@ -272,6 +275,7 @@ async def call_openai_with_attachment(
     period: str,
     api_base: str | None = None,
     client: httpx.AsyncClient | None = None,
+    system_prompt: str | None = None,
 ) -> TradeAnalysisResult:
     """Request analysis from OpenAI with snapshot data embedded in the prompt."""
 
@@ -280,7 +284,7 @@ async def call_openai_with_attachment(
 
     should_close = client is None
     if client is None:
-        client = httpx.AsyncClient(base_url=base_url, timeout=60.0)
+        client = httpx.AsyncClient(base_url=base_url, timeout=None)
 
     payload_text = file_path.read_text(encoding="utf-8")
 
@@ -298,7 +302,12 @@ async def call_openai_with_attachment(
             "input": [
                 {
                     "role": "system",
-                    "content": [{"type": "input_text", "text": SYSTEM_PROMPT}],
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (system_prompt or SYSTEM_PROMPT),
+                        }
+                    ],
                 },
                 {
                     "role": "user",
@@ -308,6 +317,17 @@ async def call_openai_with_attachment(
                 },
             ],
         }
+
+        logger.info(
+            "ChatGPT request",
+            extra={
+                "endpoint": "trade-attachment",
+                "model": model,
+                "symbol": symbol,
+                "period": period,
+                "attachment": file_path.name,
+            },
+        )
 
         response = await _post_with_retry(
             client,
@@ -362,6 +382,7 @@ async def dispatch_trade_analysis(
     model: str,
     api_base: str | None = None,
     client: httpx.AsyncClient | None = None,
+    system_prompt: str | None = None,
 ) -> TradeAnalysisResult:
     """Persist the snapshot payload and dispatch the OpenAI analysis request."""
 
@@ -389,9 +410,9 @@ async def dispatch_trade_analysis(
         period=context.period,
         api_base=api_base,
         client=client,
+        system_prompt=system_prompt,
     )
 
-    logger = logging.getLogger(__name__)
     logger.info(
         "Trade analysis dispatched",
         extra={

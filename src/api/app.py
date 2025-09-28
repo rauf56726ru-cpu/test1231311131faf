@@ -1,49 +1,41 @@
-"""Minimal FastAPI app that exposes OHLCV history for the chart."""
+"""FastAPI application powering the trading copilot UI."""
 from __future__ import annotations
 
+import html
+import json
 import logging
 import os
-from pathlib import Path
-from typing import Any, Dict, Mapping, Sequence
-
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Literal, Mapping, Sequence
 
 import httpx
-from fastapi import Body, FastAPI, HTTPException, Query, Request, Response
+from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field, validator
 
 from ..services import (
     DataQualityError,
     build_check_all_datas,
-    build_inspection_payload,
     build_placeholder_snapshot,
     dispatch_trade_analysis,
-    build_profile_package,
-    DEFAULT_SYMBOL,
-    delete_preset,
-    get_snapshot,
-    list_presets_configs,
-    list_snapshots,
-    normalise_ohlcv,
-    preset_to_payload,
-    register_snapshot,
-    render_inspection_page,
-    resolve_profile_config,
-    save_preset,
-    update_preset,
 )
-from ..services.zones import Config as ZonesConfig, detect_zones
+from ..services.analysis import SYSTEM_PROMPT
 from ..version import APP_VERSION
-from ..meta import Meta
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PUBLIC_DIR = PROJECT_ROOT / "public"
 TEMPLATES_DIR = PROJECT_ROOT / "templates"
+UPLOAD_DIR = PROJECT_ROOT / "uploads"
 
-app = FastAPI(title="Chart OHLC API")
+DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+DEFAULT_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.2"))
 
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="Trading Copilot API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -56,7 +48,7 @@ if PUBLIC_DIR.is_dir():
 
 
 def _extract_openai_error(response: httpx.Response) -> Any | None:
-    """Return a sanitised representation of an OpenAI error payload."""
+    """Extract a readable error payload from the OpenAI API."""
 
     if response is None:
         return None
@@ -65,725 +57,270 @@ def _extract_openai_error(response: httpx.Response) -> Any | None:
         payload = response.json()
     except ValueError:
         text = response.text
-        if not text:
-            return None
-        stripped = text.strip()
-        return stripped[:500] if len(stripped) > 500 else stripped
+        return text.strip()[:500] if text else None
 
     if isinstance(payload, Mapping):
         error_node = payload.get("error")
         if isinstance(error_node, Mapping):
-            cleaned: Dict[str, Any] = {}
+            cleaned: dict[str, Any] = {}
             for key in ("message", "type", "code", "param"):
                 value = error_node.get(key)
-                if isinstance(value, str):
-                    trimmed = value.strip()
-                    if trimmed:
-                        cleaned[key] = trimmed[:500] if len(trimmed) > 500 else trimmed
+                if isinstance(value, str) and value.strip():
+                    cleaned[key] = value.strip()[:500]
                 elif value is not None:
                     cleaned[key] = value
             if cleaned:
                 return cleaned
-            return {
-                key: error_node[key]
-                for key in error_node.keys()
-                if key in {"message", "type", "code", "param"} and error_node[key] is not None
-            } or str(error_node)[:500]
-        message = payload.get("message")
-        if isinstance(message, str) and message.strip():
-            trimmed = message.strip()
-            return trimmed[:500] if len(trimmed) > 500 else trimmed
-        return str(payload)[:500]
+            return str(error_node)[:500]
+        return payload
 
     if isinstance(payload, Sequence) and not isinstance(payload, (str, bytes, bytearray)):
-        return [payload[index] for index in range(min(len(payload), 5))]
+        return payload[:5]
 
     return payload
 
 
-@app.post("/inspection/snapshot")
-async def register_inspection_snapshot(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
+class ChatMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
+    @validator("content")
+    def _validate_content(cls, value: str) -> str:
+        if not value or not value.strip():
+            raise ValueError("content cannot be empty")
+        return value
+
+
+class ChatSettings(BaseModel):
+    model: str = Field(default=DEFAULT_MODEL, max_length=120)
+    temperature: float = Field(default=DEFAULT_TEMPERATURE, ge=0.0, le=2.0)
+    top_p: float | None = Field(default=None, ge=0.0, le=1.0)
+    api_base: str | None = Field(default=None, max_length=200)
+
+
+class ChatRequest(BaseModel):
+    system_prompt: str = Field(default=SYSTEM_PROMPT)
+    messages: Sequence[ChatMessage]
+    settings: ChatSettings = Field(default_factory=ChatSettings)
+    api_key: str = Field(min_length=10)
+
+
+class ChatResponse(BaseModel):
+    reply: str
+    usage: dict[str, Any] | None = None
+    raw: dict[str, Any] | None = None
+
+
+class TestEnvironmentRequest(BaseModel):
+    symbol: str = Field(default="BTCUSDT", max_length=32)
+    timeframe: str = Field(default="1m", max_length=8)
+    start: datetime | None = None
+    end: datetime | None = None
+
+
+class TradeAnalysisRequest(BaseModel):
+    api_key: str = Field(min_length=10)
+    model: str = Field(default=DEFAULT_MODEL, max_length=120)
+    system_prompt: str | None = None
+    api_base: str | None = Field(default=None, max_length=200)
+    symbol: str = Field(default="BTCUSDT", max_length=32)
+    timeframe: str = Field(default="1m", max_length=8)
+    period: str = Field(default="last_4h", max_length=32)
+    last_price: float | None = None
+
+
+def _render_test_environment_window(data: Mapping[str, Any]) -> str:
+    pretty = html.escape(json.dumps(data, ensure_ascii=False, indent=2))
+    return (
+        "<!DOCTYPE html><html lang=\"ru\"><head><meta charset=\"UTF-8\" />"
+        "<title>test environment</title><style>body{margin:0;background:#0f172a;color:#e2e8f0;font:14px/1.5 'JetBrains Mono',monospace;}"
+        "pre{padding:24px;white-space:pre-wrap;word-break:break-word;}</style></head><body>"
+        f"<pre>{pretty}</pre></body></html>"
+    )
+
+
+async def _call_chat_completion(payload: ChatRequest) -> ChatResponse:
+    base_url = payload.settings.api_base or os.getenv("OPENAI_API_BASE", "https://api.openai.com")
+    url = f"{base_url.rstrip('/')}/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {payload.api_key}",
+        "Content-Type": "application/json",
+    }
+
+    body: dict[str, Any] = {
+        "model": payload.settings.model,
+        "temperature": payload.settings.temperature,
+        "messages": [
+            {"role": "system", "content": payload.system_prompt},
+            *[
+                {"role": message.role, "content": message.content}
+                for message in payload.messages
+            ],
+        ],
+    }
+    if payload.settings.top_p is not None:
+        body["top_p"] = payload.settings.top_p
+
+    logger.info(
+        "ChatGPT request",
+        extra={
+            "endpoint": "chat.completions",
+            "model": payload.settings.model,
+            "message_count": len(body["messages"]),
+            "temperature": payload.settings.temperature,
+        },
+    )
+
+    async with httpx.AsyncClient(timeout=None) as client:
+        response = await client.post(url, headers=headers, json=body)
+
+    if not response.is_success:
+        detail = _extract_openai_error(response)
+        raise HTTPException(
+            status_code=response.status_code,
+            detail={"message": "OpenAI request failed", "openai_error": detail},
+        )
+
+    data = response.json()
+    reply = ""
     try:
-        snapshot_id = register_snapshot(payload)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"snapshot_id": snapshot_id}
+        reply = data["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError, AttributeError, TypeError):
+        reply = ""
+
+    usage = data.get("usage") if isinstance(data, Mapping) else None
+    raw = data if isinstance(data, Mapping) else None
+    return ChatResponse(reply=reply or "", usage=usage, raw=raw)
 
 
-@app.get("/inspection", response_class=HTMLResponse)
-async def inspection(
-    request: Request,
-    snapshot: str | None = Query(None, description="Snapshot identifier"),
-) -> HTMLResponse:
-    snapshots = list_snapshots()
+def _build_check_all_payload(symbol: str, timeframe: str, start: datetime | None, end: datetime | None) -> dict[str, Any]:
+    snapshot = build_placeholder_snapshot(symbol=symbol, timeframe=timeframe)
+    selection_start_ms = int(start.timestamp() * 1000) if start else None
+    selection_end_ms = int(end.timestamp() * 1000) if end else None
 
-    target_snapshot = None
+    error: str | None = None
+    try:
+        check_all = build_check_all_datas(
+            snapshot,
+            now_utc=datetime.now(timezone.utc),
+            selection_start_ms=selection_start_ms,
+            selection_end_ms=selection_end_ms,
+            hours=4,
+        )
+    except DataQualityError as exc:
+        check_all = None
+        error = str(exc)
 
-    if snapshot:
-        target_snapshot = get_snapshot(snapshot)
-        if target_snapshot is None:
-            raise HTTPException(status_code=404, detail="Snapshot not found")
-    elif snapshots:
-        target_snapshot = get_snapshot(snapshots[0]["id"])  # type: ignore[index]
+    result: dict[str, Any] = {"snapshot": snapshot, "check_all": check_all}
+    if error:
+        result["error"] = error
+    return result
 
-    if target_snapshot is None:
-        profile_config = resolve_profile_config(DEFAULT_SYMBOL, None)
-        placeholder_payload = {
-            "DATA": {
-                "symbol": DEFAULT_SYMBOL,
-                "frames": {},
-                "selection": None,
-                "delta_cvd": {},
-                "vwap_tpo": {},
-                "zones": {
-                    "symbol": DEFAULT_SYMBOL,
-                    "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
-                },
-                "tpo": {"sessions": [], "zones": []},
-                "zones_raw": None,
-                "profile": [],
-                "profile_preset": profile_config.get("preset_payload"),
-                "profile_preset_required": bool(profile_config.get("preset_required", False)),
-                "profile_defaults": None,
-                "smt": {"status": "waiting", "detail": "Создайте первый снэпшот"},
-                "meta": {"requested": {"symbol": DEFAULT_SYMBOL, "frames": []}, "source": {}},
+
+@app.get("/api/chat/defaults")
+async def chat_defaults() -> JSONResponse:
+    return JSONResponse(
+        {
+            "system_prompt": SYSTEM_PROMPT,
+            "settings": {
+                "model": DEFAULT_MODEL,
+                "temperature": DEFAULT_TEMPERATURE,
+                "top_p": None,
             },
-            "DIAGNOSTICS": {"generated_at": None, "snapshot_id": None, "captured_at": None, "frames": {}},
         }
-        html = render_inspection_page(
-            placeholder_payload,
-            snapshot_id=None,
-            symbol=DEFAULT_SYMBOL,
-            timeframe="1m",
-            snapshots=snapshots,
-        )
-        return HTMLResponse(content=html)
-
-    payload = build_inspection_payload(target_snapshot)
-
-    accept_header = request.headers.get("accept", "").lower()
-    if "application/json" in accept_header:
-        return JSONResponse(payload)
-
-    html = render_inspection_page(
-        payload,
-        snapshot_id=target_snapshot.get("id"),
-        symbol=target_snapshot.get("symbol", "UNKNOWN"),
-        timeframe=target_snapshot.get("tf", "1m"),
-        snapshots=snapshots,
-    )
-    return HTMLResponse(content=html)
-
-
-@app.get("/inspection/snapshots")
-async def inspection_snapshots() -> JSONResponse:
-    return JSONResponse(list_snapshots())
-
-
-@app.get("/inspection/check-all")
-async def inspection_check_all(
-    snapshot: str | None = Query(None, description="Snapshot identifier"),
-    now: str | None = Query(
-        None,
-        description="Override the as-of timestamp (ISO 8601, defaults to last candle)",
-    ),
-    selection_start: int | None = Query(
-        None,
-        description="Override the start of the analysed window (milliseconds)",
-    ),
-    selection_end: int | None = Query(
-        None,
-        description="Override the end of the analysed window (milliseconds)",
-    ),
-    hours: int | None = Query(
-        None,
-        description="Number of recent hours to collect detailed data for (1-4)",
-    ),
-) -> Response:
-    snapshots = list_snapshots()
-
-    target_snapshot = None
-    if snapshot:
-        target_snapshot = get_snapshot(snapshot)
-        if target_snapshot is None:
-            raise HTTPException(status_code=404, detail="Snapshot not found")
-    elif snapshots:
-        target_snapshot = get_snapshot(snapshots[0]["id"])  # type: ignore[index]
-
-    if target_snapshot is None:
-        return Response(status_code=204)
-
-    now_override = None
-    if now:
-        try:
-            parsed = datetime.fromisoformat(now)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail="Invalid now parameter") from exc
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        else:
-            parsed = parsed.astimezone(timezone.utc)
-        now_override = parsed
-
-    try:
-        payload = build_check_all_datas(
-            target_snapshot,
-            now_utc=now_override,
-            selection_start_ms=selection_start,
-            selection_end_ms=selection_end,
-            hours=hours,
-        )
-    except DataQualityError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail={"message": str(exc), "data_quality": exc.detail},
-        ) from exc
-    if payload is None:
-        return Response(status_code=204)
-
-    return JSONResponse(payload)
-
-
-@app.post("/api/analyze-from-inspection")
-async def analyze_from_inspection(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
-    snapshot_id = payload.get("snapshot_id")
-    if not snapshot_id or not isinstance(snapshot_id, str):
-        raise HTTPException(status_code=400, detail="snapshot_id is required")
-
-    selection_start_raw = payload.get("selection_start")
-    selection_end_raw = payload.get("selection_end")
-    hours_raw = payload.get("hours")
-    period_raw = payload.get("period")
-
-    try:
-        selection_start = int(selection_start_raw)
-        selection_end = int(selection_end_raw)
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="selection_start and selection_end must be integers")
-
-    if selection_end < selection_start:
-        selection_start, selection_end = selection_end, selection_start
-
-    try:
-        hours = int(hours_raw)
-    except (TypeError, ValueError):
-        hours = 1
-    hours = max(1, min(4, hours))
-
-    target_snapshot = get_snapshot(snapshot_id)
-    if target_snapshot is None:
-        raise HTTPException(status_code=404, detail="Snapshot not found")
-
-    try:
-        check_payload = build_check_all_datas(
-            target_snapshot,
-            selection_start_ms=selection_start,
-            selection_end_ms=selection_end,
-            hours=hours,
-        )
-    except DataQualityError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail={"message": str(exc), "data_quality": exc.detail},
-        ) from exc
-
-    if check_payload is None:
-        raise HTTPException(status_code=400, detail="Snapshot does not contain analyzable data")
-
-    symbol = str(
-        check_payload.get("symbol")
-        or target_snapshot.get("symbol")
-        or target_snapshot.get("pair")
-        or "UNKNOWN"
     )
 
-    period = None
-    if isinstance(period_raw, str) and period_raw.strip():
-        period = period_raw.strip()
-    else:
-        meta_source = target_snapshot.get("meta")
-        if isinstance(meta_source, Mapping):
-            if isinstance(meta_source.get("period"), str) and meta_source.get("period").strip():
-                period = str(meta_source.get("period")).strip()
-            elif isinstance(meta_source.get("window"), Mapping):
-                label = meta_source["window"].get("label")
-                if isinstance(label, str) and label.strip():
-                    period = label.strip()
-    if period is None:
-        requested_meta = (
-            check_payload.get("profile_preset")
-            if isinstance(check_payload, Mapping)
-            else None
-        )
-        if isinstance(requested_meta, Mapping):
-            key = requested_meta.get("preset_key") or requested_meta.get("period")
-            if isinstance(key, str) and key.strip():
-                period = key.strip()
-    if period is None:
-        period = "custom_range"
 
-    latest_candle = check_payload.get("latest_candle") if isinstance(check_payload, Mapping) else None
-    price_candidates = []
-    if isinstance(latest_candle, Mapping):
-        for key in ("c", "close", "price", "close_price", "last_price"):
-            value = latest_candle.get(key)
-            if isinstance(value, (int, float)):
-                price_candidates.append(float(value))
-    if not price_candidates:
-        maybe_series = check_payload.get("datas_for_last_N_hours") if isinstance(check_payload, Mapping) else None
-        if isinstance(maybe_series, Mapping):
-            frame = maybe_series.get("frames")
-            if isinstance(frame, Mapping):
-                minute_frame = frame.get("1m")
-                if isinstance(minute_frame, Mapping):
-                    candles = minute_frame.get("candles")
-                    if isinstance(candles, Sequence) and candles:
-                        tail = candles[-1]
-                        if isinstance(tail, Mapping):
-                            value = tail.get("c") or tail.get("close")
-                            if isinstance(value, (int, float)):
-                                price_candidates.append(float(value))
-    last_price = price_candidates[0] if price_candidates else 0.0
+@app.post("/api/chat")
+async def chat_endpoint(payload: ChatRequest = Body(...)) -> JSONResponse:
+    if not payload.messages:
+        raise HTTPException(status_code=400, detail="messages cannot be empty")
 
-    api_key: str | None = None
-    api_key_raw = payload.get("api_key")
-    if isinstance(api_key_raw, str):
-        candidate = api_key_raw.strip()
-        if candidate:
-            api_key = candidate
-
-    if not api_key:
-        env_key = os.environ.get("OPENAI_API_KEY")
-        if isinstance(env_key, str):
-            candidate = env_key.strip()
-            if candidate:
-                api_key = candidate
-
-    if not api_key:
-        raise HTTPException(status_code=400, detail="OpenAI API key is required")
-
-    model_candidate = payload.get("model")
-    model_id = "gpt-5"
-    if isinstance(model_candidate, str) and model_candidate.strip().lower() == "gpt-5":
-        model_id = "gpt-5"
-    else:
-        env_model = os.environ.get("OPENAI_MODEL_ID")
-        if isinstance(env_model, str) and env_model.strip().lower() == "gpt-5":
-            model_id = "gpt-5"
-
-    upload_dir = Path(
-        os.environ.get(
-            "ANALYSIS_UPLOAD_DIR",
-            str(PROJECT_ROOT / "var" / "analysis_uploads"),
-        )
-    ).expanduser()
-
-    api_base = os.environ.get("OPENAI_API_BASE")
-
-    try:
-        analysis_result = await dispatch_trade_analysis(
-            check_payload,
-            symbol=symbol,
-            period=period,
-            last_price=last_price,
-            upload_dir=upload_dir,
-            api_key=api_key,
-            model=model_id,
-            api_base=api_base,
-        )
-    except httpx.HTTPStatusError as exc:
-        openai_error_details = _extract_openai_error(exc.response)
-        logging.getLogger(__name__).exception(
-            "OpenAI request returned an error",
-            extra={
-                "snapshot_id": snapshot_id,
-                "status_code": exc.response.status_code,
-                "openai_error": openai_error_details,
-            },
-        )
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "message": "OpenAI returned an error",
-                "status_code": exc.response.status_code,
-                "openai_error": openai_error_details,
-            },
-        ) from exc
-    except httpx.RequestError as exc:
-        logging.getLogger(__name__).exception(
-            "Failed to reach OpenAI",
-            extra={"snapshot_id": snapshot_id},
-        )
-        raise HTTPException(
-            status_code=502,
-            detail="Failed to reach OpenAI",
-        ) from exc
-    except Exception as exc:  # pragma: no cover - defensive logging
-        logging.getLogger(__name__).exception(
-            "Unexpected error during trade analysis",
-            extra={"snapshot_id": snapshot_id},
-        )
-        raise HTTPException(status_code=502, detail="Trade analysis failed") from exc
-
-    debug_block: Dict[str, Any] = {
-        "symbol": symbol,
-        "period": period,
-        "last_price": last_price,
-        "model": model_id,
-        "attachment_file": analysis_result.file_path.name,
-        "attachment_size_bytes": analysis_result.attachment_size,
-        "attachment_sha256": analysis_result.attachment_sha256,
-        "latency_ms": analysis_result.latency_ms,
-    }
-    if analysis_result.raw_text and analysis_result.status != "ok":
-        debug_block["raw_text"] = analysis_result.raw_text
-
-    response_payload = {
-        "status": analysis_result.status,
-        "request_id": analysis_result.request_id,
-        "trade_json": analysis_result.trade_json,
-        "debug": debug_block,
-    }
-
-    return JSONResponse(response_payload)
+    response = await _call_chat_completion(payload)
+    return JSONResponse(response.dict())
 
 
-@app.get("/presets")
-async def list_presets_endpoint() -> JSONResponse:
-    presets = [preset_to_payload(item) for item in list_presets_configs()]
-    return JSONResponse({"ok": True, "presets": presets})
-
-
-@app.get("/presets/{symbol}")
-async def get_preset_endpoint(symbol: str) -> JSONResponse:
-    config = resolve_profile_config(symbol, None)
-    preset = config.get("preset")
-    payload = preset_to_payload(preset) if preset else None
-    return JSONResponse({"ok": True, "preset": payload})
-
-
-@app.post("/presets")
-async def create_preset_endpoint(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
-    symbol = payload.get("symbol")
-    if not symbol or not isinstance(symbol, str):
-        raise HTTPException(status_code=400, detail="symbol is required")
-    symbol_value = symbol.strip().upper()
-    body = dict(payload)
-    body.pop("symbol", None)
-    try:
-        preset = save_preset(symbol_value, body)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return JSONResponse({"ok": True, "preset": preset_to_payload(preset)})
-
-
-@app.put("/presets/{symbol}")
-async def update_preset_endpoint(symbol: str, payload: Dict[str, Any] = Body(...)) -> JSONResponse:
-    body = dict(payload)
-    try:
-        preset = update_preset(symbol, body)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return JSONResponse({"ok": True, "preset": preset_to_payload(preset)})
-
-
-@app.delete("/presets/{symbol}")
-async def delete_preset_endpoint(symbol: str) -> JSONResponse:
-    delete_preset(symbol)
-    return JSONResponse({"ok": True})
-
-
-@app.get("/profile")
-async def profile_endpoint(
-    snapshot: str = Query(..., description="Snapshot identifier"),
-    tf: str = Query("1m", description="Timeframe to analyse"),
-    last_n: int = Query(3, description="Number of recent sessions to include"),
-    tick_size: float | None = Query(None, description="Optional explicit tick size"),
-    adaptive_bins: bool | None = Query(None, description="Use adaptive ATR-based binning when no tick size"),
-    value_area_pct: float = Query(0.7, description="Value area coverage (0-1)"),
+@app.get("/api/check-all")
+async def check_all_default(
+    symbol: str = Query("BTCUSDT", max_length=32),
+    timeframe: str = Query("1m", max_length=8),
 ) -> JSONResponse:
-    target_snapshot = get_snapshot(snapshot)
-    if target_snapshot is None:
-        raise HTTPException(status_code=404, detail="Snapshot not found")
+    data = _build_check_all_payload(symbol, timeframe, None, None)
+    return JSONResponse(data)
 
-    symbol = str(target_snapshot.get("symbol") or target_snapshot.get("pair") or "UNKNOWN").upper()
 
-    timeframe = str(tf or target_snapshot.get("tf") or "1m").lower()
+@app.post("/api/test-environment")
+async def create_test_environment(payload: TestEnvironmentRequest = Body(...)) -> JSONResponse:
+    data = _build_check_all_payload(payload.symbol, payload.timeframe, payload.start, payload.end)
+    html_payload = _render_test_environment_window(data["check_all"] or {})
+    data["rendered_html"] = html_payload
+    return JSONResponse(data)
 
-    if last_n <= 0:
-        raise HTTPException(status_code=400, detail="last_n must be positive")
 
-    frames_data = target_snapshot.get("frames")
-    frames = frames_data if isinstance(frames_data, Mapping) else {}
-    raw_frame = None
-    if isinstance(frames, dict):
-        raw_frame = frames.get(timeframe) or frames.get(timeframe.upper())
-    if raw_frame is None and "candles" in target_snapshot:
-        raw_frame = {"candles": target_snapshot.get("candles")}
+@app.post("/api/trade-analysis")
+async def trade_analysis(payload: TradeAnalysisRequest = Body(...)) -> JSONResponse:
+    snapshot = build_placeholder_snapshot(symbol=payload.symbol, timeframe=payload.timeframe)
+    upload_dir = UPLOAD_DIR
+    upload_dir.mkdir(parents=True, exist_ok=True)
 
-    if isinstance(raw_frame, dict):
-        raw_candles = raw_frame.get("candles", [])
-    elif isinstance(raw_frame, (list, tuple)):
-        raw_candles = raw_frame
-    else:
-        raw_candles = []
+    logger.info(
+        "ChatGPT request",
+        extra={
+            "endpoint": "trade-analysis",
+            "model": payload.model,
+            "symbol": payload.symbol,
+            "timeframe": payload.timeframe,
+        },
+    )
 
-    use_full_span = timeframe == "1m"
-
-    try:
-        normalised = normalise_ohlcv(
-            symbol,
-            timeframe,
-            raw_candles,
-            use_full_span=use_full_span,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    candles = normalised.get("candles", []) if isinstance(normalised, dict) else []
-
-    profile_config = resolve_profile_config(symbol, target_snapshot.get("meta") if isinstance(target_snapshot.get("meta"), Mapping) else None)
-
-    target_tf_key = timeframe or profile_config.get("target_tf_key", "1m")
-    last_n_value = max(1, min(5, int(last_n or profile_config.get("last_n", 3))))
-
-    tick_size_value = tick_size if tick_size is not None else profile_config.get("tick_size")
-    adaptive_flag = adaptive_bins
-    if tick_size is None:
-        adaptive_flag = adaptive_bins if adaptive_bins is not None else bool(profile_config.get("adaptive_bins", True))
-    else:
-        adaptive_flag = bool(adaptive_bins)
-
-    value_area = value_area_pct if value_area_pct is not None else float(profile_config.get("value_area_pct", 0.7))
-    value_area = max(0.0, min(1.0, float(value_area)))
-
-    sessions = list(Meta.iter_vwap_sessions())
-    tpo_entries: list[dict[str, object]] = []
-    tpo_zones: list[dict[str, Any]] = []
-    flattened_profile: list[dict[str, float]] = []
-
-    detected_zones = {
-        "symbol": symbol,
-        "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
-    }
-
-    if candles and sessions:
-        cache_token = ("profile", snapshot, symbol, target_tf_key)
-        (tpo_entries, flattened_profile, tpo_zones) = build_profile_package(
-            candles,
-            sessions=sessions,
-            last_n=last_n_value,
-            tick_size=tick_size_value,
-            adaptive_bins=bool(adaptive_flag),
-            value_area_pct=value_area,
-            atr_multiplier=float(profile_config.get("atr_multiplier", 0.5)),
-            target_bins=int(profile_config.get("target_bins", 80)),
-            clip_threshold=float(profile_config.get("clip_threshold", 0.0)),
-            smooth_window=int(profile_config.get("smooth_window", 1)),
-            cache_token=cache_token,
-            tf_key=target_tf_key,
-        )
+    frames = snapshot.get("frames", {}) if isinstance(snapshot, Mapping) else {}
+    frame_node = frames.get(payload.timeframe)
+    candles: list[Mapping[str, Any]] = []
+    if isinstance(frame_node, Mapping):
+        raw_candles = frame_node.get("candles")
+        if isinstance(raw_candles, list):
+            candles = [item for item in raw_candles if isinstance(item, Mapping)]
+    last_price = payload.last_price
+    if last_price is None and candles:
         try:
-            zone_cfg = ZonesConfig(tick_size=tick_size_value)
-            detected_zones = detect_zones(
-                candles,
-                target_tf_key,
-                symbol,
-                zone_cfg,
-            )
-        except Exception as exc:
-            logging.getLogger(__name__).exception(
-                "Failed to detect zones for profile endpoint",
-                extra={
-                    "snapshot": snapshot,
-                    "symbol": symbol,
-                    "timeframe": target_tf_key,
-                },
-            )
+            last_price = float(candles[-1].get("c"))
+        except (ValueError, TypeError, AttributeError):
+            last_price = None
 
-            detected_zones = {
-                "symbol": symbol,
-                "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
-            }
+    result = await dispatch_trade_analysis(
+        snapshot,
+        symbol=payload.symbol,
+        period=payload.period,
+        last_price=last_price,
+        upload_dir=upload_dir,
+        api_key=payload.api_key,
+        model=payload.model,
+        api_base=payload.api_base,
+        system_prompt=payload.system_prompt,
+    )
 
-    payload = {
-        "symbol": symbol,
-        "tf": target_tf_key,
-        "tpo": {"sessions": tpo_entries, "zones": tpo_zones},
-        "profile": flattened_profile,
-        "zones": detected_zones,
-        "preset": profile_config.get("preset_payload"),
-        "preset_required": bool(profile_config.get("preset_required", False)),
+    body = {
+        "status": result.status,
+        "request_id": result.request_id,
+        "trade_json": result.trade_json,
+        "raw_text": result.raw_text,
+        "latency_ms": result.latency_ms,
+        "attachment_size": result.attachment_size,
+        "attachment_sha256": result.attachment_sha256,
+        "attachment_path": str(result.file_path),
     }
-    return JSONResponse(payload)
-
-
-@app.get("/zones")
-async def zones_endpoint(
-    snapshot: str | None = Query(None, description="Snapshot identifier"),
-    tf: str | None = Query(None, description="Timeframe to analyse"),
-    symbol: str | None = Query(None, description="Symbol override"),
-    min_gap_pct: float | None = Query(None, description="Minimum FVG size ratio"),
-    atr_period: int | None = Query(None, description="ATR period"),
-    k_impulse: float | None = Query(None, description="Impulse multiplier threshold"),
-    w_swing: int | None = Query(None, description="Swing width"),
-    r_zone_pct: float | None = Query(None, description="Zone proximity ratio"),
-    m_wick_atr: float | None = Query(None, description="Maximum wick ATR multiple"),
-    tick_size: float | None = Query(None, description="Explicit tick size"),
-    body: Dict[str, Any] | None = Body(None),
-) -> JSONResponse:
-    payload_body = body or {}
-
-    def _num(source: Mapping[str, Any], key: str) -> float | None:
-        value = source.get(key)
-        if isinstance(value, (int, float)):
-            return float(value)
-        return None
-
-    def _int(source: Mapping[str, Any], key: str) -> int | None:
-        value = source.get(key)
-        if isinstance(value, int):
-            return value
-        if isinstance(value, float):
-            return int(value)
-        return None
-
-    candles_data: Sequence[Mapping[str, Any]] | None = None
-    tick_size_value = tick_size if tick_size is not None else None
-    symbol_value = str(symbol or payload_body.get("symbol") or "").upper()
-    timeframe_value = str(tf or payload_body.get("tf") or "").lower()
-
-    if snapshot:
-        target_snapshot = get_snapshot(snapshot)
-        if target_snapshot is None:
-            raise HTTPException(status_code=404, detail="Snapshot not found")
-
-        symbol_value = str(
-            symbol
-            or target_snapshot.get("symbol")
-            or target_snapshot.get("pair")
-            or "UNKNOWN"
-        ).upper()
-
-        timeframe_value = str(tf or target_snapshot.get("tf") or "1m").lower()
-
-        frames_data = target_snapshot.get("frames")
-        frames = frames_data if isinstance(frames_data, Mapping) else {}
-        raw_frame = None
-        if isinstance(frames, dict):
-            raw_frame = frames.get(timeframe_value) or frames.get(timeframe_value.upper())
-        if raw_frame is None and "candles" in target_snapshot:
-            raw_frame = {"candles": target_snapshot.get("candles")}
-
-        if isinstance(raw_frame, Mapping):
-            raw_candles = raw_frame.get("candles", [])
-        elif isinstance(raw_frame, (list, tuple)):
-            raw_candles = raw_frame
-        else:
-            raw_candles = []
-
-        candles_data = list(raw_candles)
-
-        profile_config = resolve_profile_config(
-            symbol_value, target_snapshot.get("meta") if isinstance(target_snapshot.get("meta"), Mapping) else None
-        )
-        body_tick = _num(payload_body, "tick_size")
-        if tick_size_value is None:
-            tick_size_value = body_tick if body_tick is not None else profile_config.get("tick_size")
-    else:
-        candles_raw = payload_body.get("candles")
-        if not symbol_value:
-            symbol_value = DEFAULT_SYMBOL
-        if not timeframe_value:
-            raise HTTPException(status_code=400, detail="tf is required")
-        if not isinstance(candles_raw, Sequence):
-            raise HTTPException(status_code=400, detail="candles must be a sequence")
-        candles_data = list(candles_raw)  # type: ignore[list-item]
-        body_tick = _num(payload_body, "tick_size")
-        if tick_size_value is None and body_tick is not None:
-            tick_size_value = body_tick
-
-        try:
-            profile_config = resolve_profile_config(symbol_value, None)
-        except Exception:  # pragma: no cover - resolve_profile_config may raise
-            profile_config = {}
-        if tick_size_value is None:
-            tick_size_value = profile_config.get("tick_size") if isinstance(profile_config, Mapping) else None
-
-    if not candles_data:
-        raise HTTPException(status_code=400, detail="No candles provided")
-
-    if not symbol_value:
-        symbol_value = DEFAULT_SYMBOL
-
-    if not timeframe_value:
-        raise HTTPException(status_code=400, detail="tf is required")
-
-    cfg_kwargs: Dict[str, Any] = {}
-    body_min_gap = _num(payload_body, "min_gap_pct")
-    if min_gap_pct is not None:
-        cfg_kwargs["min_gap_pct"] = float(min_gap_pct)
-    elif body_min_gap is not None:
-        cfg_kwargs["min_gap_pct"] = float(body_min_gap)
-
-    body_atr_period = _int(payload_body, "atr_period")
-    if atr_period is not None:
-        cfg_kwargs["atr_period"] = int(atr_period)
-    elif body_atr_period is not None:
-        cfg_kwargs["atr_period"] = int(body_atr_period)
-
-    body_k_impulse = _num(payload_body, "k_impulse")
-    if k_impulse is not None:
-        cfg_kwargs["k_impulse"] = float(k_impulse)
-    elif body_k_impulse is not None:
-        cfg_kwargs["k_impulse"] = float(body_k_impulse)
-
-    body_w_swing = _int(payload_body, "w_swing")
-    if w_swing is not None:
-        cfg_kwargs["w_swing"] = int(w_swing)
-    elif body_w_swing is not None:
-        cfg_kwargs["w_swing"] = int(body_w_swing)
-
-    body_r_zone_pct = _num(payload_body, "r_zone_pct")
-    if r_zone_pct is not None:
-        cfg_kwargs["r_zone_pct"] = float(r_zone_pct)
-    elif body_r_zone_pct is not None:
-        cfg_kwargs["r_zone_pct"] = float(body_r_zone_pct)
-
-    body_m_wick_atr = _num(payload_body, "m_wick_atr")
-    if m_wick_atr is not None:
-        cfg_kwargs["m_wick_atr"] = float(m_wick_atr)
-    elif body_m_wick_atr is not None:
-        cfg_kwargs["m_wick_atr"] = float(body_m_wick_atr)
-
-    cfg_kwargs["tick_size"] = tick_size_value
-
-    zone_cfg = ZonesConfig(**cfg_kwargs)
-
-    try:
-        result = detect_zones(candles_data or [], timeframe_value, symbol_value, zone_cfg)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    return JSONResponse(result)
-
-
-@app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return JSONResponse(body)
 
 
 @app.get("/version")
-async def version() -> dict[str, str]:
-    return {"version": APP_VERSION}
+async def version() -> JSONResponse:
+    return JSONResponse({"version": APP_VERSION})
 
 
 @app.get("/", response_class=HTMLResponse)
 async def index() -> HTMLResponse:
     try:
-        html = TEMPLATES_DIR.joinpath("index.html").read_text(encoding="utf-8")
+        html_content = TEMPLATES_DIR.joinpath("index.html").read_text(encoding="utf-8")
     except FileNotFoundError as exc:  # pragma: no cover - deployment guard
         raise HTTPException(status_code=500, detail="Index template is missing") from exc
-    return HTMLResponse(content=html)
-
-
+    return HTMLResponse(content=html_content)

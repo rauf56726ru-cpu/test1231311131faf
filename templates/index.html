@@ -3,76 +3,128 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Свечной график Binance</title>
+    <title>Trading Copilot</title>
     <link rel="stylesheet" href="/public/styles.css" />
-    <script src="https://unpkg.com/lightweight-charts@4.0.0/dist/lightweight-charts.standalone.production.js"></script>
-    <script src="/public/binanceCandles.js" defer></script>
-    <script src="/public/chart-gap-watcher.js" defer></script>
-    <script src="/public/shared-candles.js" defer></script>
     <script src="/public/app.js" defer></script>
   </head>
   <body>
     <header class="page-header">
-      <div class="header-top">
-        <h1>Интерактивный свечной график</h1>
-        <div class="header-controls">
-          <div class="app-meta" aria-live="polite">
-            <span class="app-meta__label">Версия:</span>
-            <span id="app-version" class="app-meta__value">—</span>
-          </div>
-          <button id="show-inspection" class="btn-secondary" type="button">Inspection</button>
+      <div class="header-main">
+        <div>
+          <h1>Trading Copilot</h1>
+          <p class="subtitle">
+            Управляйте анализом: чат с моделью, быстрый просмотр check_all_datas и генерация сделки.
+          </p>
+        </div>
+        <div class="header-actions">
+          <button id="open-settings" class="btn-secondary" type="button">
+            Изменить настройки модели
+          </button>
         </div>
       </div>
-      <p>Выберите тикер и интервал, чтобы отобразить историю Binance с авто-заполнением гэпов и живым обновлением.</p>
     </header>
 
     <main class="page-main">
-      <section class="controls-card">
-        <form id="chart-controls" class="controls-form">
-          <label class="form-field">
-            <span>Тикер</span>
-            <input id="input-symbol" type="text" value="BTCUSDT" required autocomplete="off" />
+      <section class="card chat-card">
+        <div class="card-header">
+          <h2>Чат с моделью</h2>
+        </div>
+        <div class="prompt-editor">
+          <label class="field">
+            <span>Дефолтный промпт</span>
+            <textarea id="system-prompt" rows="6" spellcheck="false"></textarea>
           </label>
-
-          <label class="form-field">
-            <span>Интервал</span>
-            <select id="input-interval">
-              <option value="1s">1s</option>
-              <option value="1m" selected>1m</option>
-              <option value="3m">3m</option>
-              <option value="5m">5m</option>
-              <option value="15m">15m</option>
-              <option value="30m">30m</option>
-              <option value="1h">1h</option>
-              <option value="4h">4h</option>
-              <option value="1d">1d</option>
-            </select>
+          <div class="prompt-actions">
+            <button id="reset-prompt" class="btn-secondary" type="button">Сбросить</button>
+            <button id="save-prompt" class="btn-primary" type="button">Сохранить</button>
+          </div>
+        </div>
+        <div id="chat-window" class="chat-window" aria-live="polite"></div>
+        <form id="chat-form" class="chat-form">
+          <label class="field">
+            <span>Сообщение</span>
+            <textarea
+              id="chat-input"
+              rows="3"
+              placeholder="Опишите, что нужно проанализировать..."
+              required
+            ></textarea>
           </label>
-
-          <button type="submit" class="btn-primary">Построить график</button>
+          <div class="form-actions">
+            <button class="btn-primary" type="submit">Отправить</button>
+          </div>
         </form>
       </section>
 
-      <section class="chart-card">
-        <div class="chart-wrapper">
-          <div id="chart" class="chart-area" aria-label="Область графика"></div>
+      <section class="card wide-card" id="check-all-card">
+        <div class="card-header">
+          <h2>check_all_datas</h2>
+          <div class="header-buttons">
+            <button id="refresh-check-all" class="btn-secondary" type="button">Обновить</button>
+            <button id="create-test-env" class="btn-primary" type="button">Создать test environment</button>
+          </div>
         </div>
-        <aside class="chart-info">
-          <div>
-            <span class="info-label">Последняя свеча:</span>
-            <span id="last-time" class="info-value">—</span>
+        <p class="note">Выделение двух дат доступно только для тестовой среды.</p>
+        <div class="test-range">
+          <label class="field">
+            <span>Начало (UTC)</span>
+            <input id="test-start" type="datetime-local" />
+          </label>
+          <label class="field">
+            <span>Конец (UTC)</span>
+            <input id="test-end" type="datetime-local" />
+          </label>
+        </div>
+        <pre id="check-all-output" class="code-block">Нет данных</pre>
+      </section>
+
+      <section class="card wide-card" id="trade-card">
+        <div class="card-header">
+          <h2>Сделка</h2>
+          <div class="header-buttons">
+            <button id="request-trade" class="btn-primary" type="button">Получить сделку</button>
           </div>
-          <div>
-            <span class="info-label">Цена закрытия:</span>
-            <span id="last-price" class="info-value">—</span>
-          </div>
-          <div>
-            <span class="info-label">Диапазон свечи:</span>
-            <span id="last-range" class="info-value">—</span>
-          </div>
-        </aside>
-        <div id="status-message" class="status-banner" hidden></div>
+        </div>
+        <pre id="trade-output" class="code-block">Нет данных</pre>
       </section>
     </main>
+
+    <div id="settings-modal" class="modal hidden" role="dialog" aria-modal="true">
+      <div class="modal-backdrop"></div>
+      <div class="modal-content">
+        <header class="modal-header">
+          <h3>Настройки модели</h3>
+          <button id="close-settings" class="btn-icon" type="button" aria-label="Закрыть">×</button>
+        </header>
+        <form id="settings-form" class="modal-body">
+          <label class="field">
+            <span>OpenAI API key</span>
+            <input id="settings-api-key" type="password" autocomplete="off" />
+          </label>
+          <label class="field">
+            <span>Модель</span>
+            <input id="settings-model" type="text" />
+          </label>
+          <label class="field">
+            <span>Temperature</span>
+            <input id="settings-temperature" type="number" min="0" max="2" step="0.1" />
+          </label>
+          <label class="field">
+            <span>Top P (необязательно)</span>
+            <input id="settings-top-p" type="number" min="0" max="1" step="0.05" />
+          </label>
+          <label class="field">
+            <span>API Base (опционально)</span>
+            <input id="settings-api-base" type="text" />
+          </label>
+          <div class="modal-actions">
+            <button class="btn-primary" type="submit">Сохранить</button>
+            <button id="cancel-settings" class="btn-secondary" type="button">Отменить</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
   </body>
 </html>
