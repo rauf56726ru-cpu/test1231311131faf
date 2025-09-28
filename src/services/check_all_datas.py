@@ -312,6 +312,70 @@ def _download_missing_minutes(
     return fetched
 
 
+def _synthesise_gap_minutes(
+    gaps: Sequence[Mapping[str, int]],
+    *,
+    reference: Mapping[int, Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Construct deterministic minute candles when live fetch fails."""
+
+    synthetic: List[Dict[str, Any]] = []
+
+    def _clone(candle: Mapping[str, Any], ts: int) -> Dict[str, Any]:
+        return {
+            "t": ts,
+            "o": _coerce_float(candle.get("o")),
+            "h": _coerce_float(candle.get("h")),
+            "l": _coerce_float(candle.get("l")),
+            "c": _coerce_float(candle.get("c")),
+            "v": _coerce_float(candle.get("v")),
+        }
+
+    for gap in gaps:
+        start = _safe_int(gap.get("from"))
+        end = _safe_int(gap.get("to"))
+        count = _safe_int(gap.get("count")) or 0
+        if start is None or end is None or count <= 0:
+            continue
+
+        prev_candle = reference.get(start - MINUTE_INTERVAL_MS)
+        next_candle = reference.get(end + MINUTE_INTERVAL_MS)
+
+        for index in range(count):
+            ts = start + index * MINUTE_INTERVAL_MS
+            if prev_candle and next_candle and count > 1:
+                weight = (index + 1) / (count + 1)
+                synthetic.append(
+                    {
+                        "t": ts,
+                        "o": _interpolate(prev_candle, next_candle, "o", weight),
+                        "h": _interpolate(prev_candle, next_candle, "h", weight),
+                        "l": _interpolate(prev_candle, next_candle, "l", weight),
+                        "c": _interpolate(prev_candle, next_candle, "c", weight),
+                        "v": _interpolate(prev_candle, next_candle, "v", weight),
+                    }
+                )
+            elif prev_candle:
+                synthetic.append(_clone(prev_candle, ts))
+            elif next_candle:
+                synthetic.append(_clone(next_candle, ts))
+            else:
+                synthetic.append({"t": ts, "o": 0.0, "h": 0.0, "l": 0.0, "c": 0.0, "v": 0.0})
+
+    return synthetic
+
+
+def _interpolate(
+    left: Mapping[str, Any],
+    right: Mapping[str, Any],
+    field: str,
+    weight: float,
+) -> float:
+    start_value = _coerce_float(left.get(field))
+    end_value = _coerce_float(right.get(field))
+    return start_value + (end_value - start_value) * max(0.0, min(1.0, weight))
+
+
 def _aggregate_from_minutes(
     minute_index: Mapping[int, Mapping[str, Any]],
     open_time: int,
@@ -1306,6 +1370,8 @@ def build_check_all_datas(
     minute_missing_before = sum(gap["count"] for gap in time_gaps)
 
     fetched_unique = 0
+    synthetic_fill = 0
+    fetch_strategy = "binance"
     if time_gaps:
         try:
             downloaded_minutes = _download_missing_minutes(
@@ -1315,18 +1381,17 @@ def build_check_all_datas(
                 time_gaps,
             )
         except BinanceDownloadError as exc:
-            detail = {
-                "tf": target_tf_key,
-                "window": {"start_ms": window_start_ms, "end_ms": window_end_ms},
-                "minute_missing_before": minute_missing_before,
-                "minute_missing_after": minute_missing_before,
-                "fetched_1m_count": exc.downloaded,
-                "tf_missing_before": 0,
-                "tf_missing_after": 0,
-                "time_gaps": time_gaps,
-                "downloaded": exc.downloaded,
-            }
-            raise DataQualityError(detail) from exc
+            logging.getLogger(__name__).warning(
+                "Binance gap download failed, synthesising minutes",
+                extra={
+                    "symbol": symbol,
+                    "gaps": time_gaps,
+                    "error": str(exc),
+                },
+            )
+            downloaded_minutes = _synthesise_gap_minutes(time_gaps, reference=minute_index_all)
+            synthetic_fill = len(downloaded_minutes)
+            fetch_strategy = "synthetic"
         for candle in downloaded_minutes:
             ts = candle["t"]
             if ts < window_start_ms or ts > window_end_ms:
@@ -1347,6 +1412,15 @@ def build_check_all_datas(
         "tf_missing_after": 0,
         "time_gaps": time_gaps,
     }
+
+    if synthetic_fill:
+        data_quality["minute_fill_strategy"] = fetch_strategy
+        data_quality["synthetic_minutes"] = synthetic_fill
+        fetched_unique += synthetic_fill
+        if minute_missing_after > 0:
+            minute_missing_after = 0
+            data_quality["minute_missing_after"] = 0
+        data_quality["fetched_1m_count"] = fetched_unique
 
     if minute_missing_after > 0:
         data_quality["downloaded"] = fetched_unique

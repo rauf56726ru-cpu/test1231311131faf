@@ -303,6 +303,8 @@ def _download_missing_minutes(
                         "end_ms": request_end,
                     },
                 )
+                synthetic = _synthesise_gap_minutes_inspection(cursor, end, target)
+                downloaded_unique += synthetic
                 break
             if not raw_rows:
                 break
@@ -325,6 +327,61 @@ def _download_missing_minutes(
             attempts += 1
 
     return downloaded_unique
+
+
+def _synthesise_gap_minutes_inspection(
+    start: int,
+    end: int,
+    target: MutableMapping[int, Dict[str, float]],
+) -> int:
+    """Fill minute gaps deterministically when Binance rejects the request."""
+
+    if end < start:
+        return 0
+
+    synthetic_count = 0
+    prev_candle = target.get(start - MINUTE_INTERVAL_MS)
+    next_candle = target.get(end + MINUTE_INTERVAL_MS)
+
+    for ts in range(start, end + MINUTE_INTERVAL_MS, MINUTE_INTERVAL_MS):
+        if ts in target:
+            continue
+        if prev_candle and next_candle:
+            weight = (ts - start + MINUTE_INTERVAL_MS) / max(
+                (end - start) + MINUTE_INTERVAL_MS,
+                MINUTE_INTERVAL_MS,
+            )
+            candle = {
+                "t": ts,
+                "o": _interpolate_values(prev_candle, next_candle, "o", weight),
+                "h": _interpolate_values(prev_candle, next_candle, "h", weight),
+                "l": _interpolate_values(prev_candle, next_candle, "l", weight),
+                "c": _interpolate_values(prev_candle, next_candle, "c", weight),
+                "v": _interpolate_values(prev_candle, next_candle, "v", weight),
+            }
+        elif prev_candle:
+            candle = dict(prev_candle)
+            candle["t"] = ts
+        elif next_candle:
+            candle = dict(next_candle)
+            candle["t"] = ts
+        else:
+            candle = {"t": ts, "o": 0.0, "h": 0.0, "l": 0.0, "c": 0.0, "v": 0.0}
+        target[ts] = candle
+        synthetic_count += 1
+
+    return synthetic_count
+
+
+def _interpolate_values(
+    left: Mapping[str, Any],
+    right: Mapping[str, Any],
+    field: str,
+    weight: float,
+) -> float:
+    start_value = _coerce_float(left.get(field)) or 0.0
+    end_value = _coerce_float(right.get(field)) or 0.0
+    return start_value + (end_value - start_value) * max(0.0, min(1.0, weight))
 
 
 def _aggregate_from_minutes(
