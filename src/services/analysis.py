@@ -305,7 +305,7 @@ async def call_openai_with_attachment(
             "input": [
                 {
                     "role": "system",
-                    "content": [{"type": "text", "text": SYSTEM_PROMPT}],
+                    "content": [{"type": "input_text", "text": SYSTEM_PROMPT}],
                 },
                 {
                     "role": "user",

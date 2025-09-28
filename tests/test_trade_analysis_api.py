@@ -103,6 +103,11 @@ def analysis_env(tmp_path, monkeypatch):
     return upload_dir
 
 
+@pytest.fixture()
+def anyio_backend():  # pragma: no cover - used by pytest-anyio to limit backends
+    return "asyncio"
+
+
 def _build_snapshot_payload(base: datetime, count: int = 12) -> dict:
     candles = []
     for index in range(count):
@@ -167,6 +172,54 @@ def _install_openai_stub(
     monkeypatch.setattr(analysis, "call_openai_with_attachment", fake_call)
     return captured
 
+
+@pytest.mark.anyio
+async def test_call_openai_uses_input_text(monkeypatch, tmp_path) -> None:
+    attachment = tmp_path / "sample.json"
+    attachment.write_text("{}", encoding="utf-8")
+
+    captured: dict[str, Any] = {}
+
+    async def fake_post(client, url, *, headers=None, data=None, files=None, json_payload=None):
+        if url.endswith("/v1/files"):
+            assert files is not None
+            request = httpx.Request("POST", url)
+            return httpx.Response(200, request=request, json={"id": "file_uploaded"})
+
+        if url.endswith("/v1/responses"):
+            captured["payload"] = json_payload
+            request = httpx.Request("POST", url)
+            body = {
+                "id": "resp_123",
+                "output": [
+                    {
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": json.dumps({"symbol": "BTCUSDT"}),
+                            }
+                        ]
+                    }
+                ],
+            }
+            return httpx.Response(200, request=request, json=body)
+
+        raise AssertionError(f"unexpected url {url}")
+
+    monkeypatch.setattr(analysis, "_post_with_retry", fake_post)
+
+    result = await analysis.call_openai_with_attachment(
+        api_key="sk-test",
+        model="gpt-5",
+        file_path=attachment,
+        symbol="BTCUSDT",
+        period="3d_overview_4h_detail",
+    )
+
+    assert result.status == "ok"
+    payload = captured["payload"]
+    assert payload["input"][0]["content"][0]["type"] == "input_text"
+    assert payload["input"][1]["content"][0]["type"] == "input_text"
 
 def test_analyze_from_inspection_returns_payload(client: TestClient, analysis_env: Path, monkeypatch) -> None:
     base = datetime(2024, 6, 1, 12, tzinfo=UTC)
