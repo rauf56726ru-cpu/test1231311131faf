@@ -63,6 +63,13 @@
             <div class="chart-wrapper">
               <div id="chart" class="chart-area" aria-label="Область графика"></div>
             </div>
+            <div class="selection-toolbar" role="group" aria-label="Выбор диапазона на графике">
+              <div class="selection-summary">
+                <span class="info-label">Выделение</span>
+                <span id="selection-label" class="info-value">—</span>
+              </div>
+              <button id="clear-selection" class="btn-secondary" type="button">Сбросить</button>
+            </div>
             <aside class="chart-info">
               <div>
                 <span class="info-label">Последняя свеча</span>
@@ -121,17 +128,7 @@
             <button id="create-test-env" class="btn-primary" type="button">Создать test environment</button>
           </div>
         </div>
-        <p class="note">Выделение двух дат доступно только в тестовой среде.</p>
-        <div class="test-range">
-          <label class="field">
-            <span>Начало (UTC)</span>
-            <input id="test-start" type="datetime-local" />
-          </label>
-          <label class="field">
-            <span>Конец (UTC)</span>
-            <input id="test-end" type="datetime-local" />
-          </label>
-        </div>
+        <p class="note">Выберите на графике две свечи, чтобы зафиксировать диапазон для тестов и check_all_datas.</p>
         <pre id="check-all-output" class="code-block">Нет данных</pre>
       </section>
 

@@ -20,6 +20,8 @@
   const lastPriceEl = document.getElementById("last-price");
   const rangeEl = document.getElementById("last-range");
   const versionEl = document.getElementById("app-version");
+  const selectionLabelEl = document.getElementById("selection-label");
+  const clearSelectionBtn = document.getElementById("clear-selection");
 
   if (!chartContainer || !form || !symbolInput || !intervalInput) {
     console.error("Chart container or controls are missing in the DOM");
@@ -37,6 +39,10 @@
     reconnectTimer: null,
     gapWatcher: null,
     lastUpdateMs: null,
+    selectionStartMs: null,
+    selectionEndMs: null,
+    lastClosedMinute: null,
+    lastClosedTimer: null,
   };
 
   function intervalToMs(value) {
@@ -79,6 +85,93 @@
     return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(
       date.getUTCMinutes()
     )}:${pad(date.getUTCSeconds())}`;
+  }
+
+  function timeParamToMs(timeParam) {
+    if (typeof timeParam === "number" && Number.isFinite(timeParam)) {
+      return Number(timeParam) * 1000;
+    }
+    if (timeParam && typeof timeParam === "object") {
+      const year = Number(timeParam.year);
+      const month = Number(timeParam.month);
+      const day = Number(timeParam.day);
+      if (Number.isFinite(year) && Number.isFinite(month) && Number.isFinite(day)) {
+        return Date.UTC(year, month - 1, day);
+      }
+    }
+    return null;
+  }
+
+  function formatSelectionLabel(startMs, endMs) {
+    const hasStart = Number.isFinite(startMs);
+    const hasEnd = Number.isFinite(endMs);
+    if (hasStart && hasEnd) {
+      const start = Math.min(startMs, endMs);
+      const end = Math.max(startMs, endMs);
+      return `${formatUtc(start)} → ${formatUtc(end)}`;
+    }
+    if (hasStart) {
+      return `${formatUtc(startMs)} → …`;
+    }
+    return "—";
+  }
+
+  function updateSelectionLabel() {
+    if (!selectionLabelEl) return;
+    selectionLabelEl.textContent = formatSelectionLabel(state.selectionStartMs, state.selectionEndMs);
+  }
+
+  function emitSelectionChange() {
+    let detail = null;
+    const hasStart = Number.isFinite(state.selectionStartMs);
+    const hasEnd = Number.isFinite(state.selectionEndMs);
+    if (hasStart && hasEnd) {
+      detail = {
+        start: Math.min(state.selectionStartMs, state.selectionEndMs),
+        end: Math.max(state.selectionStartMs, state.selectionEndMs),
+      };
+    } else if (hasStart) {
+      detail = { start: state.selectionStartMs, end: null };
+    }
+    try {
+      document.dispatchEvent(
+        new CustomEvent("chart:selection-change", {
+          detail,
+        })
+      );
+    } catch (error) {
+      console.warn("Selection event dispatch failed", error);
+    }
+  }
+
+  function resetSelection() {
+    state.selectionStartMs = null;
+    state.selectionEndMs = null;
+    updateSelectionLabel();
+    emitSelectionChange();
+  }
+
+  function registerSelectionPoint(tsMs) {
+    if (!Number.isFinite(tsMs)) return;
+    if (!Number.isFinite(state.selectionStartMs) || Number.isFinite(state.selectionEndMs)) {
+      state.selectionStartMs = tsMs;
+      state.selectionEndMs = null;
+    } else {
+      state.selectionEndMs = tsMs;
+    }
+
+    if (
+      Number.isFinite(state.selectionStartMs) &&
+      Number.isFinite(state.selectionEndMs) &&
+      state.selectionEndMs < state.selectionStartMs
+    ) {
+      const tmp = state.selectionStartMs;
+      state.selectionStartMs = state.selectionEndMs;
+      state.selectionEndMs = tmp;
+    }
+
+    updateSelectionLabel();
+    emitSelectionChange();
   }
 
   function notifyStatus(message, variant = "info") {
@@ -205,18 +298,57 @@
   }
 
   function updateInfo(lastBar) {
-    const bar = lastBar || state.candles[state.candles.length - 1];
-    if (!bar) {
+    let payload = null;
+
+    if (state.lastClosedMinute) {
+      const close = Number(state.lastClosedMinute.close);
+      const high = Number(state.lastClosedMinute.high);
+      const low = Number(state.lastClosedMinute.low);
+      const closeTimeMs = Number.isFinite(state.lastClosedMinute.closeTimeMs)
+        ? Number(state.lastClosedMinute.closeTimeMs)
+        : Number(state.lastClosedMinute.openTimeMs) + 60_000;
+      if (
+        Number.isFinite(close) &&
+        Number.isFinite(high) &&
+        Number.isFinite(low) &&
+        Number.isFinite(closeTimeMs)
+      ) {
+        payload = { close, high, low, timeMs: closeTimeMs };
+      }
+    }
+
+    if (!payload) {
+      const bar = lastBar || state.candles[state.candles.length - 1];
+      if (bar) {
+        const close = Number(bar.close);
+        const high = Number(bar.high);
+        const low = Number(bar.low);
+        const timeMs = Number.isFinite(bar.ts_ms_utc)
+          ? Number(bar.ts_ms_utc)
+          : Number.isFinite(bar.time)
+          ? Number(bar.time) * 1000
+          : null;
+        if (Number.isFinite(close) && Number.isFinite(high) && Number.isFinite(low) && Number.isFinite(timeMs)) {
+          payload = { close, high, low, timeMs };
+        }
+      }
+    }
+
+    if (!payload) {
       if (lastTimeEl) lastTimeEl.textContent = "—";
       if (lastPriceEl) lastPriceEl.textContent = "—";
       if (rangeEl) rangeEl.textContent = "—";
       return;
     }
-    if (lastTimeEl) lastTimeEl.textContent = formatUtc(bar.ts_ms_utc);
-    if (lastPriceEl) lastPriceEl.textContent = formatNumber(bar.close, 2);
+
+    if (lastTimeEl) lastTimeEl.textContent = formatUtc(payload.timeMs);
+    if (lastPriceEl) lastPriceEl.textContent = formatNumber(payload.close, 2);
     if (rangeEl) {
-      const range = bar.high - bar.low;
-      rangeEl.textContent = `${formatNumber(range, 2)} (${formatNumber((range / bar.low) * 100, 2)}%)`;
+      const range = payload.high - payload.low;
+      const percent = Number.isFinite(payload.low) && payload.low !== 0 ? (range / payload.low) * 100 : null;
+      rangeEl.textContent = Number.isFinite(percent)
+        ? `${formatNumber(range, 2)} (${formatNumber(percent, 2)}%)`
+        : `${formatNumber(range, 2)}`;
     }
   }
 
@@ -398,6 +530,99 @@
     }
   }
 
+  function handleChartClick(param) {
+    if (!param) return;
+    let targetMs = null;
+    if (param.seriesData && typeof param.seriesData.get === "function" && state.candleSeries) {
+      const seriesPoint = param.seriesData.get(state.candleSeries);
+      if (seriesPoint) {
+        if (Number.isFinite(seriesPoint.ts_ms_utc)) {
+          targetMs = Number(seriesPoint.ts_ms_utc);
+        } else if (Number.isFinite(seriesPoint.time)) {
+          targetMs = Number(seriesPoint.time) * 1000;
+        }
+      }
+    }
+    if (!Number.isFinite(targetMs)) {
+      targetMs = timeParamToMs(param.time);
+    }
+    if (Number.isFinite(targetMs)) {
+      registerSelectionPoint(targetMs);
+    }
+  }
+
+  function stopLastClosedPolling() {
+    if (state.lastClosedTimer) {
+      clearTimeout(state.lastClosedTimer);
+      state.lastClosedTimer = null;
+    }
+  }
+
+  async function fetchLastClosedMinute(symbol) {
+    if (!symbol) return null;
+    const url = new URL("https://api.binance.com/api/v3/klines");
+    url.searchParams.set("symbol", symbol);
+    url.searchParams.set("interval", "1m");
+    url.searchParams.set("limit", "2");
+    const response = await fetch(url.toString());
+    if (!response.ok) {
+      throw new Error(`Failed to fetch last closed candle: ${response.status}`);
+    }
+    const rows = await response.json();
+    if (!Array.isArray(rows) || !rows.length) {
+      return null;
+    }
+    const lastRow = rows[rows.length - 1];
+    const useArray = Array.isArray(lastRow) ? lastRow : null;
+    const openTime = useArray ? Number(useArray[0]) : Number(lastRow?.openTime ?? lastRow?.open_time);
+    const open = useArray ? Number(useArray[1]) : Number(lastRow?.open);
+    const high = useArray ? Number(useArray[2]) : Number(lastRow?.high);
+    const low = useArray ? Number(useArray[3]) : Number(lastRow?.low);
+    const close = useArray ? Number(useArray[4]) : Number(lastRow?.close);
+    const closeTime = useArray ? Number(useArray[6]) : Number(lastRow?.closeTime ?? lastRow?.close_time);
+    if (
+      !Number.isFinite(openTime) ||
+      !Number.isFinite(high) ||
+      !Number.isFinite(low) ||
+      !Number.isFinite(close)
+    ) {
+      return null;
+    }
+    const closeTimeMs = Number.isFinite(closeTime) ? closeTime : openTime + 60_000;
+    return {
+      open,
+      high,
+      low,
+      close,
+      openTimeMs: openTime,
+      closeTimeMs,
+    };
+  }
+
+  async function updateLastClosedFromApi() {
+    try {
+      const info = await fetchLastClosedMinute(state.symbol);
+      if (info) {
+        state.lastClosedMinute = info;
+        updateInfo();
+      }
+    } catch (error) {
+      console.warn("Failed to refresh last closed candle", error);
+    }
+  }
+
+  function scheduleLastClosedPolling() {
+    stopLastClosedPolling();
+    const tick = async () => {
+      await updateLastClosedFromApi();
+      const now = Date.now();
+      const msUntilNext = 60_000 - (now % 60_000) + 750;
+      const delay = Math.min(Math.max(msUntilNext, 20_000), 80_000);
+      state.lastClosedTimer = setTimeout(tick, delay);
+    };
+    void tick();
+  }
+
   function initChart() {
     if (state.chart) return;
     state.chart = LightweightCharts.createChart(chartContainer, {
@@ -452,9 +677,12 @@
         requestGap: handleGapRequest,
       });
     }
+
+    state.chart.subscribeClick(handleChartClick);
   }
 
   async function loadSymbol(symbol, interval) {
+    stopLastClosedPolling();
     detachWs();
     notifyStatus("Загружаем историю...", "info");
     const normalizedSymbol = symbol.trim().toUpperCase();
@@ -462,10 +690,18 @@
     state.symbol = normalizedSymbol;
     state.interval = normalizedInterval;
     initChart();
+    state.candles = [];
+    if (state.candleSeries) {
+      state.candleSeries.setData([]);
+    }
+    state.lastClosedMinute = null;
+    resetSelection();
+    updateInfo();
     const restored = restoreFromSharedStore(normalizedSymbol, normalizedInterval);
     if (restored && state.gapWatcher && typeof state.gapWatcher.notifyData === "function") {
       state.gapWatcher.notifyData();
     }
+    scheduleLastClosedPolling();
     try {
       const history = await fetchHistory(normalizedSymbol, normalizedInterval, 1000);
       mergeCandles(history, { reset: true, lastUpdateMs: Date.now() });
@@ -496,6 +732,12 @@
     const interval = intervalInput.value || "1m";
     loadSymbol(symbol, interval);
   });
+
+  if (clearSelectionBtn) {
+    clearSelectionBtn.addEventListener("click", () => {
+      resetSelection();
+    });
+  }
 
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible" && !state.ws) {
@@ -536,8 +778,6 @@
     refreshCheckAll: document.getElementById("refresh-check-all"),
     createTestEnv: document.getElementById("create-test-env"),
     checkAllOutput: document.getElementById("check-all-output"),
-    testStart: document.getElementById("test-start"),
-    testEnd: document.getElementById("test-end"),
     requestTrade: document.getElementById("request-trade"),
     tradeOutput: document.getElementById("trade-output"),
   };
@@ -556,6 +796,7 @@
     loadingChat: false,
     loadingCheckAll: false,
     loadingTrade: false,
+    selection: null,
   };
 
   function showToast(message, variant = "info") {
@@ -699,11 +940,21 @@
     }
   }
 
-  function parseDateTimeValue(value) {
-    if (!value) return null;
-    const dt = new Date(value);
+  function toIsoString(ms) {
+    if (!Number.isFinite(ms)) return null;
+    const dt = new Date(Number(ms));
     if (Number.isNaN(dt.getTime())) return null;
     return dt.toISOString();
+  }
+
+  function updateSelectionState(detail) {
+    if (detail && Number.isFinite(detail.start) && Number.isFinite(detail.end)) {
+      state.selection = { start: Number(detail.start), end: Number(detail.end) };
+    } else if (detail && Number.isFinite(detail.start)) {
+      state.selection = { start: Number(detail.start), end: null };
+    } else {
+      state.selection = null;
+    }
   }
 
   function setLoading(target, loading) {
@@ -820,9 +1071,30 @@
 
   async function createTestEnvironment() {
     if (state.loadingCheckAll) return;
+    const selection = state.selection;
+    const hasStart = selection && Number.isFinite(selection.start);
+    const hasEnd = selection && Number.isFinite(selection.end);
+    if (!hasStart || !hasEnd) {
+      showToast("Выделите на графике две свечи для тестовой среды", "warning");
+      return;
+    }
+
+    const startMs = Math.min(Number(selection.start), Number(selection.end));
+    const endMs = Math.max(Number(selection.start), Number(selection.end));
+    const startIso = toIsoString(startMs);
+    const endIso = toIsoString(endMs);
+    if (!startIso || !endIso) {
+      showToast("Не удалось преобразовать диапазон в дату", "error");
+      return;
+    }
+
+    const symbolInputEl = document.getElementById("input-symbol");
+    const intervalInputEl = document.getElementById("input-interval");
     const payload = {
-      start: parseDateTimeValue(elements.testStart?.value),
-      end: parseDateTimeValue(elements.testEnd?.value),
+      symbol: symbolInputEl?.value?.trim()?.toUpperCase() || "BTCUSDT",
+      timeframe: intervalInputEl?.value || "1m",
+      start: startIso,
+      end: endIso,
     };
     state.loadingCheckAll = true;
     setLoading("createTestEnv", true);
@@ -973,6 +1245,10 @@
   if (elements.requestTrade) {
     elements.requestTrade.addEventListener("click", requestTrade);
   }
+
+  document.addEventListener("chart:selection-change", (event) => {
+    updateSelectionState(event.detail);
+  });
 
   window.addEventListener("DOMContentLoaded", init);
 })();
