@@ -27,6 +27,23 @@ MS_IN_DAY = 86_400_000
 VALID_HOUR_WINDOWS = {1, 2, 3, 4}
 VALUE_AREA_PCT = 0.70
 
+_EQUAL_LIQUIDITY_TIMEFRAMES: Tuple[str, ...] = ("15m", "1h", "4h")
+_EQUAL_LIQUIDITY_REL_TOLERANCE = {
+    "15m": 0.0005,
+    "1h": 0.0003,
+    "4h": 0.0002,
+}
+_EQUAL_LIQUIDITY_MIN_SEPARATION = {
+    "15m": 5,
+    "1h": 6,
+    "4h": 6,
+}
+_EQUAL_LIQUIDITY_PIVOT_RADIUS = {
+    "15m": 2,
+    "1h": 3,
+    "4h": 4,
+}
+
 try:
     from .ohlc import (
         TIMEFRAME_TO_MS,
@@ -375,6 +392,128 @@ def _safe_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _pivot_radius_for_equal_levels(tf: str) -> int:
+    return _EQUAL_LIQUIDITY_PIVOT_RADIUS.get(tf, 2)
+
+
+def _minimum_separation_for_equal_levels(tf: str) -> int:
+    return _EQUAL_LIQUIDITY_MIN_SEPARATION.get(tf, 5)
+
+
+def _relative_tolerance_for_equal_levels(tf: str) -> float:
+    return _EQUAL_LIQUIDITY_REL_TOLERANCE.get(tf, 0.0003)
+
+
+def _detect_equal_levels_for_timeframe(
+    candles: Sequence[Mapping[str, Any]],
+    *,
+    tf: str,
+    kind: str,
+) -> List[Dict[str, Any]]:
+    radius = max(1, _pivot_radius_for_equal_levels(tf))
+    minimum_separation = max(1, _minimum_separation_for_equal_levels(tf))
+    tolerance_ratio = max(0.0, _relative_tolerance_for_equal_levels(tf))
+    length = len(candles)
+    if length < 2 * radius + 1:
+        return []
+
+    pivots: List[Dict[str, Any]] = []
+    price_key = "h" if kind == "high" else "l"
+
+    for idx in range(radius, length - radius):
+        candle = candles[idx]
+        pivot_price = _safe_float(candle.get(price_key))
+        pivot_ts = _safe_int(candle.get("t"))
+        if pivot_price is None or pivot_ts is None:
+            continue
+        is_pivot = True
+        for offset in range(1, radius + 1):
+            left = candles[idx - offset]
+            right = candles[idx + offset]
+            left_price = _safe_float(left.get(price_key))
+            right_price = _safe_float(right.get(price_key))
+            if left_price is not None:
+                if kind == "high" and pivot_price < left_price:
+                    is_pivot = False
+                    break
+                if kind == "low" and pivot_price > left_price:
+                    is_pivot = False
+                    break
+            if right_price is not None:
+                if kind == "high" and pivot_price < right_price:
+                    is_pivot = False
+                    break
+                if kind == "low" and pivot_price > right_price:
+                    is_pivot = False
+                    break
+        if not is_pivot:
+            continue
+        pivots.append({"idx": idx, "price": pivot_price, "ts": pivot_ts})
+
+    if len(pivots) < 2:
+        return []
+
+    equal_levels: List[Dict[str, Any]] = []
+    seen_pairs: set[tuple[int, int]] = set()
+
+    for j in range(1, len(pivots)):
+        pivot_j = pivots[j]
+        best_candidate = None
+        best_diff = None
+        for i in range(j):
+            pivot_i = pivots[i]
+            if (pivot_i["idx"], pivot_j["idx"]) in seen_pairs:
+                continue
+            if pivot_j["idx"] - pivot_i["idx"] < minimum_separation:
+                continue
+            average_price = (pivot_i["price"] + pivot_j["price"]) / 2.0
+            if average_price <= 0:
+                continue
+            price_diff = abs(pivot_j["price"] - pivot_i["price"])
+            tolerance = tolerance_ratio * average_price
+            if price_diff <= tolerance:
+                if best_diff is None or price_diff < best_diff:
+                    best_candidate = pivot_i
+                    best_diff = price_diff
+        if best_candidate is None:
+            continue
+        seen_pairs.add((best_candidate["idx"], pivot_j["idx"]))
+        second_touch_ts = pivot_j["ts"]
+        equal_levels.append(
+            {
+                "price": (best_candidate["price"] + pivot_j["price"]) / 2.0,
+                "ts": second_touch_ts,
+            }
+        )
+
+    equal_levels.sort(key=lambda item: item["ts"])
+    for entry in equal_levels:
+        entry["ts"] = _isoformat_utc(entry["ts"])
+    return equal_levels
+
+
+def build_equal_liquidity_levels(
+    frames: Mapping[str, Sequence[Mapping[str, Any]]]
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Detect simplified EQH/EQL pools from timeframe candles."""
+
+    eqh_levels: List[Dict[str, Any]] = []
+    eql_levels: List[Dict[str, Any]] = []
+
+    for tf in _EQUAL_LIQUIDITY_TIMEFRAMES:
+        candles = frames.get(tf)
+        if not isinstance(candles, Sequence):
+            continue
+        eqh_levels.extend(
+            _detect_equal_levels_for_timeframe(candles, tf=tf, kind="high")
+        )
+        eql_levels.extend(
+            _detect_equal_levels_for_timeframe(candles, tf=tf, kind="low")
+        )
+
+    return {"eqh": eqh_levels, "eql": eql_levels}
 
 
 def _coerce_candle(entry: Mapping[str, Any]) -> MutableMapping[str, Any] | None:
@@ -1914,6 +2053,8 @@ def build_check_all_datas(
         if filtered:
             zone_frames[tf_key] = filtered
 
+    liquidity_equal_levels = build_equal_liquidity_levels(zone_frames)
+
     if zone_frames:
         try:
             zone_cfg = ZonesConfig(tick_size=profile_config.get("tick_size"))
@@ -2474,6 +2615,7 @@ def build_check_all_datas(
         "profile": profile_public,
         "zones": detected_zones,
         "liquidity": liquidity_payload,
+        "liquidity_levels": liquidity_equal_levels,
         "data_quality": data_quality_public,
         "ohlcv": ohlcv_block,
         "orderflow": orderflow_block,

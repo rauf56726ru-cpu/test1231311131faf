@@ -537,6 +537,15 @@ def test_historical_snapshot_still_populates_window(client: TestClient) -> None:
     liquidity_section = body.get("liquidity")
     assert isinstance(liquidity_section, dict)
     assert {"eqh", "eql", "pdh", "pdl", "sweeps"}.issubset(liquidity_section)
+    equal_levels = body.get("liquidity_levels")
+    assert isinstance(equal_levels, dict)
+    assert set(equal_levels).issuperset({"eqh", "eql"})
+    for series in equal_levels.values():
+        assert isinstance(series, list)
+        for entry in series:
+            assert "price" in entry
+            assert "ts" in entry
+            assert isinstance(entry["ts"], str)
     assert "htf" in body and isinstance(body["htf"], list)
     hourly_entry = next((block for block in body["htf"] if block.get("tf") == "1h"), None)
     assert hourly_entry is not None
