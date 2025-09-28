@@ -2,11 +2,21 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, date, time as dtime, timedelta, timezone
-from typing import DefaultDict, Dict, Iterable, List, Sequence, Tuple, Optional, Callable
+from typing import (
+    Callable,
+    DefaultDict,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import httpx
 
@@ -101,16 +111,55 @@ def _in_session(moment: dtime, start: dtime, end: dtime) -> bool:
     return moment >= start or moment < end
 
 
-def _compute_vwap(bars: Iterable[MinuteBar]) -> float:
+@dataclass(slots=True)
+class VWAPStats:
+    """Holds VWAP aggregates along with sigma channels."""
+
+    value: float
+    sigma: float
+
+    def as_sigma_payload(self, *, basis: str) -> Dict[str, object]:
+        levels = _build_sigma_levels(self.value, self.sigma)
+        return {"basis": basis, "sigma": levels}
+
+
+def _build_sigma_levels(center: float, sigma: float) -> List[Dict[str, float]]:
+    return [
+        {"k": k, "price_minus": center - sigma * k, "price_plus": center + sigma * k}
+        for k in (1, 2)
+    ]
+
+
+def _compute_vwap_stats(bars: Iterable[MinuteBar]) -> Optional[VWAPStats]:
     total_pv = 0.0
+    total_p2v = 0.0
     total_volume = 0.0
+    valid = 0
     for bar in bars:
+        volume = float(bar.volume)
+        if volume <= 0.0:
+            continue
         typical_price = (bar.high + bar.low + bar.close) / 3.0
-        total_pv += typical_price * bar.volume
-        total_volume += bar.volume
-    if total_volume <= 0:
-        return 0.0
-    return total_pv / total_volume
+        if not math.isfinite(typical_price):
+            continue
+        total_pv += typical_price * volume
+        total_p2v += typical_price * typical_price * volume
+        total_volume += volume
+        valid += 1
+    if total_volume <= 0.0:
+        return None
+    value = total_pv / total_volume
+    if valid < 2:
+        sigma = 0.0
+    else:
+        variance = max(total_p2v / total_volume - value * value, 0.0)
+        sigma = math.sqrt(variance)
+    return VWAPStats(value=value, sigma=sigma)
+
+
+def _compute_vwap(bars: Iterable[MinuteBar]) -> float:
+    stats = _compute_vwap_stats(bars)
+    return stats.value if stats is not None else 0.0
 
 
 
@@ -180,6 +229,7 @@ async def fetch_daily_vwap(
 
     last_closed = closed[-1]
     cum_tpv = 0.0
+    cum_tp2v = 0.0
     cum_volume = 0.0
     candles_used = 0
     eps = 1e-12
@@ -195,7 +245,10 @@ async def fetch_daily_vwap(
         if volume <= 0.0:
             continue
         tp = (high + low + close_price) / 3.0
+        if not math.isfinite(tp):
+            continue
         cum_tpv += tp * volume
+        cum_tp2v += tp * tp * volume
         cum_volume += volume
         candles_used += 1
 
@@ -203,6 +256,11 @@ async def fetch_daily_vwap(
         raise ValueError("no data")
 
     vwap_value = cum_tpv / max(cum_volume, eps)
+    if candles_used < 2:
+        sigma_value = 0.0
+    else:
+        variance = max(cum_tp2v / cum_volume - vwap_value * vwap_value, 0.0)
+        sigma_value = math.sqrt(variance)
     last_close_iso = datetime.fromtimestamp(int(last_closed[6]) / 1000.0, tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
     return {
@@ -211,6 +269,7 @@ async def fetch_daily_vwap(
         "last_closed_candle_time": last_close_iso,
         "cum_volume": cum_volume,
         "candles_used": candles_used,
+        "vwap_sigma": VWAPStats(value=vwap_value, sigma=sigma_value).as_sigma_payload(basis="daily"),
     }
 
 
@@ -232,7 +291,7 @@ async def fetch_session_vwap(symbol: str) -> Dict[str, object]:
 
     bars = await _fetch_minute_bars(symbol, start_ms, end_ms)
     if not bars:
-        return {"symbol": symbol.upper(), "vwap": []}
+        return {"symbol": symbol.upper(), "vwap": [], "vwap_sigma": []}
 
     sessions = list(Meta.iter_vwap_sessions())
     daily_buckets: DefaultDict[str, List[MinuteBar]] = defaultdict(list)
@@ -251,16 +310,50 @@ async def fetch_session_vwap(symbol: str) -> Dict[str, object]:
 
     ordered_dates = sorted(daily_buckets.keys())[-lookback_days:]
     results: List[Dict[str, object]] = []
+    sigma_results: List[Dict[str, object]] = []
 
     for date_key in ordered_dates:
-        daily_value = _compute_vwap(daily_buckets[date_key])
+        daily_stats = _compute_vwap_stats(daily_buckets[date_key])
+        if daily_stats is None:
+            daily_value = 0.0
+            daily_sigma = 0.0
+        else:
+            daily_value = daily_stats.value
+            daily_sigma = daily_stats.sigma
         results.append({"date": date_key, "session": "daily", "value": daily_value})
+        if daily_stats is None:
+            sigma_payload = {
+                "basis": "daily",
+                "sigma": _build_sigma_levels(daily_value, daily_sigma),
+            }
+        else:
+            sigma_payload = daily_stats.as_sigma_payload(basis="daily")
+        sigma_payload.update({"date": date_key, "session": "daily"})
+        sigma_results.append(sigma_payload)
         for session_name, _, _ in sessions:
             bars_in_session = session_buckets.get((date_key, session_name), [])
-            value = _compute_vwap(bars_in_session) if bars_in_session else 0.0
+            if bars_in_session:
+                stats = _compute_vwap_stats(bars_in_session)
+                if stats is None:
+                    value = 0.0
+                    sigma_value = 0.0
+                else:
+                    value = stats.value
+                    sigma_value = stats.sigma
+            else:
+                value = 0.0
+                sigma_value = 0.0
             results.append({"date": date_key, "session": session_name, "value": value})
+            sigma_results.append(
+                {
+                    "date": date_key,
+                    "session": session_name,
+                    "basis": "session",
+                    "sigma": _build_sigma_levels(value, sigma_value),
+                }
+            )
 
-    return {"symbol": symbol.upper(), "vwap": results}
+    return {"symbol": symbol.upper(), "vwap": results, "vwap_sigma": sigma_results}
 
 
 def fetch_session_vwap_sync(symbol: str) -> Dict[str, object]:

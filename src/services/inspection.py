@@ -712,20 +712,41 @@ def _in_session(moment: dtime, start: dtime, end: dtime) -> bool:
     return moment >= start or moment < end
 
 
-def _compute_vwap_value(entries: Iterable[Mapping[str, Any]]) -> float | None:
+def _build_sigma_levels(center: float, sigma: float) -> List[Dict[str, float]]:
+    return [
+        {"k": k, "price_minus": center - sigma * k, "price_plus": center + sigma * k}
+        for k in (1, 2)
+    ]
+
+
+def _compute_vwap_stats(entries: Iterable[Mapping[str, Any]]) -> Tuple[float, float] | None:
     total_pv = 0.0
+    total_p2v = 0.0
     total_volume = 0.0
+    valid = 0
     for entry in entries:
         high = float(entry.get("h", entry.get("high", 0.0)))
         low = float(entry.get("l", entry.get("low", 0.0)))
         close = float(entry.get("c", entry.get("close", 0.0)))
         volume = float(entry.get("v", entry.get("volume", 0.0)))
+        if volume <= 0.0:
+            continue
         typical_price = (high + low + close) / 3.0
+        if not math.isfinite(typical_price):
+            continue
         total_pv += typical_price * volume
+        total_p2v += typical_price * typical_price * volume
         total_volume += volume
+        valid += 1
     if total_volume <= 0.0:
         return None
-    return total_pv / total_volume
+    vwap_value = total_pv / total_volume
+    if valid < 2:
+        sigma_value = 0.0
+    else:
+        variance = max(total_p2v / total_volume - vwap_value * vwap_value, 0.0)
+        sigma_value = math.sqrt(variance)
+    return vwap_value, sigma_value
 
 
 def compute_session_vwaps(symbol: str, candles: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
@@ -783,20 +804,41 @@ def compute_session_vwaps(symbol: str, candles: Sequence[Mapping[str, Any]]) -> 
         ordered_dates = ordered_dates[-lookback:]
 
     results: List[Dict[str, object]] = []
+    sigma_results: List[Dict[str, object]] = []
     for date_key in ordered_dates:
-        daily_value = _compute_vwap_value(daily_buckets[date_key])
-        if daily_value is not None:
-            results.append({"date": date_key.isoformat(), "session": "daily", "value": daily_value})
+        daily_stats = _compute_vwap_stats(daily_buckets[date_key])
+        if daily_stats is None:
+            continue
+        daily_value, daily_sigma = daily_stats
+        date_str = date_key.isoformat()
+        results.append({"date": date_str, "session": "daily", "value": daily_value})
+        sigma_results.append(
+            {
+                "date": date_str,
+                "session": "daily",
+                "basis": "daily",
+                "sigma": _build_sigma_levels(daily_value, daily_sigma),
+            }
+        )
         for session_name, _, _ in sessions:
             entries = session_buckets.get((date_key, session_name))
             if not entries:
                 continue
-            session_value = _compute_vwap_value(entries)
-            if session_value is None:
+            session_stats = _compute_vwap_stats(entries)
+            if session_stats is None:
                 continue
-            results.append({"date": date_key.isoformat(), "session": session_name, "value": session_value})
+            session_value, session_sigma = session_stats
+            results.append({"date": date_str, "session": session_name, "value": session_value})
+            sigma_results.append(
+                {
+                    "date": date_str,
+                    "session": session_name,
+                    "basis": "session",
+                    "sigma": _build_sigma_levels(session_value, session_sigma),
+                }
+            )
 
-    return {"symbol": symbol.upper(), "vwap": results}
+    return {"symbol": symbol.upper(), "vwap": results, "vwap_sigma": sigma_results}
 def _coerce_frame(tf_key: str, frame: Mapping[str, Any] | Sequence[Any]) -> Dict[str, Any]:
     if tf_key not in TIMEFRAME_WINDOWS:
         raise ValueError(f"Unsupported timeframe: {tf_key}")

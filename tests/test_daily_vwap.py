@@ -2,6 +2,7 @@ from __future__ import annotations
 import asyncio
 
 from datetime import datetime, timezone
+import math
 from typing import List
 
 import pytest
@@ -73,6 +74,21 @@ def test_daily_vwap_constant_prices() -> None:
     assert result["cum_volume"] == pytest.approx(15.0)
     assert result["vwap_at_last_closed"] == pytest.approx(100.6666666667)
     assert result["last_closed_candle_time"].startswith("2024-01-01T00:01:59")
+    sigma_block = result["vwap_sigma"]
+    assert sigma_block["basis"] == "daily"
+    assert len(sigma_block["sigma"]) == 2
+    typical_prices = [
+        (101 + 99 + 100) / 3.0,
+        (102 + 100 + 101) / 3.0,
+    ]
+    volumes = [5.0, 10.0]
+    mean_price = sum(tp * v for tp, v in zip(typical_prices, volumes)) / sum(volumes)
+    expected_sigma = math.sqrt(
+        sum(v * (tp - mean_price) ** 2 for tp, v in zip(typical_prices, volumes)) / sum(volumes)
+    )
+    first_level = sigma_block["sigma"][0]
+    assert result["vwap_at_last_closed"] - first_level["price_minus"] == pytest.approx(expected_sigma)
+    assert first_level["price_plus"] - result["vwap_at_last_closed"] == pytest.approx(expected_sigma)
 
 
 
@@ -91,6 +107,11 @@ def test_future_candle_excluded() -> None:
 
     assert result["candles_used"] == 1
     assert result["vwap_at_last_closed"] == pytest.approx(100.0)
+    sigma_block = result["vwap_sigma"]
+    assert sigma_block["basis"] == "daily"
+    for entry in sigma_block["sigma"]:
+        assert entry["price_minus"] == pytest.approx(result["vwap_at_last_closed"])
+        assert entry["price_plus"] == pytest.approx(result["vwap_at_last_closed"])
 
 
 
@@ -133,5 +154,11 @@ def test_multipage_fetch() -> None:
 
     assert result["candles_used"] == 2
     assert result["vwap_at_last_closed"] == pytest.approx(101.0)
+    sigma_entries = result["vwap_sigma"]["sigma"]
+    assert len(sigma_entries) == 2
+    offsets = [result["vwap_at_last_closed"] - level["price_minus"] for level in sigma_entries]
+    assert offsets[0] < offsets[1]
+    expected_sigma = math.sqrt(((100.0 ** 2 * 5) + (102.0 ** 2 * 5)) / 10 - 101.0 ** 2)
+    assert offsets[0] == pytest.approx(expected_sigma)
 
 
