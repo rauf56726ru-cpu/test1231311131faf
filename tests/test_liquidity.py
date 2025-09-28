@@ -69,6 +69,7 @@ def test_liquidity_detects_equal_levels_and_sweeps() -> None:
 
     liquidity = build_liquidity_snapshot(
         frames,
+        symbol="BTCUSDT",
         tick_size=0.1,
         selection={"end": selection_end},
         config={
@@ -130,6 +131,15 @@ def test_liquidity_detects_equal_levels_and_sweeps() -> None:
     assert isinstance(eql_diag, dict)
     assert eqh_diag.get("cluster_count") == len(eqh_levels)
     assert eql_diag.get("cluster_count") == len(eql_levels)
+    assert eqh_diag.get("pairs_within_tol_before_cluster") == eqh_diag.get("pairs_within_tol")
+    assert eql_diag.get("pairs_within_tol_before_cluster") == eql_diag.get("pairs_within_tol")
+    assert isinstance(eqh_diag.get("sample_pairs_top10"), list)
+    assert isinstance(eql_diag.get("sample_pairs_top10"), list)
+    tick_diag = diagnostics.get("tick_size")
+    assert isinstance(tick_diag, dict)
+    assert tick_diag.get("normalized_symbol") == "BTCUSDT"
+    assert tick_diag.get("source") in {"hardcoded", "exchange", "auto"}
+    assert tick_diag.get("value") == 0.1
 
 
 def test_liquidity_respects_atr_tolerance() -> None:
@@ -145,6 +155,7 @@ def test_liquidity_respects_atr_tolerance() -> None:
     frames = {"15m": {"candles": candles}}
     liquidity = build_liquidity_snapshot(
         frames,
+        symbol="ETHUSDT",
         tick_size=0.01,
         config={
             "r_ticks": 2,
@@ -203,6 +214,7 @@ def test_liquidity_aggregates_minute_seed() -> None:
 
     liquidity = build_liquidity_snapshot(
         frames,
+        symbol="BTCUSDT",
         tick_size=0.1,
         selection={"end": selection_end},
         config={
@@ -234,7 +246,7 @@ def test_liquidity_detects_pdh_pdl_sweeps_from_minute_seed() -> None:
         (200.0, 205.0, 198.0, 203.0),
         (203.0, 206.5, 200.0, 204.5),
         (204.5, 221.5, 203.5, 219.0),  # sweep top above PDH
-        (219.0, 220.0, 178.5, 181.0),  # sweep bottom below PDL
+        (219.0, 220.0, 179.0, 181.0),  # sweep bottom below PDL
         (181.0, 190.0, 180.0, 188.0),
     ]
     for idx, spec in enumerate(blocks):
@@ -252,6 +264,7 @@ def test_liquidity_detects_pdh_pdl_sweeps_from_minute_seed() -> None:
 
     liquidity = build_liquidity_snapshot(
         frames,
+        symbol="BTCUSDT",
         tick_size=1.0,
         selection={"end": selection_end},
         config={

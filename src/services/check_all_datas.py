@@ -10,8 +10,12 @@ from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence
 import httpx
 
 import src.services.inspection as inspection
-from .inspection import build_htf_section, resolve_liquidity_tick_size
-from .liquidity import build_liquidity_snapshot
+from .inspection import build_htf_section
+from .liquidity import (
+    build_liquidity_snapshot,
+    normalise_symbol_for_tick,
+    resolve_liquidity_tick_size,
+)
 from .presets import resolve_profile_config
 from .profile import build_profile_package
 from .zones import Config as ZonesConfig, detect_zones
@@ -1359,7 +1363,7 @@ def build_check_all_datas(
         "Liquidity tick size resolved for check-all",  # contextual debug entry
         extra={
             "symbol": symbol,
-            "normalized_symbol": inspection._normalise_symbol_for_tick(symbol) or "UNKNOWN",
+            "normalized_symbol": normalise_symbol_for_tick(symbol) or "UNKNOWN",
             "tick_size": tick_size_numeric,
             "tick_size_source": tick_size_source,
         },
@@ -1367,7 +1371,9 @@ def build_check_all_datas(
 
     liquidity_payload = build_liquidity_snapshot(
         liquidity_frames,
+        symbol=symbol,
         tick_size=tick_size_numeric,
+        meta=raw_meta,
         selection=selection_payload,
         config=liquidity_config if isinstance(liquidity_config, Mapping) else None,
     )

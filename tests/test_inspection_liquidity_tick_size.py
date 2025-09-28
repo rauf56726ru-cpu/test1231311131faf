@@ -122,6 +122,20 @@ def test_inspection_liquidity_uses_normalised_tick_size(
     summary = diagnostics.get("summary")
     assert isinstance(summary, dict)
     assert summary.get("eqh") >= 0
+    tick_diag = diagnostics.get("tick_size")
+    assert isinstance(tick_diag, dict)
+    symbol_map = {0.1: "BTCUSDT", 0.01: "ETHUSDT", 0.001: "SOLUSDT"}
+    assert tick_diag.get("normalized_symbol") == symbol_map[expected_tick]
+    assert math.isclose(tick_diag.get("value", 0.0), expected_tick, rel_tol=1e-9, abs_tol=1e-9)
+    assert tick_diag.get("source") == "hardcoded"
+    levels_diag = diagnostics.get("levels")
+    assert isinstance(levels_diag, dict)
+    tf_diag = levels_diag.get("15m")
+    assert isinstance(tf_diag, dict)
+    eqh_diag = tf_diag.get("eqh")
+    assert isinstance(eqh_diag, dict)
+    assert "pairs_within_tol_before_cluster" in eqh_diag
+    assert "sample_pairs_top10" in eqh_diag
 
 
 def test_inspection_liquidity_prefers_exchange_tick_size(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -158,6 +172,11 @@ def test_inspection_liquidity_prefers_exchange_tick_size(monkeypatch: pytest.Mon
     payload = inspection.build_inspection_payload(snapshot)
     diagnostics = payload["DIAGNOSTICS"]["liquidity"]
     assert diagnostics["config"]["tick_size"] == pytest.approx(0.05)
+    tick_diag = diagnostics.get("tick_size")
+    assert isinstance(tick_diag, dict)
+    assert tick_diag.get("normalized_symbol") == "ETHUSDT"
+    assert tick_diag.get("source") == "exchange"
+    assert tick_diag.get("value") == pytest.approx(0.05)
     eqh_levels = payload["DATA"]["liquidity"]["eqh"]
     assert eqh_levels
     tolerances = {level["tolerance"] for level in eqh_levels if level.get("tolerance")}

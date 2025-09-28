@@ -4,16 +4,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+import logging
 import math
+import re
 import statistics
 from typing import Any, Dict, List, Mapping, MutableMapping, Sequence
 
-import logging
-
+from ..meta import HARDCODED_TICK_SIZES
 from .ohlc import TIMEFRAME_TO_MS, resample_ohlcv
 
 MS_IN_DAY = 86_400_000
 SUPPORTED_TIMEFRAMES: tuple[str, ...] = ("15m", "1h")
+_PRICE_FIELDS: tuple[str, ...] = ("o", "h", "l", "c")
+_SYMBOL_SUFFIXES: tuple[str, ...] = ("PERP",)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -72,6 +76,292 @@ def _count_pairs_within_tolerance(
             if abs(base - quantised[right]) <= tolerance + 1e-9:
                 count += 1
     return count
+
+
+def normalise_symbol_for_tick(symbol: str | None) -> str:
+    """Normalise symbol identifiers before tick-size lookup."""
+
+    if not symbol:
+        return ""
+
+    text = re.sub(r"\s+", "", str(symbol).upper())
+    if not text:
+        return ""
+
+    split_candidates = [part for part in re.split(r"[:/@ ]", text) if part]
+    if not split_candidates:
+        split_candidates = [text]
+    else:
+        split_candidates.append(text)
+
+    preferred: List[str] = []
+    fallback: List[str] = []
+
+    for candidate in split_candidates:
+        cleaned = re.sub(r"[^A-Z0-9]", "", candidate)
+        if not cleaned:
+            continue
+        for suffix in _SYMBOL_SUFFIXES:
+            if cleaned.endswith(suffix):
+                cleaned = cleaned[: -len(suffix)]
+        if cleaned.endswith("USDTPERP"):
+            cleaned = cleaned[: -len("USDTPERP")] + "USDT"
+        if cleaned.endswith("USD") or "USDT" in cleaned or "USDC" in cleaned:
+            preferred.append(cleaned)
+        else:
+            fallback.append(cleaned)
+
+    if preferred:
+        return preferred[0]
+    if fallback:
+        return fallback[0]
+    return ""
+
+
+def _infer_tick_size_from_frames(
+    frames: Mapping[str, Sequence[Mapping[str, Any]]]
+) -> float | None:
+    """Infer a plausible tick size from OHLCV data when metadata is missing."""
+
+    samples: List[Decimal] = []
+    seen: set[Decimal] = set()
+    for candles in frames.values():
+        if not isinstance(candles, Sequence):
+            continue
+        for candle in candles:
+            if not isinstance(candle, Mapping):
+                continue
+            for field in _PRICE_FIELDS:
+                price = _coerce_float(candle.get(field))
+                if price is None:
+                    continue
+                try:
+                    decimal_value = Decimal(str(price))
+                except (InvalidOperation, ValueError):
+                    continue
+                if decimal_value in seen:
+                    continue
+                seen.add(decimal_value)
+                samples.append(decimal_value)
+            if len(samples) >= 5_000:
+                break
+        if len(samples) >= 5_000:
+            break
+
+    if len(samples) < 2:
+        return None
+
+    samples.sort()
+    min_step: Decimal | None = None
+    previous = samples[0]
+    for current in samples[1:]:
+        diff = current - previous
+        if diff > 0:
+            if min_step is None or diff < min_step:
+                min_step = diff
+                if min_step == 0:
+                    min_step = None
+        previous = current
+
+    if min_step is not None and min_step > 0:
+        return float(min_step)
+
+    max_precision = 0
+    for value in samples:
+        exponent = -value.as_tuple().exponent
+        if exponent > max_precision:
+            max_precision = exponent
+
+    if max_precision > 0:
+        return float(10 ** (-max_precision))
+    return None
+
+
+def _extract_tick_size_from_meta(
+    meta: Mapping[str, Any] | None,
+    normalized_symbol: str,
+) -> float | None:
+    """Search snapshot metadata for a matching tick size."""
+
+    if not normalized_symbol or not isinstance(meta, Mapping):
+        return None
+
+    visited: set[int] = set()
+
+    def _candidate_from_entry(
+        entry: Mapping[str, Any],
+        *,
+        symbol_hint: str | None,
+    ) -> float | None:
+        candidate_symbol = entry.get("symbol") or entry.get("pair") or entry.get("instrument")
+        if isinstance(candidate_symbol, str):
+            candidate_norm = normalise_symbol_for_tick(candidate_symbol)
+        else:
+            candidate_norm = None
+        if not candidate_norm:
+            candidate_norm = symbol_hint
+
+        tick_fields = (
+            entry.get("tickSize"),
+            entry.get("tick_size"),
+            entry.get("ticksize"),
+        )
+        for value in tick_fields:
+            numeric = _coerce_float(value)
+            if numeric and numeric > 0 and candidate_norm == normalized_symbol:
+                return float(numeric)
+
+        filters = entry.get("filters")
+        if isinstance(filters, Sequence):
+            for filt in filters:
+                if not isinstance(filt, Mapping):
+                    continue
+                filter_type = filt.get("filterType") or filt.get("filter_type")
+                if isinstance(filter_type, str) and filter_type.upper() not in {
+                    "PRICE_FILTER",
+                    "LOT_SIZE",
+                }:
+                    continue
+                tick_value = _coerce_float(
+                    filt.get("tickSize")
+                    or filt.get("tick_size")
+                    or filt.get("ticksize")
+                )
+                if tick_value and tick_value > 0 and candidate_norm == normalized_symbol:
+                    return float(tick_value)
+        return None
+
+    def _visit(node: Any, symbol_hint: str | None = None) -> float | None:
+        if isinstance(node, Mapping):
+            node_id = id(node)
+            if node_id in visited:
+                return None
+            visited.add(node_id)
+            direct = _candidate_from_entry(node, symbol_hint=symbol_hint)
+            if direct is not None:
+                return direct
+
+            for key, value in node.items():
+                next_hint = symbol_hint
+                if isinstance(key, str):
+                    key_norm = normalise_symbol_for_tick(key)
+                    if key_norm:
+                        next_hint = key_norm
+                result = _visit(value, symbol_hint=next_hint)
+                if result is not None:
+                    return result
+        elif isinstance(node, Sequence) and not isinstance(node, (str, bytes, bytearray)):
+            for item in node:
+                result = _visit(item, symbol_hint=symbol_hint)
+                if result is not None:
+                    return result
+        return None
+
+    for key in ("exchange_info", "exchangeInfo", "exchange", "symbol_info", "symbolInfo"):
+        candidate = meta.get(key)
+        value = _visit(candidate)
+        if value is not None:
+            return value
+
+    return _visit(meta)
+
+
+def resolve_liquidity_tick_size(
+    symbol: str,
+    profile_tick_size: Any,
+    frames: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    meta: Mapping[str, Any] | None = None,
+    logger: logging.Logger | None = None,
+) -> tuple[float, str]:
+    """Resolve a positive tick size for liquidity detection with fallbacks."""
+
+    log = logger or LOGGER
+    normalized_symbol = normalise_symbol_for_tick(symbol)
+    symbol_label = symbol or "UNKNOWN"
+    base_extra = {
+        "symbol": symbol_label,
+        "normalized_symbol": normalized_symbol or "UNKNOWN",
+    }
+
+    profile_numeric = _coerce_float(profile_tick_size)
+    if profile_numeric is not None and profile_numeric <= 0:
+        profile_numeric = None
+
+    if profile_numeric is not None:
+        base_extra["profile_tick_size"] = profile_numeric
+
+    exchange_tick = _extract_tick_size_from_meta(meta, normalized_symbol)
+    hardcoded_tick = HARDCODED_TICK_SIZES.get(normalized_symbol)
+    inferred_tick = _infer_tick_size_from_frames(frames)
+
+    if exchange_tick is not None and exchange_tick > 0:
+        tick_size = float(exchange_tick)
+        tick_source = "exchange"
+    elif isinstance(hardcoded_tick, (int, float)) and hardcoded_tick > 0:
+        tick_size = float(hardcoded_tick)
+        tick_source = "hardcoded"
+    elif inferred_tick is not None and inferred_tick > 0:
+        tick_size = float(inferred_tick)
+        tick_source = "auto"
+    else:
+        log.error(
+            "Unable to resolve positive liquidity tick size",
+            extra={**base_extra, "tick_size_source": "auto"},
+        )
+        raise ValueError("Unable to resolve positive liquidity tick size")
+
+    if profile_numeric is not None and not math.isclose(
+        profile_numeric, tick_size, rel_tol=1e-12, abs_tol=1e-12
+    ):
+        log.warning(
+            "Profile tick size overridden by authoritative source",
+            extra={
+                **base_extra,
+                "tick_size_source": tick_source,
+                "tick_size": tick_size,
+            },
+        )
+
+    log.debug(
+        "Resolved liquidity tick size",
+        extra={**base_extra, "tick_size_source": tick_source, "tick_size": tick_size},
+    )
+
+    return tick_size, tick_source
+
+
+def _sample_swing_pairs(
+    swings: Sequence[Mapping[str, Any]],
+    *,
+    limit: int = 10,
+) -> List[Dict[str, Any]]:
+    """Return up to ``limit`` swing pairs sorted by ascending price delta."""
+
+    samples: List[Dict[str, Any]] = []
+    for left in range(len(swings)):
+        left_price = _coerce_float(swings[left].get("price"))
+        left_time = swings[left].get("t")
+        if left_price is None or not isinstance(left_time, (int, float)):
+            continue
+        for right in range(left + 1, len(swings)):
+            right_price = _coerce_float(swings[right].get("price"))
+            right_time = swings[right].get("t")
+            if right_price is None or not isinstance(right_time, (int, float)):
+                continue
+            delta = abs(left_price - right_price)
+            samples.append(
+                {
+                    "delta": delta,
+                    "left": {"t": int(left_time), "price": left_price},
+                    "right": {"t": int(right_time), "price": right_price},
+                }
+            )
+
+    samples.sort(key=lambda entry: entry["delta"])
+    if limit <= 0:
+        return samples
+    return samples[:limit]
 
 
 def _append_reason(
@@ -429,8 +719,22 @@ def _prepare_levels(
             "atr_period": config.atr_period,
             "atr_mult": config.sweep_atr_multiplier,
             "reasons": [],
-            "eqh": {"swing_count": 0, "cluster_count": 0, "pairs_within_tol": 0, "reasons": []},
-            "eql": {"swing_count": 0, "cluster_count": 0, "pairs_within_tol": 0, "reasons": []},
+            "eqh": {
+                "swing_count": 0,
+                "cluster_count": 0,
+                "pairs_within_tol": 0,
+                "pairs_within_tol_before_cluster": 0,
+                "sample_pairs_top10": [],
+                "reasons": [],
+            },
+            "eql": {
+                "swing_count": 0,
+                "cluster_count": 0,
+                "pairs_within_tol": 0,
+                "pairs_within_tol_before_cluster": 0,
+                "sample_pairs_top10": [],
+                "reasons": [],
+            },
         }
         diagnostics[timeframe] = frame_diag
 
@@ -476,16 +780,44 @@ def _prepare_levels(
             swings_low = swings_low[-config.lookback_swings :]
         frame_diag["eqh"]["swing_count"] = len(swings_high)
         frame_diag["eql"]["swing_count"] = len(swings_low)
-        frame_diag["eqh"]["pairs_within_tol"] = _count_pairs_within_tolerance(
+        eqh_pairs = _count_pairs_within_tolerance(
             swings_high,
             tolerance=tolerance,
             tick_size=tick_size,
         )
-        frame_diag["eql"]["pairs_within_tol"] = _count_pairs_within_tolerance(
+        frame_diag["eqh"]["pairs_within_tol_before_cluster"] = eqh_pairs
+        frame_diag["eqh"]["pairs_within_tol"] = eqh_pairs
+        frame_diag["eqh"]["sample_pairs_top10"] = _sample_swing_pairs(swings_high)
+        if eqh_pairs == 0 and len(swings_high) >= 2:
+            LOGGER.debug(
+                "No swing high pairs within tolerance prior to clustering",
+                extra={
+                    "tf": timeframe,
+                    "reason": "pairs_within_tol_before_cluster==0",
+                    "tick_size": tick_size,
+                    "tolerance": tolerance,
+                    "swings": len(swings_high),
+                },
+            )
+        eql_pairs = _count_pairs_within_tolerance(
             swings_low,
             tolerance=tolerance,
             tick_size=tick_size,
         )
+        frame_diag["eql"]["pairs_within_tol_before_cluster"] = eql_pairs
+        frame_diag["eql"]["pairs_within_tol"] = eql_pairs
+        frame_diag["eql"]["sample_pairs_top10"] = _sample_swing_pairs(swings_low)
+        if eql_pairs == 0 and len(swings_low) >= 2:
+            LOGGER.debug(
+                "No swing low pairs within tolerance prior to clustering",
+                extra={
+                    "tf": timeframe,
+                    "reason": "pairs_within_tol_before_cluster==0",
+                    "tick_size": tick_size,
+                    "tolerance": tolerance,
+                    "swings": len(swings_low),
+                },
+            )
         LOGGER.debug(
             "Liquidity swings detected",
             extra={
@@ -958,15 +1290,40 @@ def _detect_sweeps(
 def build_liquidity_snapshot(
     frames: Mapping[str, Mapping[str, Any]],
     *,
+    symbol: str | None = None,
     tick_size: float | None,
+    meta: Mapping[str, Any] | None = None,
     selection: Mapping[str, Any] | None = None,
     config: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Compute liquidity levels and sweeps for the inspection payload."""
 
-    resolved_tick = _coerce_float(tick_size)
-    if resolved_tick is None or resolved_tick <= 0:
-        raise ValueError("Liquidity detection requires a positive tick_size")
+    normalized_symbol = normalise_symbol_for_tick(symbol)
+
+    frame_sequences: Dict[str, List[Mapping[str, Any]]] = {}
+    for tf, payload in frames.items():
+        candles = _extract_candles(payload)
+        if candles:
+            frame_sequences[tf] = candles
+
+    resolved_tick, tick_source = resolve_liquidity_tick_size(
+        symbol or normalized_symbol,
+        tick_size,
+        frame_sequences,
+        meta=meta,
+        logger=LOGGER,
+    )
+    if resolved_tick <= 0:
+        LOGGER.error(
+            "Liquidity detection aborted due to non-positive tick size",
+            extra={
+                "symbol": symbol or "UNKNOWN",
+                "normalized_symbol": normalized_symbol or "UNKNOWN",
+                "tick_size": resolved_tick,
+                "tick_size_source": tick_source,
+            },
+        )
+        raise ValueError("Liquidity detection requires a positive tick size")
 
     resolved_config = _resolve_config(config)
 
@@ -1026,6 +1383,12 @@ def build_liquidity_snapshot(
             "atr_period": resolved_config.atr_period,
             "sweep_atr_multiplier": resolved_config.sweep_atr_multiplier,
             "tick_size": resolved_tick,
+        },
+        "tick_size": {
+            "symbol": symbol,
+            "normalized_symbol": normalized_symbol or "UNKNOWN",
+            "source": tick_source,
+            "value": resolved_tick,
         },
         "levels": level_diagnostics,
         "daily": daily_diagnostics,
