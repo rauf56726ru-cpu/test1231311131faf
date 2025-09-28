@@ -181,11 +181,7 @@ async def test_call_openai_uses_input_text(monkeypatch, tmp_path) -> None:
     captured: dict[str, Any] = {}
 
     async def fake_post(client, url, *, headers=None, data=None, files=None, json_payload=None):
-        if url.endswith("/v1/files"):
-            assert files is not None
-            request = httpx.Request("POST", url)
-            return httpx.Response(200, request=request, json={"id": "file_uploaded"})
-
+        assert not url.endswith("/v1/files")
         if url.endswith("/v1/responses"):
             captured["payload"] = json_payload
             request = httpx.Request("POST", url)
@@ -220,6 +216,7 @@ async def test_call_openai_uses_input_text(monkeypatch, tmp_path) -> None:
     payload = captured["payload"]
     assert payload["input"][0]["content"][0]["type"] == "input_text"
     assert payload["input"][1]["content"][0]["type"] == "input_text"
+    assert "DATA" in payload["input"][1]["content"][0]["text"]
 
 def test_analyze_from_inspection_returns_payload(client: TestClient, analysis_env: Path, monkeypatch) -> None:
     base = datetime(2024, 6, 1, 12, tzinfo=UTC)

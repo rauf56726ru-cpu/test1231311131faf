@@ -273,7 +273,7 @@ async def call_openai_with_attachment(
     api_base: str | None = None,
     client: httpx.AsyncClient | None = None,
 ) -> TradeAnalysisResult:
-    """Upload the attachment file and request analysis from OpenAI."""
+    """Request analysis from OpenAI with snapshot data embedded in the prompt."""
 
     base_url = api_base or os.environ.get("OPENAI_API_BASE", "https://api.openai.com")
     headers = {"Authorization": f"Bearer {api_key}"}
@@ -282,24 +282,17 @@ async def call_openai_with_attachment(
     if client is None:
         client = httpx.AsyncClient(base_url=base_url, timeout=60.0)
 
+    payload_text = file_path.read_text(encoding="utf-8")
+
     start = time.perf_counter()
     try:
-        with file_path.open("rb") as handle:
-            files = {"file": (file_path.name, handle.read(), "application/json")}
-        upload_response = await _post_with_retry(
-            client,
-            f"{base_url.rstrip('/')}/v1/files",
-            headers=headers,
-            data={"purpose": "assistants"},
-            files=files,
+        user_prompt = (
+            "Analyze {symbol} for period {period}.\n\nDATA:\n{data}".format(
+                symbol=symbol,
+                period=period,
+                data=payload_text,
+            )
         )
-        upload_response.raise_for_status()
-        upload_body = upload_response.json()
-        file_id = upload_body.get("id")
-        if not isinstance(file_id, str):
-            raise RuntimeError("OpenAI file upload did not return an id")
-
-        user_prompt = f"Analyze {symbol} for period {period}. DATA attached."
         response_payload = {
             "model": model,
             "input": [
@@ -311,7 +304,6 @@ async def call_openai_with_attachment(
                     "role": "user",
                     "content": [
                         {"type": "input_text", "text": user_prompt},
-                        {"type": "input_file", "file_id": file_id},
                     ],
                 },
             ],
