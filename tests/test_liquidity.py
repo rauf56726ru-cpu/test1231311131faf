@@ -46,8 +46,8 @@ def test_liquidity_detects_equal_levels_and_sweeps() -> None:
                 (103.0, 103.5, 95.1, 96.5),   # swing low close to previous
                 (96.5, 99.0, 95.8, 98.0),
                 (98.0, 99.5, 96.7, 99.0),
-                (99.0, 105.3, 99.0, 104.2),   # sweep top candle
-                (104.2, 105.0, 94.8, 95.6),   # sweep bottom candle
+                (99.0, 105.6, 99.0, 104.2),   # sweep top candle
+                (104.2, 105.0, 94.4, 95.6),   # sweep bottom candle
             ]
         )
     ]
@@ -190,8 +190,8 @@ def test_liquidity_aggregates_minute_seed() -> None:
         (103.0, 103.5, 95.1, 96.5),
         (96.5, 99.0, 95.8, 98.0),
         (98.0, 99.5, 96.7, 99.0),
-        (99.0, 105.3, 99.0, 104.2),
-        (104.2, 105.0, 94.8, 95.6),
+        (99.0, 105.6, 99.0, 104.2),
+        (104.2, 105.0, 94.4, 95.6),
     ]
     for idx, spec in enumerate(fifteen_specs):
         block_start = base + timedelta(minutes=15 * idx)
@@ -267,13 +267,13 @@ def test_liquidity_detects_pdh_pdl_sweeps_from_minute_seed() -> None:
         symbol="BTCUSDT",
         tick_size=1.0,
         selection={"end": selection_end},
-        config={
-            "r_ticks": 2,
-            "lookback": 10,
-            "swing_window": 1,
-            "atr_period": 5,
-            "sweep_atr_multiplier": 2.0,
-        },
+            config={
+                "r_ticks": 2,
+                "lookback": 10,
+                "swing_window": 1,
+                "atr_period": 3,
+                "sweep_atr_multiplier": 2.0,
+            },
     )
 
     sweeps = liquidity["sweeps"]

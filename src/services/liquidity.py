@@ -18,6 +18,7 @@ MS_IN_DAY = 86_400_000
 SUPPORTED_TIMEFRAMES: tuple[str, ...] = ("15m", "1h")
 _PRICE_FIELDS: tuple[str, ...] = ("o", "h", "l", "c")
 _SYMBOL_SUFFIXES: tuple[str, ...] = ("PERP",)
+SWEEP_CAP_PCT = 0.004
 
 LOGGER = logging.getLogger(__name__)
 
@@ -658,29 +659,44 @@ def _compute_atr_series(
     *,
     period: int,
 ) -> List[float]:
+    """Compute Wilder's ATR sequence for the supplied timeframe."""
+
     atr_values: List[float] = []
     if period <= 0:
         return [0.0 for _ in candles]
-    tr_window: List[float] = []
+
     prev_close: float | None = None
-    for candle in candles:
+    true_ranges: List[float] = []
+
+    for index, candle in enumerate(candles):
         high = _coerce_float(candle.get("h"))
         low = _coerce_float(candle.get("l"))
         close = _coerce_float(candle.get("c"))
+
         if high is None or low is None or close is None:
             atr_values.append(0.0)
             prev_close = close
             continue
+
         tr_candidates = [high - low]
         if prev_close is not None:
             tr_candidates.extend((abs(high - prev_close), abs(low - prev_close)))
         true_range = max(tr_candidates) if tr_candidates else 0.0
-        tr_window.append(true_range)
-        if len(tr_window) > period:
-            tr_window.pop(0)
-        atr = sum(tr_window) / len(tr_window) if tr_window else 0.0
+        true_ranges.append(true_range)
+
+        if index == 0:
+            atr = true_range
+        elif len(true_ranges) < period:
+            atr = sum(true_ranges) / len(true_ranges)
+        elif len(true_ranges) == period:
+            atr = sum(true_ranges[-period:]) / period
+        else:
+            prev_atr = atr_values[-1]
+            atr = ((prev_atr * (period - 1)) + true_range) / period
+
         atr_values.append(atr)
         prev_close = close
+
     return atr_values
 
 
@@ -975,6 +991,7 @@ def _detect_sweeps(
     eql: Sequence[Mapping[str, Any]],
     pdh: Mapping[str, Any] | None,
     pdl: Mapping[str, Any] | None,
+    normalized_symbol: str | None = None,
 ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
     sweeps: List[Dict[str, Any]] = []
     tick_min = tick_size if tick_size and tick_size > 0 else 0.0
@@ -1021,8 +1038,22 @@ def _detect_sweeps(
             "atr_period": config.atr_period,
             "atr_mult": config.sweep_atr_multiplier,
             "tick_size": tick_size,
-            "upper": {"levels": len(upper_levels), "events": 0, "reasons": []},
-            "lower": {"levels": len(lower_levels), "events": 0, "reasons": []},
+            "upper": {
+                "levels": len(upper_levels),
+                "events": 0,
+                "reasons": [],
+                "candidates_before_atr": 0,
+                "candidates_after_atr": 0,
+                "samples": [],
+            },
+            "lower": {
+                "levels": len(lower_levels),
+                "events": 0,
+                "reasons": [],
+                "candidates_before_atr": 0,
+                "candidates_after_atr": 0,
+                "samples": [],
+            },
         }
         diagnostics[timeframe] = frame_diag
 
@@ -1040,6 +1071,36 @@ def _detect_sweeps(
             _append_reason(frame_diag["lower"]["reasons"], "no_candles")
             continue
 
+        valid_bars = [
+            candle
+            for candle in candles
+            if _coerce_float(candle.get("h")) is not None
+            and _coerce_float(candle.get("l")) is not None
+            and _coerce_float(candle.get("c")) is not None
+        ]
+        if len(valid_bars) < config.atr_period + 1:
+            LOGGER.debug(
+                "Skipping sweep evaluation due to insufficient bars for ATR",
+                extra={
+                    "tf": timeframe,
+                    "reason": "too_few_bars",
+                    "used_source": source_label,
+                    "required": config.atr_period + 1,
+                    "available": len(valid_bars),
+                },
+            )
+            _append_reason(frame_diag["upper"]["reasons"], "too_few_bars")
+            _append_reason(frame_diag["lower"]["reasons"], "too_few_bars")
+            frame_diag["atr_stats"] = {
+                "atr_period": config.atr_period,
+                "atr_mean": None,
+                "atr_median": None,
+                "atr_limit": None,
+                "epsilon": None,
+                "tick_size": tick_size,
+            }
+            continue
+
         LOGGER.debug(
             "Evaluating sweep candidates",
             extra={
@@ -1051,7 +1112,58 @@ def _detect_sweeps(
             },
         )
         atr_values = _compute_atr_series(candles, period=config.atr_period)
+        valid_atr_values = [value for value in atr_values if value > 0]
+        atr_mean = statistics.fmean(valid_atr_values) if valid_atr_values else 0.0
+        atr_median = statistics.median(valid_atr_values) if valid_atr_values else 0.0
+        atr_limit_mean = atr_mean * config.sweep_atr_multiplier
+        epsilon_preview = max(atr_limit_mean, tick_min)
+
+        frame_diag["atr_stats"] = {
+            "atr_period": config.atr_period,
+            "atr_mean": atr_mean,
+            "atr_median": atr_median,
+            "atr_limit": atr_limit_mean,
+            "epsilon": epsilon_preview,
+            "tick_size": tick_size,
+        }
+
+        LOGGER.debug(
+            "ATR diagnostics for sweeps",
+            extra={
+                "tf": timeframe,
+                "used_source": source_label,
+                "atr_period": config.atr_period,
+                "atr_mean": atr_mean,
+                "atr_median": atr_median,
+                "atr_limit": atr_limit_mean,
+                "epsilon_preview": epsilon_preview,
+                "tick_size": tick_size,
+            },
+        )
+
+        if (
+            timeframe == "15m"
+            and normalized_symbol == "BTCUSDT"
+            and atr_mean > 0
+            and atr_mean < 5
+        ):
+            LOGGER.error(
+                "ATR too small — check units",
+                extra={
+                    "tf": timeframe,
+                    "normalized_symbol": normalized_symbol,
+                    "atr_mean": atr_mean,
+                    "atr_period": config.atr_period,
+                },
+            )
+            _append_reason(frame_diag["upper"]["reasons"], "atr_too_small")
+            _append_reason(frame_diag["lower"]["reasons"], "atr_too_small")
+            continue
+
         epsilon_samples: List[float] = []
+        upper_candidate_samples: List[Dict[str, Any]] = []
+        lower_candidate_samples: List[Dict[str, Any]] = []
+
         for index, candle in enumerate(candles):
             high = _coerce_float(candle.get("h"))
             close = _coerce_float(candle.get("c"))
@@ -1061,7 +1173,7 @@ def _detect_sweeps(
             high = _quantise(high, tick_size)
             close = _quantise(close, tick_size)
             atr_component = atr_values[index] * config.sweep_atr_multiplier
-            base_epsilon = max(tick_min, atr_component)
+            atr_limit = max(tick_min, atr_component)
             for level in upper_levels:
                 level_price = _coerce_float(level.get("price"))
                 if level_price is None:
@@ -1081,15 +1193,10 @@ def _detect_sweeps(
                 overshoot = high - level_price
                 if overshoot <= 0:
                     continue
-                price_cap = level_price * 0.004 if level_price > 0 else None
-                epsilon = base_epsilon
+                price_cap = level_price * SWEEP_CAP_PCT if level_price > 0 else None
+                epsilon = max(atr_limit, tick_min)
                 if price_cap is not None and price_cap > 0:
-                    epsilon = min(base_epsilon, max(price_cap, tick_min))
-                else:
-                    epsilon = max(base_epsilon, tick_min)
-                level_tolerance = _coerce_float(level.get("tolerance"))
-                if level_tolerance is not None and level_tolerance > 0:
-                    epsilon = min(epsilon, max(level_tolerance, tick_min))
+                    epsilon = min(epsilon, max(price_cap, tick_min))
                 epsilon_samples.append(epsilon)
                 if overshoot <= epsilon:
                     LOGGER.debug(
@@ -1113,6 +1220,18 @@ def _detect_sweeps(
                         epsilon=epsilon,
                     )
                     continue
+                frame_diag["upper"]["candidates_before_atr"] += 1
+                if len(upper_candidate_samples) < 5:
+                    upper_candidate_samples.append(
+                        {
+                            "level": level_price,
+                            "high": high,
+                            "close": close,
+                            "overshoot": overshoot,
+                            "epsilon": epsilon,
+                            "atr_limit": atr_limit,
+                        }
+                    )
                 atr_cap = max(epsilon * 2.0, tick_min)
                 if overshoot > atr_cap + 1e-9:
                     LOGGER.debug(
@@ -1136,6 +1255,7 @@ def _detect_sweeps(
                         epsilon=epsilon,
                     )
                     continue
+                frame_diag["upper"]["candidates_after_atr"] += 1
                 if close >= level_price:
                     _append_reason(
                         frame_diag["upper"]["reasons"],
@@ -1175,7 +1295,7 @@ def _detect_sweeps(
             low = _quantise(low, tick_size)
             close = _quantise(close, tick_size)
             atr_component = atr_values[index] * config.sweep_atr_multiplier
-            base_epsilon = max(tick_min, atr_component)
+            atr_limit = max(tick_min, atr_component)
             for level in lower_levels:
                 level_price = _coerce_float(level.get("price"))
                 if level_price is None:
@@ -1195,15 +1315,10 @@ def _detect_sweeps(
                 overshoot = level_price - low
                 if overshoot <= 0:
                     continue
-                price_cap = level_price * 0.004 if level_price > 0 else None
-                epsilon = base_epsilon
+                price_cap = level_price * SWEEP_CAP_PCT if level_price > 0 else None
+                epsilon = max(atr_limit, tick_min)
                 if price_cap is not None and price_cap > 0:
-                    epsilon = min(base_epsilon, max(price_cap, tick_min))
-                else:
-                    epsilon = max(base_epsilon, tick_min)
-                level_tolerance = _coerce_float(level.get("tolerance"))
-                if level_tolerance is not None and level_tolerance > 0:
-                    epsilon = min(epsilon, max(level_tolerance, tick_min))
+                    epsilon = min(epsilon, max(price_cap, tick_min))
                 epsilon_samples.append(epsilon)
                 if overshoot <= epsilon:
                     LOGGER.debug(
@@ -1227,6 +1342,18 @@ def _detect_sweeps(
                         epsilon=epsilon,
                     )
                     continue
+                frame_diag["lower"]["candidates_before_atr"] += 1
+                if len(lower_candidate_samples) < 5:
+                    lower_candidate_samples.append(
+                        {
+                            "level": level_price,
+                            "low": low,
+                            "close": close,
+                            "overshoot": overshoot,
+                            "epsilon": epsilon,
+                            "atr_limit": atr_limit,
+                        }
+                    )
                 atr_cap = max(epsilon * 2.0, tick_min)
                 if overshoot > atr_cap + 1e-9:
                     LOGGER.debug(
@@ -1250,6 +1377,7 @@ def _detect_sweeps(
                         epsilon=epsilon,
                     )
                     continue
+                frame_diag["lower"]["candidates_after_atr"] += 1
                 if close <= level_price:
                     _append_reason(
                         frame_diag["lower"]["reasons"],
@@ -1269,6 +1397,11 @@ def _detect_sweeps(
                     }
                 )
                 frame_diag["lower"]["events"] += 1
+
+        if upper_candidate_samples:
+            frame_diag["upper"]["samples"] = upper_candidate_samples
+        if lower_candidate_samples:
+            frame_diag["lower"]["samples"] = lower_candidate_samples
 
         epsilon_stats = {
             "min": min(epsilon_samples) if epsilon_samples else None,
@@ -1290,6 +1423,10 @@ def _detect_sweeps(
                 "atr_last": atr_values[-1] if atr_values else None,
                 "epsilon_min": epsilon_stats["min"],
                 "epsilon_max": epsilon_stats["max"],
+                "candidates_upper": frame_diag["upper"]["candidates_before_atr"],
+                "candidates_lower": frame_diag["lower"]["candidates_before_atr"],
+                "candidates_upper_after_atr": frame_diag["upper"]["candidates_after_atr"],
+                "candidates_lower_after_atr": frame_diag["lower"]["candidates_after_atr"],
             },
         )
 
@@ -1374,6 +1511,7 @@ def build_liquidity_snapshot(
         eql=levels["eql"],
         pdh=daily_levels["pdh"],
         pdl=daily_levels["pdl"],
+        normalized_symbol=normalized_symbol,
     )
 
     LOGGER.debug(
