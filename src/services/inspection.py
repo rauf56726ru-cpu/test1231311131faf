@@ -1596,14 +1596,21 @@ def render_inspection_page(
     }
     .checkall-control {
       display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      gap: 0.6rem;
+      flex-direction: column;
+      align-items: stretch;
+      gap: 0.75rem;
       padding: 0.75rem 1rem 0.5rem;
       background: rgba(15, 23, 42, 0.85);
       border-top: 1px solid rgba(148, 163, 184, 0.16);
     }
-    .checkall-control span {
+    .checkall-control__row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.6rem;
+    }
+    .checkall-control span,
+    .checkall-control__row span {
       font-size: 0.75rem;
       letter-spacing: 0.08em;
       text-transform: uppercase;
@@ -1616,6 +1623,47 @@ def render_inspection_page(
       padding: 0.4rem 0.7rem;
       color: var(--fg);
       min-width: 110px;
+    }
+    .checkall-compact {
+      display: grid;
+      gap: 0.6rem;
+    }
+    .checkall-compact__toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-size: 0.85rem;
+      color: rgba(226, 232, 240, 0.92);
+    }
+    .checkall-compact__toggle input[type="checkbox"] {
+      width: 1.1rem;
+      height: 1.1rem;
+      accent-color: var(--accent);
+    }
+    .checkall-compact__params {
+      display: grid;
+      gap: 0.55rem;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    }
+    .checkall-compact__params label {
+      display: flex;
+      flex-direction: column;
+      gap: 0.3rem;
+      font-size: 0.78rem;
+      color: rgba(148, 163, 184, 0.85);
+    }
+    .checkall-compact__params label span {
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-size: 0.7rem;
+      color: rgba(148, 163, 184, 0.7);
+    }
+    .checkall-compact__params input {
+      background: rgba(15, 23, 42, 0.65);
+      border: 1px solid rgba(148, 163, 184, 0.3);
+      border-radius: 10px;
+      padding: 0.45rem 0.6rem;
+      color: var(--fg);
     }
     .collapse pre {
       margin: 0;
@@ -2432,6 +2480,12 @@ def render_inspection_page(
     const checkAllPre = document.getElementById("checkall-json");
     const checkAllButton = document.getElementById("fetch-check-all");
     const checkAllHours = document.getElementById("checkall-hours");
+    const compactToggle = document.getElementById("checkall-compact-toggle");
+    const compactParamsContainer = document.querySelector("[data-compact-settings]");
+    const compactAbsField = document.getElementById("compact-eps-abs");
+    const compactRelField = document.getElementById("compact-eps-rel");
+    const compactMaxMinutesField = document.getElementById("compact-max-minutes");
+    const compactVolField = document.getElementById("compact-eps-vol");
     const snapshotMeta = document.getElementById("snapshot-meta");
     const frameSelect = document.getElementById("frame-select");
     const chartContainer = document.getElementById("inspection-chart");
@@ -2516,6 +2570,13 @@ def render_inspection_page(
       series: null,
       checkAll: null,
       hours: checkAllHours ? resolveHours(checkAllHours.value) : 1,
+      compactEnabled: false,
+      compactParams: {
+        epsAbsPrice: "",
+        epsRelPrice: "",
+        maxSegmentMinutes: "",
+        epsVol: "",
+      },
       profilePreset: initial.payload?.DATA?.profile_preset || null,
       presetRequired: Boolean(initial.payload?.DATA?.profile_preset_required),
       presetDefaults: initial.payload?.DATA?.profile_defaults || null,
@@ -2831,6 +2892,30 @@ def render_inspection_page(
       if (chartContainer) chartContainer.setAttribute("data-selection-label", label);
     }
 
+    function syncCompactControls() {
+      if (compactToggle) {
+        compactToggle.checked = Boolean(state.compactEnabled);
+      }
+      if (compactParamsContainer) {
+        compactParamsContainer.hidden = !state.compactEnabled;
+      }
+      if (state.compactParams) {
+        const { epsAbsPrice, epsRelPrice, maxSegmentMinutes, epsVol } = state.compactParams;
+        if (compactAbsField && compactAbsField.value !== epsAbsPrice) {
+          compactAbsField.value = epsAbsPrice;
+        }
+        if (compactRelField && compactRelField.value !== epsRelPrice) {
+          compactRelField.value = epsRelPrice;
+        }
+        if (compactMaxMinutesField && compactMaxMinutesField.value !== maxSegmentMinutes) {
+          compactMaxMinutesField.value = maxSegmentMinutes;
+        }
+        if (compactVolField && compactVolField.value !== epsVol) {
+          compactVolField.value = epsVol;
+        }
+      }
+    }
+
     function updateCheckAllState() {
       if (!checkAllButton) return;
       const hasSelection = Boolean(state.selection && state.selection.start && state.selection.end);
@@ -2840,6 +2925,7 @@ def render_inspection_page(
       }
       const presetReady = !state.presetRequired;
       checkAllButton.disabled = !state.snapshotId || !hasSelection || !hoursValid || !presetReady;
+      syncCompactControls();
     }
 
     function populateSnapshots(list) {
@@ -2956,6 +3042,38 @@ def render_inspection_page(
         url.searchParams.set("selection_start", String(selectionStart));
         url.searchParams.set("selection_end", String(selectionEnd));
         url.searchParams.set("hours", String(state.hours));
+        if (state.compactEnabled) {
+          url.searchParams.set("compact", "true");
+          const parseFloatParam = (value) => {
+            const raw = typeof value === "string" ? value.trim() : "";
+            if (!raw) return null;
+            const parsed = Number(raw);
+            return Number.isFinite(parsed) ? parsed : null;
+          };
+          const parseIntParam = (value) => {
+            const raw = typeof value === "string" ? value.trim() : "";
+            if (!raw) return null;
+            const parsed = Number.parseInt(raw, 10);
+            return Number.isFinite(parsed) ? Math.max(1, parsed) : null;
+          };
+          const params = state.compactParams || {};
+          const absValue = parseFloatParam(params.epsAbsPrice);
+          if (absValue !== null) {
+            url.searchParams.set("compact_eps_abs_price", String(absValue));
+          }
+          const relValue = parseFloatParam(params.epsRelPrice);
+          if (relValue !== null) {
+            url.searchParams.set("compact_eps_rel_price", String(relValue));
+          }
+          const maxMinutesValue = parseIntParam(params.maxSegmentMinutes);
+          if (maxMinutesValue !== null) {
+            url.searchParams.set("compact_max_segment_minutes", String(maxMinutesValue));
+          }
+          const volValue = parseFloatParam(params.epsVol);
+          if (volValue !== null) {
+            url.searchParams.set("compact_eps_vol", String(volValue));
+          }
+        }
         const response = await fetch(url.toString(), {
           headers: { Accept: "application/json" },
         });
@@ -3233,6 +3351,31 @@ def render_inspection_page(
         closePresetModal();
       }
     });
+
+    if (compactToggle) {
+      compactToggle.addEventListener("change", () => {
+        state.compactEnabled = compactToggle.checked;
+        syncCompactControls();
+      });
+    }
+
+    const bindCompactInput = (field, key) => {
+      if (!field) return;
+      field.addEventListener("input", () => {
+        if (!state.compactParams) return;
+        state.compactParams[key] = field.value;
+      });
+      field.addEventListener("blur", () => {
+        if (!state.compactParams) return;
+        state.compactParams[key] = field.value.trim();
+        syncCompactControls();
+      });
+    };
+
+    bindCompactInput(compactAbsField, "epsAbsPrice");
+    bindCompactInput(compactRelField, "epsRelPrice");
+    bindCompactInput(compactMaxMinutesField, "maxSegmentMinutes");
+    bindCompactInput(compactVolField, "epsVol");
 
     if (checkAllHours) {
       checkAllHours.value = String(state.hours);
@@ -4382,23 +4525,48 @@ def render_inspection_page(
                 </header>
                 <pre id=\"diagnostics-json\">{diagnostics_json_initial}</pre>
               </div>
-              <div class=\"collapse\">
-                <header data-collapse-toggle>
-                  <h3>CHECK ALL DATAS</h3>
-                  <div class=\"actions\">
-                    <button id=\"fetch-check-all\" class=\"secondary\" type=\"button\">Check all datas</button>
-                    <button class=\"secondary\" type=\"button\" data-copy-target=\"checkall-json\">Copy JSON</button>
-                  </div>
-                </header>
-                <div class=\"checkall-control\">
-                  <span>Собрать подробно информацию за N часов</span>
-                  <select id=\"checkall-hours\">
-                    <option value=\"1\">1 час</option>
-                    <option value=\"2\">2 часа</option>
-                    <option value=\"3\">3 часа</option>
-                    <option value=\"4\">4 часа</option>
-                  </select>
-                </div>
+                <div class=\"collapse\">
+                  <header data-collapse-toggle>
+                    <h3>CHECK ALL DATAS</h3>
+                    <div class=\"actions\">
+                      <button id=\"fetch-check-all\" class=\"secondary\" type=\"button\">Check all datas</button>
+                      <button class=\"secondary\" type=\"button\" data-copy-target=\"checkall-json\">Copy JSON</button>
+                    </div>
+                  </header>
+                  <div class=\"checkall-control\">
+                    <div class=\"checkall-control__row\">
+                      <span>Собрать подробно информацию за N часов</span>
+                      <select id=\"checkall-hours\">
+                        <option value=\"1\">1 час</option>
+                        <option value=\"2\">2 часа</option>
+                        <option value=\"3\">3 часа</option>
+                        <option value=\"4\">4 часа</option>
+                      </select>
+                    </div>
+                    <div class=\"checkall-compact\">
+                      <label class=\"checkall-compact__toggle\">
+                        <input id=\"checkall-compact-toggle\" type=\"checkbox\" />
+                        <span>Включить компактные 1m сегменты</span>
+                      </label>
+                      <div class=\"checkall-compact__params\" data-compact-settings hidden>
+                        <label>
+                          <span>Абсолютный порог</span>
+                          <input id=\"compact-eps-abs\" type=\"number\" min=\"0\" step=\"0.01\" placeholder=\"5\" />
+                        </label>
+                        <label>
+                          <span>Относительный порог</span>
+                          <input id=\"compact-eps-rel\" type=\"number\" min=\"0\" step=\"0.0001\" placeholder=\"0.0001\" />
+                        </label>
+                        <label>
+                          <span>Макс. длительность</span>
+                          <input id=\"compact-max-minutes\" type=\"number\" min=\"1\" step=\"1\" placeholder=\"15\" />
+                        </label>
+                        <label>
+                          <span>Порог объёма (STD)</span>
+                          <input id=\"compact-eps-vol\" type=\"number\" min=\"0\" step=\"0.01\" placeholder=\"—\" />
+                        </label>
+                      </div>
+                    </div>
                 <pre id=\"checkall-json\">{check_all_json_initial}</pre>
               </div>
               <div class=\"collapse\">
