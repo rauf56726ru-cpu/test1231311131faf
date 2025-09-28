@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 
+import math
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -523,6 +525,35 @@ def test_check_all_after_reload_returns_data(client: TestClient) -> None:
     assert body["datas_for_last_N_hours"]["range"]["start_utc"].startswith(
         expected_detailed_start
     )
+    vwap_sigma_block = body.get("vwap_sigma")
+    assert isinstance(vwap_sigma_block, dict)
+    daily_sigma = vwap_sigma_block.get("daily")
+    assert isinstance(daily_sigma, dict)
+    assert daily_sigma.get("basis") == "daily"
+    sigma_entries = daily_sigma.get("sigma")
+    assert isinstance(sigma_entries, list)
+    assert len(sigma_entries) == 2
+    first_level, second_level = sigma_entries
+    assert first_level.get("k") == 1
+    assert second_level.get("k") == 2
+    first_spread = first_level["price_plus"] - first_level["price_minus"]
+    second_spread = second_level["price_plus"] - second_level["price_minus"]
+    assert first_spread >= 0
+    assert second_spread >= first_spread
+    vwap_center = body["datas_for_last_N_hours"]["frames"]["1m"]["vwap"]
+    assert math.isclose(
+        vwap_center,
+        first_level["price_minus"] + first_spread / 2,
+        rel_tol=1e-6,
+    )
+    session_sigma = vwap_sigma_block.get("sessions")
+    assert isinstance(session_sigma, dict)
+    assert session_sigma, "expected per-session sigma levels"
+    for session_name, entry in session_sigma.items():
+        assert entry["basis"] == "session"
+        levels = entry.get("sigma")
+        assert isinstance(levels, list)
+        assert len(levels) == 2
     movement_key = next(
         key for key in body.keys() if isinstance(key, str) and key.startswith("movement_datas_for_")
     )

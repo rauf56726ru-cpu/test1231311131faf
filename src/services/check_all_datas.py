@@ -876,6 +876,57 @@ def _compute_vwap(candles: Sequence[Mapping[str, Any]]) -> float:
     return total_pv / total_volume
 
 
+def _compute_vwap_stats(
+    candles: Sequence[Mapping[str, Any]]
+) -> Tuple[float, float] | None:
+    total_pv = 0.0
+    total_p2v = 0.0
+    total_volume = 0.0
+    valid = 0
+    for candle in candles:
+        volume = float(candle.get("v", 0.0))
+        if volume <= 0.0:
+            continue
+        high = float(candle.get("h", 0.0))
+        low = float(candle.get("l", 0.0))
+        close = float(candle.get("c", 0.0))
+        typical_price = (high + low + close) / 3.0
+        if not math.isfinite(typical_price):
+            continue
+        total_pv += typical_price * volume
+        total_p2v += typical_price * typical_price * volume
+        total_volume += volume
+        valid += 1
+    if total_volume <= 0.0:
+        return None
+    value = total_pv / total_volume
+    if valid < 2:
+        sigma = 0.0
+    else:
+        variance = max(total_p2v / total_volume - value * value, 0.0)
+        sigma = math.sqrt(variance)
+    return value, sigma
+
+
+def _build_sigma_levels(center: float, sigma: float) -> List[Dict[str, float]]:
+    return [
+        {"k": k, "price_minus": center - sigma * k, "price_plus": center + sigma * k}
+        for k in (1, 2)
+    ]
+
+
+def _build_vwap_sigma_block(
+    candles: Sequence[Mapping[str, Any]], *, basis: str
+) -> Dict[str, Any]:
+    stats = _compute_vwap_stats(candles)
+    if stats is None:
+        center = _compute_vwap(candles)
+        sigma = 0.0
+    else:
+        center, sigma = stats
+    return {"basis": basis, "sigma": _build_sigma_levels(center, sigma)}
+
+
 def _typical_price(candle: Mapping[str, Any]) -> float:
     high = float(candle.get("h", 0.0))
     low = float(candle.get("l", 0.0))
@@ -1198,10 +1249,18 @@ def _build_daily_vwap(
     filtered = _filter_candles(frames[source_key], start_ms=start_ms, end_ms=end_ms)
     if not filtered:
         return None
+    stats = _compute_vwap_stats(filtered)
+    if stats is None:
+        vwap_value = _compute_vwap(filtered)
+        sigma_payload = {"basis": "daily", "sigma": _build_sigma_levels(vwap_value, 0.0)}
+    else:
+        vwap_value, sigma_value = stats
+        sigma_payload = {"basis": "daily", "sigma": _build_sigma_levels(vwap_value, sigma_value)}
     return {
         "timeframe": source_key,
-        "value": _compute_vwap(filtered),
+        "value": vwap_value,
         "summary": _summarise(filtered),
+        "vwap_sigma": sigma_payload,
     }
 
 
@@ -1726,6 +1785,9 @@ def build_check_all_datas(
 
     minute_series = frames.get("1m", [])
     daily_start_ms = _start_of_day_ms(window_end_ms)
+    daily_filtered_minutes = _filter_candles(
+        minute_series, start_ms=daily_start_ms, end_ms=window_end_ms
+    )
     daily_vwap_profile = _build_volume_profile_stats(
         minute_series,
         start_ms=daily_start_ms,
@@ -1735,8 +1797,12 @@ def build_check_all_datas(
     )
 
     session_profiles: Dict[str, Dict[str, Any]] = {}
+    session_sigma_blocks: Dict[str, Dict[str, Any]] = {}
     for session_name, session_start, session_end in sessions:
         session_start_ms, session_end_ms = _session_window(window_end_ms, session_start, session_end)
+        session_filtered = _filter_candles(
+            minute_series, start_ms=session_start_ms, end_ms=session_end_ms
+        )
         session_profiles[session_name] = _build_volume_profile_stats(
             minute_series,
             start_ms=session_start_ms,
@@ -1744,10 +1810,18 @@ def build_check_all_datas(
             tick_size=tick_size_numeric,
             value_area_pct=VALUE_AREA_PCT,
         )
+        session_sigma_blocks[session_name] = _build_vwap_sigma_block(
+            session_filtered, basis="session"
+        )
 
     vwap_payload = {
         "daily": daily_vwap_profile,
         "sessions": session_profiles,
+    }
+
+    vwap_sigma_payload = {
+        "daily": _build_vwap_sigma_block(daily_filtered_minutes, basis="daily"),
+        "sessions": session_sigma_blocks,
     }
 
     latest_candle_payload_source = (
@@ -1794,6 +1868,7 @@ def build_check_all_datas(
         "data_quality_htf": htf_quality,
         "profile_preset": profile_config.get("preset_payload"),
         "vwap": vwap_payload,
+        "vwap_sigma": vwap_sigma_payload,
     }
 
     return round_floats(response_payload)
