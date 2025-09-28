@@ -1,49 +1,54 @@
-"""Detection utilities for price zones such as FVG, OB and CISD."""
+"""Structured zone detection for Fair Value Gaps, Order Blocks and derivatives.
+
+This module implements the zone taxonomy described in the specification for
+Задача 6.  The implementation focuses on deterministic, testable logic that can
+be evaluated purely from OHLCV candles without relying on external state.
+"""
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
-from typing import Any, Dict, List, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple
 
-from .ohlc import normalise_ohlcv
+from .ohlc import TIMEFRAME_TO_MS, resample_ohlcv
+from .smc import SMCConfig, detect_smc_blocks
+
+Timeframe = str
+Candle = Mapping[str, Any]
 
 
 @dataclass(slots=True)
 class Config:
-    """Configuration parameters controlling zone detection."""
+    """Configuration bundle controlling the detectors."""
 
-    min_gap_pct: float | None = None
     tick_size: float | None = None
     atr_period: int = 14
-    k_impulse: float = 1.5
-    w_swing: int = 3
-    r_zone_pct: float = 0.15
-    m_wick_atr: float = 0.5
-    ob_lookback: int = 8
-    ob_min_body_ratio: float | None = 0.1
+    displacement_body: float = 1.0
+    displacement_range: float = 1.5
+    ob_body_max_atr: float = 0.7
+    ob_overlap_ratio: float = 0.6
+    ob_distance_atr: float = 0.5
+    min_block_ratio: float = 0.2
+    epsilon_ticks: float = 1.0
+    liquidity_window: int = 3
+    sr_merge_pct: float = 0.0002
 
 
-def _default_min_gap_pct(tf: str) -> float:
-    tf_key = str(tf or "").lower()
-    if tf_key == "1m":
-        return 0.0001
-    if tf_key == "5m":
-        return 0.0005
-    return 0.02
+_PIVOT_WINDOWS: Dict[str, int] = {"15m": 2, "1h": 3, "4h": 4}
 
 
-def _round_tick(value: float, tick_size: float | None) -> float:
-    if tick_size is None or not math.isfinite(value):
-        return float(value)
-    if tick_size <= 0:
-        return float(value)
-    return round(value / tick_size) * tick_size
+def _ms_to_iso(timestamp_ms: int) -> str:
+    return (
+        datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
-def _infer_tick_size(candles: Sequence[Mapping[str, Any]]) -> float | None:
-    """Infer the minimal price increment from the candle series."""
-
+def _infer_tick_size(candles: Sequence[Candle]) -> float | None:
     prices: List[float] = []
     for candle in candles:
         for key in ("o", "h", "l", "c"):
@@ -56,10 +61,8 @@ def _infer_tick_size(candles: Sequence[Mapping[str, Any]]) -> float | None:
                 continue
             if math.isfinite(price):
                 prices.append(price)
-
     if len(prices) < 2:
         return None
-
     prices = sorted(set(prices))
     min_diff = math.inf
     for left, right in zip(prices, prices[1:]):
@@ -68,807 +71,676 @@ def _infer_tick_size(candles: Sequence[Mapping[str, Any]]) -> float | None:
             continue
         if diff < min_diff:
             min_diff = diff
-
     if not math.isfinite(min_diff) or min_diff <= 0:
         return None
-
-    tick = round(min_diff, 12)
-    if tick <= 0:
-        tick = float(min_diff)
-    return float(tick)
+    return float(round(min_diff, 12))
 
 
-def _true_range(current: Mapping[str, float], previous: Mapping[str, float]) -> float:
-    high = current["h"]
-    low = current["l"]
-    prev_close = previous["c"]
+def _round_tick(value: float, tick_size: float | None) -> float:
+    if tick_size is None or tick_size <= 0:
+        return float(value)
+    return round(value / tick_size) * tick_size
+
+
+def _true_range(current: Candle, previous: Candle) -> float:
+    high = float(current["h"])
+    low = float(current["l"])
+    prev_close = float(previous["c"])
     return max(high - low, abs(high - prev_close), abs(low - prev_close))
 
 
-def compute_atr(candles: Sequence[Mapping[str, Any]], period: int) -> List[float]:
-    """Compute Wilder's ATR for the provided candles.
-
-    Returns a list of ATR values aligned with the input candles. Positions with
-    insufficient history are filled with ``math.nan``.
-    """
-
+def compute_atr(candles: Sequence[Candle], period: int) -> List[float]:
     if period <= 0:
         raise ValueError("period must be positive")
     if not candles:
         return []
-
     atr: List[float] = [math.nan] * len(candles)
     true_ranges: List[float] = [0.0] * len(candles)
     for i in range(1, len(candles)):
         true_ranges[i] = _true_range(candles[i], candles[i - 1])
-
-    window_sum = sum(true_ranges[1 : period + 1]) if len(candles) > period else 0.0
-    if len(candles) > period:
-        atr[period] = window_sum / period
-    else:
+    if len(candles) <= period:
         return atr
-
+    window_sum = sum(true_ranges[1 : period + 1])
+    atr[period] = window_sum / period
     for i in range(period + 1, len(candles)):
         prev_atr = atr[i - 1]
         atr[i] = (prev_atr * (period - 1) + true_ranges[i]) / period
-
     return atr
 
 
-def _candle_direction(candle: Mapping[str, Any], tick_size: float | None) -> str:
-    """Classify candle direction as bull, bear or doji."""
-
-    open_raw = candle.get("o", 0.0)
-    close_raw = candle.get("c", 0.0)
-    try:
-        open_price = float(open_raw)
-        close_price = float(close_raw)
-    except (TypeError, ValueError):
-        return "doji"
-    diff = close_price - open_price
-    if tick_size is not None and tick_size > 0:
-        tolerance = tick_size * 0.1
-    else:
-        tolerance = 1e-9
-    if diff > tolerance:
-        return "bull"
-    if diff < -tolerance:
-        return "bear"
-    return "doji"
+def _body_range(candle: Candle) -> Tuple[float, float]:
+    open_price = float(candle.get("o", 0.0))
+    close_price = float(candle.get("c", 0.0))
+    low, high = (open_price, close_price) if open_price <= close_price else (close_price, open_price)
+    return low, high
 
 
-def _locate_ob_base(
-    candles: Sequence[Mapping[str, Any]],
+def _candle_range(candle: Candle) -> Tuple[float, float]:
+    low = float(candle.get("l", 0.0))
+    high = float(candle.get("h", 0.0))
+    return (low, high) if low <= high else (high, low)
+
+
+def _pivot_span(tf: str) -> int:
+    return _PIVOT_WINDOWS.get(tf, 2)
+
+
+def _epsilon(cfg: Config, tick_size: float | None) -> float:
+    if tick_size is None or tick_size <= 0:
+        return 0.0
+    return cfg.epsilon_ticks * tick_size
+
+
+def _detect_pivots(candles: Sequence[Candle], span: int) -> List[Dict[str, Any]]:
+    if span <= 0 or len(candles) < 2 * span + 1:
+        return []
+    pivots: List[Dict[str, Any]] = []
+    for idx in range(span, len(candles) - span):
+        window = candles[idx - span : idx + span + 1]
+        center = candles[idx]
+        high = float(center["h"])
+        low = float(center["l"])
+        if all(high >= float(item["h"]) for item in window):
+            pivots.append({"type": "ph", "idx": idx, "price": high, "t": int(center["t"])})
+        if all(low <= float(item["l"]) for item in window):
+            pivots.append({"type": "pl", "idx": idx, "price": low, "t": int(center["t"])})
+    pivots.sort(key=lambda item: item["idx"])
+    return pivots
+
+
+def _detect_structure(
+    candles: Sequence[Candle],
     *,
-    impulse_idx: int,
-    lookback: int,
-    zone_type: str,
+    tf: str,
     tick_size: float | None,
-) -> int | None:
-    """Find the last opposite candle preceding the impulse within a lookback window."""
-
-    if impulse_idx <= 0:
-        return None
-
-    required_direction = "bull" if zone_type == "supply" else "bear"
-    limit = max(0, impulse_idx - (lookback if lookback and lookback > 0 else impulse_idx))
-    for idx in range(impulse_idx - 1, limit - 1, -1):
-        direction = _candle_direction(candles[idx], tick_size)
-        if direction == required_direction:
-            return idx
-    return None
-
-
-def _calc_gap_pct(bot: float, top: float) -> float:
-    mid = (bot + top) / 2
-    if mid == 0:
-        return 0.0
-    return (top - bot) / mid
-
-
-def _fvg_merge_threshold(tick_size: float | None) -> float:
-    if tick_size is None:
-        return 0.0
-    return abs(tick_size)
-
-
-def _overlaps(a_bot: float, a_top: float, b_bot: float, b_top: float, *, threshold: float) -> bool:
-    return max(a_bot, b_bot) <= min(a_top, b_top) + threshold
-
-
-def detect_fvg(candles: Sequence[Mapping[str, Any]], cfg: Config, tf: str) -> List[Dict[str, Any]]:
-    normalised = list(candles)
-    inferred_tick = _infer_tick_size(normalised)
-    effective_cfg = replace(
-        cfg,
-        tick_size=cfg.tick_size or inferred_tick,
-        min_gap_pct=(
-            cfg.min_gap_pct if cfg.min_gap_pct is not None else _default_min_gap_pct(tf)
-        ),
-    )
-    zones, _ = _detect_fvg_internal(normalised, effective_cfg, tf)
-    return zones
-
-
-def _detect_fvg_internal(
-    candles: Sequence[Mapping[str, Any]], cfg: Config, tf: str
-) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    if len(candles) < 3:
-        return [], []
-
-    min_gap_pct = (
-        cfg.min_gap_pct if cfg.min_gap_pct is not None else _default_min_gap_pct(tf)
-    )
-    inferred_tick = _infer_tick_size(candles)
-    effective_tick = cfg.tick_size or inferred_tick
-    threshold = _fvg_merge_threshold(effective_tick)
-    raw: List[Dict[str, Any]] = []
-    for i in range(1, len(candles) - 1):
-        prev_candle = candles[i - 1]
-        mid_candle = candles[i]
-        next_candle = candles[i + 1]
-
-        bull_gap = next_candle["l"] > prev_candle["h"]
-        bear_gap = next_candle["h"] < prev_candle["l"]
-
-        if bull_gap:
-            bot = prev_candle["h"]
-            top = next_candle["l"]
-            gap_pct = _calc_gap_pct(bot, top)
-            width = top - bot
-            if width <= 0:
-                continue
-            passes_pct = gap_pct >= min_gap_pct if min_gap_pct is not None else True
-            passes_tick = (
-                effective_tick is not None
-                and width + 1e-12 >= max(effective_tick, 0.0)
-            )
-            if not passes_pct and not passes_tick:
-                continue
-            raw.append(
-                {
-                    "dir": "up",
-                    "bot": bot,
-                    "top": top,
-                    "created_at": mid_candle["t"],
-                    "tf": tf,
-                    "indices": [i],
-                }
-            )
-        elif bear_gap:
-            bot = next_candle["h"]
-            top = prev_candle["l"]
-            gap_pct = _calc_gap_pct(bot, top)
-            width = top - bot
-            if width <= 0:
-                continue
-            passes_pct = gap_pct >= min_gap_pct if min_gap_pct is not None else True
-            passes_tick = (
-                effective_tick is not None
-                and width + 1e-12 >= max(effective_tick, 0.0)
-            )
-            if not passes_pct and not passes_tick:
-                continue
-            raw.append(
-                {
-                    "dir": "down",
-                    "bot": bot,
-                    "top": top,
-                    "created_at": mid_candle["t"],
-                    "tf": tf,
-                    "indices": [i],
-                }
-            )
-
-    if not raw:
-        return [], []
-
-    raw.sort(key=lambda item: item["created_at"])
-
-    merged: List[Dict[str, Any]] = []
-    for zone in raw:
-        if not merged:
-            merged.append(zone)
+    cfg: Config,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    pivots = _detect_pivots(candles, _pivot_span(tf))
+    bos_events: List[Dict[str, Any]] = []
+    choch_events: List[Dict[str, Any]] = []
+    trend: str | None = None
+    last_ph: Dict[str, Any] | None = None
+    last_pl: Dict[str, Any] | None = None
+    epsilon = _epsilon(cfg, tick_size)
+    for idx, candle in enumerate(candles):
+        for pivot in pivots:
+            if pivot["idx"] == idx:
+                if pivot["type"] == "ph":
+                    last_ph = pivot
+                elif pivot["type"] == "pl":
+                    last_pl = pivot
+        close_price = float(candle.get("c", 0.0))
+        bos_direction: str | None = None
+        if last_ph and idx > last_ph["idx"] and close_price > last_ph["price"] + epsilon:
+            bos_direction = "up"
+        if last_pl and idx > last_pl["idx"] and close_price < last_pl["price"] - epsilon:
+            bos_direction = "down"
+        if bos_direction is None:
             continue
-        last = merged[-1]
-        if last["dir"] == zone["dir"] and _overlaps(
-            last["bot"], last["top"], zone["bot"], zone["top"], threshold=threshold
-        ):
-            last["bot"] = min(last["bot"], zone["bot"])
-            last["top"] = max(last["top"], zone["top"])
-            last["created_at"] = min(last["created_at"], zone["created_at"])
-            last["indices"].extend(zone["indices"])
-        else:
-            merged.append(zone)
-
-    for zone in merged:
-        zone["indices"] = sorted(set(zone["indices"]))
-        zone["fvl"] = (zone["bot"] + zone["top"]) / 2
-        zone["bot"] = _round_tick(zone["bot"], effective_tick)
-        zone["top"] = _round_tick(zone["top"], effective_tick)
-        zone["fvl"] = _round_tick(zone["fvl"], effective_tick)
-
-    for zone in merged:
-        created_idx = min(zone["indices"])
-        status = "open"
-        bot = zone["bot"]
-        top = zone["top"]
-        for j in range(created_idx + 1, len(candles)):
-            high = candles[j]["h"]
-            low = candles[j]["l"]
-            if high >= top and low <= bot:
-                status = "closed"
-                zone["closed_at"] = candles[j]["t"]
-                break
-        zone["status"] = status
-
-    export: List[Dict[str, Any]] = []
-    metadata: List[Dict[str, Any]] = []
-    for zone in merged:
-        export_zone = {
-            "tf": tf,
-            "dir": zone["dir"],
-            "top": zone["top"],
-            "bot": zone["bot"],
-            "fvl": zone["fvl"],
-            "created_at": zone["created_at"],
-            "status": zone["status"],
-        }
-        export.append(export_zone)
-        metadata.append(
-            {
-                "dir": zone["dir"],
-                "bot": zone["bot"],
-                "top": zone["top"],
-                "created_at": zone["created_at"],
-                "created_idx": min(zone["indices"]),
-                "closed_at": zone.get("closed_at"),
-            }
+        bos_events.append(
+            {"idx": idx, "direction": bos_direction, "t": int(candle["t"]), "price": close_price}
         )
+        if trend is None:
+            trend = bos_direction
+            continue
+        if bos_direction != trend:
+            choch_events.append(
+                {"idx": idx, "direction": bos_direction, "t": int(candle["t"]), "price": close_price}
+            )
+        trend = bos_direction
+    return pivots, bos_events, choch_events
 
-    return export, metadata
 
-
-def detect_ob(candles: Sequence[Mapping[str, Any]], cfg: Config, tf: str) -> List[Dict[str, Any]]:
-    normalised = list(candles)
-    inferred_tick = _infer_tick_size(normalised)
-    effective_cfg = replace(cfg, tick_size=cfg.tick_size or inferred_tick)
-    zones, _ = _detect_ob_internal(normalised, effective_cfg, tf)
+def _fvgs_for_tf(
+    candles: Sequence[Candle],
+    *,
+    tf: str,
+    cfg: Config,
+    tick_size: float | None,
+    atr: Sequence[float],
+    bos_events: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    zones: List[Dict[str, Any]] = []
+    if len(candles) < 3:
+        return zones
+    tick = tick_size or _infer_tick_size(candles)
+    epsilon = tick or 0.0
+    bos_by_index = {event["idx"]: event for event in bos_events}
+    for i in range(len(candles) - 2):
+        c0, c1, c2 = candles[i], candles[i + 1], candles[i + 2]
+        low_mid = float(c1["l"])
+        high_mid = float(c1["h"])
+        low_next = float(c2["l"])
+        high_prev = float(c0["h"])
+        high_next = float(c2["h"])
+        low_prev = float(c0["l"])
+        atr_value = atr[i + 1] if i + 1 < len(atr) else math.nan
+        if not atr_value or math.isnan(atr_value) or atr_value <= 0:
+            continue
+        body = abs(float(c1["c"]) - float(c1["o"]))
+        range_span = float(c1["h"]) - float(c1["l"])
+        if body < cfg.displacement_body * atr_value and range_span < cfg.displacement_range * atr_value:
+            continue
+        direction: str | None = None
+        top: float | None = None
+        bot: float | None = None
+        if low_mid > high_prev + epsilon:
+            direction = "up"
+            top = low_mid
+            bot = high_prev
+        elif high_mid < low_prev - epsilon:
+            direction = "down"
+            top = low_prev
+            bot = high_mid
+        if direction is None or top is None or bot is None:
+            continue
+        width = top - bot
+        if width <= 0:
+            continue
+        if tick and width < tick:
+            continue
+        created_idx = i + 2
+        status = "open"
+        fulfil_idx: int | None = None
+        for j in range(created_idx + 1, len(candles)):
+            low = float(candles[j]["l"])
+            high = float(candles[j]["h"])
+            if direction == "up" and low <= bot:
+                status = "fulfilled"
+                fulfil_idx = j
+                break
+            if direction == "down" and high >= top:
+                status = "fulfilled"
+                fulfil_idx = j
+                break
+        if fulfil_idx is not None:
+            opposite = "down" if direction == "up" else "up"
+            inverted = False
+            for event in bos_events:
+                if event["idx"] <= fulfil_idx:
+                    continue
+                if event["direction"] != opposite:
+                    continue
+                for k in range(event["idx"], len(candles)):
+                    candle = candles[k]
+                    body_low, body_high = _body_range(candle)
+                    close_price = float(candle["c"])
+                    if body_low <= top and body_high >= bot:
+                        if direction == "up" and close_price < bot:
+                            inverted = True
+                            break
+                        if direction == "down" and close_price > top:
+                            inverted = True
+                            break
+                if inverted:
+                    break
+            if inverted:
+                status = "inverted"
+        zone = {
+            "tf": tf,
+            "direction": direction,
+            "top": _round_tick(top, tick),
+            "bot": _round_tick(bot, tick),
+            "mid": _round_tick((top + bot) / 2.0, tick),
+            "created_utc": _ms_to_iso(int(c2["t"])),
+            "status": status,
+        }
+        zones.append(zone)
     return zones
 
 
-def _detect_ob_internal(
-    candles: Sequence[Mapping[str, Any]], cfg: Config, tf: str
-) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    if len(candles) < 2:
-        return [], []
+def _evaluate_zone_status(
+    candles: Sequence[Candle],
+    *,
+    start_idx: int,
+    zone_range: Tuple[float, float],
+    zone_type: str,
+    tick: float | None,
+) -> Tuple[str, List[Tuple[float, float, int]], int | None, int | None]:
+    status = "fresh"
+    coverage: List[Tuple[float, float, int]] = []
+    first_touch: int | None = None
+    invalidated_idx: int | None = None
+    epsilon = tick or 0.0
+    low, high = zone_range
+    for idx in range(start_idx + 1, len(candles)):
+        candle = candles[idx]
+        body_low, body_high = _body_range(candle)
+        close_price = float(candle["c"])
+        overlap_low = max(low, body_low)
+        overlap_high = min(high, body_high)
+        if overlap_high > overlap_low:
+            coverage.append((overlap_low, overlap_high, idx))
+            if first_touch is None:
+                first_touch = idx
+            if body_low >= low and body_high <= high and status == "fresh":
+                status = "tapped"
+        if zone_type == "demand" and close_price < low - epsilon:
+            status = "invalidated"
+            invalidated_idx = idx
+            break
+        if zone_type == "supply" and close_price > high + epsilon:
+            status = "invalidated"
+            invalidated_idx = idx
+            break
+    return status, coverage, first_touch, invalidated_idx
 
-    atr = compute_atr(candles, cfg.atr_period)
-    tick = cfg.tick_size or _infer_tick_size(candles)
+
+def _merge_segments(segments: Iterable[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    ordered = sorted(segments, key=lambda item: item[0])
+    merged: List[Tuple[float, float]] = []
+    for low, high in ordered:
+        if not merged:
+            merged.append((low, high))
+            continue
+        last_low, last_high = merged[-1]
+        if low <= last_high:
+            merged[-1] = (last_low, max(last_high, high))
+        else:
+            merged.append((low, high))
+    return merged
+
+
+def _complement_segments(
+    base: Tuple[float, float],
+    segments: Sequence[Tuple[float, float]],
+) -> List[Tuple[float, float]]:
+    if not segments:
+        return [base]
+    merged = _merge_segments(segments)
+    low, high = base
+    cursor = low
+    leftovers: List[Tuple[float, float]] = []
+    for seg_low, seg_high in merged:
+        if seg_low > cursor:
+            leftovers.append((cursor, min(seg_low, high)))
+        cursor = max(cursor, seg_high)
+    if cursor < high:
+        leftovers.append((cursor, high))
+    return [item for item in leftovers if item[1] - item[0] > 0]
+
+
+def _ob_for_tf(
+    candles: Sequence[Candle],
+    *,
+    tf: str,
+    cfg: Config,
+    tick_size: float | None,
+    atr: Sequence[float],
+    bos_events: Sequence[Mapping[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
     zones: List[Dict[str, Any]] = []
-    metadata: List[Dict[str, Any]] = []
-    seen: Dict[tuple[str, int], int] = {}
-
-    for impulse_idx in range(1, len(candles)):
-        impulse = candles[impulse_idx]
+    raw_metadata: List[Dict[str, Any]] = []
+    smc_payload: Dict[str, Any] = {"structure": [], "liquidity": [], "ob": []}
+    tick = tick_size or _infer_tick_size(candles)
+    epsilon = tick or 0.0
+    pivot_span = _pivot_span(tf)
+    pivots = _detect_pivots(candles, pivot_span)
+    liquidity_levels: Dict[str, List[Dict[str, Any]]] = {"eqh": [], "eql": [], "pdh": [], "pdl": []}
+    for pivot in pivots:
+        entry = {"price": float(pivot["price"]), "t": int(candles[pivot["idx"]]["t"])}
+        if pivot["type"] == "ph":
+            liquidity_levels["eqh"].append(entry)
+        else:
+            liquidity_levels["eql"].append(entry)
+    if len(candles) >= 2:
+        previous = candles[:-1]
+        last_full_day = previous[-1]
+        liquidity_levels["pdh"].append({"price": float(last_full_day["h"]), "t": int(last_full_day["t"])})
+        liquidity_levels["pdl"].append({"price": float(last_full_day["l"]), "t": int(last_full_day["t"])})
+    smc_payload["liquidity"] = liquidity_levels
+    smc_payload["structure"] = [
+        {"kind": "bos", "direction": event["direction"], "t": event["t"], "price": event["price"]}
+        for event in bos_events
+    ]
+    for event in bos_events:
+        direction = event["direction"]
+        zone_type = "demand" if direction == "up" else "supply"
+        bos_idx = event["idx"]
+        impulse_idx = bos_idx - 1
+        if impulse_idx <= 0:
+            continue
         atr_value = atr[impulse_idx] if impulse_idx < len(atr) else math.nan
         if not atr_value or math.isnan(atr_value) or atr_value <= 0:
             continue
-
-        prev_candle = candles[impulse_idx - 1]
-        prev_low = prev_candle.get("l")
-        prev_high = prev_candle.get("h")
-        impulse_range = impulse["h"] - impulse["l"]
-        if impulse_range <= 0:
-            continue
-
-        bearish_confirmed = (
-            impulse_range > cfg.k_impulse * atr_value
-            and (
-                impulse["c"] < impulse["o"]
-                or (prev_low is not None and impulse["o"] < prev_low)
-            )
-        )
-        bullish_confirmed = (
-            impulse_range > cfg.k_impulse * atr_value
-            and (
-                impulse["c"] > impulse["o"]
-                or (prev_high is not None and impulse["o"] > prev_high)
-            )
-        )
-
-        if not bearish_confirmed and not bullish_confirmed:
-            continue
-
-        if bearish_confirmed:
-            zone_type = "supply"
-        else:
-            zone_type = "demand"
-
-        base_idx = _locate_ob_base(
-            candles,
-            impulse_idx=impulse_idx,
-            lookback=cfg.ob_lookback,
-            zone_type=zone_type,
-            tick_size=tick,
-        )
+        base_idx = None
+        for idx in range(max(0, impulse_idx - pivot_span), impulse_idx + 1):
+            candle = candles[idx]
+            body_low, body_high = _body_range(candle)
+            body_span = body_high - body_low
+            if body_span <= 0:
+                continue
+            if body_span > cfg.ob_body_max_atr * atr_value:
+                continue
+            base_idx = idx
         if base_idx is None:
             continue
-
-        base = candles[base_idx]
-        zone_low_raw = min(base["l"], base["h"])
-        zone_high_raw = max(base["l"], base["h"])
-        zone_height = zone_high_raw - zone_low_raw
-        if zone_height <= 0:
+        base_candle = candles[base_idx]
+        body_low, body_high = _body_range(base_candle)
+        zone_low = min(body_low, body_high)
+        zone_high = max(body_low, body_high)
+        if tick and zone_high - zone_low < 2 * tick:
             continue
-        if tick is not None and zone_height + 1e-12 < tick:
+        bos_close = float(candles[bos_idx]["c"])
+        distance = abs(bos_close - (zone_high if zone_type == "supply" else zone_low))
+        if distance < cfg.ob_distance_atr * atr_value:
             continue
-
-        if cfg.ob_min_body_ratio is not None:
-            body = abs(base["c"] - base["o"])
-            if zone_height == 0 or body / zone_height < cfg.ob_min_body_ratio:
-                continue
-
-        zone_low = _round_tick(zone_low_raw, tick)
-        zone_high = _round_tick(zone_high_raw, tick)
-        if zone_low > zone_high:
-            zone_low, zone_high = zone_high, zone_low
-
-        status, touches = _ob_status(
+        status, coverage, first_touch, invalidated_idx = _evaluate_zone_status(
             candles,
-            start_index=base_idx,
-            low=zone_low,
-            high=zone_high,
+            start_idx=bos_idx,
+            zone_range=(zone_low, zone_high),
             zone_type=zone_type,
-            tick_size=tick,
+            tick=tick,
         )
-
-        key = (zone_type, base["t"])
-        if key in seen:
-            existing_idx = seen[key]
-            current_status = zones[existing_idx]["status"]
-            # Preserve the most severe status according to priority inverted > tapped > open
-            status_priority = {"inverted": 2, "tapped": 1, "open": 0}
-            if status_priority.get(status, 0) > status_priority.get(current_status, 0):
-                zones[existing_idx]["status"] = status
-            if touches:
-                zones[existing_idx]["touches"] = touches
-            continue
-
-        zone_dict = {
+        zone = {
             "tf": tf,
             "type": zone_type,
-            "range": [zone_low, zone_high],
+            "open": _round_tick(zone_low, tick),
+            "close": _round_tick(zone_high, tick),
+            "mean": _round_tick((zone_low + zone_high) / 2.0, tick),
+            "origin_utc": _ms_to_iso(int(candles[bos_idx]["t"])),
             "status": status,
-            "created_at": base["t"],
         }
-        if touches:
-            zone_dict["touches"] = touches
-        zones.append(zone_dict)
-        seen[key] = len(zones) - 1
-        metadata.append(
+        zones.append(zone)
+        raw_metadata.append(
             {
+                "tf": tf,
                 "type": zone_type,
-                "low": zone_low,
-                "high": zone_high,
-                "created_at": base["t"],
-                "created_idx": base_idx,
-                "status": status,
-                "touches": touches,
+                "range": (zone_low, zone_high),
+                "bos_idx": bos_idx,
+                "coverage": coverage,
+                "first_touch": first_touch,
+                "invalidated_idx": invalidated_idx,
             }
         )
+        smc_payload["ob"].append(
+            {
+                "tf": tf,
+                "type": zone_type,
+                "range": [zone_low, zone_high],
+                "created_at": int(candles[bos_idx]["t"]),
+            }
+        )
+    return zones, raw_metadata, smc_payload
 
-    return zones, metadata
 
-
-def _ob_status(
-    candles: Sequence[Mapping[str, Any]],
+def _mb_bb_rb_from_smc(
+    candles: Sequence[Candle],
     *,
-    start_index: int,
-    low: float,
-    high: float,
-    zone_type: str,
+    tf: str,
+    smc_data: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    if not smc_data.get("ob"):
+        return [], [], []
+    structure_flags = smc_data.get("structure") or []
+    liquidity_levels = {
+        "eqh": smc_data.get("liquidity", {}).get("eqh", []),
+        "eql": smc_data.get("liquidity", {}).get("eql", []),
+        "pdh": smc_data.get("liquidity", {}).get("pdh", []),
+        "pdl": smc_data.get("liquidity", {}).get("pdl", []),
+    }
+    blocks = detect_smc_blocks(
+        candles,
+        timeframe=tf,
+        structure_flags=structure_flags,
+        ob_zones=smc_data.get("ob"),
+        liquidity_levels=liquidity_levels,
+        config=SMCConfig(min_block_size=0.0),
+    )
+    mb: List[Dict[str, Any]] = []
+    bb: List[Dict[str, Any]] = []
+    rb: List[Dict[str, Any]] = []
+    for block in blocks:
+        kind = block.get("kind")
+        range_low, range_high = block.get("range", [0.0, 0.0])[:2]
+        entry = {
+            "tf": tf,
+            "type": block.get("type"),
+            "open": float(range_low),
+            "close": float(range_high),
+            "mean": (float(range_low) + float(range_high)) / 2.0,
+            "origin_utc": _ms_to_iso(int(block.get("created_at", 0))),
+            "status": block.get("status", "fresh"),
+        }
+        if kind == "mb":
+            mb.append(entry)
+        elif kind == "bb":
+            bb.append(entry)
+        elif kind == "rb":
+            rb.append(entry)
+    return mb, bb, rb
+
+
+def _pb_for_tf(
+    candles: Sequence[Candle],
+    *,
+    tf: str,
+    cfg: Config,
     tick_size: float | None,
-) -> tuple[str, int]:
-    touches = 0
-    for j in range(start_index + 1, len(candles)):
-        candle = candles[j]
-        high_j = candle["h"]
-        low_j = candle["l"]
-        touched = max(low_j, low) <= min(high_j, high)
-        if touched:
-            touches += 1
-        if zone_type == "supply":
-            invert_trigger = _breaks_above(candle["c"], high, tick_size)
-        else:
-            invert_trigger = _breaks_below(candle["c"], low, tick_size)
-        if invert_trigger:
-            return "inverted", touches
-    if touches > 0:
-        return "tapped", touches
-    return "open", touches
-
-
-def _breaks_above(close: float, boundary: float, tick: float | None) -> bool:
-    if tick is None:
-        return close > boundary
-    return close >= boundary + tick
-
-
-def _breaks_below(close: float, boundary: float, tick: float | None) -> bool:
-    if tick is None:
-        return close < boundary
-    return close <= boundary - tick
-
-
-def compute_swings(candles: Sequence[Mapping[str, Any]], w: int) -> List[Dict[str, Any]]:
-    normalised = list(candles)
-    if w <= 0 or len(normalised) < 2 * w + 1:
-        return []
-
-    swings: List[Dict[str, Any]] = []
-    for idx in range(w, len(normalised) - w):
-        window = normalised[idx - w : idx + w + 1]
-        center = normalised[idx]
-        is_high = all(center["h"] > candle["h"] for candle in window if candle is not center)
-        is_low = all(center["l"] < candle["l"] for candle in window if candle is not center)
-        if is_high:
-            swings.append({"idx": idx, "t": center["t"], "type": "high", "price": center["h"]})
-        if is_low:
-            swings.append({"idx": idx, "t": center["t"], "type": "low", "price": center["l"]})
-
-    swings.sort(key=lambda item: item["idx"])
-    return swings
-
-
-def detect_inducement(
-    candles: Sequence[Mapping[str, Any]],
-    zones_fvg: Sequence[Mapping[str, Any]],
-    zones_ob: Sequence[Mapping[str, Any]],
-    cfg: Config,
-    tf: str,
+    atr: Sequence[float],
+    pivots: Sequence[Mapping[str, Any]],
 ) -> List[Dict[str, Any]]:
-    normalised = list(candles)
-    if not normalised:
-        return []
-
-    atr = compute_atr(normalised, cfg.atr_period)
-    swings = compute_swings(normalised, cfg.w_swing)
-    if not swings:
-        return []
-
-    time_to_index = {candle["t"]: idx for idx, candle in enumerate(normalised)}
-
-    zone_infos: List[Dict[str, Any]] = []
-    for zone in zones_fvg:
-        created_idx = time_to_index.get(zone["created_at"])
-        if created_idx is None:
+    blocks: List[Dict[str, Any]] = []
+    tick = tick_size or _infer_tick_size(candles)
+    for pivot in pivots:
+        idx = pivot["idx"]
+        atr_value = atr[idx] if idx < len(atr) else math.nan
+        if not atr_value or math.isnan(atr_value) or atr_value <= 0:
             continue
-        zone_infos.append(
-            {
-                "type": "fvg",
-                "dir": zone["dir"],
-                "bot": zone["bot"],
-                "top": zone["top"],
-                "created_idx": created_idx,
-            }
-        )
-    for zone in zones_ob:
-        created_at = zone.get("created_at")
-        if created_at is None:
+        window = candles[max(0, idx - 1) : min(len(candles), idx + 2)]
+        if len(window) < 2:
             continue
-        created_idx = time_to_index.get(created_at)
-        if created_idx is None:
+        range_low = min(float(candle["l"]) for candle in window)
+        range_high = max(float(candle["h"]) for candle in window)
+        if range_high - range_low > 0.6 * atr_value:
             continue
-        zone_infos.append(
-            {
-                "type": zone["type"],
-                "bot": zone["range"][0],
-                "top": zone["range"][1],
-                "created_idx": created_idx,
-            }
-        )
-
-    if not zone_infos:
-        return []
-
-    for info in zone_infos:
-        info["first_touch"] = _zone_first_touch(
-            normalised,
-            info["created_idx"],
-            info["bot"],
-            info["top"],
-        )
-
-    results: List[Dict[str, Any]] = []
-    for swing in swings:
-        idx = swing["idx"]
-        if idx >= len(atr) or math.isnan(atr[idx]):
+        body_lows: List[float] = []
+        body_highs: List[float] = []
+        for candle in window:
+            low, high = _body_range(candle)
+            body_lows.append(low)
+            body_highs.append(high)
+        block_low = min(body_lows)
+        block_high = max(body_highs)
+        if tick and block_high - block_low < 2 * tick:
             continue
-        candidate = _find_nearest_zone(
-            zone_infos,
-            swing,
-            atr_value=atr[idx],
-            candles=normalised,
-            cfg=cfg,
-        )
-        if candidate is None:
-            continue
-        zone_info, boundary = candidate
-        zone_height = zone_info["top"] - zone_info["bot"]
-        price = boundary
-
-        close = normalised[idx]["c"]
-        first_touch = zone_info.get("first_touch")
-        if zone_info["bot"] <= close <= zone_info["top"]:
-            zone_type = "inside"
-        elif first_touch is None or idx <= first_touch:
-            zone_type = "before"
-        else:
-            zone_type = "after"
-
-        results.append({"tf": tf, "type": zone_type, "price": price})
-
-    return results
-
-
-def _zone_first_touch(
-    candles: Sequence[Mapping[str, Any]], start_idx: int, bot: float, top: float
-) -> int | None:
-    for j in range(start_idx + 1, len(candles)):
-        candle = candles[j]
-        if min(candle["h"], top) >= max(candle["l"], bot):
-            return j
-    return None
-
-
-def _find_nearest_zone(
-    zone_infos: Sequence[Mapping[str, Any]],
-    swing: Mapping[str, Any],
-    *,
-    atr_value: float,
-    candles: Sequence[Mapping[str, Any]],
-    cfg: Config,
-) -> tuple[Mapping[str, Any], float] | None:
-    idx = swing["idx"]
-    candle = candles[idx]
-    high = candle["h"]
-    low = candle["l"]
-    close = candle["c"]
-
-    best_zone: Mapping[str, Any] | None = None
-    best_boundary: float | None = None
-    best_distance = math.inf
-
-    for zone in zone_infos:
-        if zone["created_idx"] > idx:
-            continue
-        bot = zone["bot"]
-        top = zone["top"]
-        zone_height = top - bot
-        boundary_candidates: List[float] = []
-        if swing["type"] == "high":
-            if high >= top:
-                boundary_candidates.append(top)
-            if high >= bot:
-                boundary_candidates.append(bot)
-        else:
-            if low <= bot:
-                boundary_candidates.append(bot)
-            if low <= top:
-                boundary_candidates.append(top)
-
-        for boundary in boundary_candidates:
-            distance = abs(swing["price"] - boundary)
-            if zone_height <= 0:
-                if cfg.tick_size is None or distance > cfg.tick_size:
-                    continue
-            else:
-                if distance > cfg.r_zone_pct * zone_height:
-                    continue
-
-            wick_ok = False
-            threshold = cfg.m_wick_atr * atr_value
-            if swing["type"] == "high":
-                if high >= boundary and high - boundary <= threshold and close <= boundary:
-                    wick_ok = True
-            else:
-                if low <= boundary and boundary - low <= threshold and close >= boundary:
-                    wick_ok = True
-            if not wick_ok:
+        direction = "demand" if pivot["type"] == "pl" else "supply"
+        retest_idx: int | None = None
+        for j in range(idx + 1, len(candles)):
+            candle = candles[j]
+            low, high = _candle_range(candle)
+            close_price = float(candle["c"])
+            atr_j = atr[j] if j < len(atr) else atr_value
+            if high < block_low or low > block_high:
                 continue
-
-            if distance < best_distance:
-                best_distance = distance
-                best_zone = zone
-                best_boundary = boundary
-
-    if best_zone is None or best_boundary is None:
-        return None
-    return best_zone, best_boundary
-
-
-def detect_cisd(
-    candles: Sequence[Mapping[str, Any]],
-    zones_fvg: Sequence[Mapping[str, Any]],
-    swings: Sequence[Mapping[str, Any]],
-    cfg: Config,
-    tf: str,
-) -> List[Dict[str, Any]]:
-    normalised = list(candles)
-    if not normalised:
-        return []
-
-    if not swings:
-        swings = compute_swings(normalised, cfg.w_swing)
-
-    if not swings:
-        return []
-
-    time_to_index = {candle["t"]: idx for idx, candle in enumerate(normalised)}
-    fvg_meta = []
-    for zone in zones_fvg:
-        created_idx = time_to_index.get(zone["created_at"])
-        if created_idx is None:
+            if direction == "demand" and close_price - block_high >= 0.5 * atr_j:
+                retest_idx = j
+                break
+            if direction == "supply" and block_low - close_price >= 0.5 * atr_j:
+                retest_idx = j
+                break
+        if retest_idx is None:
             continue
-        fvg_meta.append(
+        status, _, _, _ = _evaluate_zone_status(
+            candles,
+            start_idx=retest_idx,
+            zone_range=(block_low, block_high),
+            zone_type=direction,
+            tick=tick,
+        )
+        blocks.append(
             {
-                "dir": zone["dir"],
-                "bot": zone["bot"],
-                "top": zone["top"],
-                "created_idx": created_idx,
-                "status": zone["status"],
+                "tf": tf,
+                "type": direction,
+                "open": _round_tick(block_low, tick),
+                "close": _round_tick(block_high, tick),
+                "mean": _round_tick((block_low + block_high) / 2.0, tick),
+                "origin_utc": _ms_to_iso(int(candles[retest_idx]["t"])),
+                "status": status,
             }
         )
+    return blocks
 
-    if not fvg_meta:
-        return []
 
-    closed_bear_zones = [
-        meta for meta in fvg_meta if meta["dir"] == "down" and meta["status"] == "closed"
-    ]
-    closed_bull_zones = [
-        meta for meta in fvg_meta if meta["dir"] == "up" and meta["status"] == "closed"
-    ]
-
-    if not closed_bear_zones and not closed_bull_zones:
-        return []
-
-    tick = cfg.tick_size
-    swing_highs: List[float] = []
-    swing_lows: List[float] = []
-    swing_idx_pointer = 0
-    swings_sorted = sorted(swings, key=lambda item: item["idx"])
-
-    results: List[Dict[str, Any]] = []
-    for i, candle in enumerate(normalised):
-        while swing_idx_pointer < len(swings_sorted) and swings_sorted[swing_idx_pointer][
-            "idx"
-        ] == i:
-            swing = swings_sorted[swing_idx_pointer]
-            if swing["type"] == "high":
-                swing_highs.append(swing["price"])
-            else:
-                swing_lows.append(swing["price"])
-            swing_idx_pointer += 1
-
-        if i == 0:
+def _sr_levels(
+    candles_4h: Sequence[Candle],
+    candles_1d: Sequence[Candle],
+    *,
+    cfg: Config,
+    tick_size: float | None,
+) -> List[Dict[str, Any]]:
+    tick = tick_size or _infer_tick_size(candles_4h)
+    epsilon_pct = cfg.sr_merge_pct
+    levels: List[Dict[str, Any]] = []
+    pivots = _detect_pivots(candles_4h, _pivot_span("4h"))
+    for pivot in pivots[-4:]:
+        price = float(pivot["price"])
+        level_type = "resistance" if pivot["type"] == "ph" else "support"
+        ts_iso = _ms_to_iso(int(candles_4h[pivot["idx"]]["t"]))
+        levels.append({"type": level_type, "price": price, "ts": ts_iso, "valid": True})
+    if candles_1d:
+        previous = candles_1d[-1]
+        levels.append(
+            {
+                "type": "resistance",
+                "price": float(previous["h"]),
+                "ts": _ms_to_iso(int(previous["t"])),
+                "valid": True,
+            }
+        )
+        levels.append(
+            {
+                "type": "support",
+                "price": float(previous["l"]),
+                "ts": _ms_to_iso(int(previous["t"])),
+                "valid": True,
+            }
+        )
+    merged: List[Dict[str, Any]] = []
+    for level in sorted(levels, key=lambda item: item["price"]):
+        if not merged:
+            merged.append(level)
             continue
-
-        last_high = swing_highs[-1] if swing_highs else None
-        last_low = swing_lows[-1] if swing_lows else None
-
-        close = candle["c"]
-
-        if last_high is not None and _breaks_above(close, last_high, tick):
-            if _validate_structure(swing_highs, swing_lows, direction="up") and _has_closed_zone(
-                closed_bear_zones, i
-            ):
-                results.append({"tf": tf, "type": "bull", "delivery_candle": candle["t"]})
-
-        if last_low is not None and _breaks_below(close, last_low, tick):
-            if _validate_structure(swing_highs, swing_lows, direction="down") and _has_closed_zone(
-                closed_bull_zones, i
-            ):
-                results.append({"tf": tf, "type": "bear", "delivery_candle": candle["t"]})
-
-    unique: Dict[tuple[str, int], Dict[str, Any]] = {}
-    for item in results:
-        unique[(item["type"], item["delivery_candle"])] = item
-    return list(unique.values())
+        prev = merged[-1]
+        pct_diff = abs(level["price"] - prev["price"]) / max(level["price"], prev["price"], tick or 1.0)
+        if pct_diff <= epsilon_pct and level["type"] == prev["type"]:
+            prev["price"] = (prev["price"] + level["price"]) / 2.0
+            prev["ts"] = max(prev["ts"], level["ts"])
+        else:
+            merged.append(level)
+    return merged
 
 
-def _validate_structure(highs: Sequence[float], lows: Sequence[float], *, direction: str) -> bool:
-    if direction == "up":
-        if len(lows) < 2 or len(highs) < 2:
-            return False
-        return lows[-2] > lows[-1] and highs[-2] > highs[-1]
-    if len(lows) < 2 or len(highs) < 2:
-        return False
-    return lows[-2] < lows[-1] and highs[-2] < highs[-1]
+def _profile_levels(
+    profile_refs: Mapping[str, Mapping[str, float]] | None,
+) -> List[Dict[str, Any]]:
+    if not isinstance(profile_refs, Mapping):
+        return []
+    levels: List[Dict[str, Any]] = []
+    for session, values in profile_refs.items():
+        if not isinstance(values, Mapping):
+            continue
+        for key in ("poc", "vah", "val"):
+            if key not in values:
+                continue
+            try:
+                price = float(values[key])
+            except (TypeError, ValueError):
+                continue
+            levels.append({"type": key, "price": price, "session": session})
+    return levels
 
 
-def _has_closed_zone(zones: Sequence[Mapping[str, Any]], index: int) -> bool:
-    for zone in zones:
-        if zone["created_idx"] < index:
-            return True
-    return False
+def _ensure_timeframes(
+    frames: Mapping[str, Sequence[Candle]],
+    required: Sequence[str],
+) -> Dict[str, List[Candle]]:
+    result: Dict[str, List[Candle]] = {}
+    base_1m = list(frames.get("1m", []))
+    for tf in required:
+        candles = frames.get(tf)
+        if candles:
+            result[tf] = list(candles)
+            continue
+        if not base_1m:
+            result[tf] = []
+            continue
+        interval = TIMEFRAME_TO_MS.get(tf)
+        if interval is None:
+            result[tf] = []
+            continue
+        aggregated = resample_ohlcv(base_1m, interval)
+        result[tf] = aggregated
+    return result
 
 
 def detect_zones(
-    candles: Sequence[Mapping[str, Any]], tf: str, symbol: str, cfg: Config
+    frames: Mapping[str, Sequence[Candle]],
+    *,
+    symbol: str,
+    cfg: Config,
+    profile_levels: Mapping[str, Mapping[str, float]] | None = None,
 ) -> Dict[str, Any]:
-    payload = normalise_ohlcv(symbol, tf, candles, use_full_span=True)
-    series = payload.get("candles", []) if isinstance(payload, Mapping) else []
-    inferred_tick = _infer_tick_size(series)
-    effective_cfg = replace(
-        cfg,
-        tick_size=cfg.tick_size or inferred_tick,
-        min_gap_pct=(
-            cfg.min_gap_pct if cfg.min_gap_pct is not None else _default_min_gap_pct(tf)
-        ),
-    )
-    fvg_zones, _ = _detect_fvg_internal(series, effective_cfg, tf)
-    ob_zones, _ = _detect_ob_internal(series, effective_cfg, tf)
-    swings = compute_swings(series, effective_cfg.w_swing)
-    inducement = detect_inducement(series, fvg_zones, ob_zones, effective_cfg, tf)
-    cisd = detect_cisd(series, fvg_zones, swings, effective_cfg, tf)
-
-    return {
+    timeframes = _ensure_timeframes(frames, ["15m", "1h", "4h", "1d"])
+    tick = cfg.tick_size or _infer_tick_size(frames.get("1m", []))
+    fvg_all: List[Dict[str, Any]] = []
+    ob_all: List[Dict[str, Any]] = []
+    mb_all: List[Dict[str, Any]] = []
+    bb_all: List[Dict[str, Any]] = []
+    rb_all: List[Dict[str, Any]] = []
+    pb_all: List[Dict[str, Any]] = []
+    sr_levels: List[Dict[str, Any]] = []
+    for tf in ("15m", "1h", "4h"):
+        candles = timeframes.get(tf, [])
+        if len(candles) < 3:
+            continue
+        atr = compute_atr(candles, cfg.atr_period)
+        pivots, bos_events, choch_events = _detect_structure(candles, tf=tf, tick_size=tick, cfg=cfg)
+        fvg_all.extend(
+            _fvgs_for_tf(
+                candles,
+                tf=tf,
+                cfg=cfg,
+                tick_size=tick,
+                atr=atr,
+                bos_events=bos_events,
+            )
+        )
+        ob_zones, metadata, smc_payload = _ob_for_tf(
+            candles,
+            tf=tf,
+            cfg=cfg,
+            tick_size=tick,
+            atr=atr,
+            bos_events=bos_events,
+        )
+        ob_all.extend(ob_zones)
+        mb, bb, rb = _mb_bb_rb_from_smc(candles, tf=tf, smc_data=smc_payload)
+        mb_all.extend(mb)
+        bb_all.extend(bb)
+        rb_all.extend(rb)
+        pb_all.extend(
+            _pb_for_tf(
+                candles,
+                tf=tf,
+                cfg=cfg,
+                tick_size=tick,
+                atr=atr,
+                pivots=pivots,
+            )
+        )
+    sr_levels = _sr_levels(timeframes.get("4h", []), timeframes.get("1d", []), cfg=cfg, tick_size=tick)
+    payload = {
         "symbol": symbol,
         "zones": {
-            "fvg": fvg_zones,
-            "ob": ob_zones,
-            "inducement": inducement,
-            "cisd": cisd,
+            "fvg": fvg_all,
+            "ob": ob_all,
+            "mb": mb_all,
+            "bb": bb_all,
+            "rb": rb_all,
+            "pb": pb_all,
+            "sr": sr_levels,
+            "profile_levels": _profile_levels(profile_levels),
         },
     }
-
-
-def flatten_structured(zones_structured: Dict[str, Any]) -> List[Dict[str, Any]]:
-    result: List[Dict[str, Any]] = []
-    fvg_zones = zones_structured.get("zones", {}).get("fvg", [])
-    for zone in fvg_zones:
-        result.append({
-            "type": "fvg_top",
-            "price": zone["top"],
-            "dir": zone["dir"],
-        })
-        result.append({
-            "type": "fvg_bot",
-            "price": zone["bot"],
-            "dir": zone["dir"],
-        })
-        result.append({
-            "type": "fvl",
-            "price": zone["fvl"],
-            "dir": zone["dir"],
-        })
-    ob_zones = zones_structured.get("zones", {}).get("ob", [])
-    for zone in ob_zones:
-        result.append({
-            "type": "ob_min",
-            "price": zone["range"][0],
-            "dir": zone.get("type"),
-        })
-        result.append({
-            "type": "ob_max",
-            "price": zone["range"][1],
-            "dir": zone.get("type"),
-        })
-    inducements = zones_structured.get("zones", {}).get("inducement", [])
-    for zone in inducements:
-        result.append({
-            "type": "inducement",
-            "price": zone.get("price"),
-            "dir": zone.get("type"),
-        })
-    cisd_zones = zones_structured.get("zones", {}).get("cisd", [])
-    for zone in cisd_zones:
-        result.append({
-            "type": f"cisd_{zone.get('type')}",
-            "price": None,
-            "dir": zone.get("type"),
-        })
-    return result
-
+    return payload

@@ -30,6 +30,7 @@ from .presets import (
     update_preset,
 )
 from .liquidity import build_liquidity_snapshot
+from .zones import Config as ZonesConfig, detect_zones
 from .ohlc import (
     TIMEFRAME_WINDOWS,
     fetch_ohlcv,
@@ -78,4 +79,6 @@ __all__ = [
     "DataQualityError",
     "aggregate_1m_to_1h",
     "build_multi_timeframe_ohlcv",
+    "ZonesConfig",
+    "detect_zones",
 ]

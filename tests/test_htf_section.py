@@ -139,7 +139,23 @@ def test_build_inspection_payload_includes_htf(monkeypatch) -> None:
 
     monkeypatch.setattr(inspection, "_DEFAULT_MINUTE_FETCHER", lambda *args, **kwargs: [])
     monkeypatch.setattr(inspection, "build_profile_package", lambda *args, **kwargs: ([], [], []))
-    monkeypatch.setattr(inspection, "detect_zones", lambda *args, **kwargs: {"symbol": "BTCUSDT", "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []}})
+    monkeypatch.setattr(
+        inspection,
+        "detect_zones",
+        lambda *args, **kwargs: {
+            "symbol": "BTCUSDT",
+            "zones": {
+                "fvg": [],
+                "ob": [],
+                "mb": [],
+                "bb": [],
+                "rb": [],
+                "pb": [],
+                "sr": [],
+                "profile_levels": [],
+            },
+        },
+    )
     monkeypatch.setattr(
         inspection,
         "resolve_profile_config",

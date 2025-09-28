@@ -53,7 +53,16 @@ def _install_common_stubs(
         "detect_zones",
         lambda *args, **kwargs: {
             "symbol": args[2] if len(args) > 2 else kwargs.get("symbol"),
-            "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
+            "zones": {
+                "fvg": [],
+                "ob": [],
+                "mb": [],
+                "bb": [],
+                "rb": [],
+                "pb": [],
+                "sr": [],
+                "profile_levels": [],
+            },
         },
     )
     monkeypatch.setattr(

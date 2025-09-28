@@ -564,7 +564,16 @@ async def profile_endpoint(
 
     detected_zones = {
         "symbol": symbol,
-        "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
+        "zones": {
+            "fvg": [],
+            "ob": [],
+            "mb": [],
+            "bb": [],
+            "rb": [],
+            "pb": [],
+            "sr": [],
+            "profile_levels": [],
+        },
     }
 
     if candles and sessions:
@@ -583,13 +592,30 @@ async def profile_endpoint(
             cache_token=cache_token,
             tf_key=target_tf_key,
         )
+        profile_level_map: Dict[str, Dict[str, float]] = {}
+        for entry in tpo_entries:
+            if not isinstance(entry, Mapping):
+                continue
+            session = str(entry.get("session") or "daily").lower()
+            session_levels = profile_level_map.setdefault(session, {})
+            for key, target in (("POC", "poc"), ("VAH", "vah"), ("VAL", "val")):
+                value = entry.get(key)
+                if value is None:
+                    continue
+                try:
+                    session_levels[target] = float(value)
+                except (TypeError, ValueError):
+                    continue
         try:
             zone_cfg = ZonesConfig(tick_size=tick_size_value)
+            zone_frames = {target_tf_key: candles}
+            if timeframe and timeframe != target_tf_key:
+                zone_frames[timeframe] = candles
             detected_zones = detect_zones(
-                candles,
-                target_tf_key,
-                symbol,
-                zone_cfg,
+                zone_frames,
+                symbol=symbol,
+                cfg=zone_cfg,
+                profile_levels=profile_level_map,
             )
         except Exception as exc:
             logging.getLogger(__name__).exception(
@@ -603,8 +629,25 @@ async def profile_endpoint(
 
             detected_zones = {
                 "symbol": symbol,
-                "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
+                "zones": {
+                    "fvg": [],
+                    "ob": [],
+                    "mb": [],
+                    "bb": [],
+                    "rb": [],
+                    "pb": [],
+                    "sr": [],
+                    "profile_levels": [],
+                },
             }
+        else:
+            zones_container = detected_zones.get("zones") if isinstance(detected_zones, Mapping) else None
+            if isinstance(zones_container, dict) and profile_level_map and not zones_container.get("profile_levels"):
+                zones_container["profile_levels"] = [
+                    {"type": level, "price": price, "session": session}
+                    for session, mapping in profile_level_map.items()
+                    for level, price in mapping.items()
+                ]
 
     payload = {
         "symbol": symbol,
@@ -760,8 +803,11 @@ async def zones_endpoint(
 
     zone_cfg = ZonesConfig(**cfg_kwargs)
 
+    zone_frames: Dict[str, Sequence[Mapping[str, Any]]] = {}
+    if candles_data:
+        zone_frames[timeframe_value] = candles_data
     try:
-        result = detect_zones(candles_data or [], timeframe_value, symbol_value, zone_cfg)
+        result = detect_zones(zone_frames, symbol=symbol_value, cfg=zone_cfg)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

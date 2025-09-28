@@ -1461,6 +1461,29 @@ def _filter_indicator_block(value: Any, start_ms: int | None, end_ms: int | None
     return value
 
 
+def _build_profile_level_map(
+    profile_tpo: Sequence[Mapping[str, Any]] | None,
+) -> Dict[str, Dict[str, float]]:
+    levels: Dict[str, Dict[str, float]] = {}
+    if not profile_tpo:
+        return levels
+    for entry in profile_tpo:
+        if not isinstance(entry, Mapping):
+            continue
+        session_raw = entry.get("session") or "daily"
+        session = str(session_raw).lower()
+        session_levels = levels.setdefault(session, {})
+        for key, target in (("POC", "poc"), ("VAH", "vah"), ("VAL", "val")):
+            value = entry.get(key)
+            if value is None:
+                continue
+            try:
+                session_levels[target] = float(value)
+            except (TypeError, ValueError):
+                continue
+    return levels
+
+
 def _collect_nested_events(source: Any, events: List[Mapping[str, Any]]) -> None:
     if isinstance(source, Mapping):
         for key in ("events", "flags", "signals"):
@@ -1673,9 +1696,19 @@ def build_check_all_datas(
     profile_tpo: List[Dict[str, Any]] = []
     profile_flat: List[Dict[str, float]] = []
     profile_zones: List[Dict[str, Any]] = []
+    profile_level_map: Dict[str, Dict[str, float]] = {}
     detected_zones: Dict[str, Any] = {
         "symbol": symbol,
-        "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
+        "zones": {
+            "fvg": [],
+            "ob": [],
+            "mb": [],
+            "bb": [],
+            "rb": [],
+            "pb": [],
+            "sr": [],
+            "profile_levels": [],
+        },
     }
 
     target_tf_key = profile_config.get("target_tf_key", "1m")
@@ -1718,6 +1751,7 @@ def build_check_all_datas(
             cache_token=cache_token,
             tf_key=target_tf_key,
         )
+        profile_level_map = _build_profile_level_map(profile_tpo)
 
     snapshot_selection = snapshot.get("selection") if isinstance(snapshot.get("selection"), Mapping) else None
     selection_start = selection_start_ms or _safe_int(snapshot_selection.get("start")) if snapshot_selection else None
@@ -1874,22 +1908,20 @@ def build_check_all_datas(
     reference_dt = datetime.fromtimestamp(reference_ts / 1000.0, tz=UTC)
     detailed_start_ts = window_start_ms
 
-    detection_candles: List[Dict[str, Any]] = []
-    if base_candles:
-        detection_candles = _filter_candles(
-            base_candles,
-            start_ms=detailed_start_ts,
-            end_ms=window_end_ms,
-        )
+    zone_frames: Dict[str, List[Dict[str, Any]]] = {}
+    for tf_key, candles in frames.items():
+        filtered = _filter_candles(candles, start_ms=detailed_start_ts, end_ms=window_end_ms)
+        if filtered:
+            zone_frames[tf_key] = filtered
 
-    if detection_candles:
+    if zone_frames:
         try:
             zone_cfg = ZonesConfig(tick_size=profile_config.get("tick_size"))
             detected_zones = detect_zones(
-                detection_candles,
-                target_tf_key,
-                symbol,
-                zone_cfg,
+                zone_frames,
+                symbol=symbol,
+                cfg=zone_cfg,
+                profile_levels=profile_level_map,
             )
         except Exception:  # pragma: no cover - defensive logging guard
             logging.getLogger(__name__).exception(
@@ -1902,8 +1934,26 @@ def build_check_all_datas(
             )
             detected_zones = {
                 "symbol": symbol,
-                "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
+                "zones": {
+                    "fvg": [],
+                    "ob": [],
+                    "mb": [],
+                    "bb": [],
+                    "rb": [],
+                    "pb": [],
+                    "sr": [],
+                    "profile_levels": [],
+                },
             }
+
+    zones_container = detected_zones.get("zones") if isinstance(detected_zones, Mapping) else None
+    if isinstance(zones_container, MutableMapping) and profile_level_map:
+        if not zones_container.get("profile_levels"):
+            zones_container["profile_levels"] = [
+                {"type": level, "price": price, "session": session}
+                for session, level_map in profile_level_map.items()
+                for level, price in level_map.items()
+            ]
 
     movement_anchor_ts = detailed_start_ts
     movement_start_ts = min(selection_start, movement_anchor_ts)
