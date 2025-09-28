@@ -21,9 +21,6 @@ from .presets import resolve_profile_config
 from .profile import build_profile_package
 from .smc import SMCConfig, detect_smc_blocks
 from .zones import Config as ZonesConfig, detect_zones
-from ..meta import Meta
-
-
 UTC = timezone.utc
 MS_IN_HOUR = 3_600_000
 MS_IN_DAY = 86_400_000
@@ -51,6 +48,12 @@ except ImportError:  # pragma: no cover - circular import guard
 
 MINUTE_INTERVAL_MS = TIMEFRAME_TO_MS.get("1m", MS_IN_HOUR // 60)
 
+VWAP_TPO_SESSIONS: Tuple[Tuple[str, dtime, dtime], ...] = (
+    ("asia", dtime(hour=0, minute=0), dtime(hour=3, minute=0)),
+    ("london", dtime(hour=7, minute=0), dtime(hour=10, minute=0)),
+    ("ny", dtime(hour=13, minute=30), dtime(hour=16, minute=30)),
+)
+
 BINANCE_FAPI_REST = "https://fapi.binance.com/fapi/v1/klines"
 _RETRYABLE_STATUS = {418, 429, 500, 502, 503, 504}
 _MAX_RETRIES = 5
@@ -69,6 +72,14 @@ class BinanceDownloadError(RuntimeError):
     def __init__(self, downloaded: int, message: str):
         super().__init__(message)
         self.downloaded = int(downloaded)
+
+
+def _isoformat_utc(timestamp_ms: int) -> str:
+    """Return a stable Z-suffixed ISO string for a millisecond timestamp."""
+
+    clamped_ms = max(0, int(timestamp_ms))
+    dt = datetime.fromtimestamp(clamped_ms / 1000.0, tz=UTC)
+    return dt.isoformat().replace("+00:00", "Z")
 
 
 def _round_float_value(value: float, ndigits: int = 3) -> float:
@@ -1336,7 +1347,7 @@ def _session_window(
     anchor_ms: int,
     start_time: dtime,
     end_time: dtime,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     anchor_aligned = _align_to_interval(anchor_ms, MINUTE_INTERVAL_MS)
     anchor_dt = datetime.fromtimestamp(anchor_aligned / 1000.0, tz=UTC)
     day_start = datetime(anchor_dt.year, anchor_dt.month, anchor_dt.day, tzinfo=UTC)
@@ -1347,12 +1358,46 @@ def _session_window(
         session_end_dt += timedelta(days=1)
 
     start_ms = int(session_start_dt.timestamp() * 1000)
-    raw_end_ms = int(session_end_dt.timestamp() * 1000) - MINUTE_INTERVAL_MS
+    end_boundary_ms = int(session_end_dt.timestamp() * 1000)
+    raw_end_ms = end_boundary_ms - MINUTE_INTERVAL_MS
     if raw_end_ms < start_ms:
         raw_end_ms = start_ms
 
     end_ms = min(raw_end_ms, anchor_aligned)
-    return start_ms, end_ms
+    close_ms = end_boundary_ms
+
+    if end_ms < start_ms:
+        end_ms = start_ms
+    return start_ms, end_ms, close_ms
+
+
+def _compute_initial_balance_extrema(
+    candles: Sequence[Mapping[str, Any]],
+    *,
+    session_start_ms: int,
+    minutes: int = 60,
+) -> tuple[float | None, float | None]:
+    """Determine the high/low for the initial balance slice of a session."""
+
+    if minutes <= 0:
+        return None, None
+
+    cutoff_ms = session_start_ms + minutes * MINUTE_INTERVAL_MS
+    ib_high: float | None = None
+    ib_low: float | None = None
+
+    for candle in candles:
+        ts = _safe_int(candle.get("t"))
+        if ts is None or ts < session_start_ms or ts >= cutoff_ms:
+            continue
+        high_val = _safe_float(candle.get("h"))
+        low_val = _safe_float(candle.get("l"))
+        if high_val is not None:
+            ib_high = high_val if ib_high is None else max(ib_high, high_val)
+        if low_val is not None:
+            ib_low = low_val if ib_low is None else min(ib_low, low_val)
+
+    return ib_high, ib_low
 
 
 def _extract_range(candidate: Mapping[str, Any]) -> tuple[int, int] | None:
@@ -1624,7 +1669,7 @@ def build_check_all_datas(
     symbol = str(snapshot.get("symbol") or snapshot.get("pair") or "UNKNOWN").upper()
     raw_meta = snapshot.get("meta") if isinstance(snapshot.get("meta"), Mapping) else None
     profile_config = resolve_profile_config(symbol, raw_meta)
-    sessions = list(Meta.iter_vwap_sessions())
+    sessions = list(VWAP_TPO_SESSIONS)
     profile_tpo: List[Dict[str, Any]] = []
     profile_flat: List[Dict[str, float]] = []
     profile_zones: List[Dict[str, Any]] = []
@@ -2149,21 +2194,46 @@ def build_check_all_datas(
 
     session_profiles: Dict[str, Dict[str, Any]] = {}
     session_sigma_blocks: Dict[str, Dict[str, Any]] = {}
+    session_boundaries: Dict[str, Dict[str, Any]] = {}
     for session_name, session_start, session_end in sessions:
-        session_start_ms, session_end_ms = _session_window(window_end_ms, session_start, session_end)
+        (
+            session_start_ms,
+            session_end_ms,
+            session_close_ms,
+        ) = _session_window(window_end_ms, session_start, session_end)
         session_filtered = _filter_candles(
             minute_series, start_ms=session_start_ms, end_ms=session_end_ms
         )
-        session_profiles[session_name] = _build_volume_profile_stats(
+        ib_high, ib_low = _compute_initial_balance_extrema(
+            session_filtered, session_start_ms=session_start_ms
+        )
+        profile_entry = _build_volume_profile_stats(
             minute_series,
             start_ms=session_start_ms,
             end_ms=session_end_ms,
             tick_size=tick_size_numeric,
             value_area_pct=VALUE_AREA_PCT,
         )
+        if isinstance(profile_entry, MutableMapping):
+            if "session_high" in profile_entry and "high" not in profile_entry:
+                profile_entry["high"] = profile_entry.get("session_high")
+            if "session_low" in profile_entry and "low" not in profile_entry:
+                profile_entry["low"] = profile_entry.get("session_low")
+            profile_entry["open_utc"] = _isoformat_utc(session_start_ms)
+            profile_entry["close_utc"] = _isoformat_utc(session_close_ms)
+            profile_entry["ib_high"] = ib_high
+            profile_entry["ib_low"] = ib_low
+        session_profiles[session_name] = profile_entry
         session_sigma_blocks[session_name] = _build_vwap_sigma_block(
             session_filtered, basis="session"
         )
+        session_boundaries[session_name] = {
+            "start_ms": session_start_ms,
+            "end_ms": session_end_ms,
+            "close_ms": session_close_ms,
+            "ib_high": ib_high,
+            "ib_low": ib_low,
+        }
 
     vwap_payload = {
         "daily": daily_vwap_profile,
@@ -2173,6 +2243,123 @@ def build_check_all_datas(
     vwap_sigma_payload = {
         "daily": _build_vwap_sigma_block(daily_filtered_minutes, basis="daily"),
         "sessions": session_sigma_blocks,
+    }
+
+    session_time_lookup = {
+        str(name).lower(): (start_time, end_time)
+        for name, start_time, end_time in sessions
+    }
+    for entry in profile_tpo:
+        if not isinstance(entry, MutableMapping):
+            continue
+        session_label = entry.get("session")
+        if not isinstance(session_label, str) or session_label.lower() == "daily":
+            continue
+        schedule = session_time_lookup.get(session_label.lower())
+        if not schedule:
+            continue
+        date_str = entry.get("date")
+        session_date = None
+        if isinstance(date_str, str) and date_str:
+            try:
+                session_date = datetime.fromisoformat(date_str).date()
+            except ValueError:
+                session_date = None
+        if session_date is None:
+            continue
+        start_time, end_time = schedule
+        start_dt = datetime.combine(session_date, start_time, tzinfo=UTC)
+        end_dt = datetime.combine(session_date, end_time, tzinfo=UTC)
+        if end_time <= start_time:
+            end_dt += timedelta(days=1)
+        start_ms = int(start_dt.timestamp() * 1000)
+        end_ms = int(end_dt.timestamp() * 1000) - MINUTE_INTERVAL_MS
+        session_candles = _filter_candles(
+            minute_series, start_ms=start_ms, end_ms=end_ms
+        )
+        ib_high, ib_low = _compute_initial_balance_extrema(
+            session_candles, session_start_ms=start_ms
+        )
+        if "session_high" in entry and "high" not in entry:
+            entry["high"] = entry.get("session_high")
+        if "session_low" in entry and "low" not in entry:
+            entry["low"] = entry.get("session_low")
+        entry["open_utc"] = _isoformat_utc(start_ms)
+        entry["close_utc"] = _isoformat_utc(int(end_dt.timestamp() * 1000))
+        entry["ib_high"] = ib_high
+        entry["ib_low"] = ib_low
+
+    def _sigma_levels_map(block: Mapping[str, Any] | None) -> Dict[int, Dict[str, float | None]]:
+        levels: Dict[int, Dict[str, float | None]] = {}
+        if not isinstance(block, Mapping):
+            return levels
+        sigma_entries = block.get("sigma")
+        if not isinstance(sigma_entries, Sequence):
+            return levels
+        for entry in sigma_entries:
+            if not isinstance(entry, Mapping):
+                continue
+            try:
+                key = int(entry.get("k"))
+            except (TypeError, ValueError):
+                continue
+            minus_val = _safe_float(entry.get("price_minus"))
+            plus_val = _safe_float(entry.get("price_plus"))
+            levels[key] = {"minus": minus_val, "plus": plus_val}
+        return levels
+
+    def _sd_payload(levels: Mapping[int, Mapping[str, float | None]], order: int) -> Dict[str, float | None]:
+        payload = levels.get(order, {}) if isinstance(levels, Mapping) else {}
+        minus_value = payload.get("minus") if isinstance(payload, Mapping) else None
+        plus_value = payload.get("plus") if isinstance(payload, Mapping) else None
+        return {"minus": minus_value, "plus": plus_value}
+
+    daily_sigma_levels = _sigma_levels_map(vwap_sigma_payload.get("daily"))
+    vwap_tpo_daily = None
+    if isinstance(daily_vwap_profile, Mapping) and daily_vwap_profile:
+        vwap_tpo_daily = {
+            "open_utc": _isoformat_utc(daily_start_ms),
+            "vwap": daily_vwap_profile.get("vwap"),
+            "sd1": _sd_payload(daily_sigma_levels, 1),
+            "sd2": _sd_payload(daily_sigma_levels, 2),
+        }
+
+    vwap_tpo_sessions: Dict[str, Dict[str, Any]] = {}
+    session_sigma_levels: Dict[str, Dict[int, Dict[str, float | None]]] = {
+        name: _sigma_levels_map(block)
+        for name, block in session_sigma_blocks.items()
+    }
+    for session_name, profile_entry in session_profiles.items():
+        boundary = session_boundaries.get(session_name, {})
+        sigma_levels = session_sigma_levels.get(session_name, {})
+        open_ms = boundary.get("start_ms")
+        close_ms = boundary.get("close_ms")
+        ib_high = boundary.get("ib_high")
+        ib_low = boundary.get("ib_low")
+        session_payload = {
+            "open_utc": _isoformat_utc(open_ms) if open_ms is not None else None,
+            "close_utc": _isoformat_utc(close_ms) if close_ms is not None else None,
+            "vwap": profile_entry.get("vwap") if isinstance(profile_entry, Mapping) else None,
+            "sd1": _sd_payload(sigma_levels, 1),
+            "sd2": _sd_payload(sigma_levels, 2),
+            "poc": profile_entry.get("poc") if isinstance(profile_entry, Mapping) else None,
+            "vah": profile_entry.get("vah") if isinstance(profile_entry, Mapping) else None,
+            "val": profile_entry.get("val") if isinstance(profile_entry, Mapping) else None,
+            "ib_high": ib_high,
+            "ib_low": ib_low,
+            "high": profile_entry.get("session_high") if isinstance(profile_entry, Mapping) else None,
+            "low": profile_entry.get("session_low") if isinstance(profile_entry, Mapping) else None,
+        }
+        if isinstance(profile_entry, Mapping):
+            if profile_entry.get("high") is not None:
+                session_payload["high"] = profile_entry.get("high")
+            if profile_entry.get("low") is not None:
+                session_payload["low"] = profile_entry.get("low")
+        vwap_tpo_sessions[session_name] = session_payload
+
+    vwap_tpo_block = {
+        "daily": vwap_tpo_daily,
+        "sessions": vwap_tpo_sessions,
     }
 
     latest_candle_payload_source = (
@@ -2223,6 +2410,7 @@ def build_check_all_datas(
         "profile_preset": profile_config.get("preset_payload"),
         "vwap": vwap_payload,
         "vwap_sigma": vwap_sigma_payload,
+        "vwap_tpo": vwap_tpo_block,
     }
 
     return round_floats(response_payload)

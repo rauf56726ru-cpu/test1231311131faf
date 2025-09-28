@@ -206,19 +206,27 @@ def test_check_all_includes_vwap_profiles(client: TestClient) -> None:
 
     asia_window = vwap_block["sessions"]["asia"]["window"]
     assert asia_window["start"].startswith("2024-01-01T00:00:00")
-    assert asia_window["end"].startswith("2024-01-01T06:59:00")
-    assert vwap_block["sessions"]["asia"]["vwap"] > 0
-    assert "session_high" in vwap_block["sessions"]["asia"]
-    assert "session_low" in vwap_block["sessions"]["asia"]
+    assert asia_window["end"].startswith("2024-01-01T02:59:00")
+    assert vwap_block["sessions"]["asia"]["vwap"] == 0.0
+    assert vwap_block["sessions"]["asia"].get("session_high") is None
+    assert vwap_block["sessions"]["asia"].get("session_low") is None
+    assert vwap_block["sessions"]["asia"].get("high") is None
+    assert vwap_block["sessions"]["asia"].get("low") is None
+    assert vwap_block["sessions"]["asia"].get("open_utc", "").startswith("2024-01-01T00:00:00")
+    assert vwap_block["sessions"]["asia"].get("close_utc", "").startswith("2024-01-01T03:00:00")
 
     london_window = vwap_block["sessions"]["london"]["window"]
     assert london_window["start"].startswith("2024-01-01T07:00:00")
-    assert london_window["end"].startswith("2024-01-01T12:59:00")
+    assert london_window["end"].startswith("2024-01-01T09:59:00")
     assert vwap_block["sessions"]["london"]["poc"] is not None
     assert vwap_block["sessions"]["london"]["vah"] is not None
     assert vwap_block["sessions"]["london"]["val"] is not None
     assert "session_high" in vwap_block["sessions"]["london"]
     assert "session_low" in vwap_block["sessions"]["london"]
+    assert vwap_block["sessions"]["london"].get("open_utc", "").startswith("2024-01-01T07:00:00")
+    assert vwap_block["sessions"]["london"].get("close_utc", "").startswith("2024-01-01T10:00:00")
+    assert vwap_block["sessions"]["london"].get("ib_high") is not None
+    assert vwap_block["sessions"]["london"].get("ib_low") is not None
 
     ny_window = vwap_block["sessions"]["ny"]["window"]
     assert ny_window["start"].startswith("2024-01-01T13:30:00")
@@ -226,6 +234,32 @@ def test_check_all_includes_vwap_profiles(client: TestClient) -> None:
     assert vwap_block["sessions"]["ny"]["vwap"] > 0
     assert "session_high" in vwap_block["sessions"]["ny"]
     assert "session_low" in vwap_block["sessions"]["ny"]
+    assert vwap_block["sessions"]["ny"].get("open_utc", "").startswith("2024-01-01T13:30:00")
+    assert vwap_block["sessions"]["ny"].get("close_utc", "").startswith("2024-01-01T16:30:00")
+    assert vwap_block["sessions"]["ny"].get("ib_high") is not None
+    assert vwap_block["sessions"]["ny"].get("ib_low") is not None
+
+    vwap_tpo_block = body.get("vwap_tpo")
+    assert isinstance(vwap_tpo_block, dict)
+    assert vwap_tpo_block["daily"]["open_utc"].startswith("2024-01-01T00:00:00")
+    assert vwap_tpo_block["daily"]["sd1"]["plus"] >= vwap_tpo_block["daily"]["sd1"]["minus"]
+    session_alias = vwap_tpo_block["sessions"]["ny"]
+    assert session_alias["open_utc"].startswith("2024-01-01T13:30:00")
+    assert session_alias["close_utc"].startswith("2024-01-01T16:30:00")
+    assert session_alias["poc"] == vwap_block["sessions"]["ny"]["poc"]
+    assert session_alias["ib_high"] == vwap_block["sessions"]["ny"].get("ib_high")
+    assert session_alias["sd2"]["plus"] >= session_alias["sd1"]["plus"]
+
+    tpo_sessions = body["tpo"]["sessions"]
+    assert isinstance(tpo_sessions, list)
+    ny_sessions = [entry for entry in tpo_sessions if entry.get("session") == "ny"]
+    assert ny_sessions, "expected NY session entries in TPO payload"
+    latest_ny = ny_sessions[-1]
+    assert latest_ny["high"] == latest_ny.get("session_high")
+    assert latest_ny["low"] == latest_ny.get("session_low")
+    assert latest_ny["open_utc"].startswith("2024-01-01T13:30:00")
+    assert latest_ny["close_utc"].startswith("2024-01-01T16:30:00")
+    assert "ib_high" in latest_ny and "ib_low" in latest_ny
 
 
 def test_vwap_profile_tick_size_stability(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
