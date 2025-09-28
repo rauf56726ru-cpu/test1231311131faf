@@ -331,6 +331,104 @@ def test_check_all_payload_includes_multi_tf_ohlcv_block(client: TestClient) -> 
     assert ohlcv_block["1d"]["candles"] == []
 
 
+def test_check_all_payload_includes_orderflow_block(client: TestClient) -> None:
+    base = datetime(2024, 3, 1, 12, 0, tzinfo=timezone.utc)
+    minute = timedelta(minutes=1)
+    candles = []
+    for offset in range(3):
+        moment = base + offset * minute
+        ts = int(moment.timestamp() * 1000)
+        if offset == 0:
+            candle = {"t": ts, "o": 100.0, "h": 100.5, "l": 99.5, "c": 100.4, "v": 10.0}
+        elif offset == 1:
+            candle = {"t": ts, "o": 100.4, "h": 100.6, "l": 99.0, "c": 99.05, "v": 12.0}
+        else:
+            candle = {"t": ts, "o": 99.05, "h": 101.0, "l": 98.8, "c": 100.95, "v": 15.0}
+        candles.append(candle)
+
+    trades = [
+        {"t": candles[0]["t"] + 10_000, "q": 2.0, "side": "buy"},
+        {"t": candles[0]["t"] + 20_000, "q": 1.5, "side": "buy"},
+        {"t": candles[0]["t"] + 30_000, "q": 0.5, "side": "sell"},
+        {"t": candles[1]["t"] + 5_000, "q": 4.0, "side": "buy"},
+        {"t": candles[1]["t"] + 10_000, "q": 1.0, "side": "sell"},
+        {"t": candles[2]["t"] + 15_000, "q": 1.0, "side": "buy"},
+        {"t": candles[2]["t"] + 20_000, "q": 6.0, "side": "sell"},
+    ]
+
+    payload = {
+        "symbol": "BTCUSDT",
+        "tf": "1m",
+        "candles": candles,
+        "agg_trades": {"symbol": "BTCUSDT", "agg": trades},
+    }
+
+    create_response = client.post("/inspection/snapshot", json=payload)
+    assert create_response.status_code == 200
+    snapshot_id = create_response.json()["snapshot_id"]
+
+    response = client.get("/inspection/check-all", params={"snapshot": snapshot_id, "hours": 1})
+    assert response.status_code == 200
+    body = response.json()
+
+    orderflow_block = body.get("orderflow")
+    assert isinstance(orderflow_block, dict)
+    assert set(orderflow_block.keys()) == {"1m", "3m", "5m", "15m"}
+
+    minute_series = orderflow_block["1m"].get("per_bar")
+    assert isinstance(minute_series, list)
+    minute_map = {entry["ts"]: entry for entry in minute_series}
+
+    first_bar = minute_map[candles[0]["t"]]
+    assert first_bar["delta"] == pytest.approx(3.0)
+    assert first_bar["cvd"] == pytest.approx(3.0)
+    assert first_bar["ask_vol"] == pytest.approx(3.5)
+    assert first_bar["bid_vol"] == pytest.approx(0.5)
+    assert first_bar["imbalance_buy"] is True
+    assert first_bar["imbalance_sell"] is False
+    assert first_bar["absorption_low"] is False
+    assert first_bar["absorption_high"] is False
+    assert first_bar["large_trades_count"] == 0
+
+    second_bar = minute_map[candles[1]["t"]]
+    assert second_bar["delta"] == pytest.approx(3.0)
+    assert second_bar["cvd"] == pytest.approx(6.0)
+    assert second_bar["ask_vol"] == pytest.approx(4.0)
+    assert second_bar["bid_vol"] == pytest.approx(1.0)
+    assert second_bar["imbalance_buy"] is True
+    assert second_bar["imbalance_sell"] is False
+    assert second_bar["absorption_low"] is True
+    assert second_bar["absorption_high"] is False
+    assert second_bar["large_trades_count"] == 0
+
+    third_bar = minute_map[candles[2]["t"]]
+    assert third_bar["delta"] == pytest.approx(-5.0)
+    assert third_bar["cvd"] == pytest.approx(1.0)
+    assert third_bar["ask_vol"] == pytest.approx(1.0)
+    assert third_bar["bid_vol"] == pytest.approx(6.0)
+    assert third_bar["imbalance_buy"] is False
+    assert third_bar["imbalance_sell"] is True
+    assert third_bar["absorption_low"] is False
+    assert third_bar["absorption_high"] is True
+    assert third_bar["large_trades_count"] == 1
+
+    three_minute = orderflow_block["3m"].get("per_bar")
+    assert isinstance(three_minute, list)
+    interval_3m = check_all_datas.TIMEFRAME_TO_MS["3m"]
+    bucket_ts = (candles[0]["t"] // interval_3m) * interval_3m
+    aggregated = {entry["ts"]: entry for entry in three_minute}.get(bucket_ts)
+    assert aggregated is not None
+    assert aggregated["delta"] == pytest.approx(1.0)
+    assert aggregated["cvd"] == pytest.approx(1.0)
+    assert aggregated["ask_vol"] == pytest.approx(8.5)
+    assert aggregated["bid_vol"] == pytest.approx(7.5)
+    assert aggregated["large_trades_count"] == 1
+    assert aggregated["imbalance_buy"] is True
+    assert aggregated["imbalance_sell"] is True
+    assert aggregated["absorption_low"] is True
+    assert aggregated["absorption_high"] is True
+
+
 def test_historical_snapshot_still_populates_window(client: TestClient) -> None:
     base = (
         datetime.now(timezone.utc)

@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, time as dtime
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple
 
@@ -641,6 +642,436 @@ def _summarise_delta_series(series: Sequence[Mapping[str, Any]]) -> Dict[str, An
         "cvd_change": cvd_change,
         "delta_pct_total": delta_pct_total,
     }
+
+
+@dataclass(slots=True)
+class OrderflowConfig:
+    """Configuration overrides for orderflow-derived metrics."""
+
+    imbalance_ratio: float = 1.8
+    absorption_ratio: float = 2.0
+    atr_period: int = 14
+    atr_band_k: float = 0.2
+    large_trade_min_qty: float = 0.0
+    large_trade_lookback_minutes: int = 2880
+    large_trade_percentile: float = 0.99
+    epsilon: float = 1e-9
+
+
+def _resolve_orderflow_config(meta: Mapping[str, Any] | None) -> OrderflowConfig:
+    if not isinstance(meta, Mapping):
+        return OrderflowConfig()
+
+    source = None
+    for key in ("orderflow", "order_flow", "orderFlow"):
+        candidate = meta.get(key)
+        if isinstance(candidate, Mapping):
+            source = candidate
+            break
+
+    if source is None:
+        return OrderflowConfig()
+
+    config = OrderflowConfig()
+
+    def _float(name: str, default: float) -> float:
+        value = source.get(name)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _int(name: str, default: int) -> int:
+        value = source.get(name)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    for key in ("imbalance_ratio", "imbalanceThreshold", "imbalance_threshold"):
+        if key in source:
+            config.imbalance_ratio = max(0.0, _float(key, config.imbalance_ratio))
+            break
+
+    for key in ("absorption_ratio", "absorptionThreshold", "absorption_threshold"):
+        if key in source:
+            config.absorption_ratio = max(0.0, _float(key, config.absorption_ratio))
+            break
+
+    for key in ("atr_period", "atrPeriod"):
+        if key in source:
+            config.atr_period = max(1, _int(key, config.atr_period))
+            break
+
+    for key in ("atr_band_k", "atrBandK", "atr_band_multiplier"):
+        if key in source:
+            config.atr_band_k = max(0.0, _float(key, config.atr_band_k))
+            break
+
+    for key in ("large_trade_min_qty", "large_trade_qty", "large_trade_trigger"):
+        if key in source:
+            config.large_trade_min_qty = max(0.0, _float(key, config.large_trade_min_qty))
+            break
+
+    for key in ("large_trade_lookback_minutes", "largeTradeLookbackMinutes"):
+        if key in source:
+            config.large_trade_lookback_minutes = max(1, _int(key, config.large_trade_lookback_minutes))
+            break
+
+    for key in ("large_trade_percentile", "largeTradePercentile"):
+        if key in source:
+            percentile = _float(key, config.large_trade_percentile)
+            if 0.0 < percentile < 1.0:
+                config.large_trade_percentile = percentile
+            break
+
+    if "epsilon" in source:
+        config.epsilon = max(1e-12, _float("epsilon", config.epsilon))
+
+    return config
+
+
+def _percentile(values: Sequence[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    if percentile <= 0:
+        return min(values)
+    if percentile >= 1:
+        return max(values)
+    ordered = sorted(values)
+    index = (len(ordered) - 1) * percentile
+    lower = math.floor(index)
+    upper = math.ceil(index)
+    if lower == upper:
+        return ordered[int(index)]
+    lower_value = ordered[lower]
+    upper_value = ordered[upper]
+    weight = index - lower
+    return lower_value * (1 - weight) + upper_value * weight
+
+
+def _compute_atr_series(
+    candles: Sequence[Mapping[str, Any]],
+    *,
+    period: int,
+) -> Dict[int, float]:
+    atr_values: Dict[int, float] = {}
+    prev_close: float | None = None
+    recent_tr: List[float] = []
+    sorted_candles: List[Tuple[int, Mapping[str, Any]]] = []
+    for candle in candles:
+        ts = _safe_int(candle.get("t"))
+        if ts is None:
+            continue
+        sorted_candles.append((ts, candle))
+    sorted_candles.sort(key=lambda item: item[0])
+
+    if not sorted_candles:
+        return atr_values
+
+    period = max(1, int(period))
+
+    for ts, candle in sorted_candles:
+        high = float(candle.get("h", 0.0))
+        low = float(candle.get("l", 0.0))
+        close = float(candle.get("c", 0.0))
+        range_high_low = high - low
+        if prev_close is None:
+            true_range = range_high_low
+        else:
+            true_range = max(
+                range_high_low,
+                abs(high - prev_close),
+                abs(low - prev_close),
+            )
+        recent_tr.append(true_range)
+        if len(recent_tr) > period:
+            recent_tr.pop(0)
+        atr = sum(recent_tr) / len(recent_tr)
+        atr_values[ts] = atr
+        prev_close = close
+
+    return atr_values
+
+
+def _extract_trades(payload: Any) -> List[Dict[str, Any]]:
+    if not isinstance(payload, Mapping):
+        return []
+    trades_raw = payload.get("agg")
+    trades: List[Dict[str, Any]] = []
+    if not isinstance(trades_raw, Sequence):
+        return trades
+    for entry in trades_raw:
+        if not isinstance(entry, Mapping):
+            continue
+        ts = _safe_int(entry.get("t"))
+        if ts is None:
+            continue
+        qty = _coerce_float(entry.get("q"))
+        if not math.isfinite(qty):
+            continue
+        side = str(entry.get("side", "")).strip().lower()
+        if side not in {"buy", "sell"}:
+            continue
+        trades.append({"t": ts, "q": float(qty), "side": side})
+    return trades
+
+
+def _bucket_trades_by_minute(
+    trades: Sequence[Mapping[str, Any]],
+    *,
+    minute_interval: int,
+    start_ms: int | None,
+    end_ms: int | None,
+) -> Dict[int, List[Mapping[str, Any]]]:
+    buckets: Dict[int, List[Mapping[str, Any]]] = {}
+    for trade in trades:
+        ts = _safe_int(trade.get("t"))
+        if ts is None:
+            continue
+        if start_ms is not None and ts < start_ms:
+            continue
+        if end_ms is not None and ts >= end_ms:
+            continue
+        bucket = _align_to_interval(ts, minute_interval)
+        buckets.setdefault(bucket, []).append(trade)
+    return buckets
+
+
+def _compute_large_trade_threshold(
+    trades: Sequence[Mapping[str, Any]],
+    *,
+    cutoff_ts: int | None,
+    lookback_minutes: int,
+    minute_interval: int,
+    base_threshold: float,
+    percentile: float,
+) -> float:
+    if not trades:
+        return max(0.0, base_threshold)
+
+    reference_cutoff = None
+    if cutoff_ts is not None:
+        reference_cutoff = cutoff_ts - max(0, lookback_minutes - 1) * minute_interval
+
+    quantities: List[float] = []
+    for trade in trades:
+        ts = _safe_int(trade.get("t"))
+        if ts is None:
+            continue
+        if reference_cutoff is not None and ts < reference_cutoff:
+            continue
+        qty = _coerce_float(trade.get("q"))
+        if math.isfinite(qty):
+            quantities.append(float(qty))
+
+    if not quantities:
+        for trade in trades:
+            qty = _coerce_float(trade.get("q"))
+            if math.isfinite(qty):
+                quantities.append(float(qty))
+
+    percentile_value = _percentile(quantities, percentile) if quantities else None
+    threshold = max(0.0, base_threshold)
+    if percentile_value is not None:
+        threshold = max(threshold, float(percentile_value))
+    return threshold
+
+
+def _build_orderflow_per_bar(
+    minute_candles: Sequence[Mapping[str, Any]],
+    trades_by_minute: Mapping[int, Sequence[Mapping[str, Any]]],
+    *,
+    config: OrderflowConfig,
+    large_trade_threshold: float,
+) -> List[Dict[str, Any]]:
+    series: List[Dict[str, Any]] = []
+    atr_series = _compute_atr_series(minute_candles, period=config.atr_period)
+
+    running_cvd = 0.0
+    for candle in sorted(minute_candles, key=lambda item: _safe_int(item.get("t")) or 0):
+        ts = _safe_int(candle.get("t"))
+        if ts is None:
+            continue
+        trades = trades_by_minute.get(ts, [])
+        ask_volume = sum(float(trade.get("q", 0.0)) for trade in trades if str(trade.get("side")).lower() == "buy")
+        bid_volume = sum(float(trade.get("q", 0.0)) for trade in trades if str(trade.get("side")).lower() == "sell")
+
+        delta = ask_volume - bid_volume
+        running_cvd += delta
+
+        atr_value = atr_series.get(ts)
+        if atr_value is None or not math.isfinite(atr_value) or atr_value <= 0:
+            atr_value = max(float(candle.get("h", 0.0)) - float(candle.get("l", 0.0)), 0.0)
+        band = atr_value * config.atr_band_k
+
+        close_price = float(candle.get("c", 0.0))
+        high_price = float(candle.get("h", 0.0))
+        low_price = float(candle.get("l", 0.0))
+
+        close_near_high = abs(high_price - close_price) <= band if band > 0 else math.isclose(high_price, close_price)
+        close_near_low = abs(close_price - low_price) <= band if band > 0 else math.isclose(low_price, close_price)
+
+        imbalance_buy = False
+        imbalance_sell = False
+        if ask_volume > 0:
+            imbalance_buy = (ask_volume / max(bid_volume, config.epsilon)) >= config.imbalance_ratio
+        if bid_volume > 0:
+            imbalance_sell = (bid_volume / max(ask_volume, config.epsilon)) >= config.imbalance_ratio
+
+        absorption_high = (
+            delta < 0
+            and close_near_high
+            and bid_volume > 0
+            and (bid_volume / max(ask_volume, config.epsilon)) >= config.absorption_ratio
+        )
+        absorption_low = (
+            delta > 0
+            and close_near_low
+            and ask_volume > 0
+            and (ask_volume / max(bid_volume, config.epsilon)) >= config.absorption_ratio
+        )
+
+        large_count = 0
+        if trades:
+            threshold = max(0.0, large_trade_threshold)
+            large_count = sum(1 for trade in trades if float(trade.get("q", 0.0)) >= threshold)
+
+        series.append(
+            {
+                "ts": ts,
+                "delta": delta,
+                "cvd": running_cvd,
+                "bid_vol": bid_volume,
+                "ask_vol": ask_volume,
+                "large_trades_count": int(large_count),
+                "absorption_high": bool(absorption_high),
+                "absorption_low": bool(absorption_low),
+                "imbalance_buy": bool(imbalance_buy),
+                "imbalance_sell": bool(imbalance_sell),
+            }
+        )
+
+    return series
+
+
+def _aggregate_orderflow_series(
+    series: Sequence[Mapping[str, Any]],
+    *,
+    interval_ms: int,
+    minute_interval: int,
+) -> List[Dict[str, Any]]:
+    if not series:
+        return []
+
+    per_minute = {int(item["ts"]): item for item in series if isinstance(item, Mapping) and "ts" in item}
+    bucket_times = sorted({_align_to_interval(ts, interval_ms) for ts in per_minute})
+    expected = max(1, interval_ms // minute_interval)
+
+    aggregated: List[Dict[str, Any]] = []
+    running_cvd = 0.0
+
+    for bucket_start in bucket_times:
+        bucket_entries: List[Mapping[str, Any]] = []
+        for index in range(expected):
+            minute_ts = bucket_start + index * minute_interval
+            entry = per_minute.get(minute_ts)
+            if entry is None:
+                bucket_entries = []
+                break
+            bucket_entries.append(entry)
+        if not bucket_entries:
+            continue
+
+        ask_volume = sum(float(entry.get("ask_vol", 0.0)) for entry in bucket_entries)
+        bid_volume = sum(float(entry.get("bid_vol", 0.0)) for entry in bucket_entries)
+        delta = ask_volume - bid_volume
+        running_cvd += delta
+
+        aggregated.append(
+            {
+                "ts": bucket_start,
+                "delta": delta,
+                "cvd": running_cvd,
+                "bid_vol": bid_volume,
+                "ask_vol": ask_volume,
+                "large_trades_count": int(
+                    sum(int(entry.get("large_trades_count", 0)) for entry in bucket_entries)
+                ),
+                "absorption_high": any(bool(entry.get("absorption_high")) for entry in bucket_entries),
+                "absorption_low": any(bool(entry.get("absorption_low")) for entry in bucket_entries),
+                "imbalance_buy": any(bool(entry.get("imbalance_buy")) for entry in bucket_entries),
+                "imbalance_sell": any(bool(entry.get("imbalance_sell")) for entry in bucket_entries),
+            }
+        )
+
+    return aggregated
+
+
+def _build_orderflow_block(
+    minute_candles: Sequence[Mapping[str, Any]],
+    trades_payload: Any,
+    *,
+    config: OrderflowConfig,
+) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
+    minute_interval = MINUTE_INTERVAL_MS
+    if not minute_candles or minute_interval <= 0:
+        return {tf: {"per_bar": []} for tf in ("1m", "3m", "5m", "15m")}
+
+    trades = _extract_trades(trades_payload)
+    minute_ts: List[int] = []
+    for candle in minute_candles:
+        ts = _safe_int(candle.get("t"))
+        if ts is not None:
+            minute_ts.append(ts)
+    minute_ts.sort()
+    start_ms = minute_ts[0] if minute_ts else None
+    end_ms = (minute_ts[-1] + minute_interval) if minute_ts else None
+
+    trades_by_minute = _bucket_trades_by_minute(
+        trades,
+        minute_interval=minute_interval,
+        start_ms=start_ms,
+        end_ms=end_ms,
+    )
+
+    last_ts = minute_ts[-1] if minute_ts else None
+    threshold = _compute_large_trade_threshold(
+        trades,
+        cutoff_ts=last_ts,
+        lookback_minutes=config.large_trade_lookback_minutes,
+        minute_interval=minute_interval,
+        base_threshold=config.large_trade_min_qty,
+        percentile=config.large_trade_percentile,
+    )
+
+    minute_series = _build_orderflow_per_bar(
+        minute_candles,
+        trades_by_minute,
+        config=config,
+        large_trade_threshold=threshold,
+    )
+
+    result: Dict[str, Dict[str, List[Dict[str, Any]]]] = {
+        "1m": {"per_bar": minute_series},
+    }
+
+    for tf in ("3m", "5m", "15m"):
+        interval_ms = TIMEFRAME_TO_MS.get(tf)
+        if not interval_ms or interval_ms <= minute_interval:
+            if interval_ms == minute_interval:
+                result[tf] = {"per_bar": minute_series[:]}
+            else:
+                result[tf] = {"per_bar": []}
+            continue
+        aggregated = _aggregate_orderflow_series(
+            minute_series,
+            interval_ms=interval_ms,
+            minute_interval=minute_interval,
+        )
+        result[tf] = {"per_bar": aggregated}
+
+    return result
 
 
 def _compute_vwap(candles: Sequence[Mapping[str, Any]]) -> float:
@@ -1655,6 +2086,12 @@ def build_check_all_datas(
             if ts in minute_window_index
         ]
 
+    orderflow_config = _resolve_orderflow_config(raw_meta)
+    orderflow_block = _build_orderflow_block(
+        minute_htf_source,
+        snapshot.get("agg_trades"),
+        config=orderflow_config,
+    )
     ohlcv_block = build_multi_timeframe_ohlcv(minute_htf_source)
     hourly_htf = aggregate_1m_to_1h(minute_htf_source) if minute_frame_present else []
     htf_blocks: List[Dict[str, Any]] = []
@@ -1779,6 +2216,7 @@ def build_check_all_datas(
         "liquidity": liquidity_payload,
         "data_quality": data_quality_public,
         "ohlcv": ohlcv_block,
+        "orderflow": orderflow_block,
         "htf": htf_blocks,
         "htf_details": htf_section,
         "data_quality_htf": htf_quality,
