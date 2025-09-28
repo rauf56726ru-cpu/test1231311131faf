@@ -1716,12 +1716,55 @@ def render_inspection_page(
     }
     .analysis-actions {
       display: flex;
-      align-items: center;
+      align-items: flex-end;
       gap: 0.75rem;
       padding: 0.75rem 0.25rem 0.25rem;
       flex-wrap: wrap;
     }
-    .analysis-actions button {
+    .analysis-credentials {
+      display: flex;
+      flex: 1 1 280px;
+      min-width: min(100%, 340px);
+      flex-direction: column;
+      gap: 0.45rem;
+    }
+    .analysis-credentials span {
+      font-size: 0.75rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: rgba(148, 163, 184, 0.78);
+    }
+    .analysis-input-row {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    #analysis-api-key {
+      flex: 1;
+      border-radius: 12px;
+      border: 1px solid rgba(148, 163, 184, 0.3);
+      padding: 0.55rem 0.75rem;
+      background: rgba(15, 23, 42, 0.65);
+      color: var(--fg);
+      letter-spacing: 0.02em;
+    }
+    #analysis-api-key:focus {
+      outline: none;
+      border-color: rgba(56, 189, 248, 0.65);
+      box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.15);
+    }
+    .analysis-key-toggle {
+      min-width: auto;
+      padding: 0.5rem 0.75rem;
+      white-space: nowrap;
+    }
+    .analysis-actions__controls {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+    }
+    .analysis-actions__controls > button {
       min-width: 220px;
     }
     .analysis-status {
@@ -2191,6 +2234,9 @@ def render_inspection_page(
     }
     """
 
+    analysis_configured = bool(os.environ.get("OPENAI_API_KEY"))
+    model_id_default = "gpt-5"
+
     script_block = (
         "window.__INSPECTION_INITIAL__ = {\n"
         f"  payload: {payload_json},\n"
@@ -2198,7 +2244,9 @@ def render_inspection_page(
         f"  symbol: {json.dumps(symbol_value)},\n"
         f"  timeframe: {json.dumps(timeframe_value)},\n"
         f"  snapshots: {snapshots_json},\n"
-        f"  defaultSymbol: {json.dumps(DEFAULT_SYMBOL)}\n"
+        f"  defaultSymbol: {json.dumps(DEFAULT_SYMBOL)},\n"
+        f"  analysisConfigured: {json.dumps(analysis_configured)},\n"
+        f"  modelId: {json.dumps(model_id_default)}\n"
         "};\n"
     )
 
@@ -2412,6 +2460,32 @@ def render_inspection_page(
     pre.textContent = JSON.stringify(data ?? null, null, 2);
   }
 
+  const API_KEY_STORAGE_KEY = "inspection.openai_api_key";
+
+  function loadStoredApiKey() {
+    try {
+      if (!window || !window.localStorage) return "";
+      const value = window.localStorage.getItem(API_KEY_STORAGE_KEY);
+      return typeof value === "string" ? value : "";
+    } catch (error) {
+      console.warn("Failed to read OpenAI API key from storage", error);
+      return "";
+    }
+  }
+
+  function persistStoredApiKey(value) {
+    try {
+      if (!window || !window.localStorage) return;
+      if (value) {
+        window.localStorage.setItem(API_KEY_STORAGE_KEY, value);
+      } else {
+        window.localStorage.removeItem(API_KEY_STORAGE_KEY);
+      }
+    } catch (error) {
+      console.warn("Failed to persist OpenAI API key", error);
+    }
+  }
+
   function selectionLabel(start, end) {
     if (!start || !end) return "Выделите диапазон";
     const from = formatTs(start);
@@ -2594,6 +2668,8 @@ def render_inspection_page(
     const analysisStatusEl = document.getElementById("analysis-status");
     const analysisPre = document.getElementById("analysis-json");
     const analysisDebugPre = document.getElementById("analysis-debug-json");
+    const analysisApiKeyInput = document.getElementById("analysis-api-key");
+    const analysisApiKeyToggle = document.getElementById("analysis-api-key-toggle");
     const snapshotMeta = document.getElementById("snapshot-meta");
     const frameSelect = document.getElementById("frame-select");
     const chartContainer = document.getElementById("inspection-chart");
@@ -2633,6 +2709,7 @@ def render_inspection_page(
 
     initCollapsibles();
 
+    const storedApiKey = loadStoredApiKey().trim();
     const resolveHours = (value) => {
       const parsed = Number(value);
       if (!Number.isFinite(parsed)) return 1;
@@ -2683,6 +2760,12 @@ def render_inspection_page(
         trade: null,
         debug: null,
         requestId: null,
+        apiConfigured: Boolean(initial.analysisConfigured),
+        apiKey: storedApiKey,
+        modelId:
+          typeof initial.modelId === "string" && initial.modelId.trim().toLowerCase() === "gpt-5"
+            ? "gpt-5"
+            : "gpt-5",
       },
       hours: checkAllHours ? resolveHours(checkAllHours.value) : 1,
       profilePreset: initial.payload?.DATA?.profile_preset || null,
@@ -2693,6 +2776,25 @@ def render_inspection_page(
       managingSymbol: null,
       presetModalOpen: false,
     };
+
+    if (analysisApiKeyInput) {
+      analysisApiKeyInput.value = storedApiKey;
+      analysisApiKeyInput.addEventListener("input", () => {
+        const cleaned = analysisApiKeyInput.value.trim();
+        state.analysis.apiKey = cleaned;
+        persistStoredApiKey(cleaned);
+        updateAnalysisControls();
+      });
+    }
+
+    if (analysisApiKeyToggle && analysisApiKeyInput) {
+      analysisApiKeyToggle.addEventListener("click", () => {
+        const currentType = analysisApiKeyInput.getAttribute("type") === "text" ? "text" : "password";
+        const nextType = currentType === "password" ? "text" : "password";
+        analysisApiKeyInput.setAttribute("type", nextType);
+        analysisApiKeyToggle.textContent = nextType === "text" ? "Скрыть" : "Показать";
+      });
+    }
 
     const AUTO_PRESET_SYMBOLS = new Set(["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
 
@@ -2750,7 +2852,9 @@ def render_inspection_page(
       const end = Number(state.selection?.end ?? Number.NaN);
       const hasSelection = Number.isFinite(start) && Number.isFinite(end) && start !== end;
       const busy = state.analysis.status === "pending" || state.analysis.status === "sent";
-      analysisButton.disabled = !state.snapshotId || !hasSelection || busy;
+      const hasApiAccess =
+        state.analysis.apiConfigured || Boolean((state.analysis.apiKey || "").trim());
+      analysisButton.disabled = !state.snapshotId || !hasSelection || busy || !hasApiAccess;
     }
 
     function resetAnalysisState() {
@@ -3232,6 +3336,15 @@ def render_inspection_page(
       const selectionEnd = Math.floor(Math.max(rawStart, rawEnd));
       const hoursValue = Number.isFinite(state.hours) ? state.hours : 1;
       const period = resolveAnalysisPeriod();
+      const apiKeyValue = (state.analysis.apiKey || "").trim();
+      if (!state.analysis.apiConfigured && !apiKeyValue) {
+        updateStatus("Укажите OpenAI API key перед анализом сделки", "warning");
+        updateAnalysisControls();
+        if (analysisApiKeyInput) {
+          analysisApiKeyInput.focus();
+        }
+        return;
+      }
 
       state.analysis.status = "pending";
       state.analysis.resultStatus = null;
@@ -3244,16 +3357,28 @@ def render_inspection_page(
       updateStatus("Готовим данные для анализа сделки...", "info");
 
       try {
+        const modelId =
+          typeof state.analysis.modelId === "string" && state.analysis.modelId.trim().toLowerCase() === "gpt-5"
+            ? "gpt-5"
+            : "gpt-5";
+        state.analysis.modelId = modelId;
+
+        const requestBody = {
+          snapshot_id: state.snapshotId,
+          selection_start: selectionStart,
+          selection_end: selectionEnd,
+          hours: hoursValue,
+          period,
+          model: modelId,
+        };
+        if (apiKeyValue) {
+          requestBody.api_key = apiKeyValue;
+        }
+
         const response = await fetch("/api/analyze-from-inspection", {
           method: "POST",
           headers: { "Content-Type": "application/json", Accept: "application/json" },
-          body: JSON.stringify({
-            snapshot_id: state.snapshotId,
-            selection_start: selectionStart,
-            selection_end: selectionEnd,
-            hours: hoursValue,
-            period,
-          }),
+          body: JSON.stringify(requestBody),
         });
 
         state.analysis.status = "sent";
@@ -3585,6 +3710,8 @@ def render_inspection_page(
         requestTradeAnalysis();
       });
     }
+
+    updateAnalysisControls();
 
     if (clearSelection) {
       clearSelection.addEventListener("click", () => {
@@ -4739,8 +4866,17 @@ def render_inspection_page(
                 <pre id=\"checkall-json\">{check_all_json_initial}</pre>
               </div>
               <div class="analysis-actions">
-                <button id="analysis-send" class="primary" type="button">Отправить сделку на анализ</button>
-                <span id="analysis-status" class="analysis-status" data-status="idle">—</span>
+                <label class="analysis-credentials" for="analysis-api-key">
+                  <span>OpenAI API Key</span>
+                  <div class="analysis-input-row">
+                    <input id="analysis-api-key" type="password" placeholder="sk-..." autocomplete="off" spellcheck="false" />
+                    <button id="analysis-api-key-toggle" class="secondary analysis-key-toggle" type="button" data-api-key-visibility>Показать</button>
+                  </div>
+                </label>
+                <div class="analysis-actions__controls">
+                  <button id="analysis-send" class="primary" type="button">Отправить сделку на анализ</button>
+                  <span id="analysis-status" class="analysis-status" data-status="idle">—</span>
+                </div>
               </div>
               <div class="collapse" data-analysis-panel>
                 <header data-collapse-toggle>

@@ -1,6 +1,7 @@
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -94,7 +95,7 @@ def stub_binance_minutes(monkeypatch):
 def analysis_env(tmp_path, monkeypatch):
     upload_dir = tmp_path / "analysis"
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-    monkeypatch.setenv("OPENAI_MODEL_ID", "test-model")
+    monkeypatch.setenv("OPENAI_MODEL_ID", "gpt-5")
     monkeypatch.setenv("ANALYSIS_UPLOAD_DIR", str(upload_dir))
     return upload_dir
 
@@ -127,8 +128,23 @@ def _build_snapshot_payload(base: datetime, count: int = 12) -> dict:
     return payload
 
 
-def _install_openai_stub(monkeypatch, *, status: str = "ok", trade: dict | None = None, raw: str | None = None):
+def _install_openai_stub(
+    monkeypatch,
+    *,
+    status: str = "ok",
+    trade: dict | None = None,
+    raw: str | None = None,
+    expected_key: str | None = None,
+    expected_model: str | None = None,
+):
+    captured: dict[str, Any] = {}
+
     async def fake_call(**kwargs):
+        captured["kwargs"] = kwargs
+        if expected_key is not None:
+            assert kwargs.get("api_key") == expected_key
+        if expected_model is not None:
+            assert kwargs.get("model") == expected_model
         file_path: Path = kwargs["file_path"]
         data = file_path.read_bytes()
         digest = analysis.sha256(data).hexdigest()
@@ -146,6 +162,7 @@ def _install_openai_stub(monkeypatch, *, status: str = "ok", trade: dict | None 
         )
 
     monkeypatch.setattr(analysis, "call_openai_with_attachment", fake_call)
+    return captured
 
 
 def test_analyze_from_inspection_returns_payload(client: TestClient, analysis_env: Path, monkeypatch) -> None:
@@ -156,7 +173,11 @@ def test_analyze_from_inspection_returns_payload(client: TestClient, analysis_en
     assert create_response.status_code == 200
     snapshot_id = create_response.json()["snapshot_id"]
 
-    _install_openai_stub(monkeypatch)
+    captured = _install_openai_stub(
+        monkeypatch,
+        expected_key="test-key",
+        expected_model="gpt-5",
+    )
 
     selection = payload["selection"]
     body = {
@@ -182,6 +203,8 @@ def test_analyze_from_inspection_returns_payload(client: TestClient, analysis_en
     assert stored["SYMBOL"] == "BTCUSDT"
     assert stored["PERIOD"] == "3d_overview_4h_detail"
     assert stored["DATA"]["snapshot_id"]
+    assert debug["model"] == "gpt-5"
+    assert captured["kwargs"]["api_key"] == "test-key"
 
 
 def test_analyze_from_inspection_handles_insufficient(client: TestClient, analysis_env: Path, monkeypatch) -> None:
@@ -192,11 +215,13 @@ def test_analyze_from_inspection_handles_insufficient(client: TestClient, analys
     assert create_response.status_code == 200
     snapshot_id = create_response.json()["snapshot_id"]
 
-    _install_openai_stub(
+    captured = _install_openai_stub(
         monkeypatch,
         status="insufficient_data",
         trade=None,
         raw="not-json",
+        expected_key="test-key",
+        expected_model="gpt-5",
     )
 
     selection = payload["selection"]
@@ -215,3 +240,71 @@ def test_analyze_from_inspection_handles_insufficient(client: TestClient, analys
     assert data["trade_json"] is None
     assert "raw_text" in data["debug"]
     assert data["debug"]["period"] == "custom_period"
+    assert data["debug"]["model"] == "gpt-5"
+    assert captured["kwargs"]["api_key"] == "test-key"
+
+
+def test_analyze_from_inspection_accepts_api_key_override(
+    client: TestClient,
+    analysis_env: Path,
+    monkeypatch,
+) -> None:
+    base = datetime(2024, 6, 3, 10, tzinfo=UTC)
+    payload = _build_snapshot_payload(base)
+
+    create_response = client.post("/inspection/snapshot", json=payload)
+    assert create_response.status_code == 200
+    snapshot_id = create_response.json()["snapshot_id"]
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    captured = _install_openai_stub(
+        monkeypatch,
+        expected_key="override-key",
+        expected_model="gpt-5",
+    )
+
+    selection = payload["selection"]
+    body = {
+        "snapshot_id": snapshot_id,
+        "selection_start": selection["start"],
+        "selection_end": selection["end"],
+        "hours": 2,
+        "period": "override_period",
+        "api_key": "override-key",
+    }
+
+    response = client.post("/api/analyze-from-inspection", json=body)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"
+    assert data["debug"]["model"] == "gpt-5"
+    assert captured["kwargs"]["api_key"] == "override-key"
+
+
+def test_analyze_from_inspection_requires_api_key_when_missing(
+    client: TestClient,
+    analysis_env: Path,
+    monkeypatch,
+) -> None:
+    base = datetime(2024, 6, 4, 7, tzinfo=UTC)
+    payload = _build_snapshot_payload(base)
+
+    create_response = client.post("/inspection/snapshot", json=payload)
+    assert create_response.status_code == 200
+    snapshot_id = create_response.json()["snapshot_id"]
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    selection = payload["selection"]
+    body = {
+        "snapshot_id": snapshot_id,
+        "selection_start": selection["start"],
+        "selection_end": selection["end"],
+        "hours": 1,
+        "period": "needs_key",
+    }
+
+    response = client.post("/api/analyze-from-inspection", json=body)
+    assert response.status_code == 400
+    assert response.json()["detail"] == "OpenAI API key is required"

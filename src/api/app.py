@@ -299,10 +299,31 @@ async def analyze_from_inspection(payload: Dict[str, Any] = Body(...)) -> JSONRe
                                 price_candidates.append(float(value))
     last_price = price_candidates[0] if price_candidates else 0.0
 
-    api_key = os.environ.get("OPENAI_API_KEY")
-    model_id = os.environ.get("OPENAI_MODEL_ID")
-    if not api_key or not model_id:
-        raise HTTPException(status_code=500, detail="OpenAI configuration is missing")
+    api_key: str | None = None
+    api_key_raw = payload.get("api_key")
+    if isinstance(api_key_raw, str):
+        candidate = api_key_raw.strip()
+        if candidate:
+            api_key = candidate
+
+    if not api_key:
+        env_key = os.environ.get("OPENAI_API_KEY")
+        if isinstance(env_key, str):
+            candidate = env_key.strip()
+            if candidate:
+                api_key = candidate
+
+    if not api_key:
+        raise HTTPException(status_code=400, detail="OpenAI API key is required")
+
+    model_candidate = payload.get("model")
+    model_id = "gpt-5"
+    if isinstance(model_candidate, str) and model_candidate.strip().lower() == "gpt-5":
+        model_id = "gpt-5"
+    else:
+        env_model = os.environ.get("OPENAI_MODEL_ID")
+        if isinstance(env_model, str) and env_model.strip().lower() == "gpt-5":
+            model_id = "gpt-5"
 
     upload_dir = Path(
         os.environ.get(
@@ -359,6 +380,7 @@ async def analyze_from_inspection(payload: Dict[str, Any] = Body(...)) -> JSONRe
         "symbol": symbol,
         "period": period,
         "last_price": last_price,
+        "model": model_id,
         "attachment_file": analysis_result.file_path.name,
         "attachment_size_bytes": analysis_result.attachment_size,
         "attachment_sha256": analysis_result.attachment_sha256,
