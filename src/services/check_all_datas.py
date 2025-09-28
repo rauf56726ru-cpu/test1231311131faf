@@ -11,6 +11,7 @@ from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence,
 import httpx
 
 import src.services.inspection as inspection
+from .binance import BINANCE_FAPI_REST
 from .inspection import build_htf_section
 from .liquidity import (
     build_liquidity_snapshot,
@@ -71,7 +72,6 @@ VWAP_TPO_SESSIONS: Tuple[Tuple[str, dtime, dtime], ...] = (
     ("ny", dtime(hour=13, minute=30), dtime(hour=16, minute=30)),
 )
 
-BINANCE_FAPI_REST = "https://fapi.binance.com/fapi/v1/klines"
 _RETRYABLE_STATUS = {418, 429, 500, 502, 503, 504}
 _MAX_RETRIES = 5
 

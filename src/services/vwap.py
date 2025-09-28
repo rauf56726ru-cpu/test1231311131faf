@@ -21,9 +21,8 @@ from typing import (
 import httpx
 
 from ..meta import Meta
+from .binance import BINANCE_FAPI_REST
 from .ohlc import TIMEFRAME_TO_MS
-BINANCE_SPOT_REST = "https://api.binance.com/api/v3/klines"
-BINANCE_FAPI_REST = "https://fapi.binance.com/fapi/v1/klines"
 
 VWAP_INTERVAL = "1m"
 INTERVAL_MS = TIMEFRAME_TO_MS[VWAP_INTERVAL]
@@ -202,7 +201,7 @@ async def fetch_daily_vwap(
     factory = client_factory or (lambda: httpx.AsyncClient(timeout=10.0))
     async with factory() as client:
         while True:
-            response = await client.get(BINANCE_SPOT_REST, params=params)
+            response = await client.get(BINANCE_FAPI_REST, params=params)
             response.raise_for_status()
             batch = response.json()
             if not isinstance(batch, list) or not batch:

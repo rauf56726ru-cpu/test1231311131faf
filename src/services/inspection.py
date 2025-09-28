@@ -25,6 +25,7 @@ from typing import (
 
 import httpx
 
+from .binance import BINANCE_FAPI_REST
 from .liquidity import (
     build_liquidity_snapshot,
     normalise_symbol_for_tick,
@@ -58,7 +59,6 @@ _SNAPSHOT_ID_SANITISER = re.compile(r"[^A-Za-z0-9._-]")
 MS_IN_DAY = 86_400_000
 HTF_TIMEFRAMES: Tuple[str, ...] = ("15m", "1h", "4h", "1d")
 MINUTE_INTERVAL_MS = TIMEFRAME_TO_MS.get("1m", 60_000)
-BINANCE_FAPI_REST = "https://fapi.binance.com/fapi/v1/klines"
 
 
 
@@ -930,6 +930,35 @@ def register_snapshot(snapshot: Mapping[str, Any]) -> str:
         value = snapshot.get(key)
         if isinstance(value, Mapping):
             meta[key] = dict(value)
+
+    primary_frame = frames.get(primary_tf, {})
+    t_values: List[int] = []
+    if isinstance(primary_frame, Mapping):
+        raw_candles = primary_frame.get("candles")
+        if isinstance(raw_candles, Sequence):
+            for candle in raw_candles:
+                ts: int | None = None
+                if isinstance(candle, Mapping):
+                    ts = _safe_int(
+                        candle.get("t")
+                        or candle.get("time")
+                        or candle.get("openTime")
+                        or candle.get("open_time")
+                    )
+                elif isinstance(candle, Sequence) and candle:
+                    ts = _safe_int(candle[0])
+                if ts is not None:
+                    t_values.append(ts)
+    if t_values:
+        t_values.sort()
+        meta["t_first"] = t_values[0]
+        meta["t_last"] = t_values[-1]
+
+    existing_source = meta.get("source")
+    if isinstance(existing_source, Mapping):
+        meta["source_details"] = dict(existing_source)
+    meta["source"] = "futures"
+    meta["market"] = "USDT-M Futures"
 
     selection = snapshot.get("selection") if isinstance(snapshot.get("selection"), Mapping) else None
     selection_data = None
@@ -2389,7 +2418,7 @@ def render_inspection_page(
   }
 
   async function fetchRange(symbol, interval, startMs, endMs, limit = 1000) {
-    const url = new URL("https://api.binance.com/api/v3/klines");
+    const url = new URL("https://fapi.binance.com/fapi/v1/klines");
     url.searchParams.set("symbol", symbol);
     url.searchParams.set("interval", interval);
     if (Number.isFinite(startMs)) {
@@ -2398,7 +2427,7 @@ def render_inspection_page(
     if (Number.isFinite(endMs)) {
       url.searchParams.set("endTime", Math.floor(endMs));
     }
-    url.searchParams.set("limit", String(Math.max(1, Math.min(limit, 1000))));
+    url.searchParams.set("limit", String(Math.max(1, Math.min(limit, 1500))));
     const response = await fetch(url.toString());
     if (!response.ok) {
       throw new Error(`Failed to fetch range: ${response.status}`);
@@ -2504,7 +2533,7 @@ def render_inspection_page(
     const seen = new Set();
     const intervalMs = TIMEFRAME_TO_MS[interval] || 60000;
     const hintedLimit = Number.isFinite(options.limit) ? Math.floor(options.limit) : null;
-    const batchLimit = Math.max(1, Math.min(1000, hintedLimit || 1000));
+    const batchLimit = Math.max(1, Math.min(1500, hintedLimit || 1000));
     const hasStart = Number.isFinite(startMs);
     const hasEnd = Number.isFinite(endMs);
     let startBound = null;
@@ -2524,7 +2553,7 @@ def render_inspection_page(
     const guardLimit = 4096;
 
     while (true) {
-      const url = new URL("https://api.binance.com/api/v3/klines");
+      const url = new URL("https://fapi.binance.com/fapi/v1/klines");
       url.searchParams.set("symbol", symbol.toUpperCase());
       url.searchParams.set("interval", interval);
       if (Number.isFinite(cursor)) {

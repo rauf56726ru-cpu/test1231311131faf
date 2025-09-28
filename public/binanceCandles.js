@@ -7,7 +7,7 @@
 })(typeof self !== "undefined" ? self : this, function () {
   "use strict";
 
-  const BASE_URL = "https://api.binance.com/api/v3/klines";
+  const BASE_URL = "https://fapi.binance.com/fapi/v1/klines";
 
   /**
    * @typedef {Object} Bar
@@ -121,7 +121,7 @@
       throw new Error("symbol and interval are required");
     }
 
-    const cappedLimit = Math.max(1, Math.min(Number(limit) || 500, 1000));
+    const cappedLimit = Math.max(1, Math.min(Number(limit) || 500, 1500));
     const url =
       `${BASE_URL}?symbol=${encodeURIComponent(symbol)}` +
       `&interval=${encodeURIComponent(interval)}` +

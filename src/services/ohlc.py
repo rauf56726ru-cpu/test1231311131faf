@@ -21,6 +21,8 @@ from typing import (
 
 import httpx
 
+from .binance import BINANCE_FAPI_REST
+
 # Mapping of supported timeframes to their window sizes.
 TIMEFRAME_WINDOWS: Dict[str, timedelta] = {
     "1m": timedelta(hours=8),
@@ -869,7 +871,6 @@ def normalise_ohlcv_sync(
         include_diagnostics=include_diagnostics,
         use_full_span=use_full_span,
     )
-BINANCE_FAPI_REST = "https://fapi.binance.com/fapi/v1/klines"
 
 
 @dataclass(slots=True)
