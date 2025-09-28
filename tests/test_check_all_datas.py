@@ -586,3 +586,103 @@ def test_detailed_section_backfills_minute_frame(client: TestClient) -> None:
 
     assert "3m" not in detailed["frames"]
     assert "5m" not in detailed["frames"]
+
+
+def test_compact_minutes_disabled_by_default(client: TestClient) -> None:
+    base = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    payload = _build_snapshot_payload(base, count=12)
+
+    create_response = client.post("/inspection/snapshot", json=payload)
+    assert create_response.status_code == 200
+    snapshot_id = create_response.json()["snapshot_id"]
+
+    response = client.get(
+        "/inspection/check-all",
+        params={"snapshot": snapshot_id, "hours": 1},
+    )
+    assert response.status_code == 200
+    body = response.json()
+
+    frames = body["datas_for_last_N_hours"]["frames"]
+    assert "1m_compact" not in frames
+    assert "compact_stats" not in frames["1m"]
+
+
+def test_compact_minutes_plateau_segment(client: TestClient) -> None:
+    base = datetime.now(timezone.utc).replace(second=0, microsecond=0) - timedelta(minutes=60)
+    candles = []
+    plateau_candles = []
+    for index in range(61):
+        ts = int((base + timedelta(minutes=index)).timestamp() * 1000)
+        if index < 12:
+            candle = {
+                "t": ts,
+                "o": 100.0,
+                "h": 100.1,
+                "l": 99.9,
+                "c": 100.0,
+                "v": 3.0,
+            }
+            plateau_candles.append(candle)
+        else:
+            open_price = 200.0 + index
+            candle = {
+                "t": ts,
+                "o": open_price,
+                "h": open_price + 25.0,
+                "l": open_price - 25.0,
+                "c": open_price + 5.0,
+                "v": 5.0 + index,
+            }
+        candles.append(candle)
+
+    payload = {
+        "symbol": "ETHUSDT",
+        "tf": "1m",
+        "candles": candles,
+        "selection": {"start": candles[0]["t"], "end": candles[-1]["t"]},
+    }
+
+    create_response = client.post("/inspection/snapshot", json=payload)
+    assert create_response.status_code == 200
+    snapshot_id = create_response.json()["snapshot_id"]
+
+    response = client.get(
+        "/inspection/check-all",
+        params={"snapshot": snapshot_id, "hours": 1, "compact": True},
+    )
+    assert response.status_code == 200
+    body = response.json()
+
+    frames = body["datas_for_last_N_hours"]["frames"]
+    segments = frames.get("1m_compact")
+    assert isinstance(segments, list)
+    plateau_segment = next(
+        seg for seg in segments if seg["t_start"] == plateau_candles[0]["t"]
+    )
+
+    assert plateau_segment["t_end"] == plateau_candles[-1]["t"]
+    assert plateau_segment["count"] == len(plateau_candles)
+    assert plateau_segment["volume_sum"] == pytest.approx(
+        sum(candle["v"] for candle in plateau_candles)
+    )
+    assert plateau_segment["low_min"] == pytest.approx(
+        min(candle["l"] for candle in plateau_candles)
+    )
+    assert plateau_segment["high_max"] == pytest.approx(
+        max(candle["h"] for candle in plateau_candles)
+    )
+    assert plateau_segment["ranges"]["open"] == [
+        pytest.approx(100.0),
+        pytest.approx(100.0),
+    ]
+    assert plateau_segment["ranges"]["volume"] == [
+        pytest.approx(3.0),
+        pytest.approx(3.0),
+    ]
+
+    stats = frames["1m"]["compact_stats"]
+    assert stats["raw_count"] == len(candles)
+    assert stats["segment_count"] <= stats["raw_count"]
+    expected_ratio = round(stats["segment_count"] / stats["raw_count"], 3)
+    assert stats["reduction_ratio"] == expected_ratio

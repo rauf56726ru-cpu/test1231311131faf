@@ -5,7 +5,7 @@ import logging
 import math
 import time
 from datetime import datetime, timedelta, timezone, time as dtime
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple
 
 import httpx
 
@@ -41,6 +41,12 @@ MINUTE_INTERVAL_MS = TIMEFRAME_TO_MS.get("1m", MS_IN_HOUR // 60)
 BINANCE_FAPI_REST = "https://fapi.binance.com/fapi/v1/klines"
 _RETRYABLE_STATUS = {418, 429, 500, 502, 503, 504}
 _MAX_RETRIES = 5
+
+_COMPACT_DEFAULTS = {
+    "eps_abs_price": 5.0,
+    "eps_rel_price": 0.0001,
+    "max_segment_minutes": 15,
+}
 
 
 class DataQualityError(RuntimeError):
@@ -608,6 +614,238 @@ def _build_delta_series(candles: Sequence[Mapping[str, Any]]) -> List[Dict[str, 
     return series
 
 
+def _resolve_compact_parameters(
+    meta_config: Mapping[str, Any] | None,
+    override_config: Mapping[str, Any] | None,
+) -> Tuple[float, float, int, float | None]:
+    config: Dict[str, Any] = {}
+    if isinstance(meta_config, Mapping):
+        config.update(meta_config)
+    if isinstance(override_config, Mapping):
+        config.update({key: value for key, value in override_config.items() if value is not None})
+
+    def _float_value(key: str, default: float) -> float:
+        raw = config.get(key)
+        if raw is None:
+            return default
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return default
+
+    def _int_value(key: str, default: int) -> int:
+        raw = config.get(key)
+        if raw is None:
+            return default
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return default
+        return value if value > 0 else default
+
+    eps_abs_price = _float_value("eps_abs_price", _COMPACT_DEFAULTS["eps_abs_price"])
+    eps_rel_price = _float_value("eps_rel_price", _COMPACT_DEFAULTS["eps_rel_price"])
+    max_segment_minutes = _int_value("max_segment_minutes", _COMPACT_DEFAULTS["max_segment_minutes"])
+
+    eps_vol_raw = config.get("eps_vol")
+    eps_vol: float | None
+    if eps_vol_raw is None:
+        eps_vol = None
+    else:
+        try:
+            eps_vol = float(eps_vol_raw)
+        except (TypeError, ValueError):
+            eps_vol = None
+        if eps_vol is not None and eps_vol <= 0:
+            eps_vol = None
+
+    return eps_abs_price, eps_rel_price, max_segment_minutes, eps_vol
+
+
+def _compact_minute_segments(
+    candles: Sequence[Mapping[str, Any]],
+    *,
+    eps_abs_price: float,
+    eps_rel_price: float,
+    max_segment_minutes: int,
+    eps_vol: float | None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    ordered = [c for c in candles if _safe_int(c.get("t")) is not None]
+    ordered.sort(key=lambda item: _safe_int(item.get("t")) or 0)
+
+    if not ordered:
+        return [], {"raw_count": 0, "segment_count": 0, "reduction_ratio": 1.0}
+
+    segments: List[Dict[str, Any]] = []
+
+    def _initialise_segment(candle: Mapping[str, Any]) -> Dict[str, Any]:
+        ts = int(_safe_int(candle.get("t")) or 0)
+        open_price = _coerce_float(candle.get("o"))
+        high_price = _coerce_float(candle.get("h"))
+        low_price = _coerce_float(candle.get("l"))
+        close_price = _coerce_float(candle.get("c"))
+        volume = _coerce_float(candle.get("v"))
+        return {
+            "t_start": ts,
+            "t_end": ts,
+            "o_start": open_price,
+            "c_end": close_price,
+            "high_max": high_price,
+            "low_min": low_price,
+            "volume_sum": volume,
+            "count": 1,
+            "_open_min": open_price,
+            "_open_max": open_price,
+            "_close_min": close_price,
+            "_close_max": close_price,
+            "_high_min": high_price,
+            "_high_max": high_price,
+            "_low_min": low_price,
+            "_low_max": low_price,
+            "_volume_min": volume,
+            "_volume_max": volume,
+            "_volume_mean": volume,
+            "_volume_m2": 0.0,
+        }
+
+    def _volume_stats_after_extend(segment: Dict[str, Any], volume: float) -> Tuple[float, float, float]:
+        count = int(segment["count"])
+        mean = float(segment.get("_volume_mean", 0.0))
+        m2 = float(segment.get("_volume_m2", 0.0))
+        new_count = count + 1
+        delta = volume - mean
+        new_mean = mean + (delta / new_count)
+        new_m2 = m2 + delta * (volume - new_mean)
+        std = math.sqrt(new_m2 / new_count) if new_count > 1 else 0.0
+        return std, new_mean, new_m2
+
+    current = _initialise_segment(ordered[0])
+
+    for candle in ordered[1:]:
+        ts = int(_safe_int(candle.get("t")) or 0)
+        open_price = _coerce_float(candle.get("o"))
+        high_price = _coerce_float(candle.get("h"))
+        low_price = _coerce_float(candle.get("l"))
+        close_price = _coerce_float(candle.get("c"))
+        volume = _coerce_float(candle.get("v"))
+
+        candidate_high_max = max(float(current["high_max"]), high_price)
+        candidate_low_min = min(float(current["low_min"]), low_price)
+        mid_price = (candidate_high_max + candidate_low_min) / 2 if math.isfinite(candidate_high_max + candidate_low_min) else 0.0
+        price_threshold = max(eps_abs_price, eps_rel_price * mid_price)
+        price_range = candidate_high_max - candidate_low_min
+
+        new_t_end = ts
+        duration_minutes = int(((new_t_end - int(current["t_start"])) // MINUTE_INTERVAL_MS) + 1)
+
+        volume_std = 0.0
+        new_mean = float(current.get("_volume_mean", 0.0))
+        new_m2 = float(current.get("_volume_m2", 0.0))
+        if eps_vol is not None:
+            volume_std, new_mean, new_m2 = _volume_stats_after_extend(current, volume)
+
+        can_extend = (
+            price_range <= price_threshold
+            and duration_minutes <= max_segment_minutes
+            and (eps_vol is None or volume_std <= eps_vol)
+        )
+
+        if not can_extend:
+            segments.append(
+                {
+                    "t_start": current["t_start"],
+                    "t_end": current["t_end"],
+                    "o_start": current["o_start"],
+                    "c_end": current["c_end"],
+                    "high_max": current["high_max"],
+                    "low_min": current["low_min"],
+                    "volume_sum": current["volume_sum"],
+                    "count": current["count"],
+                    "ranges": {
+                        "open": [current["_open_min"], current["_open_max"]],
+                        "close": [current["_close_min"], current["_close_max"]],
+                        "high": [current["_high_min"], current["_high_max"]],
+                        "low": [current["_low_min"], current["_low_max"]],
+                        "volume": [current["_volume_min"], current["_volume_max"]],
+                    },
+                }
+            )
+            current = _initialise_segment(candle)
+            continue
+
+        current["t_end"] = new_t_end
+        current["c_end"] = close_price
+        current["high_max"] = candidate_high_max
+        current["low_min"] = candidate_low_min
+        current["volume_sum"] = float(current["volume_sum"]) + volume
+        current["count"] = int(current["count"]) + 1
+        current["_open_min"] = min(current["_open_min"], open_price)
+        current["_open_max"] = max(current["_open_max"], open_price)
+        current["_close_min"] = min(current["_close_min"], close_price)
+        current["_close_max"] = max(current["_close_max"], close_price)
+        current["_high_min"] = min(current["_high_min"], high_price)
+        current["_high_max"] = max(current["_high_max"], high_price)
+        current["_low_min"] = min(current["_low_min"], low_price)
+        current["_low_max"] = max(current["_low_max"], low_price)
+        current["_volume_min"] = min(current["_volume_min"], volume)
+        current["_volume_max"] = max(current["_volume_max"], volume)
+        if eps_vol is not None:
+            current["_volume_mean"] = new_mean
+            current["_volume_m2"] = new_m2
+
+    segments.append(
+        {
+            "t_start": current["t_start"],
+            "t_end": current["t_end"],
+            "o_start": current["o_start"],
+            "c_end": current["c_end"],
+            "high_max": current["high_max"],
+            "low_min": current["low_min"],
+            "volume_sum": current["volume_sum"],
+            "count": current["count"],
+            "ranges": {
+                "open": [current["_open_min"], current["_open_max"]],
+                "close": [current["_close_min"], current["_close_max"]],
+                "high": [current["_high_min"], current["_high_max"]],
+                "low": [current["_low_min"], current["_low_max"]],
+                "volume": [current["_volume_min"], current["_volume_max"]],
+            },
+        }
+    )
+
+    total_volume = sum(float(segment["volume_sum"]) for segment in segments)
+    raw_volume = sum(_coerce_float(candle.get("v")) for candle in ordered)
+    if segments and not math.isclose(total_volume, raw_volume, rel_tol=1e-9, abs_tol=1e-9):
+        diff = raw_volume - total_volume
+        segments[-1]["volume_sum"] = float(segments[-1]["volume_sum"]) + diff
+
+    raw_lows = [float(candle.get("l", 0.0)) for candle in ordered]
+    raw_highs = [float(candle.get("h", 0.0)) for candle in ordered]
+    if segments:
+        lowest_segment_low = min(float(segment["low_min"]) for segment in segments)
+        highest_segment_high = max(float(segment["high_max"]) for segment in segments)
+        if raw_lows:
+            lowest_raw = min(raw_lows)
+            if not math.isclose(lowest_segment_low, lowest_raw, rel_tol=1e-9, abs_tol=1e-9):
+                segments[0]["low_min"] = lowest_raw
+        if raw_highs:
+            highest_raw = max(raw_highs)
+            if not math.isclose(highest_segment_high, highest_raw, rel_tol=1e-9, abs_tol=1e-9):
+                segments[-1]["high_max"] = highest_raw
+
+    raw_count = len(ordered)
+    segment_count = len(segments)
+    reduction_ratio = (segment_count / raw_count) if raw_count else 1.0
+
+    stats = {
+        "raw_count": raw_count,
+        "segment_count": segment_count,
+        "reduction_ratio": reduction_ratio,
+    }
+
+    return segments, stats
+
+
 def _summarise_delta_series(series: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     if not series:
         return {"count": 0, "net_delta": 0.0, "cvd_change": 0.0, "delta_pct_total": 0.0}
@@ -974,6 +1212,8 @@ def build_check_all_datas(
     selection_start_ms: int | None = None,
     selection_end_ms: int | None = None,
     hours: int | None = None,
+    compact: bool = False,
+    compact_overrides: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any] | None:
     """Create an enriched payload for the snapshot health endpoint."""
 
@@ -999,6 +1239,19 @@ def build_check_all_datas(
     symbol = str(snapshot.get("symbol") or snapshot.get("pair") or "UNKNOWN").upper()
     raw_meta = snapshot.get("meta") if isinstance(snapshot.get("meta"), Mapping) else None
     profile_config = resolve_profile_config(symbol, raw_meta)
+    compact_meta_config = raw_meta.get("compact") if isinstance(raw_meta, Mapping) else None
+    if compact:
+        (
+            compact_eps_abs,
+            compact_eps_rel,
+            compact_max_minutes,
+            compact_eps_vol,
+        ) = _resolve_compact_parameters(compact_meta_config, compact_overrides)
+    else:
+        compact_eps_abs = _COMPACT_DEFAULTS["eps_abs_price"]
+        compact_eps_rel = _COMPACT_DEFAULTS["eps_rel_price"]
+        compact_max_minutes = _COMPACT_DEFAULTS["max_segment_minutes"]
+        compact_eps_vol = None
     sessions = list(Meta.iter_vwap_sessions())
     profile_tpo: List[Dict[str, Any]] = []
     profile_flat: List[Dict[str, float]] = []
@@ -1264,7 +1517,9 @@ def build_check_all_datas(
     movement_start_dt = datetime.fromtimestamp(movement_start_ts / 1000.0, tz=UTC)
     movement_end_dt = datetime.fromtimestamp(movement_end_ts / 1000.0, tz=UTC)
 
-    detailed_frames: Dict[str, Dict[str, Any]] = {}
+    detailed_frames: Dict[str, Any] = {}
+    compact_segments: List[Dict[str, Any]] | None = None
+    compact_stats: Dict[str, Any] | None = None
     for tf_key, candles in frames.items():
         filtered = _filter_candles(candles, start_ms=detailed_start_ts, end_ms=reference_ts)
         delta_series = _build_delta_series(filtered)
@@ -1274,6 +1529,14 @@ def build_check_all_datas(
             "delta_cvd": delta_series,
             "vwap": _compute_vwap(filtered),
         }
+        if compact and tf_key == "1m":
+            compact_segments, compact_stats = _compact_minute_segments(
+                filtered,
+                eps_abs_price=compact_eps_abs,
+                eps_rel_price=compact_eps_rel,
+                max_segment_minutes=compact_max_minutes,
+                eps_vol=compact_eps_vol,
+            )
 
     zones_detailed = _filter_indicator_block(snapshot.get("zones"), detailed_start_ts, reference_ts)
     smt_detailed = _filter_indicator_block(snapshot.get("smt"), detailed_start_ts, reference_ts)
@@ -1285,6 +1548,15 @@ def build_check_all_datas(
     )
     daily_vwap_detailed = _build_daily_vwap(frames, start_ms=detailed_start_ts, end_ms=reference_ts)
 
+    if compact:
+        detailed_frames["1m_compact"] = compact_segments or []
+        if "1m" in detailed_frames:
+            detailed_frames["1m"]["compact_stats"] = compact_stats or {
+                "raw_count": 0,
+                "segment_count": 0,
+                "reduction_ratio": 1.0,
+            }
+
     detailed_section = {
         "hours": hours_window,
         "range": {
@@ -1295,7 +1567,11 @@ def build_check_all_datas(
         "indicators": {
             "zones": zones_detailed,
             "smt": smt_detailed,
-            "delta_cvd": {tf: details["delta_cvd"] for tf, details in detailed_frames.items()},
+            "delta_cvd": {
+                tf: details["delta_cvd"]
+                for tf, details in detailed_frames.items()
+                if isinstance(details, Mapping) and "delta_cvd" in details
+            },
             "vwap_daily": daily_vwap_detailed,
             "agg_trades": agg_trades_detailed,
         },

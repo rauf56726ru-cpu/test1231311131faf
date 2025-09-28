@@ -150,6 +150,23 @@ async def inspection_check_all(
         None,
         description="Number of recent hours to collect detailed data for (1-4)",
     ),
+    compact: bool = Query(False, description="Include compacted 1m frames"),
+    compact_eps_abs_price: float | None = Query(
+        None,
+        description="Absolute price epsilon for compact segments",
+    ),
+    compact_eps_rel_price: float | None = Query(
+        None,
+        description="Relative price epsilon for compact segments (fraction)",
+    ),
+    compact_max_segment_minutes: int | None = Query(
+        None,
+        description="Maximum number of minutes per compact segment",
+    ),
+    compact_eps_vol: float | None = Query(
+        None,
+        description="Optional volume standard deviation threshold for segments",
+    ),
 ) -> Response:
     snapshots = list_snapshots()
 
@@ -176,6 +193,13 @@ async def inspection_check_all(
             parsed = parsed.astimezone(timezone.utc)
         now_override = parsed
 
+    compact_overrides = {
+        "eps_abs_price": compact_eps_abs_price,
+        "eps_rel_price": compact_eps_rel_price,
+        "max_segment_minutes": compact_max_segment_minutes,
+        "eps_vol": compact_eps_vol,
+    }
+
     try:
         payload = build_check_all_datas(
             target_snapshot,
@@ -183,6 +207,8 @@ async def inspection_check_all(
             selection_start_ms=selection_start,
             selection_end_ms=selection_end,
             hours=hours,
+            compact=compact,
+            compact_overrides={k: v for k, v in compact_overrides.items() if v is not None},
         )
     except DataQualityError as exc:
         raise HTTPException(
