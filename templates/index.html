@@ -3,58 +3,115 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Trading Copilot</title>
+    <title>Интерактивный торговый терминал</title>
     <link rel="stylesheet" href="/public/styles.css" />
+    <script src="https://unpkg.com/lightweight-charts@4.0.0/dist/lightweight-charts.standalone.production.js"></script>
+    <script src="/public/binanceCandles.js" defer></script>
+    <script src="/public/chart-gap-watcher.js" defer></script>
+    <script src="/public/shared-candles.js" defer></script>
     <script src="/public/app.js" defer></script>
   </head>
   <body>
     <header class="page-header">
-      <div class="header-main">
+      <div class="header-top">
         <div>
-          <h1>Trading Copilot</h1>
+          <h1>Интерактивный торговый терминал</h1>
           <p class="subtitle">
-            Управляйте анализом: чат с моделью, быстрый просмотр check_all_datas и генерация сделки.
+            Комбинируйте свечной график Binance, чат с моделью и быстрые отчёты check_all_datas для подготовки сделок.
           </p>
         </div>
-        <div class="header-actions">
-          <button id="open-settings" class="btn-secondary" type="button">
-            Изменить настройки модели
-          </button>
+        <div class="header-controls">
+          <div class="app-meta" aria-live="polite">
+            <span class="app-meta__label">Версия</span>
+            <span id="app-version" class="app-meta__value">—</span>
+          </div>
+          <button id="open-settings" class="btn-secondary" type="button">Изменить настройки модели</button>
         </div>
       </div>
     </header>
 
     <main class="page-main">
-      <section class="card chat-card">
-        <div class="card-header">
-          <h2>Чат с моделью</h2>
+      <div class="terminal-layout">
+        <div class="chart-column">
+          <section class="card controls-card">
+            <form id="chart-controls" class="controls-form">
+              <label class="form-field">
+                <span>Тикер</span>
+                <input id="input-symbol" type="text" value="BTCUSDT" required autocomplete="off" />
+              </label>
+
+              <label class="form-field">
+                <span>Интервал</span>
+                <select id="input-interval">
+                  <option value="1s">1s</option>
+                  <option value="1m" selected>1m</option>
+                  <option value="3m">3m</option>
+                  <option value="5m">5m</option>
+                  <option value="15m">15m</option>
+                  <option value="30m">30m</option>
+                  <option value="1h">1h</option>
+                  <option value="4h">4h</option>
+                  <option value="1d">1d</option>
+                </select>
+              </label>
+
+              <button type="submit" class="btn-primary">Построить график</button>
+            </form>
+          </section>
+
+          <section class="card chart-card">
+            <div class="chart-wrapper">
+              <div id="chart" class="chart-area" aria-label="Область графика"></div>
+            </div>
+            <aside class="chart-info">
+              <div>
+                <span class="info-label">Последняя свеча</span>
+                <span id="last-time" class="info-value">—</span>
+              </div>
+              <div>
+                <span class="info-label">Цена закрытия</span>
+                <span id="last-price" class="info-value">—</span>
+              </div>
+              <div>
+                <span class="info-label">Диапазон свечи</span>
+                <span id="last-range" class="info-value">—</span>
+              </div>
+            </aside>
+            <div id="status-message" class="status-banner" hidden></div>
+          </section>
         </div>
-        <div class="prompt-editor">
-          <label class="field">
-            <span>Дефолтный промпт</span>
-            <textarea id="system-prompt" rows="6" spellcheck="false"></textarea>
-          </label>
-          <div class="prompt-actions">
-            <button id="reset-prompt" class="btn-secondary" type="button">Сбросить</button>
-            <button id="save-prompt" class="btn-primary" type="button">Сохранить</button>
+
+        <section class="card chat-card">
+          <div class="card-header">
+            <h2>Чат с моделью</h2>
           </div>
-        </div>
-        <div id="chat-window" class="chat-window" aria-live="polite"></div>
-        <form id="chat-form" class="chat-form">
-          <label class="field">
-            <span>Сообщение</span>
-            <textarea
-              id="chat-input"
-              rows="3"
-              placeholder="Опишите, что нужно проанализировать..."
-              required
-            ></textarea>
-          </label>
-          <div class="form-actions">
-            <button class="btn-primary" type="submit">Отправить</button>
+          <div class="prompt-editor">
+            <label class="field">
+              <span>Дефолтный промпт</span>
+              <textarea id="system-prompt" rows="6" spellcheck="false"></textarea>
+            </label>
+            <div class="prompt-actions">
+              <button id="reset-prompt" class="btn-secondary" type="button">Сбросить</button>
+              <button id="save-prompt" class="btn-primary" type="button">Сохранить</button>
+            </div>
           </div>
-        </form>
-      </section>
+          <div id="chat-window" class="chat-window" aria-live="polite"></div>
+          <form id="chat-form" class="chat-form">
+            <label class="field">
+              <span>Сообщение</span>
+              <textarea
+                id="chat-input"
+                rows="3"
+                placeholder="Опишите, что нужно проанализировать..."
+                required
+              ></textarea>
+            </label>
+            <div class="form-actions">
+              <button class="btn-primary" type="submit">Отправить</button>
+            </div>
+          </form>
+        </section>
+      </div>
 
       <section class="card wide-card" id="check-all-card">
         <div class="card-header">
@@ -64,7 +121,7 @@
             <button id="create-test-env" class="btn-primary" type="button">Создать test environment</button>
           </div>
         </div>
-        <p class="note">Выделение двух дат доступно только для тестовой среды.</p>
+        <p class="note">Выделение двух дат доступно только в тестовой среде.</p>
         <div class="test-range">
           <label class="field">
             <span>Начало (UTC)</span>
@@ -110,7 +167,7 @@
             <input id="settings-temperature" type="number" min="0" max="2" step="0.1" />
           </label>
           <label class="field">
-            <span>Top P (необязательно)</span>
+            <span>Top P (опционально)</span>
             <input id="settings-top-p" type="number" min="0" max="1" step="0.05" />
           </label>
           <label class="field">
