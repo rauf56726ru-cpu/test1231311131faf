@@ -250,6 +250,12 @@ def test_check_all_includes_vwap_profiles(client: TestClient) -> None:
     assert session_alias["ib_high"] == vwap_block["sessions"]["ny"].get("ib_high")
     assert session_alias["sd2"]["plus"] >= session_alias["sd1"]["plus"]
 
+    composite_day = body["tpo"].get("composite_day")
+    assert isinstance(composite_day, dict)
+    assert composite_day["poc"] == pytest.approx(vwap_block["daily"]["poc"])
+    assert composite_day["vah"] == pytest.approx(vwap_block["daily"]["vah"])
+    assert composite_day["val"] == pytest.approx(vwap_block["daily"]["val"])
+
     tpo_sessions = body["tpo"]["sessions"]
     assert isinstance(tpo_sessions, list)
     ny_sessions = [entry for entry in tpo_sessions if entry.get("session") == "ny"]
@@ -524,6 +530,7 @@ def test_historical_snapshot_still_populates_window(client: TestClient) -> None:
     assert "tpo" in body and isinstance(body["tpo"], dict)
     assert isinstance(body["tpo"].get("sessions"), list)
     assert isinstance(body["tpo"].get("zones"), list)
+    assert isinstance(body["tpo"].get("composite_day"), dict)
     assert "profile" in body and isinstance(body["profile"], list)
     assert "zones" in body and isinstance(body["zones"], dict)
     assert body["zones"].get("zones") is not None

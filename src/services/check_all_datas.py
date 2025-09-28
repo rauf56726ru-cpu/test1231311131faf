@@ -2192,6 +2192,17 @@ def build_check_all_datas(
         value_area_pct=VALUE_AREA_PCT,
     )
 
+    composite_day_end_ms = daily_start_ms + MS_IN_DAY - MINUTE_INTERVAL_MS
+    if composite_day_end_ms < daily_start_ms:
+        composite_day_end_ms = daily_start_ms
+    composite_day_profile = _build_volume_profile_stats(
+        minute_series,
+        start_ms=daily_start_ms,
+        end_ms=min(window_end_ms, composite_day_end_ms),
+        tick_size=tick_size_numeric,
+        value_area_pct=VALUE_AREA_PCT,
+    )
+
     session_profiles: Dict[str, Dict[str, Any]] = {}
     session_sigma_blocks: Dict[str, Dict[str, Any]] = {}
     session_boundaries: Dict[str, Dict[str, Any]] = {}
@@ -2357,6 +2368,14 @@ def build_check_all_datas(
                 session_payload["low"] = profile_entry.get("low")
         vwap_tpo_sessions[session_name] = session_payload
 
+    composite_day_payload = None
+    if isinstance(composite_day_profile, Mapping):
+        composite_day_payload = {
+            "poc": composite_day_profile.get("poc"),
+            "vah": composite_day_profile.get("vah"),
+            "val": composite_day_profile.get("val"),
+        }
+
     vwap_tpo_block = {
         "daily": vwap_tpo_daily,
         "sessions": vwap_tpo_sessions,
@@ -2397,7 +2416,11 @@ def build_check_all_datas(
         "latest_candle": dict(latest_candle_payload),
         "datas_for_last_N_hours": detailed_section,
         movement_key: movement_section,
-        "tpo": {"sessions": profile_tpo, "zones": profile_zones},
+        "tpo": {
+            "sessions": profile_tpo,
+            "zones": profile_zones,
+            "composite_day": composite_day_payload,
+        },
         "profile": profile_public,
         "zones": detected_zones,
         "liquidity": liquidity_payload,
