@@ -1435,6 +1435,19 @@ def build_check_all_datas(
         config=liquidity_config if isinstance(liquidity_config, Mapping) else None,
     )
 
+    liquidity_diagnostics = (
+        liquidity_payload.pop("diagnostics", None)
+        if isinstance(liquidity_payload, MutableMapping)
+        else None
+    )
+    liquidity_config_payload = (
+        liquidity_diagnostics.get("config")
+        if isinstance(liquidity_diagnostics, Mapping)
+        else None
+    )
+    if isinstance(liquidity_config_payload, Mapping):
+        liquidity_payload["config"] = dict(liquidity_config_payload)
+
     minute_series = frames.get("1m", [])
     daily_start_ms = _start_of_day_ms(window_end_ms)
     daily_vwap_profile = _build_volume_profile_stats(
