@@ -295,24 +295,33 @@ def resolve_liquidity_tick_size(
     hardcoded_tick = HARDCODED_TICK_SIZES.get(normalized_symbol)
     inferred_tick = _infer_tick_size_from_frames(frames)
 
-    if exchange_tick is not None and exchange_tick > 0:
-        tick_size = float(exchange_tick)
-        tick_source = "exchange"
-    elif isinstance(hardcoded_tick, (int, float)) and hardcoded_tick > 0:
+    tick_size: float | None = None
+    tick_source = "auto"
+
+    if isinstance(hardcoded_tick, (int, float)) and hardcoded_tick > 0:
         tick_size = float(hardcoded_tick)
         tick_source = "hardcoded"
+    elif profile_numeric is not None and profile_numeric > 0:
+        tick_size = float(profile_numeric)
+        tick_source = "profile"
+    elif exchange_tick is not None and exchange_tick > 0:
+        tick_size = float(exchange_tick)
+        tick_source = "exchange"
     elif inferred_tick is not None and inferred_tick > 0:
         tick_size = float(inferred_tick)
         tick_source = "auto"
-    else:
+
+    if tick_size is None or tick_size <= 0:
         log.error(
             "Unable to resolve positive liquidity tick size",
             extra={**base_extra, "tick_size_source": "auto"},
         )
         raise ValueError("Unable to resolve positive liquidity tick size")
 
-    if profile_numeric is not None and not math.isclose(
-        profile_numeric, tick_size, rel_tol=1e-12, abs_tol=1e-12
+    if (
+        profile_numeric is not None
+        and tick_source != "profile"
+        and not math.isclose(profile_numeric, tick_size, rel_tol=1e-12, abs_tol=1e-12)
     ):
         log.warning(
             "Profile tick size overridden by authoritative source",
@@ -320,6 +329,7 @@ def resolve_liquidity_tick_size(
                 **base_extra,
                 "tick_size_source": tick_source,
                 "tick_size": tick_size,
+                "profile_tick_size": profile_numeric,
             },
         )
 

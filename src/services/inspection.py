@@ -1021,10 +1021,8 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
         full_candles_by_tf[tf_key] = raw_candles
         if tf_key == "1m":
             liquidity_sources[tf_key] = "minute"
-        elif tf_key in {"15m", "1h"}:
-            liquidity_sources.setdefault(tf_key, "short_window")
         elif tf_key == "1d":
-            liquidity_sources.setdefault(tf_key, "short_window")
+            liquidity_sources.setdefault(tf_key, "frame")
 
         filtered_candles = _filter_by_selection(raw_candles, start=start, end=end)
         result["candles"] = filtered_candles
@@ -1045,11 +1043,6 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
             "selection": {"start": start, "end": end},
             "value": _compute_vwap(filtered_candles),
         }
-
-    for tf_key in ("15m", "1h"):
-        if liquidity_sources.get(tf_key) == "short_window":
-            full_candles_by_tf.pop(tf_key, None)
-            liquidity_sources.pop(tf_key, None)
 
     htf_candles_map = (
         htf_section.get("candles")
@@ -1087,7 +1080,8 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
             "value": _compute_vwap(filtered_candles),
         }
         full_candles_by_tf[tf_key] = candles
-        liquidity_sources.setdefault(tf_key, "aggregated")
+        if liquidity_sources.get(tf_key) != "htf":
+            liquidity_sources[tf_key] = "aggregated"
 
     for tf_key in ("15m", "1h"):
         candles = full_candles_by_tf.get(tf_key)

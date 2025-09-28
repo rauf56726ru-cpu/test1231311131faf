@@ -138,7 +138,9 @@ def test_inspection_liquidity_uses_normalised_tick_size(
     assert "sample_pairs_top10" in eqh_diag
 
 
-def test_inspection_liquidity_prefers_exchange_tick_size(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_inspection_liquidity_prefers_hardcoded_over_exchange(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     base = datetime(2024, 6, 1, tzinfo=UTC)
     candles_15m = _sample_candles(base)
     candles_1d = [
@@ -171,14 +173,14 @@ def test_inspection_liquidity_prefers_exchange_tick_size(monkeypatch: pytest.Mon
 
     payload = inspection.build_inspection_payload(snapshot)
     diagnostics = payload["DIAGNOSTICS"]["liquidity"]
-    assert diagnostics["config"]["tick_size"] == pytest.approx(0.05)
+    assert diagnostics["config"]["tick_size"] == pytest.approx(0.01)
     tick_diag = diagnostics.get("tick_size")
     assert isinstance(tick_diag, dict)
     assert tick_diag.get("normalized_symbol") == "ETHUSDT"
-    assert tick_diag.get("source") == "exchange"
-    assert tick_diag.get("value") == pytest.approx(0.05)
+    assert tick_diag.get("source") == "hardcoded"
+    assert tick_diag.get("value") == pytest.approx(0.01)
     eqh_levels = payload["DATA"]["liquidity"]["eqh"]
     assert eqh_levels
     tolerances = {level["tolerance"] for level in eqh_levels if level.get("tolerance")}
     assert tolerances, "Expected tolerances to be reported"
-    assert all(math.isclose(tol, max(5 * 0.05, 0.05)) for tol in tolerances)
+    assert all(math.isclose(tol, max(5 * 0.01, 0.01)) for tol in tolerances)
