@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import (
@@ -312,6 +313,10 @@ def _aggregate_bucket(
 
 def build_multi_timeframe_ohlcv(
     minute_rows: Sequence[Mapping[str, Any] | Sequence[object] | Candle],
+    *,
+    symbol: str | None = None,
+    fetcher: Callable[[str, str], Mapping[str, Any] | Sequence[Mapping[str, Any] | Sequence[object]]]
+    | None = None,
 ) -> Dict[str, Dict[str, List[Dict[str, float | int]]]]:
     """Build OHLCV series for supported timeframes using minute candles as seed.
 
@@ -325,6 +330,40 @@ def build_multi_timeframe_ohlcv(
         raise ValueError("1m timeframe is not defined")
 
     minutes: Dict[int, Candle] = {}
+    fetch_fn: Callable[[str, str], Mapping[str, Any] | Sequence[Mapping[str, Any] | Sequence[object]]] | None = None
+    if symbol:
+        fetch_fn = fetcher or fetch_ohlcv_sync
+
+    def _payload_to_candles(
+        payload: Mapping[str, Any]
+        | Sequence[Mapping[str, Any] | Sequence[object] | Candle]
+        | None,
+    ) -> List[Candle]:
+        if payload is None:
+            return []
+        rows: Sequence[Mapping[str, Any] | Sequence[object] | Candle]
+        if isinstance(payload, Mapping):
+            raw_rows = payload.get("candles")
+            if not isinstance(raw_rows, Sequence):
+                return []
+            rows = raw_rows  # type: ignore[assignment]
+        elif isinstance(payload, Sequence):
+            rows = payload  # type: ignore[assignment]
+        else:
+            return []
+
+        candles_out: List[Candle] = []
+        for row in rows:
+            if isinstance(row, Candle):
+                candles_out.append(row)
+                continue
+            if isinstance(row, Mapping) or isinstance(row, Sequence):
+                candle_obj = _to_candle_mapping(row)  # type: ignore[arg-type]
+            else:
+                candle_obj = None
+            if candle_obj is not None:
+                candles_out.append(candle_obj)
+        return candles_out
     for row in minute_rows:
         candle: Candle | None
         if isinstance(row, Candle):
@@ -349,9 +388,44 @@ def build_multi_timeframe_ohlcv(
         minutes[aligned_ts] = candle
 
     result: Dict[str, Dict[str, List[Dict[str, float | int]]]] = {}
+    if not minutes and fetch_fn and symbol:
+        try:
+            fetched_minutes = _payload_to_candles(fetch_fn(symbol, "1m"))
+        except Exception:  # pragma: no cover - defensive fallback
+            fetched_minutes = []
+        for candle in fetched_minutes:
+            aligned_ts = _align_to_interval(int(candle.t), minute_interval)
+            minutes[aligned_ts] = Candle(
+                t=aligned_ts,
+                o=float(candle.o),
+                h=float(candle.h),
+                l=float(candle.l),
+                c=float(candle.c),
+                v=float(candle.v),
+            )
+
     if not minutes:
         for tf in TIMEFRAME_TO_MS:
-            result[tf] = {"candles": []}
+            fallback: List[Dict[str, float | int]] = []
+            if fetch_fn and symbol:
+                try:
+                    fetched_payload = fetch_fn(symbol, tf)
+                except Exception:  # pragma: no cover - defensive fallback
+                    fetched_payload = None
+                fetched_candles = _payload_to_candles(fetched_payload)
+                if fetched_candles:
+                    fallback = [
+                        Candle(
+                            t=_align_to_interval(int(candle.t), TIMEFRAME_TO_MS[tf]),
+                            o=float(candle.o),
+                            h=float(candle.h),
+                            l=float(candle.l),
+                            c=float(candle.c),
+                            v=float(candle.v),
+                        ).as_dict()
+                        for candle in sorted(fetched_candles, key=lambda c: c.t)
+                    ]
+            result[tf] = {"candles": fallback}
         return result
 
     sorted_minutes = sorted(minutes)
@@ -391,7 +465,31 @@ def build_multi_timeframe_ohlcv(
                 continue
             aggregated.append(aggregated_candle)
 
-        result[tf] = {"candles": aggregated}
+        if aggregated:
+            result[tf] = {"candles": aggregated}
+            continue
+
+        fallback: List[Dict[str, float | int]] = []
+        if fetch_fn and symbol:
+            try:
+                fetched_payload = fetch_fn(symbol, tf)
+            except Exception:  # pragma: no cover - defensive fallback
+                fetched_payload = None
+            fetched_candles = _payload_to_candles(fetched_payload)
+            if fetched_candles:
+                fallback = [
+                    Candle(
+                        t=_align_to_interval(int(candle.t), interval_ms),
+                        o=float(candle.o),
+                        h=float(candle.h),
+                        l=float(candle.l),
+                        c=float(candle.c),
+                        v=float(candle.v),
+                    ).as_dict()
+                    for candle in sorted(fetched_candles, key=lambda c: c.t)
+                ]
+
+        result[tf] = {"candles": fallback}
 
     return result
 
@@ -608,7 +706,32 @@ def fetch_ohlcv_sync(
 ) -> Dict[str, object]:
     """Synchronous helper for fetching OHLC candles."""
 
-    return asyncio.run(fetch_ohlcv(symbol, timeframe, hours=hours))
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(fetch_ohlcv(symbol, timeframe, hours=hours))
+
+    result_holder: list[Dict[str, object] | Exception] = []
+
+    def _runner() -> None:
+        try:
+            outcome = asyncio.run(fetch_ohlcv(symbol, timeframe, hours=hours))
+        except Exception as exc:  # pragma: no cover - defensive re-raise
+            result_holder.append(exc)
+        else:
+            result_holder.append(outcome)
+
+    thread = threading.Thread(target=_runner, name="fetch_ohlcv_sync", daemon=True)
+    thread.start()
+    thread.join()
+
+    if not result_holder:
+        raise RuntimeError("fetch_ohlcv_sync thread did not return a result")
+
+    outcome = result_holder[0]
+    if isinstance(outcome, Exception):
+        raise outcome
+    return outcome
 
 
 def _limit_window(interval_ms: int, window: timedelta) -> int:

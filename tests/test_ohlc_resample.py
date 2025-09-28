@@ -128,3 +128,34 @@ def test_build_multi_timeframe_ohlcv_respects_complete_windows():
     assert daily[0]["t"] == int(base.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
     assert pytest.approx(daily[0]["c"]) == candles[1440 - 1]["c"]
     assert pytest.approx(daily[0]["v"]) == sum(c["v"] for c in candles[:1440])
+
+
+def test_build_multi_timeframe_ohlcv_fetches_missing():
+    calls: list[tuple[str, str]] = []
+
+    base_ts = 1_700_000_000_000
+
+    def fake_fetch(symbol: str, timeframe: str, hours: int | None = None):
+        calls.append((symbol, timeframe))
+        interval = TIMEFRAME_TO_MS.get(timeframe, 60_000)
+        aligned = base_ts - (base_ts % interval)
+        candles = []
+        for idx in range(2):
+            open_ts = aligned + idx * interval
+            candles.append(
+                {
+                    "t": open_ts,
+                    "o": 100.0 + idx,
+                    "h": 101.0 + idx,
+                    "l": 99.0 + idx,
+                    "c": 100.5 + idx,
+                    "v": 5.0 + idx,
+                }
+            )
+        return {"symbol": symbol, "tf": timeframe, "candles": candles, "last_ts": candles[-1]["t"]}
+
+    block = build_multi_timeframe_ohlcv([], symbol="BTCUSDT", fetcher=fake_fetch)
+
+    assert calls and calls[0] == ("BTCUSDT", "1m")
+    for tf, payload in block.items():
+        assert payload["candles"], f"Expected fetched candles for {tf}"

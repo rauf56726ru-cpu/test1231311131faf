@@ -88,6 +88,37 @@ def stub_binance_minutes(monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def stub_fetch_ohlcv(monkeypatch):
+    import src.services.ohlc as ohlc
+
+    base_epoch = 1_700_000_000_000
+
+    def _aligned_base(interval_ms: int) -> int:
+        return base_epoch - (base_epoch % interval_ms)
+
+    def fake_fetch(symbol: str, timeframe: str, hours: int | None = None):
+        interval_ms = ohlc.TIMEFRAME_TO_MS.get(timeframe, 60_000)
+        start_ts = _aligned_base(interval_ms)
+        candles = []
+        for index in range(3):
+            open_ts = start_ts + index * interval_ms
+            candles.append(
+                {
+                    "t": open_ts,
+                    "o": 200.0 + index,
+                    "h": 201.0 + index,
+                    "l": 199.0 + index,
+                    "c": 200.5 + index,
+                    "v": 10.0 + index,
+                }
+            )
+        return {"symbol": symbol, "tf": timeframe, "candles": candles, "last_ts": candles[-1]["t"]}
+
+    monkeypatch.setattr(ohlc, "fetch_ohlcv_sync", fake_fetch)
+    yield
+
+
 def _build_snapshot_payload(base: datetime, count: int = 12) -> dict:
     candles = []
     for index in range(count):
@@ -352,9 +383,12 @@ def test_check_all_payload_includes_multi_tf_ohlcv_block(client: TestClient) -> 
         candles = ohlcv_block[tf].get("candles", [])
         interval_ms = check_all_datas.TIMEFRAME_TO_MS[tf]
         expected = total_minutes // max(1, interval_ms // minute_interval)
-        assert len(candles) == expected
-        for candle in candles:
-            assert candle["t"] % interval_ms == 0
+        if expected == 0:
+            assert candles, f"Expected fallback candles for {tf} timeframe"
+        else:
+            assert len(candles) == expected
+            for candle in candles:
+                assert candle["t"] % interval_ms == 0
 
     hourly = ohlcv_block["1h"]["candles"]
     if hourly:
@@ -368,7 +402,7 @@ def test_check_all_payload_includes_multi_tf_ohlcv_block(client: TestClient) -> 
         assert pytest.approx(first_hour["l"]) == min(minute_map[ts]["l"] for ts in expected_minutes)
         assert pytest.approx(first_hour["v"]) == sum(minute_map[ts]["v"] for ts in expected_minutes)
 
-    assert ohlcv_block["1d"]["candles"] == []
+    assert ohlcv_block["1d"]["candles"]
 
 
 def test_check_all_payload_includes_orderflow_block(client: TestClient) -> None:

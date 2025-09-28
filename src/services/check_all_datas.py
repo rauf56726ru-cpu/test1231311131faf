@@ -2328,7 +2328,7 @@ def build_check_all_datas(
         snapshot.get("agg_trades"),
         config=orderflow_config,
     )
-    ohlcv_block = build_multi_timeframe_ohlcv(minute_htf_source)
+    ohlcv_block = build_multi_timeframe_ohlcv(minute_htf_source, symbol=symbol)
     hourly_htf = aggregate_1m_to_1h(minute_htf_source) if minute_frame_present else []
     htf_blocks: List[Dict[str, Any]] = []
     if minute_frame_present:
