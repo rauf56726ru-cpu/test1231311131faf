@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, Mapping, Sequence
 
 from datetime import datetime, timezone
 
+import httpx
 from fastapi import Body, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -17,6 +19,7 @@ from ..services import (
     build_check_all_datas,
     build_inspection_payload,
     build_placeholder_snapshot,
+    dispatch_trade_analysis,
     build_profile_package,
     DEFAULT_SYMBOL,
     delete_preset,
@@ -193,6 +196,185 @@ async def inspection_check_all(
         return Response(status_code=204)
 
     return JSONResponse(payload)
+
+
+@app.post("/api/analyze-from-inspection")
+async def analyze_from_inspection(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
+    snapshot_id = payload.get("snapshot_id")
+    if not snapshot_id or not isinstance(snapshot_id, str):
+        raise HTTPException(status_code=400, detail="snapshot_id is required")
+
+    selection_start_raw = payload.get("selection_start")
+    selection_end_raw = payload.get("selection_end")
+    hours_raw = payload.get("hours")
+    period_raw = payload.get("period")
+
+    try:
+        selection_start = int(selection_start_raw)
+        selection_end = int(selection_end_raw)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="selection_start and selection_end must be integers")
+
+    if selection_end < selection_start:
+        selection_start, selection_end = selection_end, selection_start
+
+    try:
+        hours = int(hours_raw)
+    except (TypeError, ValueError):
+        hours = 1
+    hours = max(1, min(4, hours))
+
+    target_snapshot = get_snapshot(snapshot_id)
+    if target_snapshot is None:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+
+    try:
+        check_payload = build_check_all_datas(
+            target_snapshot,
+            selection_start_ms=selection_start,
+            selection_end_ms=selection_end,
+            hours=hours,
+        )
+    except DataQualityError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"message": str(exc), "data_quality": exc.detail},
+        ) from exc
+
+    if check_payload is None:
+        raise HTTPException(status_code=400, detail="Snapshot does not contain analyzable data")
+
+    symbol = str(
+        check_payload.get("symbol")
+        or target_snapshot.get("symbol")
+        or target_snapshot.get("pair")
+        or "UNKNOWN"
+    )
+
+    period = None
+    if isinstance(period_raw, str) and period_raw.strip():
+        period = period_raw.strip()
+    else:
+        meta_source = target_snapshot.get("meta")
+        if isinstance(meta_source, Mapping):
+            if isinstance(meta_source.get("period"), str) and meta_source.get("period").strip():
+                period = str(meta_source.get("period")).strip()
+            elif isinstance(meta_source.get("window"), Mapping):
+                label = meta_source["window"].get("label")
+                if isinstance(label, str) and label.strip():
+                    period = label.strip()
+    if period is None:
+        requested_meta = (
+            check_payload.get("profile_preset")
+            if isinstance(check_payload, Mapping)
+            else None
+        )
+        if isinstance(requested_meta, Mapping):
+            key = requested_meta.get("preset_key") or requested_meta.get("period")
+            if isinstance(key, str) and key.strip():
+                period = key.strip()
+    if period is None:
+        period = "custom_range"
+
+    latest_candle = check_payload.get("latest_candle") if isinstance(check_payload, Mapping) else None
+    price_candidates = []
+    if isinstance(latest_candle, Mapping):
+        for key in ("c", "close", "price", "close_price", "last_price"):
+            value = latest_candle.get(key)
+            if isinstance(value, (int, float)):
+                price_candidates.append(float(value))
+    if not price_candidates:
+        maybe_series = check_payload.get("datas_for_last_N_hours") if isinstance(check_payload, Mapping) else None
+        if isinstance(maybe_series, Mapping):
+            frame = maybe_series.get("frames")
+            if isinstance(frame, Mapping):
+                minute_frame = frame.get("1m")
+                if isinstance(minute_frame, Mapping):
+                    candles = minute_frame.get("candles")
+                    if isinstance(candles, Sequence) and candles:
+                        tail = candles[-1]
+                        if isinstance(tail, Mapping):
+                            value = tail.get("c") or tail.get("close")
+                            if isinstance(value, (int, float)):
+                                price_candidates.append(float(value))
+    last_price = price_candidates[0] if price_candidates else 0.0
+
+    api_key = os.environ.get("OPENAI_API_KEY")
+    model_id = os.environ.get("OPENAI_MODEL_ID")
+    if not api_key or not model_id:
+        raise HTTPException(status_code=500, detail="OpenAI configuration is missing")
+
+    upload_dir = Path(
+        os.environ.get(
+            "ANALYSIS_UPLOAD_DIR",
+            str(PROJECT_ROOT / "var" / "analysis_uploads"),
+        )
+    ).expanduser()
+
+    api_base = os.environ.get("OPENAI_API_BASE")
+
+    try:
+        analysis_result = await dispatch_trade_analysis(
+            check_payload,
+            symbol=symbol,
+            period=period,
+            last_price=last_price,
+            upload_dir=upload_dir,
+            api_key=api_key,
+            model=model_id,
+            api_base=api_base,
+        )
+    except httpx.HTTPStatusError as exc:
+        logging.getLogger(__name__).exception(
+            "OpenAI request returned an error",
+            extra={
+                "snapshot_id": snapshot_id,
+                "status_code": exc.response.status_code,
+            },
+        )
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "OpenAI returned an error",
+                "status_code": exc.response.status_code,
+            },
+        ) from exc
+    except httpx.RequestError as exc:
+        logging.getLogger(__name__).exception(
+            "Failed to reach OpenAI",
+            extra={"snapshot_id": snapshot_id},
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to reach OpenAI",
+        ) from exc
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logging.getLogger(__name__).exception(
+            "Unexpected error during trade analysis",
+            extra={"snapshot_id": snapshot_id},
+        )
+        raise HTTPException(status_code=502, detail="Trade analysis failed") from exc
+
+    debug_block: Dict[str, Any] = {
+        "symbol": symbol,
+        "period": period,
+        "last_price": last_price,
+        "attachment_file": analysis_result.file_path.name,
+        "attachment_size_bytes": analysis_result.attachment_size,
+        "attachment_sha256": analysis_result.attachment_sha256,
+        "latency_ms": analysis_result.latency_ms,
+    }
+    if analysis_result.raw_text and analysis_result.status != "ok":
+        debug_block["raw_text"] = analysis_result.raw_text
+
+    response_payload = {
+        "status": analysis_result.status,
+        "request_id": analysis_result.request_id,
+        "trade_json": analysis_result.trade_json,
+        "debug": debug_block,
+    }
+
+    return JSONResponse(response_payload)
 
 
 @app.get("/presets")

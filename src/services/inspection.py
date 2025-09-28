@@ -1452,6 +1452,8 @@ def render_inspection_page(
     diagnostics_json_initial = _format_json_block(diagnostics_section)
     metric_json_initial = _format_json_block(metric_section)
     check_all_json_initial = _format_json_block(None)
+    analysis_json_initial = _format_json_block(None)
+    analysis_debug_json_initial = _format_json_block(None)
 
     style_block = """
     :root {
@@ -1711,6 +1713,67 @@ def render_inspection_page(
       padding: 0.4rem 0.7rem;
       color: var(--fg);
       min-width: 110px;
+    }
+    .analysis-actions {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      padding: 0.75rem 0.25rem 0.25rem;
+      flex-wrap: wrap;
+    }
+    .analysis-actions button {
+      min-width: 220px;
+    }
+    .analysis-status {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 140px;
+      padding: 0.45rem 0.85rem;
+      border-radius: 999px;
+      font-size: 0.85rem;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      border: 1px solid rgba(148, 163, 184, 0.2);
+      background: rgba(15, 23, 42, 0.6);
+      color: var(--muted);
+      transition: background 0.2s ease, color 0.2s ease, border-color 0.2s ease;
+    }
+    .analysis-status[data-status="pending"],
+    .analysis-status[data-status="sent"] {
+      background: rgba(14, 116, 144, 0.3);
+      border-color: rgba(45, 212, 191, 0.35);
+      color: #2dd4bf;
+    }
+    .analysis-status[data-status="succeeded"] {
+      background: rgba(21, 128, 61, 0.28);
+      border-color: rgba(34, 197, 94, 0.45);
+      color: #4ade80;
+    }
+    .analysis-status[data-status="insufficient"] {
+      background: rgba(202, 138, 4, 0.28);
+      border-color: rgba(250, 204, 21, 0.4);
+      color: #facc15;
+    }
+    .analysis-status[data-status="failed"] {
+      background: rgba(185, 28, 28, 0.28);
+      border-color: rgba(248, 113, 113, 0.45);
+      color: #f87171;
+    }
+    .analysis-panel {
+      display: grid;
+      gap: 1rem;
+      padding: 1rem;
+      background: rgba(15, 23, 42, 0.85);
+      border-top: 1px solid rgba(148, 163, 184, 0.18);
+    }
+    .analysis-panel > div > span.badge {
+      margin-bottom: 0.5rem;
+    }
+    .analysis-panel pre {
+      max-height: 320px;
+      overflow: auto;
+      background: rgba(2, 6, 23, 0.9);
     }
     .collapse pre {
       margin: 0;
@@ -2527,6 +2590,10 @@ def render_inspection_page(
     const checkAllPre = document.getElementById("checkall-json");
     const checkAllButton = document.getElementById("fetch-check-all");
     const checkAllHours = document.getElementById("checkall-hours");
+    const analysisButton = document.getElementById("analysis-send");
+    const analysisStatusEl = document.getElementById("analysis-status");
+    const analysisPre = document.getElementById("analysis-json");
+    const analysisDebugPre = document.getElementById("analysis-debug-json");
     const snapshotMeta = document.getElementById("snapshot-meta");
     const frameSelect = document.getElementById("frame-select");
     const chartContainer = document.getElementById("inspection-chart");
@@ -2610,6 +2677,13 @@ def render_inspection_page(
       chart: null,
       series: null,
       checkAll: null,
+      analysis: {
+        status: "idle",
+        resultStatus: null,
+        trade: null,
+        debug: null,
+        requestId: null,
+      },
       hours: checkAllHours ? resolveHours(checkAllHours.value) : 1,
       profilePreset: initial.payload?.DATA?.profile_preset || null,
       presetRequired: Boolean(initial.payload?.DATA?.profile_preset_required),
@@ -2634,6 +2708,66 @@ def render_inspection_page(
         normaliseSymbol(initial.symbol) ||
         defaultSymbol
       );
+    }
+
+    function resolveAnalysisPeriod() {
+      const source = state.payload?.DATA?.meta?.source;
+      const requested = state.payload?.DATA?.meta?.requested;
+      const preset = state.payload?.DATA?.profile_preset;
+      const candidates = [
+        source && typeof source.period === "string" ? source.period : null,
+        source && typeof source?.window?.label === "string" ? source.window.label : null,
+        requested && typeof requested?.period === "string" ? requested.period : null,
+        preset && typeof preset?.period === "string" ? preset.period : null,
+        preset && typeof preset?.preset_key === "string" ? preset.preset_key : null,
+      ];
+      for (const candidate of candidates) {
+        if (candidate && typeof candidate === "string" && candidate.trim()) {
+          return candidate.trim();
+        }
+      }
+      return "custom_range";
+    }
+
+    function updateAnalysisIndicator() {
+      if (!analysisStatusEl) return;
+      const status = state.analysis.status || "idle";
+      analysisStatusEl.dataset.status = status;
+      const labels = {
+        idle: "—",
+        pending: "Подготовка",
+        sent: "Отправлено",
+        succeeded: "Готово",
+        insufficient: "Недостаточно данных",
+        failed: "Ошибка",
+      };
+      analysisStatusEl.textContent = labels[status] || "—";
+    }
+
+    function updateAnalysisControls() {
+      if (!analysisButton) return;
+      const start = Number(state.selection?.start ?? Number.NaN);
+      const end = Number(state.selection?.end ?? Number.NaN);
+      const hasSelection = Number.isFinite(start) && Number.isFinite(end) && start !== end;
+      const busy = state.analysis.status === "pending" || state.analysis.status === "sent";
+      analysisButton.disabled = !state.snapshotId || !hasSelection || busy;
+    }
+
+    function resetAnalysisState() {
+      state.analysis.status = "idle";
+      state.analysis.resultStatus = null;
+      state.analysis.trade = null;
+      state.analysis.debug = null;
+      state.analysis.requestId = null;
+      setJson(analysisPre, null);
+      setJson(analysisDebugPre, null);
+      updateAnalysisIndicator();
+      updateAnalysisControls();
+    }
+
+    function applyAnalysisResult(trade, debug) {
+      setJson(analysisPre, trade);
+      setJson(analysisDebugPre, debug);
     }
 
     function renderPresetChip() {
@@ -2902,6 +3036,7 @@ def render_inspection_page(
       }
     }
 
+    resetAnalysisState();
     renderPresetState();
     updateCheckAllState();
 
@@ -2927,14 +3062,16 @@ def render_inspection_page(
     }
 
     function updateCheckAllState() {
-      if (!checkAllButton) return;
       const hasSelection = Boolean(state.selection && state.selection.start && state.selection.end);
       const hoursValid = Number.isFinite(state.hours) && state.hours >= 1 && state.hours <= 4;
       if (checkAllHours && hoursValid) {
         checkAllHours.value = String(state.hours);
       }
       const presetReady = !state.presetRequired;
-      checkAllButton.disabled = !state.snapshotId || !hasSelection || !hoursValid || !presetReady;
+      if (checkAllButton) {
+        checkAllButton.disabled = !state.snapshotId || !hasSelection || !hoursValid || !presetReady;
+      }
+      updateAnalysisControls();
     }
 
     function populateSnapshots(list) {
@@ -3077,6 +3214,99 @@ def render_inspection_page(
       }
     }
 
+    async function requestTradeAnalysis() {
+      if (!state.snapshotId) {
+        updateStatus("Выберите снэпшот перед анализом сделки", "warning");
+        return;
+      }
+
+      const rawStart = Number(state.selection?.start ?? Number.NaN);
+      const rawEnd = Number(state.selection?.end ?? Number.NaN);
+      if (!Number.isFinite(rawStart) || !Number.isFinite(rawEnd) || rawStart === rawEnd) {
+        updateStatus("Выберите диапазон свечей для анализа сделки", "warning");
+        updateAnalysisControls();
+        return;
+      }
+
+      const selectionStart = Math.floor(Math.min(rawStart, rawEnd));
+      const selectionEnd = Math.floor(Math.max(rawStart, rawEnd));
+      const hoursValue = Number.isFinite(state.hours) ? state.hours : 1;
+      const period = resolveAnalysisPeriod();
+
+      state.analysis.status = "pending";
+      state.analysis.resultStatus = null;
+      state.analysis.requestId = null;
+      state.analysis.trade = null;
+      state.analysis.debug = null;
+      applyAnalysisResult(null, null);
+      updateAnalysisIndicator();
+      updateAnalysisControls();
+      updateStatus("Готовим данные для анализа сделки...", "info");
+
+      try {
+        const response = await fetch("/api/analyze-from-inspection", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: JSON.stringify({
+            snapshot_id: state.snapshotId,
+            selection_start: selectionStart,
+            selection_end: selectionEnd,
+            hours: hoursValue,
+            period,
+          }),
+        });
+
+        state.analysis.status = "sent";
+        updateAnalysisIndicator();
+
+        let payload;
+        if (!response.ok) {
+          let detail = `HTTP ${response.status}`;
+          try {
+            const errorBody = await response.json();
+            if (typeof errorBody?.detail === "string") {
+              detail = errorBody.detail;
+            } else if (errorBody?.detail?.message) {
+              detail = String(errorBody.detail.message);
+            }
+          } catch (error) {
+            // Ignore body parsing errors
+          }
+          throw new Error(detail);
+        } else {
+          payload = await response.json();
+        }
+
+        state.analysis.requestId = typeof payload?.request_id === "string" ? payload.request_id : null;
+        state.analysis.trade = payload?.trade_json || null;
+        state.analysis.debug = payload?.debug || null;
+        state.analysis.resultStatus = typeof payload?.status === "string" ? payload.status : null;
+        applyAnalysisResult(state.analysis.trade, state.analysis.debug);
+
+        if (state.analysis.resultStatus === "ok") {
+          state.analysis.status = "succeeded";
+          updateStatus("Сделка проанализирована", "success");
+        } else if (state.analysis.resultStatus === "insufficient_data") {
+          state.analysis.status = "insufficient";
+          updateStatus("Модели не хватает данных для сделки", "warning");
+        } else {
+          state.analysis.status = "failed";
+          updateStatus("Анализ сделки завершился с ошибкой", "error");
+        }
+      } catch (error) {
+        console.error(error);
+        const message = error && typeof error.message === "string" ? error.message : "Неизвестная ошибка";
+        state.analysis.status = "failed";
+        state.analysis.trade = null;
+        state.analysis.debug = { error: message };
+        applyAnalysisResult(null, state.analysis.debug);
+        updateStatus(`Ошибка отправки сделки${message ? `: ${message}` : ""}`, "error");
+      } finally {
+        updateAnalysisIndicator();
+        updateAnalysisControls();
+      }
+    }
+
     function ensureChart() {
       if (!chartContainer) return;
       const ensureLibrary = () => {
@@ -3171,6 +3401,7 @@ def render_inspection_page(
               state.selection.end = tmp;
             }
           }
+          resetAnalysisState();
           updateSelectionLabel();
           updateCheckAllState();
         });
@@ -3229,6 +3460,7 @@ def render_inspection_page(
         state.selection = payload?.DATA?.selection || null;
         state.checkAll = null;
         setJson(checkAllPre, null);
+        resetAnalysisState();
         updateCheckAllState();
         state.profilePreset = payload?.DATA?.profile_preset || null;
         state.presetRequired = Boolean(payload?.DATA?.profile_preset_required);
@@ -3346,9 +3578,18 @@ def render_inspection_page(
       });
     }
 
+    if (analysisButton) {
+      analysisButton.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        requestTradeAnalysis();
+      });
+    }
+
     if (clearSelection) {
       clearSelection.addEventListener("click", () => {
         state.selection = null;
+        resetAnalysisState();
         updateSelectionLabel();
         updateCheckAllState();
       });
@@ -4496,6 +4737,29 @@ def render_inspection_page(
                       </select>
                     </div>
                 <pre id=\"checkall-json\">{check_all_json_initial}</pre>
+              </div>
+              <div class="analysis-actions">
+                <button id="analysis-send" class="primary" type="button">Отправить сделку на анализ</button>
+                <span id="analysis-status" class="analysis-status" data-status="idle">—</span>
+              </div>
+              <div class="collapse" data-analysis-panel>
+                <header data-collapse-toggle>
+                  <h3>Сделка</h3>
+                  <div class="actions">
+                    <button class="secondary" type="button" data-copy-target="analysis-json">Скопировать JSON</button>
+                    <button class="secondary" type="button" data-copy-target="analysis-debug-json">Скопировать debug</button>
+                  </div>
+                </header>
+                <div class="analysis-panel">
+                  <div>
+                    <span class="badge">Ответ модели</span>
+                    <pre id="analysis-json">{analysis_json_initial}</pre>
+                  </div>
+                  <div>
+                    <span class="badge">Debug</span>
+                    <pre id="analysis-debug-json">{analysis_debug_json_initial}</pre>
+                  </div>
+                </div>
               </div>
               <div class=\"collapse\">
                 <header data-collapse-toggle>

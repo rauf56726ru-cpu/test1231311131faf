@@ -1,0 +1,217 @@
+import json
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from src.api.app import app
+import src.services.analysis as analysis
+import src.services.check_all_datas as check_all_datas
+import src.services.inspection as inspection
+from src.services import presets
+from src.services.analysis import TradeAnalysisResult
+
+
+UTC = timezone.utc
+
+
+@pytest.fixture()
+def client() -> TestClient:
+    return TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def preset_storage(tmp_path, monkeypatch):
+    storage_path = tmp_path / "presets.json"
+    monkeypatch.setattr(presets, "_PRESET_STORAGE_PATH", storage_path)
+    presets._PRESET_CACHE.clear()
+    presets._STORAGE_LOADED = False
+    yield
+    presets._PRESET_CACHE.clear()
+    presets._STORAGE_LOADED = False
+
+
+@pytest.fixture(autouse=True)
+def snapshot_storage(tmp_path, monkeypatch):
+    storage_dir = tmp_path / "snapshots"
+    monkeypatch.setattr(inspection, "SNAPSHOT_STORAGE_DIR", storage_dir)
+    inspection._SNAPSHOT_STORE.clear()
+    inspection._ensure_storage_dir()
+    inspection._load_existing_snapshots()
+    yield storage_dir
+    inspection._SNAPSHOT_STORE.clear()
+
+
+@pytest.fixture(autouse=True)
+def stub_binance_minutes(monkeypatch):
+    def filler(symbol: str, start_ms: int, end_ms: int, gaps):
+        candles = []
+        for gap in gaps:
+            cursor = int(gap["from"])
+            limit = int(gap["to"])
+            while cursor <= limit:
+                candles.append(
+                    {
+                        "t": cursor,
+                        "o": 100.0,
+                        "h": 101.0,
+                        "l": 99.0,
+                        "c": 100.5,
+                        "v": 1.0,
+                    }
+                )
+                cursor += 60_000
+        return candles
+
+    monkeypatch.setattr(check_all_datas, "_download_missing_minutes", filler)
+
+    def filler_htf(symbol: str, gaps, *, fetcher, target):
+        inserted = 0
+        for gap in gaps:
+            cursor = int(gap.get("from", 0))
+            limit = int(gap.get("to", cursor))
+            while cursor <= limit:
+                candle = {
+                    "t": cursor,
+                    "o": 100.0,
+                    "h": 101.0,
+                    "l": 99.0,
+                    "c": 100.5,
+                    "v": 1.0,
+                }
+                if cursor not in target:
+                    inserted += 1
+                target[cursor] = candle
+                cursor += 60_000
+        return inserted
+
+    monkeypatch.setattr(inspection, "_download_missing_minutes", filler_htf)
+    yield
+
+
+@pytest.fixture()
+def analysis_env(tmp_path, monkeypatch):
+    upload_dir = tmp_path / "analysis"
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_MODEL_ID", "test-model")
+    monkeypatch.setenv("ANALYSIS_UPLOAD_DIR", str(upload_dir))
+    return upload_dir
+
+
+def _build_snapshot_payload(base: datetime, count: int = 12) -> dict:
+    candles = []
+    for index in range(count):
+        moment = base + timedelta(minutes=index)
+        timestamp_ms = int(moment.timestamp() * 1000)
+        open_price = 100.0 + index
+        close_price = open_price + 0.5
+        high_price = close_price + 0.25
+        low_price = open_price - 0.25
+        volume = 5.0 + index * 0.1
+        candles.append(
+            {
+                "t": timestamp_ms,
+                "o": round(open_price, 2),
+                "h": round(high_price, 2),
+                "l": round(low_price, 2),
+                "c": round(close_price, 2),
+                "v": round(volume, 3),
+            }
+        )
+
+    selection = {"start": candles[0]["t"], "end": candles[-1]["t"]} if candles else None
+    payload = {"symbol": "BTCUSDT", "tf": "1m", "candles": candles}
+    if selection:
+        payload["selection"] = selection
+    return payload
+
+
+def _install_openai_stub(monkeypatch, *, status: str = "ok", trade: dict | None = None, raw: str | None = None):
+    async def fake_call(**kwargs):
+        file_path: Path = kwargs["file_path"]
+        data = file_path.read_bytes()
+        digest = analysis.sha256(data).hexdigest()
+        trade_payload = trade if trade is not None else {"symbol": "BTCUSDT", "status": "ok"}
+        raw_text = raw if raw is not None else json.dumps(trade_payload)
+        return TradeAnalysisResult(
+            status=status,
+            request_id="resp_test",
+            trade_json=trade_payload if status == "ok" else None,
+            raw_text=raw_text,
+            file_path=file_path,
+            latency_ms=125,
+            attachment_size=len(data),
+            attachment_sha256=digest,
+        )
+
+    monkeypatch.setattr(analysis, "call_openai_with_attachment", fake_call)
+
+
+def test_analyze_from_inspection_returns_payload(client: TestClient, analysis_env: Path, monkeypatch) -> None:
+    base = datetime(2024, 6, 1, 12, tzinfo=UTC)
+    payload = _build_snapshot_payload(base)
+
+    create_response = client.post("/inspection/snapshot", json=payload)
+    assert create_response.status_code == 200
+    snapshot_id = create_response.json()["snapshot_id"]
+
+    _install_openai_stub(monkeypatch)
+
+    selection = payload["selection"]
+    body = {
+        "snapshot_id": snapshot_id,
+        "selection_start": selection["start"],
+        "selection_end": selection["end"],
+        "hours": 2,
+        "period": "3d_overview_4h_detail",
+    }
+
+    response = client.post("/api/analyze-from-inspection", json=body)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"
+    assert data["request_id"] == "resp_test"
+    assert data["trade_json"]["symbol"] == "BTCUSDT"
+    debug = data["debug"]
+    assert debug["period"] == "3d_overview_4h_detail"
+    assert debug["attachment_file"]
+    file_path = analysis_env / debug["attachment_file"]
+    assert file_path.exists()
+    stored = json.loads(file_path.read_text(encoding="utf-8"))
+    assert stored["SYMBOL"] == "BTCUSDT"
+    assert stored["PERIOD"] == "3d_overview_4h_detail"
+    assert stored["DATA"]["snapshot_id"]
+
+
+def test_analyze_from_inspection_handles_insufficient(client: TestClient, analysis_env: Path, monkeypatch) -> None:
+    base = datetime(2024, 6, 2, 8, tzinfo=UTC)
+    payload = _build_snapshot_payload(base)
+
+    create_response = client.post("/inspection/snapshot", json=payload)
+    assert create_response.status_code == 200
+    snapshot_id = create_response.json()["snapshot_id"]
+
+    _install_openai_stub(
+        monkeypatch,
+        status="insufficient_data",
+        trade=None,
+        raw="not-json",
+    )
+
+    selection = payload["selection"]
+    body = {
+        "snapshot_id": snapshot_id,
+        "selection_start": selection["start"],
+        "selection_end": selection["end"],
+        "hours": 1,
+        "period": "custom_period",
+    }
+
+    response = client.post("/api/analyze-from-inspection", json=body)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "insufficient_data"
+    assert data["trade_json"] is None
+    assert "raw_text" in data["debug"]
+    assert data["debug"]["period"] == "custom_period"
