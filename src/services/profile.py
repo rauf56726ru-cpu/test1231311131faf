@@ -48,6 +48,23 @@ def _extract_timestamp(candle: Mapping[str, Any]) -> int | None:
     return None
 
 
+def _session_extrema(
+    candles: Sequence[Mapping[str, Any]]
+) -> Tuple[float, float] | None:
+    max_high: float | None = None
+    min_low: float | None = None
+    for candle in candles:
+        high_value = _ensure_float(candle.get("h") or candle.get("high"), default=math.nan)
+        low_value = _ensure_float(candle.get("l") or candle.get("low"), default=math.nan)
+        if math.isfinite(high_value):
+            max_high = high_value if max_high is None else max(max_high, high_value)
+        if math.isfinite(low_value):
+            min_low = low_value if min_low is None else min(min_low, low_value)
+    if max_high is None or min_low is None:
+        return None
+    return float(max_high), float(min_low)
+
+
 def split_by_sessions(
     candles: Sequence[Mapping[str, Any]],
     sessions: Iterable[Tuple[str, dtime, dtime]],
@@ -393,7 +410,11 @@ def compute_session_profiles(
         return profile
 
     def make_payload(
-        day_key: date, session_label: str, profile: VolumeProfile
+        day_key: date,
+        session_label: str,
+        profile: VolumeProfile,
+        *,
+        extrema: Tuple[float, float] | None = None,
     ) -> Dict[str, object]:
         payload: Dict[str, object] = {
             "date": day_key.isoformat(),
@@ -426,6 +447,11 @@ def compute_session_profiles(
                 payload["VAH"] = float(profile.vah)
             if profile.val is not None and math.isfinite(float(profile.val)):
                 payload["VAL"] = float(profile.val)
+        if session_label != "daily" and extrema is not None:
+            high_value, low_value = extrema
+            if math.isfinite(high_value) and math.isfinite(low_value):
+                payload["session_high"] = float(high_value)
+                payload["session_low"] = float(low_value)
         return payload
 
     summaries: List[Dict[str, object]] = []
@@ -443,7 +469,13 @@ def compute_session_profiles(
             if not session_candles:
                 continue
             session_profile = resolve_profile(session_candles, (day_key, session_name))
-            session_payload = make_payload(day_key, session_name, session_profile)
+            extrema = _session_extrema(session_candles)
+            session_payload = make_payload(
+                day_key,
+                session_name,
+                session_profile,
+                extrema=extrema,
+            )
             session_payloads.append(session_payload)
 
         if session_payloads:

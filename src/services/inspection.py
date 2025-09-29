@@ -25,6 +25,7 @@ from typing import (
 
 import httpx
 
+from .binance import BINANCE_FAPI_REST
 from .liquidity import (
     build_liquidity_snapshot,
     normalise_symbol_for_tick,
@@ -58,7 +59,6 @@ _SNAPSHOT_ID_SANITISER = re.compile(r"[^A-Za-z0-9._-]")
 MS_IN_DAY = 86_400_000
 HTF_TIMEFRAMES: Tuple[str, ...] = ("15m", "1h", "4h", "1d")
 MINUTE_INTERVAL_MS = TIMEFRAME_TO_MS.get("1m", 60_000)
-BINANCE_FAPI_REST = "https://fapi.binance.com/fapi/v1/klines"
 
 
 
@@ -792,7 +792,10 @@ def compute_session_vwaps(symbol: str, candles: Sequence[Mapping[str, Any]]) -> 
     sessions = list(Meta.iter_vwap_sessions())
 
     daily_buckets: defaultdict = defaultdict(list)  # type: ignore[var-annotated]
-    session_buckets: DefaultDict[Tuple[datetime.date, str], List[Mapping[str, Any]]] = defaultdict(list)
+    session_buckets: DefaultDict[
+        Tuple[datetime.date, str], List[Mapping[str, Any]]
+    ] = defaultdict(list)
+    session_extrema: Dict[Tuple[datetime.date, str], Tuple[float, float]] = {}
 
     for open_ms, high, low, close, volume in bars:
         dt = datetime.fromtimestamp(open_ms / 1000.0, tz=timezone.utc)
@@ -802,8 +805,17 @@ def compute_session_vwaps(symbol: str, candles: Sequence[Mapping[str, Any]]) -> 
         daily_buckets[dt.date()].append(entry)
         moment = dt.time()
         for session_name, start_time, end_time in sessions:
-            if _in_session(moment, start_time, end_time):
-                session_buckets[(dt.date(), session_name)].append(entry)
+            if not _in_session(moment, start_time, end_time):
+                continue
+            bucket_key = (dt.date(), session_name)
+            session_buckets[bucket_key].append(entry)
+            high_value = float(entry["h"])
+            low_value = float(entry["l"])
+            if bucket_key in session_extrema:
+                prev_high, prev_low = session_extrema[bucket_key]
+                high_value = max(prev_high, high_value)
+                low_value = min(prev_low, low_value)
+            session_extrema[bucket_key] = (high_value, low_value)
 
     ordered_dates = sorted(daily_buckets.keys())
     if len(ordered_dates) > lookback:
@@ -834,7 +846,17 @@ def compute_session_vwaps(symbol: str, candles: Sequence[Mapping[str, Any]]) -> 
             if session_stats is None:
                 continue
             session_value, session_sigma = session_stats
-            results.append({"date": date_str, "session": session_name, "value": session_value})
+            result_entry = {
+                "date": date_str,
+                "session": session_name,
+                "value": session_value,
+            }
+            extrema = session_extrema.get((date_key, session_name))
+            if extrema is not None:
+                session_high, session_low = extrema
+                result_entry["session_high"] = session_high
+                result_entry["session_low"] = session_low
+            results.append(result_entry)
             sigma_results.append(
                 {
                     "date": date_str,
@@ -908,6 +930,35 @@ def register_snapshot(snapshot: Mapping[str, Any]) -> str:
         value = snapshot.get(key)
         if isinstance(value, Mapping):
             meta[key] = dict(value)
+
+    primary_frame = frames.get(primary_tf, {})
+    t_values: List[int] = []
+    if isinstance(primary_frame, Mapping):
+        raw_candles = primary_frame.get("candles")
+        if isinstance(raw_candles, Sequence):
+            for candle in raw_candles:
+                ts: int | None = None
+                if isinstance(candle, Mapping):
+                    ts = _safe_int(
+                        candle.get("t")
+                        or candle.get("time")
+                        or candle.get("openTime")
+                        or candle.get("open_time")
+                    )
+                elif isinstance(candle, Sequence) and candle:
+                    ts = _safe_int(candle[0])
+                if ts is not None:
+                    t_values.append(ts)
+    if t_values:
+        t_values.sort()
+        meta["t_first"] = t_values[0]
+        meta["t_last"] = t_values[-1]
+
+    existing_source = meta.get("source")
+    if isinstance(existing_source, Mapping):
+        meta["source_details"] = dict(existing_source)
+    meta["source"] = "futures"
+    meta["market"] = "USDT-M Futures"
 
     selection = snapshot.get("selection") if isinstance(snapshot.get("selection"), Mapping) else None
     selection_data = None
@@ -1173,8 +1224,17 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
     tpo_zone_items: List[Dict[str, Any]] = []
     flattened_profile: List[Dict[str, float]] = []
     detected_zones: Dict[str, Any] = {
-        "symbol": symbol,
-        "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
+        "zones": {
+            "fvg": [],
+            "ob": [],
+            "mb": [],
+            "bb": [],
+            "rb": [],
+            "pb": [],
+            "sr": [],
+            "profile_levels": [],
+        },
+        "meta": {},
     }
     profile_candles: List[Dict[str, Any]] = []
 
@@ -1232,19 +1292,29 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
             flattened_profile = []
             tpo_zone_items = []
             detected_zones = {
-                "symbol": symbol,
-                "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
+                "zones": {
+                    "fvg": [],
+                    "ob": [],
+                    "mb": [],
+                    "bb": [],
+                    "rb": [],
+                    "pb": [],
+                    "sr": [],
+                    "profile_levels": [],
+                },
+                "meta": {},
             }
             profile_ready = False
 
     if profile_ready and profile_candles:
         try:
             zone_cfg = ZonesConfig(tick_size=tick_size_value)
+            zone_frames: Dict[str, Sequence[Mapping[str, Any]]] = {
+                target_tf_key: profile_candles
+            }
             detected_zones = detect_zones(
-                profile_candles,
-                target_tf_key,
-                symbol,
-                zone_cfg,
+                frames=zone_frames,
+                config=zone_cfg,
             )
         except Exception:  # pragma: no cover - defensive guard
             logging.getLogger(__name__).exception(
@@ -1256,8 +1326,17 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
                 },
             )
             detected_zones = {
-                "symbol": symbol,
-                "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
+                "zones": {
+                    "fvg": [],
+                    "ob": [],
+                    "mb": [],
+                    "bb": [],
+                    "rb": [],
+                    "pb": [],
+                    "sr": [],
+                    "profile_levels": [],
+                },
+                "meta": {},
             }
 
     raw_meta = snapshot.get("meta") if isinstance(snapshot.get("meta"), Mapping) else {}
@@ -1430,6 +1509,8 @@ def render_inspection_page(
     diagnostics_json_initial = _format_json_block(diagnostics_section)
     metric_json_initial = _format_json_block(metric_section)
     check_all_json_initial = _format_json_block(None)
+    analysis_json_initial = _format_json_block(None)
+    analysis_debug_json_initial = _format_json_block(None)
 
     style_block = """
     :root {
@@ -1689,6 +1770,110 @@ def render_inspection_page(
       padding: 0.4rem 0.7rem;
       color: var(--fg);
       min-width: 110px;
+    }
+    .analysis-actions {
+      display: flex;
+      align-items: flex-end;
+      gap: 0.75rem;
+      padding: 0.75rem 0.25rem 0.25rem;
+      flex-wrap: wrap;
+    }
+    .analysis-credentials {
+      display: flex;
+      flex: 1 1 280px;
+      min-width: min(100%, 340px);
+      flex-direction: column;
+      gap: 0.45rem;
+    }
+    .analysis-credentials span {
+      font-size: 0.75rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: rgba(148, 163, 184, 0.78);
+    }
+    .analysis-input-row {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    #analysis-api-key {
+      flex: 1;
+      border-radius: 12px;
+      border: 1px solid rgba(148, 163, 184, 0.3);
+      padding: 0.55rem 0.75rem;
+      background: rgba(15, 23, 42, 0.65);
+      color: var(--fg);
+      letter-spacing: 0.02em;
+    }
+    #analysis-api-key:focus {
+      outline: none;
+      border-color: rgba(56, 189, 248, 0.65);
+      box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.15);
+    }
+    .analysis-key-toggle {
+      min-width: auto;
+      padding: 0.5rem 0.75rem;
+      white-space: nowrap;
+    }
+    .analysis-actions__controls {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+    }
+    .analysis-actions__controls > button {
+      min-width: 220px;
+    }
+    .analysis-status {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 140px;
+      padding: 0.45rem 0.85rem;
+      border-radius: 999px;
+      font-size: 0.85rem;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      border: 1px solid rgba(148, 163, 184, 0.2);
+      background: rgba(15, 23, 42, 0.6);
+      color: var(--muted);
+      transition: background 0.2s ease, color 0.2s ease, border-color 0.2s ease;
+    }
+    .analysis-status[data-status="pending"],
+    .analysis-status[data-status="sent"] {
+      background: rgba(14, 116, 144, 0.3);
+      border-color: rgba(45, 212, 191, 0.35);
+      color: #2dd4bf;
+    }
+    .analysis-status[data-status="succeeded"] {
+      background: rgba(21, 128, 61, 0.28);
+      border-color: rgba(34, 197, 94, 0.45);
+      color: #4ade80;
+    }
+    .analysis-status[data-status="insufficient"] {
+      background: rgba(202, 138, 4, 0.28);
+      border-color: rgba(250, 204, 21, 0.4);
+      color: #facc15;
+    }
+    .analysis-status[data-status="failed"] {
+      background: rgba(185, 28, 28, 0.28);
+      border-color: rgba(248, 113, 113, 0.45);
+      color: #f87171;
+    }
+    .analysis-panel {
+      display: grid;
+      gap: 1rem;
+      padding: 1rem;
+      background: rgba(15, 23, 42, 0.85);
+      border-top: 1px solid rgba(148, 163, 184, 0.18);
+    }
+    .analysis-panel > div > span.badge {
+      margin-bottom: 0.5rem;
+    }
+    .analysis-panel pre {
+      max-height: 320px;
+      overflow: auto;
+      background: rgba(2, 6, 23, 0.9);
     }
     .collapse pre {
       margin: 0;
@@ -2106,6 +2291,9 @@ def render_inspection_page(
     }
     """
 
+    analysis_configured = bool(os.environ.get("OPENAI_API_KEY"))
+    model_id_default = "gpt-5"
+
     script_block = (
         "window.__INSPECTION_INITIAL__ = {\n"
         f"  payload: {payload_json},\n"
@@ -2113,7 +2301,9 @@ def render_inspection_page(
         f"  symbol: {json.dumps(symbol_value)},\n"
         f"  timeframe: {json.dumps(timeframe_value)},\n"
         f"  snapshots: {snapshots_json},\n"
-        f"  defaultSymbol: {json.dumps(DEFAULT_SYMBOL)}\n"
+        f"  defaultSymbol: {json.dumps(DEFAULT_SYMBOL)},\n"
+        f"  analysisConfigured: {json.dumps(analysis_configured)},\n"
+        f"  modelId: {json.dumps(model_id_default)}\n"
         "};\n"
     )
 
@@ -2256,7 +2446,7 @@ def render_inspection_page(
   }
 
   async function fetchRange(symbol, interval, startMs, endMs, limit = 1000) {
-    const url = new URL("https://api.binance.com/api/v3/klines");
+    const url = new URL("https://fapi.binance.com/fapi/v1/klines");
     url.searchParams.set("symbol", symbol);
     url.searchParams.set("interval", interval);
     if (Number.isFinite(startMs)) {
@@ -2265,7 +2455,7 @@ def render_inspection_page(
     if (Number.isFinite(endMs)) {
       url.searchParams.set("endTime", Math.floor(endMs));
     }
-    url.searchParams.set("limit", String(Math.max(1, Math.min(limit, 1000))));
+    url.searchParams.set("limit", String(Math.max(1, Math.min(limit, 1500))));
     const response = await fetch(url.toString());
     if (!response.ok) {
       throw new Error(`Failed to fetch range: ${response.status}`);
@@ -2327,6 +2517,32 @@ def render_inspection_page(
     pre.textContent = JSON.stringify(data ?? null, null, 2);
   }
 
+  const API_KEY_STORAGE_KEY = "inspection.openai_api_key";
+
+  function loadStoredApiKey() {
+    try {
+      if (!window || !window.localStorage) return "";
+      const value = window.localStorage.getItem(API_KEY_STORAGE_KEY);
+      return typeof value === "string" ? value : "";
+    } catch (error) {
+      console.warn("Failed to read OpenAI API key from storage", error);
+      return "";
+    }
+  }
+
+  function persistStoredApiKey(value) {
+    try {
+      if (!window || !window.localStorage) return;
+      if (value) {
+        window.localStorage.setItem(API_KEY_STORAGE_KEY, value);
+      } else {
+        window.localStorage.removeItem(API_KEY_STORAGE_KEY);
+      }
+    } catch (error) {
+      console.warn("Failed to persist OpenAI API key", error);
+    }
+  }
+
   function selectionLabel(start, end) {
     if (!start || !end) return "Выделите диапазон";
     const from = formatTs(start);
@@ -2345,7 +2561,7 @@ def render_inspection_page(
     const seen = new Set();
     const intervalMs = TIMEFRAME_TO_MS[interval] || 60000;
     const hintedLimit = Number.isFinite(options.limit) ? Math.floor(options.limit) : null;
-    const batchLimit = Math.max(1, Math.min(1000, hintedLimit || 1000));
+    const batchLimit = Math.max(1, Math.min(1500, hintedLimit || 1000));
     const hasStart = Number.isFinite(startMs);
     const hasEnd = Number.isFinite(endMs);
     let startBound = null;
@@ -2365,7 +2581,7 @@ def render_inspection_page(
     const guardLimit = 4096;
 
     while (true) {
-      const url = new URL("https://api.binance.com/api/v3/klines");
+      const url = new URL("https://fapi.binance.com/fapi/v1/klines");
       url.searchParams.set("symbol", symbol.toUpperCase());
       url.searchParams.set("interval", interval);
       if (Number.isFinite(cursor)) {
@@ -2505,6 +2721,12 @@ def render_inspection_page(
     const checkAllPre = document.getElementById("checkall-json");
     const checkAllButton = document.getElementById("fetch-check-all");
     const checkAllHours = document.getElementById("checkall-hours");
+    const analysisButton = document.getElementById("analysis-send");
+    const analysisStatusEl = document.getElementById("analysis-status");
+    const analysisPre = document.getElementById("analysis-json");
+    const analysisDebugPre = document.getElementById("analysis-debug-json");
+    const analysisApiKeyInput = document.getElementById("analysis-api-key");
+    const analysisApiKeyToggle = document.getElementById("analysis-api-key-toggle");
     const snapshotMeta = document.getElementById("snapshot-meta");
     const frameSelect = document.getElementById("frame-select");
     const chartContainer = document.getElementById("inspection-chart");
@@ -2544,6 +2766,7 @@ def render_inspection_page(
 
     initCollapsibles();
 
+    const storedApiKey = loadStoredApiKey().trim();
     const resolveHours = (value) => {
       const parsed = Number(value);
       if (!Number.isFinite(parsed)) return 1;
@@ -2588,6 +2811,19 @@ def render_inspection_page(
       chart: null,
       series: null,
       checkAll: null,
+      analysis: {
+        status: "idle",
+        resultStatus: null,
+        trade: null,
+        debug: null,
+        requestId: null,
+        apiConfigured: Boolean(initial.analysisConfigured),
+        apiKey: storedApiKey,
+        modelId:
+          typeof initial.modelId === "string" && initial.modelId.trim().toLowerCase() === "gpt-5"
+            ? "gpt-5"
+            : "gpt-5",
+      },
       hours: checkAllHours ? resolveHours(checkAllHours.value) : 1,
       profilePreset: initial.payload?.DATA?.profile_preset || null,
       presetRequired: Boolean(initial.payload?.DATA?.profile_preset_required),
@@ -2597,6 +2833,25 @@ def render_inspection_page(
       managingSymbol: null,
       presetModalOpen: false,
     };
+
+    if (analysisApiKeyInput) {
+      analysisApiKeyInput.value = storedApiKey;
+      analysisApiKeyInput.addEventListener("input", () => {
+        const cleaned = analysisApiKeyInput.value.trim();
+        state.analysis.apiKey = cleaned;
+        persistStoredApiKey(cleaned);
+        updateAnalysisControls();
+      });
+    }
+
+    if (analysisApiKeyToggle && analysisApiKeyInput) {
+      analysisApiKeyToggle.addEventListener("click", () => {
+        const currentType = analysisApiKeyInput.getAttribute("type") === "text" ? "text" : "password";
+        const nextType = currentType === "password" ? "text" : "password";
+        analysisApiKeyInput.setAttribute("type", nextType);
+        analysisApiKeyToggle.textContent = nextType === "text" ? "Скрыть" : "Показать";
+      });
+    }
 
     const AUTO_PRESET_SYMBOLS = new Set(["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
 
@@ -2612,6 +2867,68 @@ def render_inspection_page(
         normaliseSymbol(initial.symbol) ||
         defaultSymbol
       );
+    }
+
+    function resolveAnalysisPeriod() {
+      const source = state.payload?.DATA?.meta?.source;
+      const requested = state.payload?.DATA?.meta?.requested;
+      const preset = state.payload?.DATA?.profile_preset;
+      const candidates = [
+        source && typeof source.period === "string" ? source.period : null,
+        source && typeof source?.window?.label === "string" ? source.window.label : null,
+        requested && typeof requested?.period === "string" ? requested.period : null,
+        preset && typeof preset?.period === "string" ? preset.period : null,
+        preset && typeof preset?.preset_key === "string" ? preset.preset_key : null,
+      ];
+      for (const candidate of candidates) {
+        if (candidate && typeof candidate === "string" && candidate.trim()) {
+          return candidate.trim();
+        }
+      }
+      return "custom_range";
+    }
+
+    function updateAnalysisIndicator() {
+      if (!analysisStatusEl) return;
+      const status = state.analysis.status || "idle";
+      analysisStatusEl.dataset.status = status;
+      const labels = {
+        idle: "—",
+        pending: "Подготовка",
+        sent: "Отправлено",
+        succeeded: "Готово",
+        insufficient: "Недостаточно данных",
+        failed: "Ошибка",
+      };
+      analysisStatusEl.textContent = labels[status] || "—";
+    }
+
+    function updateAnalysisControls() {
+      if (!analysisButton) return;
+      const start = Number(state.selection?.start ?? Number.NaN);
+      const end = Number(state.selection?.end ?? Number.NaN);
+      const hasSelection = Number.isFinite(start) && Number.isFinite(end) && start !== end;
+      const busy = state.analysis.status === "pending" || state.analysis.status === "sent";
+      const hasApiAccess =
+        state.analysis.apiConfigured || Boolean((state.analysis.apiKey || "").trim());
+      analysisButton.disabled = !state.snapshotId || !hasSelection || busy || !hasApiAccess;
+    }
+
+    function resetAnalysisState() {
+      state.analysis.status = "idle";
+      state.analysis.resultStatus = null;
+      state.analysis.trade = null;
+      state.analysis.debug = null;
+      state.analysis.requestId = null;
+      setJson(analysisPre, null);
+      setJson(analysisDebugPre, null);
+      updateAnalysisIndicator();
+      updateAnalysisControls();
+    }
+
+    function applyAnalysisResult(trade, debug) {
+      setJson(analysisPre, trade);
+      setJson(analysisDebugPre, debug);
     }
 
     function renderPresetChip() {
@@ -2880,6 +3197,7 @@ def render_inspection_page(
       }
     }
 
+    resetAnalysisState();
     renderPresetState();
     updateCheckAllState();
 
@@ -2905,14 +3223,16 @@ def render_inspection_page(
     }
 
     function updateCheckAllState() {
-      if (!checkAllButton) return;
       const hasSelection = Boolean(state.selection && state.selection.start && state.selection.end);
       const hoursValid = Number.isFinite(state.hours) && state.hours >= 1 && state.hours <= 4;
       if (checkAllHours && hoursValid) {
         checkAllHours.value = String(state.hours);
       }
       const presetReady = !state.presetRequired;
-      checkAllButton.disabled = !state.snapshotId || !hasSelection || !hoursValid || !presetReady;
+      if (checkAllButton) {
+        checkAllButton.disabled = !state.snapshotId || !hasSelection || !hoursValid || !presetReady;
+      }
+      updateAnalysisControls();
     }
 
     function populateSnapshots(list) {
@@ -3055,6 +3375,120 @@ def render_inspection_page(
       }
     }
 
+    async function requestTradeAnalysis() {
+      if (!state.snapshotId) {
+        updateStatus("Выберите снэпшот перед анализом сделки", "warning");
+        return;
+      }
+
+      const rawStart = Number(state.selection?.start ?? Number.NaN);
+      const rawEnd = Number(state.selection?.end ?? Number.NaN);
+      if (!Number.isFinite(rawStart) || !Number.isFinite(rawEnd) || rawStart === rawEnd) {
+        updateStatus("Выберите диапазон свечей для анализа сделки", "warning");
+        updateAnalysisControls();
+        return;
+      }
+
+      const selectionStart = Math.floor(Math.min(rawStart, rawEnd));
+      const selectionEnd = Math.floor(Math.max(rawStart, rawEnd));
+      const hoursValue = Number.isFinite(state.hours) ? state.hours : 1;
+      const period = resolveAnalysisPeriod();
+      const apiKeyValue = (state.analysis.apiKey || "").trim();
+      if (!state.analysis.apiConfigured && !apiKeyValue) {
+        updateStatus("Укажите OpenAI API key перед анализом сделки", "warning");
+        updateAnalysisControls();
+        if (analysisApiKeyInput) {
+          analysisApiKeyInput.focus();
+        }
+        return;
+      }
+
+      state.analysis.status = "pending";
+      state.analysis.resultStatus = null;
+      state.analysis.requestId = null;
+      state.analysis.trade = null;
+      state.analysis.debug = null;
+      applyAnalysisResult(null, null);
+      updateAnalysisIndicator();
+      updateAnalysisControls();
+      updateStatus("Готовим данные для анализа сделки...", "info");
+
+      try {
+        const modelId =
+          typeof state.analysis.modelId === "string" && state.analysis.modelId.trim().toLowerCase() === "gpt-5"
+            ? "gpt-5"
+            : "gpt-5";
+        state.analysis.modelId = modelId;
+
+        const requestBody = {
+          snapshot_id: state.snapshotId,
+          selection_start: selectionStart,
+          selection_end: selectionEnd,
+          hours: hoursValue,
+          period,
+          model: modelId,
+        };
+        if (apiKeyValue) {
+          requestBody.api_key = apiKeyValue;
+        }
+
+        const response = await fetch("/api/analyze-from-inspection", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: JSON.stringify(requestBody),
+        });
+
+        state.analysis.status = "sent";
+        updateAnalysisIndicator();
+
+        let payload;
+        if (!response.ok) {
+          let detail = `HTTP ${response.status}`;
+          try {
+            const errorBody = await response.json();
+            if (typeof errorBody?.detail === "string") {
+              detail = errorBody.detail;
+            } else if (errorBody?.detail?.message) {
+              detail = String(errorBody.detail.message);
+            }
+          } catch (error) {
+            // Ignore body parsing errors
+          }
+          throw new Error(detail);
+        } else {
+          payload = await response.json();
+        }
+
+        state.analysis.requestId = typeof payload?.request_id === "string" ? payload.request_id : null;
+        state.analysis.trade = payload?.trade_json || null;
+        state.analysis.debug = payload?.debug || null;
+        state.analysis.resultStatus = typeof payload?.status === "string" ? payload.status : null;
+        applyAnalysisResult(state.analysis.trade, state.analysis.debug);
+
+        if (state.analysis.resultStatus === "ok") {
+          state.analysis.status = "succeeded";
+          updateStatus("Сделка проанализирована", "success");
+        } else if (state.analysis.resultStatus === "insufficient_data") {
+          state.analysis.status = "insufficient";
+          updateStatus("Модели не хватает данных для сделки", "warning");
+        } else {
+          state.analysis.status = "failed";
+          updateStatus("Анализ сделки завершился с ошибкой", "error");
+        }
+      } catch (error) {
+        console.error(error);
+        const message = error && typeof error.message === "string" ? error.message : "Неизвестная ошибка";
+        state.analysis.status = "failed";
+        state.analysis.trade = null;
+        state.analysis.debug = { error: message };
+        applyAnalysisResult(null, state.analysis.debug);
+        updateStatus(`Ошибка отправки сделки${message ? `: ${message}` : ""}`, "error");
+      } finally {
+        updateAnalysisIndicator();
+        updateAnalysisControls();
+      }
+    }
+
     function ensureChart() {
       if (!chartContainer) return;
       const ensureLibrary = () => {
@@ -3149,6 +3583,7 @@ def render_inspection_page(
               state.selection.end = tmp;
             }
           }
+          resetAnalysisState();
           updateSelectionLabel();
           updateCheckAllState();
         });
@@ -3207,6 +3642,7 @@ def render_inspection_page(
         state.selection = payload?.DATA?.selection || null;
         state.checkAll = null;
         setJson(checkAllPre, null);
+        resetAnalysisState();
         updateCheckAllState();
         state.profilePreset = payload?.DATA?.profile_preset || null;
         state.presetRequired = Boolean(payload?.DATA?.profile_preset_required);
@@ -3324,9 +3760,20 @@ def render_inspection_page(
       });
     }
 
+    if (analysisButton) {
+      analysisButton.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        requestTradeAnalysis();
+      });
+    }
+
+    updateAnalysisControls();
+
     if (clearSelection) {
       clearSelection.addEventListener("click", () => {
         state.selection = null;
+        resetAnalysisState();
         updateSelectionLabel();
         updateCheckAllState();
       });
@@ -4474,6 +4921,38 @@ def render_inspection_page(
                       </select>
                     </div>
                 <pre id=\"checkall-json\">{check_all_json_initial}</pre>
+              </div>
+              <div class="analysis-actions">
+                <label class="analysis-credentials" for="analysis-api-key">
+                  <span>OpenAI API Key</span>
+                  <div class="analysis-input-row">
+                    <input id="analysis-api-key" type="password" placeholder="sk-..." autocomplete="off" spellcheck="false" />
+                    <button id="analysis-api-key-toggle" class="secondary analysis-key-toggle" type="button" data-api-key-visibility>Показать</button>
+                  </div>
+                </label>
+                <div class="analysis-actions__controls">
+                  <button id="analysis-send" class="primary" type="button">Отправить сделку на анализ</button>
+                  <span id="analysis-status" class="analysis-status" data-status="idle">—</span>
+                </div>
+              </div>
+              <div class="collapse" data-analysis-panel>
+                <header data-collapse-toggle>
+                  <h3>Сделка</h3>
+                  <div class="actions">
+                    <button class="secondary" type="button" data-copy-target="analysis-json">Скопировать JSON</button>
+                    <button class="secondary" type="button" data-copy-target="analysis-debug-json">Скопировать debug</button>
+                  </div>
+                </header>
+                <div class="analysis-panel">
+                  <div>
+                    <span class="badge">Ответ модели</span>
+                    <pre id="analysis-json">{analysis_json_initial}</pre>
+                  </div>
+                  <div>
+                    <span class="badge">Debug</span>
+                    <pre id="analysis-debug-json">{analysis_debug_json_initial}</pre>
+                  </div>
+                </div>
               </div>
               <div class=\"collapse\">
                 <header data-collapse-toggle>

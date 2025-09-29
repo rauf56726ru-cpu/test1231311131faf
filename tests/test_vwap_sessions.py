@@ -21,6 +21,13 @@ def extract_map(payload: dict[str, object]) -> dict[tuple[str, str], float]:
     }
 
 
+def find_entry(payload: dict[str, object], date: str, session: str) -> dict[str, object]:
+    for entry in payload.get("vwap", []):
+        if entry.get("date") == date and entry.get("session") == session:
+            return entry
+    raise AssertionError(f"Missing entry for {(date, session)}")
+
+
 def extract_sigma_map(payload: dict[str, object]) -> dict[tuple[str, str], dict[str, object]]:
     sigma_entries = payload.get("vwap_sigma", [])
     return {
@@ -53,9 +60,9 @@ def test_constant_price_vwap() -> None:
 def test_session_boundaries_inclusive_start_exclusive_end() -> None:
     base = datetime(2024, 1, 1, tzinfo=timezone.utc)
     candles = [
-        make_candle(base.replace(hour=8, minute=0), 110.0, 1.0),
-        make_candle(base.replace(hour=12, minute=0), 150.0, 1.0),
-        make_candle(base.replace(hour=20, minute=0), 190.0, 1.0),
+        make_candle(base.replace(hour=7, minute=0), 110.0, 1.0),
+        make_candle(base.replace(hour=13, minute=30), 150.0, 1.0),
+        make_candle(base.replace(hour=21, minute=0), 190.0, 1.0),
     ]
 
     result = compute_session_vwaps("ethusdt", candles)
@@ -63,9 +70,15 @@ def test_session_boundaries_inclusive_start_exclusive_end() -> None:
 
     assert ("2024-01-01", "london") in mapping
     assert ("2024-01-01", "ny") in mapping
-    # london entry should correspond to price at 08:00, ny to price at 12:00 (20:00 excluded)
-    assert mapping[("2024-01-01", "london")] == pytest.approx(110.0)
-    assert mapping[("2024-01-01", "ny")] == pytest.approx(150.0)
+    london_entry = find_entry(result, "2024-01-01", "london")
+    ny_entry = find_entry(result, "2024-01-01", "ny")
+    # london entry should correspond to price at 07:00, ny to price at 13:30 (21:00 excluded)
+    assert london_entry["value"] == pytest.approx(110.0)
+    assert london_entry["session_high"] == pytest.approx(110.0)
+    assert london_entry["session_low"] == pytest.approx(110.0)
+    assert ny_entry["value"] == pytest.approx(150.0)
+    assert ny_entry["session_high"] == pytest.approx(150.0)
+    assert ny_entry["session_low"] == pytest.approx(150.0)
 
 
 def test_zero_volume_skips_sessions() -> None:

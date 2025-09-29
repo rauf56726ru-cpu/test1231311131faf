@@ -4,12 +4,14 @@ from __future__ import annotations
 import logging
 import math
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, time as dtime
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple
 
 import httpx
 
 import src.services.inspection as inspection
+from .binance import BINANCE_FAPI_REST
 from .inspection import build_htf_section
 from .liquidity import (
     build_liquidity_snapshot,
@@ -20,17 +22,36 @@ from .presets import resolve_profile_config
 from .profile import build_profile_package
 from .smc import SMCConfig, detect_smc_blocks
 from .zones import Config as ZonesConfig, detect_zones
-from ..meta import Meta
-
-
 UTC = timezone.utc
 MS_IN_HOUR = 3_600_000
 MS_IN_DAY = 86_400_000
 VALID_HOUR_WINDOWS = {1, 2, 3, 4}
 VALUE_AREA_PCT = 0.70
 
+_EQUAL_LIQUIDITY_TIMEFRAMES: Tuple[str, ...] = ("15m", "1h", "4h")
+_EQUAL_LIQUIDITY_REL_TOLERANCE = {
+    "15m": 0.0005,
+    "1h": 0.0003,
+    "4h": 0.0002,
+}
+_EQUAL_LIQUIDITY_MIN_SEPARATION = {
+    "15m": 5,
+    "1h": 6,
+    "4h": 6,
+}
+_EQUAL_LIQUIDITY_PIVOT_RADIUS = {
+    "15m": 2,
+    "1h": 3,
+    "4h": 4,
+}
+
 try:
-    from .ohlc import TIMEFRAME_TO_MS, aggregate_1m_to_1h, resample_ohlcv
+    from .ohlc import (
+        TIMEFRAME_TO_MS,
+        aggregate_1m_to_1h,
+        build_multi_timeframe_ohlcv,
+        resample_ohlcv,
+    )
 except ImportError:  # pragma: no cover - circular import guard
     TIMEFRAME_TO_MS = {"1m": MS_IN_HOUR // 60}
 
@@ -40,9 +61,17 @@ except ImportError:  # pragma: no cover - circular import guard
     def aggregate_1m_to_1h(*args, **kwargs):  # type: ignore[override]
         raise ImportError("aggregate_1m_to_1h is unavailable")
 
+    def build_multi_timeframe_ohlcv(*args, **kwargs):  # type: ignore[override]
+        raise ImportError("build_multi_timeframe_ohlcv is unavailable")
+
 MINUTE_INTERVAL_MS = TIMEFRAME_TO_MS.get("1m", MS_IN_HOUR // 60)
 
-BINANCE_FAPI_REST = "https://fapi.binance.com/fapi/v1/klines"
+VWAP_TPO_SESSIONS: Tuple[Tuple[str, dtime, dtime], ...] = (
+    ("asia", dtime(hour=0, minute=0), dtime(hour=3, minute=0)),
+    ("london", dtime(hour=7, minute=0), dtime(hour=10, minute=0)),
+    ("ny", dtime(hour=13, minute=30), dtime(hour=16, minute=30)),
+)
+
 _RETRYABLE_STATUS = {418, 429, 500, 502, 503, 504}
 _MAX_RETRIES = 5
 
@@ -60,6 +89,30 @@ class BinanceDownloadError(RuntimeError):
     def __init__(self, downloaded: int, message: str):
         super().__init__(message)
         self.downloaded = int(downloaded)
+
+
+def _isoformat_utc(timestamp_ms: int) -> str:
+    """Return a stable Z-suffixed ISO string for a millisecond timestamp."""
+
+    clamped_ms = max(0, int(timestamp_ms))
+    dt = datetime.fromtimestamp(clamped_ms / 1000.0, tz=UTC)
+    return dt.isoformat().replace("+00:00", "Z")
+
+
+def _iso_to_ms(value: Any) -> int | None:
+    """Parse an ISO-8601 string into a UTC millisecond timestamp."""
+
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    else:
+        parsed = parsed.astimezone(UTC)
+    return int(parsed.timestamp() * 1000)
 
 
 def _round_float_value(value: float, ndigits: int = 3) -> float:
@@ -338,6 +391,16 @@ def _coerce_float(value: Any) -> float:
         return 0.0
 
 
+def _safe_float(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(result):
+        return None
+    return result
+
+
 def _safe_int(value: Any) -> int | None:
     try:
         if value is None:
@@ -345,6 +408,128 @@ def _safe_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _pivot_radius_for_equal_levels(tf: str) -> int:
+    return _EQUAL_LIQUIDITY_PIVOT_RADIUS.get(tf, 2)
+
+
+def _minimum_separation_for_equal_levels(tf: str) -> int:
+    return _EQUAL_LIQUIDITY_MIN_SEPARATION.get(tf, 5)
+
+
+def _relative_tolerance_for_equal_levels(tf: str) -> float:
+    return _EQUAL_LIQUIDITY_REL_TOLERANCE.get(tf, 0.0003)
+
+
+def _detect_equal_levels_for_timeframe(
+    candles: Sequence[Mapping[str, Any]],
+    *,
+    tf: str,
+    kind: str,
+) -> List[Dict[str, Any]]:
+    radius = max(1, _pivot_radius_for_equal_levels(tf))
+    minimum_separation = max(1, _minimum_separation_for_equal_levels(tf))
+    tolerance_ratio = max(0.0, _relative_tolerance_for_equal_levels(tf))
+    length = len(candles)
+    if length < 2 * radius + 1:
+        return []
+
+    pivots: List[Dict[str, Any]] = []
+    price_key = "h" if kind == "high" else "l"
+
+    for idx in range(radius, length - radius):
+        candle = candles[idx]
+        pivot_price = _safe_float(candle.get(price_key))
+        pivot_ts = _safe_int(candle.get("t"))
+        if pivot_price is None or pivot_ts is None:
+            continue
+        is_pivot = True
+        for offset in range(1, radius + 1):
+            left = candles[idx - offset]
+            right = candles[idx + offset]
+            left_price = _safe_float(left.get(price_key))
+            right_price = _safe_float(right.get(price_key))
+            if left_price is not None:
+                if kind == "high" and pivot_price < left_price:
+                    is_pivot = False
+                    break
+                if kind == "low" and pivot_price > left_price:
+                    is_pivot = False
+                    break
+            if right_price is not None:
+                if kind == "high" and pivot_price < right_price:
+                    is_pivot = False
+                    break
+                if kind == "low" and pivot_price > right_price:
+                    is_pivot = False
+                    break
+        if not is_pivot:
+            continue
+        pivots.append({"idx": idx, "price": pivot_price, "ts": pivot_ts})
+
+    if len(pivots) < 2:
+        return []
+
+    equal_levels: List[Dict[str, Any]] = []
+    seen_pairs: set[tuple[int, int]] = set()
+
+    for j in range(1, len(pivots)):
+        pivot_j = pivots[j]
+        best_candidate = None
+        best_diff = None
+        for i in range(j):
+            pivot_i = pivots[i]
+            if (pivot_i["idx"], pivot_j["idx"]) in seen_pairs:
+                continue
+            if pivot_j["idx"] - pivot_i["idx"] < minimum_separation:
+                continue
+            average_price = (pivot_i["price"] + pivot_j["price"]) / 2.0
+            if average_price <= 0:
+                continue
+            price_diff = abs(pivot_j["price"] - pivot_i["price"])
+            tolerance = tolerance_ratio * average_price
+            if price_diff <= tolerance:
+                if best_diff is None or price_diff < best_diff:
+                    best_candidate = pivot_i
+                    best_diff = price_diff
+        if best_candidate is None:
+            continue
+        seen_pairs.add((best_candidate["idx"], pivot_j["idx"]))
+        second_touch_ts = pivot_j["ts"]
+        equal_levels.append(
+            {
+                "price": (best_candidate["price"] + pivot_j["price"]) / 2.0,
+                "ts": second_touch_ts,
+            }
+        )
+
+    equal_levels.sort(key=lambda item: item["ts"])
+    for entry in equal_levels:
+        entry["ts"] = _isoformat_utc(entry["ts"])
+    return equal_levels
+
+
+def build_equal_liquidity_levels(
+    frames: Mapping[str, Sequence[Mapping[str, Any]]]
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Detect simplified EQH/EQL pools from timeframe candles."""
+
+    eqh_levels: List[Dict[str, Any]] = []
+    eql_levels: List[Dict[str, Any]] = []
+
+    for tf in _EQUAL_LIQUIDITY_TIMEFRAMES:
+        candles = frames.get(tf)
+        if not isinstance(candles, Sequence):
+            continue
+        eqh_levels.extend(
+            _detect_equal_levels_for_timeframe(candles, tf=tf, kind="high")
+        )
+        eql_levels.extend(
+            _detect_equal_levels_for_timeframe(candles, tf=tf, kind="low")
+        )
+
+    return {"eqh": eqh_levels, "eql": eql_levels}
 
 
 def _coerce_candle(entry: Mapping[str, Any]) -> MutableMapping[str, Any] | None:
@@ -625,6 +810,436 @@ def _summarise_delta_series(series: Sequence[Mapping[str, Any]]) -> Dict[str, An
     }
 
 
+@dataclass(slots=True)
+class OrderflowConfig:
+    """Configuration overrides for orderflow-derived metrics."""
+
+    imbalance_ratio: float = 1.8
+    absorption_ratio: float = 2.0
+    atr_period: int = 14
+    atr_band_k: float = 0.2
+    large_trade_min_qty: float = 0.0
+    large_trade_lookback_minutes: int = 2880
+    large_trade_percentile: float = 0.99
+    epsilon: float = 1e-9
+
+
+def _resolve_orderflow_config(meta: Mapping[str, Any] | None) -> OrderflowConfig:
+    if not isinstance(meta, Mapping):
+        return OrderflowConfig()
+
+    source = None
+    for key in ("orderflow", "order_flow", "orderFlow"):
+        candidate = meta.get(key)
+        if isinstance(candidate, Mapping):
+            source = candidate
+            break
+
+    if source is None:
+        return OrderflowConfig()
+
+    config = OrderflowConfig()
+
+    def _float(name: str, default: float) -> float:
+        value = source.get(name)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _int(name: str, default: int) -> int:
+        value = source.get(name)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    for key in ("imbalance_ratio", "imbalanceThreshold", "imbalance_threshold"):
+        if key in source:
+            config.imbalance_ratio = max(0.0, _float(key, config.imbalance_ratio))
+            break
+
+    for key in ("absorption_ratio", "absorptionThreshold", "absorption_threshold"):
+        if key in source:
+            config.absorption_ratio = max(0.0, _float(key, config.absorption_ratio))
+            break
+
+    for key in ("atr_period", "atrPeriod"):
+        if key in source:
+            config.atr_period = max(1, _int(key, config.atr_period))
+            break
+
+    for key in ("atr_band_k", "atrBandK", "atr_band_multiplier"):
+        if key in source:
+            config.atr_band_k = max(0.0, _float(key, config.atr_band_k))
+            break
+
+    for key in ("large_trade_min_qty", "large_trade_qty", "large_trade_trigger"):
+        if key in source:
+            config.large_trade_min_qty = max(0.0, _float(key, config.large_trade_min_qty))
+            break
+
+    for key in ("large_trade_lookback_minutes", "largeTradeLookbackMinutes"):
+        if key in source:
+            config.large_trade_lookback_minutes = max(1, _int(key, config.large_trade_lookback_minutes))
+            break
+
+    for key in ("large_trade_percentile", "largeTradePercentile"):
+        if key in source:
+            percentile = _float(key, config.large_trade_percentile)
+            if 0.0 < percentile < 1.0:
+                config.large_trade_percentile = percentile
+            break
+
+    if "epsilon" in source:
+        config.epsilon = max(1e-12, _float("epsilon", config.epsilon))
+
+    return config
+
+
+def _percentile(values: Sequence[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    if percentile <= 0:
+        return min(values)
+    if percentile >= 1:
+        return max(values)
+    ordered = sorted(values)
+    index = (len(ordered) - 1) * percentile
+    lower = math.floor(index)
+    upper = math.ceil(index)
+    if lower == upper:
+        return ordered[int(index)]
+    lower_value = ordered[lower]
+    upper_value = ordered[upper]
+    weight = index - lower
+    return lower_value * (1 - weight) + upper_value * weight
+
+
+def _compute_atr_series(
+    candles: Sequence[Mapping[str, Any]],
+    *,
+    period: int,
+) -> Dict[int, float]:
+    atr_values: Dict[int, float] = {}
+    prev_close: float | None = None
+    recent_tr: List[float] = []
+    sorted_candles: List[Tuple[int, Mapping[str, Any]]] = []
+    for candle in candles:
+        ts = _safe_int(candle.get("t"))
+        if ts is None:
+            continue
+        sorted_candles.append((ts, candle))
+    sorted_candles.sort(key=lambda item: item[0])
+
+    if not sorted_candles:
+        return atr_values
+
+    period = max(1, int(period))
+
+    for ts, candle in sorted_candles:
+        high = float(candle.get("h", 0.0))
+        low = float(candle.get("l", 0.0))
+        close = float(candle.get("c", 0.0))
+        range_high_low = high - low
+        if prev_close is None:
+            true_range = range_high_low
+        else:
+            true_range = max(
+                range_high_low,
+                abs(high - prev_close),
+                abs(low - prev_close),
+            )
+        recent_tr.append(true_range)
+        if len(recent_tr) > period:
+            recent_tr.pop(0)
+        atr = sum(recent_tr) / len(recent_tr)
+        atr_values[ts] = atr
+        prev_close = close
+
+    return atr_values
+
+
+def _extract_trades(payload: Any) -> List[Dict[str, Any]]:
+    if not isinstance(payload, Mapping):
+        return []
+    trades_raw = payload.get("agg")
+    trades: List[Dict[str, Any]] = []
+    if not isinstance(trades_raw, Sequence):
+        return trades
+    for entry in trades_raw:
+        if not isinstance(entry, Mapping):
+            continue
+        ts = _safe_int(entry.get("t"))
+        if ts is None:
+            continue
+        qty = _coerce_float(entry.get("q"))
+        if not math.isfinite(qty):
+            continue
+        side = str(entry.get("side", "")).strip().lower()
+        if side not in {"buy", "sell"}:
+            continue
+        trades.append({"t": ts, "q": float(qty), "side": side})
+    return trades
+
+
+def _bucket_trades_by_minute(
+    trades: Sequence[Mapping[str, Any]],
+    *,
+    minute_interval: int,
+    start_ms: int | None,
+    end_ms: int | None,
+) -> Dict[int, List[Mapping[str, Any]]]:
+    buckets: Dict[int, List[Mapping[str, Any]]] = {}
+    for trade in trades:
+        ts = _safe_int(trade.get("t"))
+        if ts is None:
+            continue
+        if start_ms is not None and ts < start_ms:
+            continue
+        if end_ms is not None and ts >= end_ms:
+            continue
+        bucket = _align_to_interval(ts, minute_interval)
+        buckets.setdefault(bucket, []).append(trade)
+    return buckets
+
+
+def _compute_large_trade_threshold(
+    trades: Sequence[Mapping[str, Any]],
+    *,
+    cutoff_ts: int | None,
+    lookback_minutes: int,
+    minute_interval: int,
+    base_threshold: float,
+    percentile: float,
+) -> float:
+    if not trades:
+        return max(0.0, base_threshold)
+
+    reference_cutoff = None
+    if cutoff_ts is not None:
+        reference_cutoff = cutoff_ts - max(0, lookback_minutes - 1) * minute_interval
+
+    quantities: List[float] = []
+    for trade in trades:
+        ts = _safe_int(trade.get("t"))
+        if ts is None:
+            continue
+        if reference_cutoff is not None and ts < reference_cutoff:
+            continue
+        qty = _coerce_float(trade.get("q"))
+        if math.isfinite(qty):
+            quantities.append(float(qty))
+
+    if not quantities:
+        for trade in trades:
+            qty = _coerce_float(trade.get("q"))
+            if math.isfinite(qty):
+                quantities.append(float(qty))
+
+    percentile_value = _percentile(quantities, percentile) if quantities else None
+    threshold = max(0.0, base_threshold)
+    if percentile_value is not None:
+        threshold = max(threshold, float(percentile_value))
+    return threshold
+
+
+def _build_orderflow_per_bar(
+    minute_candles: Sequence[Mapping[str, Any]],
+    trades_by_minute: Mapping[int, Sequence[Mapping[str, Any]]],
+    *,
+    config: OrderflowConfig,
+    large_trade_threshold: float,
+) -> List[Dict[str, Any]]:
+    series: List[Dict[str, Any]] = []
+    atr_series = _compute_atr_series(minute_candles, period=config.atr_period)
+
+    running_cvd = 0.0
+    for candle in sorted(minute_candles, key=lambda item: _safe_int(item.get("t")) or 0):
+        ts = _safe_int(candle.get("t"))
+        if ts is None:
+            continue
+        trades = trades_by_minute.get(ts, [])
+        ask_volume = sum(float(trade.get("q", 0.0)) for trade in trades if str(trade.get("side")).lower() == "buy")
+        bid_volume = sum(float(trade.get("q", 0.0)) for trade in trades if str(trade.get("side")).lower() == "sell")
+
+        delta = ask_volume - bid_volume
+        running_cvd += delta
+
+        atr_value = atr_series.get(ts)
+        if atr_value is None or not math.isfinite(atr_value) or atr_value <= 0:
+            atr_value = max(float(candle.get("h", 0.0)) - float(candle.get("l", 0.0)), 0.0)
+        band = atr_value * config.atr_band_k
+
+        close_price = float(candle.get("c", 0.0))
+        high_price = float(candle.get("h", 0.0))
+        low_price = float(candle.get("l", 0.0))
+
+        close_near_high = abs(high_price - close_price) <= band if band > 0 else math.isclose(high_price, close_price)
+        close_near_low = abs(close_price - low_price) <= band if band > 0 else math.isclose(low_price, close_price)
+
+        imbalance_buy = False
+        imbalance_sell = False
+        if ask_volume > 0:
+            imbalance_buy = (ask_volume / max(bid_volume, config.epsilon)) >= config.imbalance_ratio
+        if bid_volume > 0:
+            imbalance_sell = (bid_volume / max(ask_volume, config.epsilon)) >= config.imbalance_ratio
+
+        absorption_high = (
+            delta < 0
+            and close_near_high
+            and bid_volume > 0
+            and (bid_volume / max(ask_volume, config.epsilon)) >= config.absorption_ratio
+        )
+        absorption_low = (
+            delta > 0
+            and close_near_low
+            and ask_volume > 0
+            and (ask_volume / max(bid_volume, config.epsilon)) >= config.absorption_ratio
+        )
+
+        large_count = 0
+        if trades:
+            threshold = max(0.0, large_trade_threshold)
+            large_count = sum(1 for trade in trades if float(trade.get("q", 0.0)) >= threshold)
+
+        series.append(
+            {
+                "ts": ts,
+                "delta": delta,
+                "cvd": running_cvd,
+                "bid_vol": bid_volume,
+                "ask_vol": ask_volume,
+                "large_trades_count": int(large_count),
+                "absorption_high": bool(absorption_high),
+                "absorption_low": bool(absorption_low),
+                "imbalance_buy": bool(imbalance_buy),
+                "imbalance_sell": bool(imbalance_sell),
+            }
+        )
+
+    return series
+
+
+def _aggregate_orderflow_series(
+    series: Sequence[Mapping[str, Any]],
+    *,
+    interval_ms: int,
+    minute_interval: int,
+) -> List[Dict[str, Any]]:
+    if not series:
+        return []
+
+    per_minute = {int(item["ts"]): item for item in series if isinstance(item, Mapping) and "ts" in item}
+    bucket_times = sorted({_align_to_interval(ts, interval_ms) for ts in per_minute})
+    expected = max(1, interval_ms // minute_interval)
+
+    aggregated: List[Dict[str, Any]] = []
+    running_cvd = 0.0
+
+    for bucket_start in bucket_times:
+        bucket_entries: List[Mapping[str, Any]] = []
+        for index in range(expected):
+            minute_ts = bucket_start + index * minute_interval
+            entry = per_minute.get(minute_ts)
+            if entry is None:
+                bucket_entries = []
+                break
+            bucket_entries.append(entry)
+        if not bucket_entries:
+            continue
+
+        ask_volume = sum(float(entry.get("ask_vol", 0.0)) for entry in bucket_entries)
+        bid_volume = sum(float(entry.get("bid_vol", 0.0)) for entry in bucket_entries)
+        delta = ask_volume - bid_volume
+        running_cvd += delta
+
+        aggregated.append(
+            {
+                "ts": bucket_start,
+                "delta": delta,
+                "cvd": running_cvd,
+                "bid_vol": bid_volume,
+                "ask_vol": ask_volume,
+                "large_trades_count": int(
+                    sum(int(entry.get("large_trades_count", 0)) for entry in bucket_entries)
+                ),
+                "absorption_high": any(bool(entry.get("absorption_high")) for entry in bucket_entries),
+                "absorption_low": any(bool(entry.get("absorption_low")) for entry in bucket_entries),
+                "imbalance_buy": any(bool(entry.get("imbalance_buy")) for entry in bucket_entries),
+                "imbalance_sell": any(bool(entry.get("imbalance_sell")) for entry in bucket_entries),
+            }
+        )
+
+    return aggregated
+
+
+def _build_orderflow_block(
+    minute_candles: Sequence[Mapping[str, Any]],
+    trades_payload: Any,
+    *,
+    config: OrderflowConfig,
+) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
+    minute_interval = MINUTE_INTERVAL_MS
+    if not minute_candles or minute_interval <= 0:
+        return {tf: {"per_bar": []} for tf in ("1m", "3m", "5m", "15m")}
+
+    trades = _extract_trades(trades_payload)
+    minute_ts: List[int] = []
+    for candle in minute_candles:
+        ts = _safe_int(candle.get("t"))
+        if ts is not None:
+            minute_ts.append(ts)
+    minute_ts.sort()
+    start_ms = minute_ts[0] if minute_ts else None
+    end_ms = (minute_ts[-1] + minute_interval) if minute_ts else None
+
+    trades_by_minute = _bucket_trades_by_minute(
+        trades,
+        minute_interval=minute_interval,
+        start_ms=start_ms,
+        end_ms=end_ms,
+    )
+
+    last_ts = minute_ts[-1] if minute_ts else None
+    threshold = _compute_large_trade_threshold(
+        trades,
+        cutoff_ts=last_ts,
+        lookback_minutes=config.large_trade_lookback_minutes,
+        minute_interval=minute_interval,
+        base_threshold=config.large_trade_min_qty,
+        percentile=config.large_trade_percentile,
+    )
+
+    minute_series = _build_orderflow_per_bar(
+        minute_candles,
+        trades_by_minute,
+        config=config,
+        large_trade_threshold=threshold,
+    )
+
+    result: Dict[str, Dict[str, List[Dict[str, Any]]]] = {
+        "1m": {"per_bar": minute_series},
+    }
+
+    for tf in ("3m", "5m", "15m"):
+        interval_ms = TIMEFRAME_TO_MS.get(tf)
+        if not interval_ms or interval_ms <= minute_interval:
+            if interval_ms == minute_interval:
+                result[tf] = {"per_bar": minute_series[:]}
+            else:
+                result[tf] = {"per_bar": []}
+            continue
+        aggregated = _aggregate_orderflow_series(
+            minute_series,
+            interval_ms=interval_ms,
+            minute_interval=minute_interval,
+        )
+        result[tf] = {"per_bar": aggregated}
+
+    return result
+
+
 def _compute_vwap(candles: Sequence[Mapping[str, Any]]) -> float:
     total_pv = 0.0
     total_volume = 0.0
@@ -755,10 +1370,28 @@ def _build_volume_profile_stats(
             "window": {"start": window_start_iso, "end": window_end_iso},
         }
 
+    session_high: float | None = None
+    session_low: float | None = None
+
+    def _attach_extrema(payload: Dict[str, Any]) -> Dict[str, Any]:
+        if session_high is not None and session_low is not None:
+            payload["session_high"] = session_high
+            payload["session_low"] = session_low
+        return payload
+
     vwap_value = _compute_vwap(scoped)
     prices: List[float] = []
     volumes: List[float] = []
     for candle in scoped:
+        high_value = _safe_float(candle.get("h") or candle.get("high"))
+        low_value = _safe_float(candle.get("l") or candle.get("low"))
+        if high_value is not None:
+            session_high = (
+                high_value if session_high is None else max(session_high, high_value)
+            )
+        if low_value is not None:
+            session_low = low_value if session_low is None else min(session_low, low_value)
+
         volume = float(candle.get("v", 0.0))
         if volume <= 0:
             continue
@@ -769,23 +1402,27 @@ def _build_volume_profile_stats(
         volumes.append(volume)
 
     if not prices or not volumes:
-        return {
-            "vwap": vwap_value,
-            "poc": None,
-            "vah": None,
-            "val": None,
-            "window": {"start": window_start_iso, "end": window_end_iso},
-        }
+        return _attach_extrema(
+            {
+                "vwap": vwap_value,
+                "poc": None,
+                "vah": None,
+                "val": None,
+                "window": {"start": window_start_iso, "end": window_end_iso},
+            }
+        )
 
     bin_size = _determine_bin_size(prices, tick_size)
     if not bin_size or bin_size <= 0:
-        return {
-            "vwap": vwap_value,
-            "poc": None,
-            "vah": None,
-            "val": None,
-            "window": {"start": window_start_iso, "end": window_end_iso},
-        }
+        return _attach_extrema(
+            {
+                "vwap": vwap_value,
+                "poc": None,
+                "vah": None,
+                "val": None,
+                "window": {"start": window_start_iso, "end": window_end_iso},
+            }
+        )
 
     min_price = min(prices)
     max_price = max(prices)
@@ -803,13 +1440,15 @@ def _build_volume_profile_stats(
 
     total_volume = sum(histogram)
     if total_volume <= 0:
-        return {
-            "vwap": vwap_value,
-            "poc": None,
-            "vah": None,
-            "val": None,
-            "window": {"start": window_start_iso, "end": window_end_iso},
-        }
+        return _attach_extrema(
+            {
+                "vwap": vwap_value,
+                "poc": None,
+                "vah": None,
+                "val": None,
+                "window": {"start": window_start_iso, "end": window_end_iso},
+            }
+        )
 
     poc_index = max(range(len(histogram)), key=lambda idx: histogram[idx])
     poc_price = start_bin + poc_index * bin_size
@@ -842,12 +1481,54 @@ def _build_volume_profile_stats(
     val_price = start_bin + left * bin_size
     vah_price = start_bin + right * bin_size
 
+    return _attach_extrema(
+        {
+            "vwap": vwap_value,
+            "poc": round(poc_price, 12),
+            "vah": round(vah_price, 12),
+            "val": round(val_price, 12),
+            "window": {"start": window_start_iso, "end": window_end_iso},
+        }
+    )
+
+
+def _build_prev_day_block(
+    candles: Sequence[Mapping[str, Any]],
+    *,
+    daily_start_ms: int,
+    tick_size: float | None,
+) -> Dict[str, float | None]:
+    """Compute previous-day reference levels from minute candles."""
+
+    prev_end_ms = daily_start_ms - MINUTE_INTERVAL_MS
+    prev_start_ms = daily_start_ms - MS_IN_DAY
+    if prev_end_ms < prev_start_ms:
+        prev_end_ms = prev_start_ms
+
+    scoped = _filter_candles(candles, start_ms=prev_start_ms, end_ms=prev_end_ms)
+    summary = _summarise(scoped)
+    profile = _build_volume_profile_stats(
+        candles,
+        start_ms=prev_start_ms,
+        end_ms=prev_end_ms,
+        tick_size=tick_size,
+        value_area_pct=VALUE_AREA_PCT,
+    )
+
+    def _float_or_none(value: Any) -> float | None:
+        return _safe_float(value)
+
+    close_value: float | None = None
+    if scoped:
+        close_value = _safe_float(scoped[-1].get("c"))
+
     return {
-        "vwap": vwap_value,
-        "poc": round(poc_price, 12),
-        "vah": round(vah_price, 12),
-        "val": round(val_price, 12),
-        "window": {"start": window_start_iso, "end": window_end_iso},
+        "pdh": _float_or_none(summary.get("high")),
+        "pdl": _float_or_none(summary.get("low")),
+        "close": close_value,
+        "poc": _float_or_none((profile or {}).get("poc")),
+        "vah": _float_or_none((profile or {}).get("vah")),
+        "val": _float_or_none((profile or {}).get("val")),
     }
 
 
@@ -861,7 +1542,7 @@ def _session_window(
     anchor_ms: int,
     start_time: dtime,
     end_time: dtime,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     anchor_aligned = _align_to_interval(anchor_ms, MINUTE_INTERVAL_MS)
     anchor_dt = datetime.fromtimestamp(anchor_aligned / 1000.0, tz=UTC)
     day_start = datetime(anchor_dt.year, anchor_dt.month, anchor_dt.day, tzinfo=UTC)
@@ -872,12 +1553,46 @@ def _session_window(
         session_end_dt += timedelta(days=1)
 
     start_ms = int(session_start_dt.timestamp() * 1000)
-    raw_end_ms = int(session_end_dt.timestamp() * 1000) - MINUTE_INTERVAL_MS
+    end_boundary_ms = int(session_end_dt.timestamp() * 1000)
+    raw_end_ms = end_boundary_ms - MINUTE_INTERVAL_MS
     if raw_end_ms < start_ms:
         raw_end_ms = start_ms
 
     end_ms = min(raw_end_ms, anchor_aligned)
-    return start_ms, end_ms
+    close_ms = end_boundary_ms
+
+    if end_ms < start_ms:
+        end_ms = start_ms
+    return start_ms, end_ms, close_ms
+
+
+def _compute_initial_balance_extrema(
+    candles: Sequence[Mapping[str, Any]],
+    *,
+    session_start_ms: int,
+    minutes: int = 60,
+) -> tuple[float | None, float | None]:
+    """Determine the high/low for the initial balance slice of a session."""
+
+    if minutes <= 0:
+        return None, None
+
+    cutoff_ms = session_start_ms + minutes * MINUTE_INTERVAL_MS
+    ib_high: float | None = None
+    ib_low: float | None = None
+
+    for candle in candles:
+        ts = _safe_int(candle.get("t"))
+        if ts is None or ts < session_start_ms or ts >= cutoff_ms:
+            continue
+        high_val = _safe_float(candle.get("h"))
+        low_val = _safe_float(candle.get("l"))
+        if high_val is not None:
+            ib_high = high_val if ib_high is None else max(ib_high, high_val)
+        if low_val is not None:
+            ib_low = low_val if ib_low is None else min(ib_low, low_val)
+
+    return ib_high, ib_low
 
 
 def _extract_range(candidate: Mapping[str, Any]) -> tuple[int, int] | None:
@@ -939,6 +1654,29 @@ def _filter_indicator_block(value: Any, start_ms: int | None, end_ms: int | None
         return filtered_items if has_range else filtered_items
 
     return value
+
+
+def _build_profile_level_map(
+    profile_tpo: Sequence[Mapping[str, Any]] | None,
+) -> Dict[str, Dict[str, float]]:
+    levels: Dict[str, Dict[str, float]] = {}
+    if not profile_tpo:
+        return levels
+    for entry in profile_tpo:
+        if not isinstance(entry, Mapping):
+            continue
+        session_raw = entry.get("session") or "daily"
+        session = str(session_raw).lower()
+        session_levels = levels.setdefault(session, {})
+        for key, target in (("POC", "poc"), ("VAH", "vah"), ("VAL", "val")):
+            value = entry.get(key)
+            if value is None:
+                continue
+            try:
+                session_levels[target] = float(value)
+            except (TypeError, ValueError):
+                continue
+    return levels
 
 
 def _collect_nested_events(source: Any, events: List[Mapping[str, Any]]) -> None:
@@ -1149,14 +1887,25 @@ def build_check_all_datas(
     symbol = str(snapshot.get("symbol") or snapshot.get("pair") or "UNKNOWN").upper()
     raw_meta = snapshot.get("meta") if isinstance(snapshot.get("meta"), Mapping) else None
     profile_config = resolve_profile_config(symbol, raw_meta)
-    sessions = list(Meta.iter_vwap_sessions())
+    sessions = list(VWAP_TPO_SESSIONS)
     profile_tpo: List[Dict[str, Any]] = []
     profile_flat: List[Dict[str, float]] = []
     profile_zones: List[Dict[str, Any]] = []
+    profile_level_map: Dict[str, Dict[str, float]] = {}
     detected_zones: Dict[str, Any] = {
         "symbol": symbol,
-        "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
+        "zones": {
+            "fvg": [],
+            "ob": [],
+            "mb": [],
+            "bb": [],
+            "rb": [],
+            "pb": [],
+            "sr": [],
+            "profile_levels": [],
+        },
     }
+    zone_cfg = ZonesConfig(tick_size=profile_config.get("tick_size"))
 
     target_tf_key = profile_config.get("target_tf_key", "1m")
     base_candidates = frames.get(target_tf_key, [])
@@ -1198,6 +1947,7 @@ def build_check_all_datas(
             cache_token=cache_token,
             tf_key=target_tf_key,
         )
+        profile_level_map = _build_profile_level_map(profile_tpo)
 
     snapshot_selection = snapshot.get("selection") if isinstance(snapshot.get("selection"), Mapping) else None
     selection_start = selection_start_ms or _safe_int(snapshot_selection.get("start")) if snapshot_selection else None
@@ -1303,6 +2053,121 @@ def build_check_all_datas(
     frames["1m"] = [minute_index_all[ts] for ts in sorted(minute_index_all)]
     minute_candles = frames["1m"]
 
+    zones_window_hours = max(48, hours_window)
+    fifteen_min_ms = TIMEFRAME_TO_MS.get("15m") or 15 * MINUTE_INTERVAL_MS
+    zone_window_ms = zones_window_hours * MS_IN_HOUR
+    raw_zone_start = max(0, window_end_ms - zone_window_ms)
+    if fifteen_min_ms:
+        raw_zone_start = max(0, _align_to_interval(raw_zone_start, fifteen_min_ms))
+    zones_window_start_ms = raw_zone_start
+    warmup_bars_base = zone_cfg.atr_period + 50
+    min_bars_per_tf = {"15m": 200, "1h": 60, "4h": 6}
+    history_candidate = zones_window_start_ms
+    for tf_key, baseline in min_bars_per_tf.items():
+        required = max(baseline, warmup_bars_base)
+        interval_ms_tf = TIMEFRAME_TO_MS.get(tf_key)
+        if not interval_ms_tf:
+            continue
+        candidate = zones_window_start_ms - required * interval_ms_tf
+        if candidate < history_candidate:
+            history_candidate = candidate
+    history_candidate = min(history_candidate, zones_window_start_ms - MS_IN_DAY)
+    zones_history_start_ms = max(0, history_candidate)
+    zones_history_start_ms = max(0, _align_to_interval(zones_history_start_ms, MINUTE_INTERVAL_MS))
+
+    zone_expected_minutes = _build_expected_times(
+        zones_history_start_ms, window_end_ms, MINUTE_INTERVAL_MS
+    )
+    zone_history_gaps = _summarise_missing_times(zone_expected_minutes, minute_index_all)
+    if zone_history_gaps:
+        try:
+            zone_downloaded_minutes = _download_missing_minutes(
+                symbol,
+                zones_history_start_ms,
+                window_end_ms,
+                zone_history_gaps,
+            )
+        except BinanceDownloadError as exc:
+            detail = {
+                "tf": target_tf_key,
+                "window": {"start_ms": zones_history_start_ms, "end_ms": window_end_ms},
+                "stage": "zones_history",
+                "minute_missing_before": sum(gap["count"] for gap in zone_history_gaps),
+                "fetched_1m_count": exc.downloaded,
+                "time_gaps": zone_history_gaps,
+            }
+            raise DataQualityError(detail) from exc
+        for candle in zone_downloaded_minutes:
+            ts = candle["t"]
+            if ts < zones_history_start_ms or ts > window_end_ms:
+                continue
+            minute_index_all[ts] = candle
+
+    frames["1m"] = [minute_index_all[ts] for ts in sorted(minute_index_all)]
+    minute_candles = frames["1m"]
+
+    minute_zone_history = _filter_candles(
+        minute_candles, start_ms=zones_history_start_ms, end_ms=window_end_ms
+    )
+    minute_zone_window = [
+        candle for candle in minute_zone_history if int(candle["t"]) >= zones_window_start_ms
+    ]
+
+    def _build_zone_frames(source: Sequence[Mapping[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+        bundle: Dict[str, List[Dict[str, Any]]] = {}
+        if not source:
+            return bundle
+        ordered = sorted(source, key=lambda candle: int(candle["t"]))
+        bundle["1m"] = [dict(item) for item in ordered]
+        for tf_key in ("3m", "5m", "15m", "1h", "4h", "1d"):
+            interval_ms_tf = TIMEFRAME_TO_MS.get(tf_key)
+            if interval_ms_tf is None:
+                continue
+            aggregated = resample_ohlcv(ordered, interval_ms_tf)
+            if not aggregated:
+                continue
+            normalised: List[Dict[str, Any]] = []
+            for item in aggregated:
+                if not isinstance(item, Mapping):
+                    continue
+                ts = _safe_int(item.get("t"))
+                if ts is None or ts > window_end_ms:
+                    continue
+                normalised.append(
+                    {
+                        "t": ts,
+                        "o": _coerce_float(item.get("o")),
+                        "h": _coerce_float(item.get("h")),
+                        "l": _coerce_float(item.get("l")),
+                        "c": _coerce_float(item.get("c")),
+                        "v": _coerce_float(item.get("v")),
+                    }
+                )
+            if normalised:
+                normalised.sort(key=lambda candle: candle["t"])
+                bundle[tf_key] = normalised
+        return bundle
+
+    zone_frames_full = _build_zone_frames(minute_zone_history)
+    zone_frames_window = _build_zone_frames(minute_zone_window)
+
+    zone_tf_lengths = {
+        tf: len(zone_frames_window.get(tf, [])) for tf in ("15m", "1h", "4h", "1d")
+    }
+    warmup_bars_per_tf: Dict[str, int] = {}
+    for tf in ("15m", "1h", "4h", "1d"):
+        total = len(zone_frames_full.get(tf, []))
+        window_count = len(zone_frames_window.get(tf, []))
+        warmup_bars_per_tf[tf] = max(0, total - window_count)
+    zones_diag = {
+        "tf_lengths": zone_tf_lengths,
+        "atr_period": zone_cfg.atr_period,
+        "warmup_bars_per_tf": warmup_bars_per_tf,
+        "window_hours": zones_window_hours,
+        "tick_size": zone_cfg.tick_size,
+    }
+    liquidity_equal_levels = build_equal_liquidity_levels(zone_frames_full)
+
     base_index_all = {candle["t"]: candle for candle in base_candles}
 
     if target_interval_ms <= MINUTE_INTERVAL_MS:
@@ -1353,37 +2218,6 @@ def build_check_all_datas(
     reference_ts = window_end_ms + MINUTE_INTERVAL_MS
     reference_dt = datetime.fromtimestamp(reference_ts / 1000.0, tz=UTC)
     detailed_start_ts = window_start_ms
-
-    detection_candles: List[Dict[str, Any]] = []
-    if base_candles:
-        detection_candles = _filter_candles(
-            base_candles,
-            start_ms=detailed_start_ts,
-            end_ms=window_end_ms,
-        )
-
-    if detection_candles:
-        try:
-            zone_cfg = ZonesConfig(tick_size=profile_config.get("tick_size"))
-            detected_zones = detect_zones(
-                detection_candles,
-                target_tf_key,
-                symbol,
-                zone_cfg,
-            )
-        except Exception:  # pragma: no cover - defensive logging guard
-            logging.getLogger(__name__).exception(
-                "Failed to detect zones for check-all payload",
-                extra={
-                    "snapshot_id": snapshot.get("id"),
-                    "symbol": symbol,
-                    "timeframe": target_tf_key,
-                },
-            )
-            detected_zones = {
-                "symbol": symbol,
-                "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
-            }
 
     movement_anchor_ts = detailed_start_ts
     movement_start_ts = min(selection_start, movement_anchor_ts)
@@ -1512,8 +2346,6 @@ def build_check_all_datas(
         },
     }
 
-    movement_key = f"movement_datas_for_{movement_days}_days"
-
     tick_size_value = profile_config.get("tick_size") if isinstance(profile_config, Mapping) else None
     tick_size_numeric: float | None = None
     if isinstance(tick_size_value, (int, float)) and tick_size_value > 0:
@@ -1580,6 +2412,106 @@ def build_check_all_datas(
         },
     )
 
+    if tick_size_numeric and isinstance(tick_size_numeric, (int, float)):
+        zone_cfg.tick_size = float(tick_size_numeric)
+    zones_diag["tick_size"] = zone_cfg.tick_size
+
+    if zone_frames_full:
+        try:
+            detected_zones = detect_zones(
+                frames=zone_frames_full,
+                profile_levels=profile_level_map,
+                liquidity_levels=liquidity_equal_levels,
+                config=zone_cfg,
+            )
+        except Exception:  # pragma: no cover - defensive logging guard
+            logging.getLogger(__name__).exception(
+                "Failed to detect zones for check-all payload",
+                extra={
+                    "snapshot_id": snapshot.get("id"),
+                    "symbol": symbol,
+                    "timeframe": target_tf_key,
+                },
+            )
+            detected_zones = {
+                "zones": {
+                    "fvg": [],
+                    "ob": [],
+                    "mb": [],
+                    "bb": [],
+                    "rb": [],
+                    "pb": [],
+                    "sr": [],
+                    "profile_levels": [],
+                },
+                "meta": {},
+            }
+
+    zones_container = detected_zones.get("zones") if isinstance(detected_zones, Mapping) else None
+    if isinstance(zones_container, MutableMapping) and profile_level_map:
+        if not zones_container.get("profile_levels"):
+            zones_container["profile_levels"] = [
+                {"type": level, "price": price, "session": session}
+                for session, level_map in profile_level_map.items()
+                for level, price in level_map.items()
+            ]
+
+    if isinstance(detected_zones, MutableMapping):
+        meta_block = detected_zones.setdefault("meta", {})
+        if isinstance(meta_block, MutableMapping):
+            meta_block["zones_diag"] = zones_diag
+    if isinstance(zones_container, MutableMapping):
+        timestamp_filters = {
+            "fvg": "created_utc",
+            "ob": "origin_utc",
+            "mb": "origin_utc",
+            "bb": "origin_utc",
+            "rb": "origin_utc",
+            "pb": "origin_utc",
+            "sr": "ts",
+        }
+        for key, field in timestamp_filters.items():
+            series = zones_container.get(key)
+            if not isinstance(series, Sequence):
+                continue
+            filtered: List[Dict[str, Any]] = []
+            for item in series:
+                if not isinstance(item, Mapping):
+                    continue
+                ts_ms = _iso_to_ms(item.get(field))
+                if ts_ms is None or ts_ms >= zones_window_start_ms:
+                    filtered.append(dict(item))
+            zones_container[key] = filtered
+
+        fvg_series = zones_container.get("fvg")
+        if isinstance(fvg_series, Sequence) and not fvg_series:
+            meta_block = (
+                detected_zones.get("meta") if isinstance(detected_zones, Mapping) else None
+            )
+            fvg_stats: Dict[str, Any] = {}
+            if isinstance(meta_block, Mapping):
+                stats_payload = meta_block.get("fvg_stats")
+                if isinstance(stats_payload, Mapping):
+                    for tf_key, tf_stats in stats_payload.items():
+                        tf_name = str(tf_key)
+                        if isinstance(tf_stats, Mapping):
+                            fvg_stats[tf_name] = {
+                                str(metric): int(value)
+                                for metric, value in tf_stats.items()
+                                if isinstance(value, (int, float))
+                            }
+                        else:
+                            fvg_stats[tf_name] = tf_stats
+            logging.getLogger(__name__).info(
+                "FVG detection returned no zones for window",
+                extra={
+                    "symbol": symbol,
+                    "fvg_stats": fvg_stats,
+                    "zones_window_start": zones_window_start_ms,
+                    "window_hours": zones_window_hours,
+                },
+            )
+
     liquidity_payload = build_liquidity_snapshot(
         liquidity_frames,
         symbol=symbol,
@@ -1611,6 +2543,13 @@ def build_check_all_datas(
             if ts in minute_window_index
         ]
 
+    orderflow_config = _resolve_orderflow_config(raw_meta)
+    orderflow_block = _build_orderflow_block(
+        minute_htf_source,
+        snapshot.get("agg_trades"),
+        config=orderflow_config,
+    )
+    ohlcv_block = build_multi_timeframe_ohlcv(minute_htf_source, symbol=symbol)
     hourly_htf = aggregate_1m_to_1h(minute_htf_source) if minute_frame_present else []
     htf_blocks: List[Dict[str, Any]] = []
     if minute_frame_present:
@@ -1665,23 +2604,59 @@ def build_check_all_datas(
         value_area_pct=VALUE_AREA_PCT,
     )
 
+    composite_day_end_ms = daily_start_ms + MS_IN_DAY - MINUTE_INTERVAL_MS
+    if composite_day_end_ms < daily_start_ms:
+        composite_day_end_ms = daily_start_ms
+    composite_day_profile = _build_volume_profile_stats(
+        minute_series,
+        start_ms=daily_start_ms,
+        end_ms=min(window_end_ms, composite_day_end_ms),
+        tick_size=tick_size_numeric,
+        value_area_pct=VALUE_AREA_PCT,
+    )
+
     session_profiles: Dict[str, Dict[str, Any]] = {}
     session_sigma_blocks: Dict[str, Dict[str, Any]] = {}
+    session_boundaries: Dict[str, Dict[str, Any]] = {}
     for session_name, session_start, session_end in sessions:
-        session_start_ms, session_end_ms = _session_window(window_end_ms, session_start, session_end)
+        (
+            session_start_ms,
+            session_end_ms,
+            session_close_ms,
+        ) = _session_window(window_end_ms, session_start, session_end)
         session_filtered = _filter_candles(
             minute_series, start_ms=session_start_ms, end_ms=session_end_ms
         )
-        session_profiles[session_name] = _build_volume_profile_stats(
+        ib_high, ib_low = _compute_initial_balance_extrema(
+            session_filtered, session_start_ms=session_start_ms
+        )
+        profile_entry = _build_volume_profile_stats(
             minute_series,
             start_ms=session_start_ms,
             end_ms=session_end_ms,
             tick_size=tick_size_numeric,
             value_area_pct=VALUE_AREA_PCT,
         )
+        if isinstance(profile_entry, MutableMapping):
+            if "session_high" in profile_entry and "high" not in profile_entry:
+                profile_entry["high"] = profile_entry.get("session_high")
+            if "session_low" in profile_entry and "low" not in profile_entry:
+                profile_entry["low"] = profile_entry.get("session_low")
+            profile_entry["open_utc"] = _isoformat_utc(session_start_ms)
+            profile_entry["close_utc"] = _isoformat_utc(session_close_ms)
+            profile_entry["ib_high"] = ib_high
+            profile_entry["ib_low"] = ib_low
+        session_profiles[session_name] = profile_entry
         session_sigma_blocks[session_name] = _build_vwap_sigma_block(
             session_filtered, basis="session"
         )
+        session_boundaries[session_name] = {
+            "start_ms": session_start_ms,
+            "end_ms": session_end_ms,
+            "close_ms": session_close_ms,
+            "ib_high": ib_high,
+            "ib_low": ib_low,
+        }
 
     vwap_payload = {
         "daily": daily_vwap_profile,
@@ -1693,52 +2668,269 @@ def build_check_all_datas(
         "sessions": session_sigma_blocks,
     }
 
-    latest_candle_payload_source = (
-        latest_candle_source
-        or (primary_candles[-1] if primary_candles else None)
-    )
-    latest_candle_payload = (
-        dict(latest_candle_payload_source)
-        if isinstance(latest_candle_payload_source, Mapping)
-        else {}
-    )
-
-    data_quality_public = {
-        key: data_quality[key]
-        for key in (
-            "tf",
-            "window",
-            "minute_missing_before",
-            "minute_missing_after",
-            "tf_missing_before",
-            "tf_missing_after",
+    session_time_lookup = {
+        str(name).lower(): (start_time, end_time)
+        for name, start_time, end_time in sessions
+    }
+    for entry in profile_tpo:
+        if not isinstance(entry, MutableMapping):
+            continue
+        session_label = entry.get("session")
+        if not isinstance(session_label, str) or session_label.lower() == "daily":
+            continue
+        schedule = session_time_lookup.get(session_label.lower())
+        if not schedule:
+            continue
+        date_str = entry.get("date")
+        session_date = None
+        if isinstance(date_str, str) and date_str:
+            try:
+                session_date = datetime.fromisoformat(date_str).date()
+            except ValueError:
+                session_date = None
+        if session_date is None:
+            continue
+        start_time, end_time = schedule
+        start_dt = datetime.combine(session_date, start_time, tzinfo=UTC)
+        end_dt = datetime.combine(session_date, end_time, tzinfo=UTC)
+        if end_time <= start_time:
+            end_dt += timedelta(days=1)
+        start_ms = int(start_dt.timestamp() * 1000)
+        end_ms = int(end_dt.timestamp() * 1000) - MINUTE_INTERVAL_MS
+        session_candles = _filter_candles(
+            minute_series, start_ms=start_ms, end_ms=end_ms
         )
-        if key in data_quality
+        ib_high, ib_low = _compute_initial_balance_extrema(
+            session_candles, session_start_ms=start_ms
+        )
+        if "session_high" in entry and "high" not in entry:
+            entry["high"] = entry.get("session_high")
+        if "session_low" in entry and "low" not in entry:
+            entry["low"] = entry.get("session_low")
+        entry["open_utc"] = _isoformat_utc(start_ms)
+        entry["close_utc"] = _isoformat_utc(int(end_dt.timestamp() * 1000))
+        entry["ib_high"] = ib_high
+        entry["ib_low"] = ib_low
+
+    def _sigma_levels_map(block: Mapping[str, Any] | None) -> Dict[int, Dict[str, float | None]]:
+        levels: Dict[int, Dict[str, float | None]] = {}
+        if not isinstance(block, Mapping):
+            return levels
+        sigma_entries = block.get("sigma")
+        if not isinstance(sigma_entries, Sequence):
+            return levels
+        for entry in sigma_entries:
+            if not isinstance(entry, Mapping):
+                continue
+            try:
+                key = int(entry.get("k"))
+            except (TypeError, ValueError):
+                continue
+            minus_val = _safe_float(entry.get("price_minus"))
+            plus_val = _safe_float(entry.get("price_plus"))
+            levels[key] = {"minus": minus_val, "plus": plus_val}
+        return levels
+
+    def _sd_payload(levels: Mapping[int, Mapping[str, float | None]], order: int) -> Dict[str, float | None]:
+        payload = levels.get(order, {}) if isinstance(levels, Mapping) else {}
+        minus_value = payload.get("minus") if isinstance(payload, Mapping) else None
+        plus_value = payload.get("plus") if isinstance(payload, Mapping) else None
+        return {"minus": minus_value, "plus": plus_value}
+
+    daily_sigma_levels = _sigma_levels_map(vwap_sigma_payload.get("daily"))
+    vwap_tpo_daily = None
+    if isinstance(daily_vwap_profile, Mapping) and daily_vwap_profile:
+        vwap_tpo_daily = {
+            "open_utc": _isoformat_utc(daily_start_ms),
+            "vwap": daily_vwap_profile.get("vwap"),
+            "sd1": _sd_payload(daily_sigma_levels, 1),
+            "sd2": _sd_payload(daily_sigma_levels, 2),
+        }
+
+    vwap_tpo_sessions: Dict[str, Dict[str, Any]] = {}
+    session_sigma_levels: Dict[str, Dict[int, Dict[str, float | None]]] = {
+        name: _sigma_levels_map(block)
+        for name, block in session_sigma_blocks.items()
+    }
+    for session_name, profile_entry in session_profiles.items():
+        boundary = session_boundaries.get(session_name, {})
+        sigma_levels = session_sigma_levels.get(session_name, {})
+        open_ms = boundary.get("start_ms")
+        close_ms = boundary.get("close_ms")
+        ib_high = boundary.get("ib_high")
+        ib_low = boundary.get("ib_low")
+        session_payload = {
+            "open_utc": _isoformat_utc(open_ms) if open_ms is not None else None,
+            "close_utc": _isoformat_utc(close_ms) if close_ms is not None else None,
+            "vwap": profile_entry.get("vwap") if isinstance(profile_entry, Mapping) else None,
+            "sd1": _sd_payload(sigma_levels, 1),
+            "sd2": _sd_payload(sigma_levels, 2),
+            "poc": profile_entry.get("poc") if isinstance(profile_entry, Mapping) else None,
+            "vah": profile_entry.get("vah") if isinstance(profile_entry, Mapping) else None,
+            "val": profile_entry.get("val") if isinstance(profile_entry, Mapping) else None,
+            "ib_high": ib_high,
+            "ib_low": ib_low,
+            "high": profile_entry.get("session_high") if isinstance(profile_entry, Mapping) else None,
+            "low": profile_entry.get("session_low") if isinstance(profile_entry, Mapping) else None,
+        }
+        if isinstance(profile_entry, Mapping):
+            if profile_entry.get("high") is not None:
+                session_payload["high"] = profile_entry.get("high")
+            if profile_entry.get("low") is not None:
+                session_payload["low"] = profile_entry.get("low")
+        vwap_tpo_sessions[session_name] = session_payload
+
+    composite_day_payload = None
+    if isinstance(composite_day_profile, Mapping):
+        composite_day_payload = {
+            "poc": composite_day_profile.get("poc"),
+            "vah": composite_day_profile.get("vah"),
+            "val": composite_day_profile.get("val"),
+        }
+
+    vwap_tpo_block = {
+        "daily": vwap_tpo_daily,
+        "sessions": vwap_tpo_sessions,
     }
 
-    profile_public = _filter_profile_entries(profile_flat)
+    prev_day_block = _build_prev_day_block(
+        minute_series,
+        daily_start_ms=daily_start_ms,
+        tick_size=tick_size_numeric,
+    )
+
+    def _float_or_none(value: Any) -> float | None:
+        return _safe_float(value)
+
+    composite_day_public = {
+        "poc": _float_or_none((composite_day_payload or {}).get("poc")),
+        "vah": _float_or_none((composite_day_payload or {}).get("vah")),
+        "val": _float_or_none((composite_day_payload or {}).get("val")),
+    }
+
+    def _normalise_sd(sd_block: Mapping[str, Any] | None) -> Dict[str, float | None]:
+        if not isinstance(sd_block, Mapping):
+            return {"minus": None, "plus": None}
+        return {
+            "minus": _float_or_none(sd_block.get("minus")),
+            "plus": _float_or_none(sd_block.get("plus")),
+        }
+
+    daily_sd1 = _normalise_sd((vwap_tpo_daily or {}).get("sd1") if isinstance(vwap_tpo_daily, Mapping) else None)
+    daily_sd2 = _normalise_sd((vwap_tpo_daily or {}).get("sd2") if isinstance(vwap_tpo_daily, Mapping) else None)
+    daily_open = None
+    daily_vwap_value = None
+    if isinstance(vwap_tpo_daily, Mapping):
+        daily_open = vwap_tpo_daily.get("open_utc")
+        daily_vwap_value = _float_or_none(vwap_tpo_daily.get("vwap"))
+    if daily_open is None:
+        daily_open = _isoformat_utc(daily_start_ms)
+
+    vwap_tpo_daily_public = {
+        "open_utc": daily_open,
+        "vwap": daily_vwap_value,
+        "sd1": daily_sd1,
+        "sd2": daily_sd2,
+    }
+
+    ordered_sessions: Dict[str, Dict[str, Any]] = {}
+    for session_name, _, _ in sessions:
+        raw_payload = vwap_tpo_sessions.get(session_name, {})
+        open_utc = raw_payload.get("open_utc") if isinstance(raw_payload, Mapping) else None
+        close_utc = raw_payload.get("close_utc") if isinstance(raw_payload, Mapping) else None
+        ordered_sessions[session_name] = {
+            "open_utc": open_utc,
+            "close_utc": close_utc,
+            "vwap": _float_or_none(raw_payload.get("vwap")) if isinstance(raw_payload, Mapping) else None,
+            "sd1": _normalise_sd(raw_payload.get("sd1") if isinstance(raw_payload, Mapping) else None),
+            "sd2": _normalise_sd(raw_payload.get("sd2") if isinstance(raw_payload, Mapping) else None),
+            "poc": _float_or_none(raw_payload.get("poc")) if isinstance(raw_payload, Mapping) else None,
+            "vah": _float_or_none(raw_payload.get("vah")) if isinstance(raw_payload, Mapping) else None,
+            "val": _float_or_none(raw_payload.get("val")) if isinstance(raw_payload, Mapping) else None,
+            "ib_high": _float_or_none(raw_payload.get("ib_high")) if isinstance(raw_payload, Mapping) else None,
+            "ib_low": _float_or_none(raw_payload.get("ib_low")) if isinstance(raw_payload, Mapping) else None,
+            "high": _float_or_none(raw_payload.get("high")) if isinstance(raw_payload, Mapping) else None,
+            "low": _float_or_none(raw_payload.get("low")) if isinstance(raw_payload, Mapping) else None,
+        }
+
+    vwap_tpo_public = {
+        "daily": vwap_tpo_daily_public,
+        "sessions": ordered_sessions,
+    }
+
+    ohlcv_public: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+    for tf in ("1m", "3m", "5m", "15m", "1h", "4h", "1d"):
+        tf_payload = ohlcv_block.get(tf) if isinstance(ohlcv_block, Mapping) else None
+        candles: List[Dict[str, Any]] = []
+        if isinstance(tf_payload, Mapping):
+            raw_candles = tf_payload.get("candles")
+            if isinstance(raw_candles, Sequence):
+                candles = [dict(candle) for candle in raw_candles if isinstance(candle, Mapping)]
+        ohlcv_public[tf] = {"candles": candles}
+
+    orderflow_public: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+    for tf in ("1m", "3m", "5m", "15m"):
+        tf_payload = orderflow_block.get(tf) if isinstance(orderflow_block, Mapping) else None
+        per_bar: List[Dict[str, Any]] = []
+        if isinstance(tf_payload, Mapping):
+            raw_series = tf_payload.get("per_bar")
+            if isinstance(raw_series, Sequence):
+                per_bar = [dict(entry) for entry in raw_series if isinstance(entry, Mapping)]
+        orderflow_public[tf] = {"per_bar": per_bar}
+
+    zones_container = detected_zones.get("zones") if isinstance(detected_zones, Mapping) else None
+    zone_keys = ("fvg", "ob", "mb", "bb", "rb", "pb", "sr", "profile_levels")
+    zones_public: Dict[str, List[Dict[str, Any]]] = {key: [] for key in zone_keys}
+    if isinstance(zones_container, Mapping):
+        for key in zone_keys:
+            raw_zone = zones_container.get(key)
+            if isinstance(raw_zone, Sequence):
+                zones_public[key] = [
+                    dict(item) for item in raw_zone if isinstance(item, Mapping)
+                ]
+
+    liquidity_public = {
+        "eqh": list(liquidity_equal_levels.get("eqh", [])),
+        "eql": list(liquidity_equal_levels.get("eql", [])),
+    }
+
+    risk_prefs_public = {"rr_min": 2.5, "risk_per_trade_pct": 1.0}
+
+    context_meta = raw_meta.get("context") if isinstance(raw_meta, Mapping) else None
+    raw_bias: str | None = None
+    raw_narrative: str | None = None
+    raw_open_opposite: Any = None
+    if isinstance(context_meta, Mapping):
+        for key in ("globalBias", "global_bias"):
+            value = context_meta.get(key)
+            if isinstance(value, str):
+                raw_bias = value.lower()
+                break
+        narrative_value = context_meta.get("narrative")
+        if isinstance(narrative_value, str):
+            raw_narrative = narrative_value
+        raw_open_opposite = context_meta.get("openOppositeZones")
+        if raw_open_opposite is None:
+            raw_open_opposite = context_meta.get("open_opposite_zones")
+
+    allowed_bias = {"bull", "bear", "neutral"}
+    context_public = {
+        "globalBias": raw_bias if raw_bias in allowed_bias else "neutral",
+        "narrative": raw_narrative or "",
+        "openOppositeZones": bool(raw_open_opposite) if isinstance(raw_open_opposite, bool) else False,
+    }
 
     response_payload = {
-        "snapshot_id": snapshot.get("id"),
-        "symbol": snapshot.get("symbol"),
-        "timeframe": snapshot.get("tf"),
-        "selection": {"start": selection_start, "end": selection_end},
-        "asof_utc": reference_dt.isoformat(),
-        "latest_candle_utc": latest_candle_dt.isoformat(),
-        "latest_candle": dict(latest_candle_payload),
-        "datas_for_last_N_hours": detailed_section,
-        movement_key: movement_section,
-        "tpo": {"sessions": profile_tpo, "zones": profile_zones},
-        "profile": profile_public,
-        "zones": detected_zones,
-        "liquidity": liquidity_payload,
-        "data_quality": data_quality_public,
-        "htf": htf_blocks,
-        "htf_details": htf_section,
-        "data_quality_htf": htf_quality,
-        "profile_preset": profile_config.get("preset_payload"),
-        "vwap": vwap_payload,
-        "vwap_sigma": vwap_sigma_payload,
+        "symbol": symbol,
+        "ohlcv": ohlcv_public,
+        "orderflow": orderflow_public,
+        "vwap_tpo": vwap_tpo_public,
+        "tpo": {"composite_day": composite_day_public},
+        "prev_day": prev_day_block,
+        "zones": zones_public,
+        "liquidity": liquidity_public,
+        "risk_prefs": risk_prefs_public,
+        "context": context_public,
     }
 
     return round_floats(response_payload)

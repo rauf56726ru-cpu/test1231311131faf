@@ -395,7 +395,7 @@
     detachWs();
     const symbol = state.symbol.toLowerCase();
     const interval = state.interval;
-    const url = `wss://stream.binance.com:9443/ws/${symbol}@kline_${interval}`;
+    const url = `wss://fstream.binance.com/ws/${symbol}@kline_${interval}`;
     const ws = new WebSocket(url);
     state.ws = ws;
     ws.onopen = () => {
@@ -421,7 +421,7 @@
   }
 
   async function fetchRange(symbol, interval, startMs, endMs, limit = 1000) {
-    const url = new URL("https://api.binance.com/api/v3/klines");
+    const url = new URL("https://fapi.binance.com/fapi/v1/klines");
     url.searchParams.set("symbol", symbol);
     url.searchParams.set("interval", interval);
     if (Number.isFinite(startMs)) {
@@ -430,7 +430,7 @@
     if (Number.isFinite(endMs)) {
       url.searchParams.set("endTime", Math.floor(endMs));
     }
-    url.searchParams.set("limit", String(Math.max(1, Math.min(limit, 1000))));
+    url.searchParams.set("limit", String(Math.max(1, Math.min(limit, 1500))));
     const resp = await fetch(url.toString());
     if (!resp.ok) {
       throw new Error(`Failed to fetch gap candles: ${resp.status}`);

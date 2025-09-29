@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
 
+from src.services.check_all_datas import build_equal_liquidity_levels
 from src.services.liquidity import build_liquidity_snapshot
 
 
@@ -282,4 +283,36 @@ def test_liquidity_detects_pdh_pdl_sweeps_from_minute_seed() -> None:
     assert level_types == {"pdh", "pdl"}
     types = {event["type"] for event in sweeps}
     assert types == {"sweep_top", "sweep_bottom"}
+
+
+def test_build_equal_liquidity_levels_detects_second_touch() -> None:
+    base = datetime(2024, 3, 1, tzinfo=UTC)
+    highs = [95.0, 98.0, 101.0, 100.0, 99.0, 97.0, 96.0, 97.0, 101.02, 98.0, 97.0, 96.0, 95.0]
+    lows = [93.0, 92.0, 91.0, 90.0, 88.0, 89.0, 90.0, 91.0, 92.0, 91.0, 88.02, 89.0, 90.0]
+    candles: list[dict[str, float]] = []
+    for idx, (high, low) in enumerate(zip(highs, lows)):
+        moment = base + timedelta(minutes=15 * idx)
+        ts = int(moment.timestamp() * 1000)
+        mid = (high + low) / 2.0
+        candles.append({"t": ts, "o": mid, "h": high, "l": low, "c": mid, "v": 1.0})
+
+    levels = build_equal_liquidity_levels({"15m": candles})
+    eqh_levels = levels["eqh"]
+    eql_levels = levels["eql"]
+
+    assert len(eqh_levels) == 1
+    assert len(eql_levels) == 1
+
+    eqh_entry = eqh_levels[0]
+    eql_entry = eql_levels[0]
+
+    expected_high_ts = (base + timedelta(minutes=15 * 8)).isoformat().replace("+00:00", "Z")
+    expected_low_ts = (base + timedelta(minutes=15 * 10)).isoformat().replace("+00:00", "Z")
+    assert eqh_entry["ts"] == expected_high_ts
+    assert eql_entry["ts"] == expected_low_ts
+
+    expected_high_price = (highs[2] + highs[8]) / 2.0
+    expected_low_price = (lows[4] + lows[10]) / 2.0
+    assert abs(eqh_entry["price"] - expected_high_price) < 1e-6
+    assert abs(eql_entry["price"] - expected_low_price) < 1e-6
 

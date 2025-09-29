@@ -1,6 +1,8 @@
 """Service layer exports for the chart backend."""
 
+from .binance import BINANCE_FAPI_REST
 from .check_all_datas import build_check_all_datas, DataQualityError
+from .analysis import dispatch_trade_analysis
 from .inspection import (
     build_inspection_payload,
     build_placeholder_snapshot,
@@ -29,11 +31,13 @@ from .presets import (
     update_preset,
 )
 from .liquidity import build_liquidity_snapshot
+from .zones import Config as ZonesConfig, detect_zones
 from .ohlc import (
     TIMEFRAME_WINDOWS,
     fetch_ohlcv,
     fetch_ohlcv_sync,
     aggregate_1m_to_1h,
+    build_multi_timeframe_ohlcv,
     normalise_ohlcv,
     normalise_ohlcv_sync,
 )
@@ -41,9 +45,11 @@ from .vwap import fetch_daily_vwap, fetch_daily_vwap_sync
 from .trades import AggTradeCollector
 
 __all__ = [
+    "BINANCE_FAPI_REST",
     "build_inspection_payload",
     "build_liquidity_snapshot",
     "build_check_all_datas",
+    "dispatch_trade_analysis",
     "build_placeholder_snapshot",
     "DEFAULT_SYMBOL",
     "get_snapshot",
@@ -74,4 +80,7 @@ __all__ = [
     "update_preset",
     "DataQualityError",
     "aggregate_1m_to_1h",
+    "build_multi_timeframe_ohlcv",
+    "ZonesConfig",
+    "detect_zones",
 ]

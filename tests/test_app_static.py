@@ -37,6 +37,7 @@ def test_inspection_placeholder_has_default_symbol(client: TestClient) -> None:
     response = client.get("/inspection")
     assert response.status_code == 200
     assert "value=\"BTCUSDT\"" in response.text
+    assert "Отправить сделку на анализ" in response.text
 
 
 def test_inspection_snapshot_roundtrip(client: TestClient) -> None:
