@@ -35,6 +35,11 @@ class Config:
     epsilon_ticks: float = 1.0
     liquidity_window: int = 3
     sr_merge_pct: float = 0.0002
+    zones_window_start_ms: int | None = None
+    window_end_ms_prev_closed: int | None = None
+    allow_base_fallback: bool = False
+    base_fallback_max_age: int = 200
+    base_fallback_max_distance_atr: float = 3.0
 
 
 _PIVOT_WINDOWS: Dict[str, int] = {"15m": 2, "1h": 3, "4h": 4}
@@ -232,14 +237,26 @@ def _detect_structure(
         if bos_direction is None:
             continue
         bos_events.append(
-            {"idx": idx, "direction": bos_direction, "t": int(candle["t"]), "price": close_price}
+            {
+                "idx": idx,
+                "direction": bos_direction,
+                "t": int(candle["t"]),
+                "price": close_price,
+                "kind": "bos",
+            }
         )
         if trend is None:
             trend = bos_direction
             continue
         if bos_direction != trend:
             choch_events.append(
-                {"idx": idx, "direction": bos_direction, "t": int(candle["t"]), "price": close_price}
+                {
+                    "idx": idx,
+                    "direction": bos_direction,
+                    "t": int(candle["t"]),
+                    "price": close_price,
+                    "kind": "choch",
+                }
             )
         trend = bos_direction
     return pivots, bos_events, choch_events
@@ -487,6 +504,7 @@ def _ob_for_tf(
     tick_size: float | None,
     atr: Sequence[float],
     bos_events: Sequence[Mapping[str, Any]],
+    choch_events: Sequence[Mapping[str, Any]],
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
     zones: List[Dict[str, Any]] = []
     raw_metadata: List[Dict[str, Any]] = []
@@ -508,10 +526,36 @@ def _ob_for_tf(
         liquidity_levels["pdh"].append({"price": float(last_full_day["h"]), "t": int(last_full_day["t"])})
         liquidity_levels["pdl"].append({"price": float(last_full_day["l"]), "t": int(last_full_day["t"])})
     smc_payload["liquidity"] = liquidity_levels
-    smc_payload["structure"] = [
-        {"kind": "bos", "direction": event["direction"], "t": event["t"], "price": event["price"]}
-        for event in bos_events
-    ]
+    window_start = cfg.zones_window_start_ms
+    window_end = cfg.window_end_ms_prev_closed
+    if candles:
+        if window_start is None:
+            window_start = int(candles[0]["t"])
+        if window_end is None:
+            window_end = int(candles[-1]["t"])
+        else:
+            window_end = min(window_end, int(candles[-1]["t"]))
+    structure_events: List[Dict[str, Any]] = []
+    for event in list(bos_events) + list(choch_events):
+        event_ts = int(event.get("t", 0))
+        if window_start is not None and event_ts < window_start:
+            continue
+        if window_end is not None and event_ts > window_end:
+            continue
+        structure_events.append(
+            {
+                "kind": event.get("kind", ""),
+                "direction": event.get("direction"),
+                "t": event_ts,
+                "price": event.get("price"),
+                "idx": event.get("idx"),
+                "tf": tf,
+            }
+        )
+    structure_events.sort(key=lambda item: item.get("t", 0))
+    smc_payload["structure"] = structure_events
+    smc_payload["window"] = {"start": window_start, "end": window_end}
+    smc_payload["tf"] = tf
     for event in bos_events:
         direction = event["direction"]
         zone_type = "demand" if direction == "up" else "supply"
@@ -622,13 +666,21 @@ def _mb_bb_rb_from_smc(
         return [], [], [], diagnostics
     displacement_body = cfg.displacement_body
     displacement_range = cfg.displacement_range
+    smc_config = SMCConfig(
+        min_block_size=0.0,
+        zones_window_start_ms=cfg.zones_window_start_ms,
+        window_end_ms_prev_closed=cfg.window_end_ms_prev_closed,
+        allow_base_fallback=cfg.allow_base_fallback,
+        base_fallback_max_age=cfg.base_fallback_max_age,
+        base_fallback_max_distance_atr=cfg.base_fallback_max_distance_atr,
+    )
     blocks, smc_stats = detect_smc_blocks(
         candles,
         timeframe=tf,
         structure_flags=structure_flags,
         ob_zones=ob_series,
         liquidity_levels=liquidity_levels,
-        config=SMCConfig(min_block_size=0.0),
+        config=smc_config,
         atr=atr,
         returns_sigma=returns_sigma,
         displacement_body=displacement_body,
@@ -643,12 +695,13 @@ def _mb_bb_rb_from_smc(
     for block in blocks:
         kind = block.get("kind")
         range_low, range_high = block.get("range", [0.0, 0.0])[:2]
+        mean_price = (float(range_low) + float(range_high)) / 2.0
         entry = {
             "tf": tf,
             "type": block.get("type"),
             "open": float(range_low),
             "close": float(range_high),
-            "mean": (float(range_low) + float(range_high)) / 2.0,
+            "mean": _round_tick(mean_price, tick_size),
             "origin_utc": _ms_to_iso(int(block.get("created_at", 0))),
             "status": block.get("status", "fresh"),
         }
@@ -930,10 +983,60 @@ def detect_zones(
         valid_atr = sum(1 for value in atr if isinstance(value, (int, float)) and math.isfinite(value) and value > 0)
         tf_diag["atr"] = {"length": len(atr), "valid_values": valid_atr}
         pivots, bos_events, choch_events = _detect_structure(candles, tf=tf, tick_size=tick, cfg=cfg)
+        tf_window_start = cfg.zones_window_start_ms
+        tf_window_end = cfg.window_end_ms_prev_closed
+        if candles:
+            first_ts = int(candles[0]["t"])
+            last_ts = int(candles[-1]["t"])
+            if tf_window_start is None:
+                tf_window_start = first_ts
+            if tf_window_end is None:
+                tf_window_end = last_ts
+            else:
+                tf_window_end = min(tf_window_end, last_ts)
+        pivots_in_window: List[Dict[str, Any]] = []
+        if pivots:
+            for pivot in pivots:
+                idx = int(pivot.get("idx", -1))
+                if idx < 0 or idx >= len(candles):
+                    continue
+                pivot_ts = int(candles[idx]["t"])
+                if tf_window_start is not None and pivot_ts < tf_window_start:
+                    continue
+                if tf_window_end is not None and pivot_ts > tf_window_end:
+                    continue
+                pivots_in_window.append(dict(pivot))
+        bos_in_window: List[Dict[str, Any]] = []
+        for event in bos_events:
+            event_ts = int(event.get("t", 0))
+            if tf_window_start is not None and event_ts < tf_window_start:
+                continue
+            if tf_window_end is not None and event_ts > tf_window_end:
+                continue
+            bos_in_window.append(event)
+        choch_in_window: List[Dict[str, Any]] = []
+        for event in choch_events:
+            event_ts = int(event.get("t", 0))
+            if tf_window_start is not None and event_ts < tf_window_start:
+                continue
+            if tf_window_end is not None and event_ts > tf_window_end:
+                continue
+            choch_in_window.append(event)
+        bos_up_count = sum(1 for event in bos_in_window if event.get("direction") == "up")
+        bos_down_count = sum(1 for event in bos_in_window if event.get("direction") == "down")
         tf_diag["structure"] = {
-            "pivots": len(pivots),
-            "bos": len(bos_events),
-            "choch": len(choch_events),
+            "pivots": len(pivots_in_window),
+            "bos": len(bos_in_window),
+            "bos_up": bos_up_count,
+            "bos_down": bos_down_count,
+            "choch": len(choch_in_window),
+        }
+        tf_diag["structure_diag"] = {
+            "tf": tf,
+            "pivots": len(pivots_in_window),
+            "bos_up": bos_up_count,
+            "bos_down": bos_down_count,
+            "choch": len(choch_in_window),
         }
         for key in (
             "fvg_triplets",
@@ -968,6 +1071,7 @@ def detect_zones(
             tick_size=tick,
             atr=atr,
             bos_events=bos_events,
+            choch_events=choch_events,
         )
         ob_entry: Dict[str, Any] = {"count": len(ob_zones)}
         if not ob_zones:
@@ -999,6 +1103,11 @@ def detect_zones(
             "rb_reject_no_impulse",
         ):
             smc_diag.setdefault(key, 0)
+        smc_diag.setdefault("rb_flow", {})
+        smc_diag.setdefault("rb_reject", {})
+        smc_diag.setdefault("base_tick_collapse", 0)
+        smc_diag.setdefault("base_fallback_used", False)
+        smc_diag.setdefault("rb_impulse_ok", False)
         tf_diag["smc"] = smc_diag
         tf_diag["mb"] = {"count": len(mb)}
         if not mb and smc_diag.get("reason"):
@@ -1020,6 +1129,15 @@ def detect_zones(
         rb_entry: Dict[str, Any] = {"count": len(rb), "stats": rb_stats}
         if smc_diag.get("reason"):
             rb_entry["reason"] = smc_diag["reason"]
+        flow_diag = smc_diag.get("rb_flow")
+        if isinstance(flow_diag, Mapping):
+            rb_entry["flow"] = {str(k): int(v) for k, v in flow_diag.items() if isinstance(v, (int, float))}
+        reject_diag = smc_diag.get("rb_reject")
+        if isinstance(reject_diag, Mapping):
+            rb_entry["reject"] = {str(k): int(v) for k, v in reject_diag.items() if isinstance(v, (int, float))}
+        rb_entry["base_fallback_used"] = bool(smc_diag.get("base_fallback_used"))
+        rb_entry["impulse_ok"] = bool(smc_diag.get("rb_impulse_ok"))
+        rb_entry["base_tick_collapse"] = int(smc_diag.get("base_tick_collapse", 0))
         tf_diag["rb"] = rb_entry
         mb_all.extend(mb)
         bb_all.extend(bb)

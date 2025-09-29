@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Mapping, MutableMapping, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence
 
 
 @dataclass(slots=True)
@@ -15,6 +15,11 @@ class SMCConfig:
     displacement_factor: float = 1.5
     displacement_lookback: int = 5
     ttl_bars: int = 50
+    zones_window_start_ms: int | None = None
+    window_end_ms_prev_closed: int | None = None
+    allow_base_fallback: bool = False
+    base_fallback_max_age: int = 200
+    base_fallback_max_distance_atr: float = 3.0
 
 
 def _candle_body_range(candle: Mapping[str, float]) -> tuple[float, float]:
@@ -379,16 +384,21 @@ def detect_smc_blocks(
     displacement_body: float = 1.0,
     displacement_range: float = 1.5,
     tick_size: float | None = None,
-) -> tuple[List[MutableMapping[str, object]], Dict[str, int]]:
+) -> tuple[List[MutableMapping[str, object]], Dict[str, Any]]:
     """Detect breaker, mitigation and reversal blocks on the supplied candles."""
 
-    diagnostics: Dict[str, int] = {
+    diagnostics: Dict[str, Any] = {
         "rb_raw_count": 0,
         "rb_reject_no_eq": 0,
         "rb_reject_no_sweep": 0,
         "rb_reject_no_choch": 0,
         "rb_reject_no_base": 0,
         "rb_reject_no_impulse": 0,
+        "rb_flow": {"eq_found": 0, "sweep": 0, "choch": 0, "base": 0, "impulse": 0},
+        "rb_reject": {"no_eq": 0, "no_sweep": 0, "no_choch": 0, "no_base": 0, "no_impulse": 0},
+        "base_tick_collapse": 0,
+        "base_fallback_used": False,
+        "rb_impulse_ok": False,
     }
 
     if not candles:
@@ -543,9 +553,6 @@ def detect_smc_blocks(
                 break
 
     # Reversal Blocks
-    eq_levels_present = any(key in {"eqh", "eql"} for key, _ in liquidity)
-    if not eq_levels_present:
-        diagnostics["rb_reject_no_eq"] = max(diagnostics["rb_reject_no_eq"], 1)
 
     def _atr_value(idx: int) -> float:
         if atr is None or idx >= len(atr):
@@ -557,21 +564,145 @@ def detect_smc_blocks(
             return math.nan
         return float(returns_sigma[idx])
 
+    window_start_ms = cfg.zones_window_start_ms
+    window_end_ms = cfg.window_end_ms_prev_closed
+    if candles:
+        first_ts = int(candles[0]["t"])
+        last_ts = int(candles[-1]["t"])
+        if window_start_ms is None:
+            window_start_ms = first_ts
+        if window_end_ms is None:
+            window_end_ms = last_ts
+        else:
+            window_end_ms = min(window_end_ms, last_ts)
+
+    window_indices = [
+        idx
+        for idx, candle in enumerate(candles)
+        if (window_start_ms is None or int(candle["t"]) >= window_start_ms)
+        and (window_end_ms is None or int(candle["t"]) <= window_end_ms)
+    ]
+
+    flow_counters: Dict[str, int] = diagnostics.setdefault(
+        "rb_flow",
+        {"eq_found": 0, "sweep": 0, "choch": 0, "base": 0, "impulse": 0},
+    )
+    reject_counters: Dict[str, int] = diagnostics.setdefault(
+        "rb_reject",
+        {"no_eq": 0, "no_sweep": 0, "no_choch": 0, "no_base": 0, "no_impulse": 0},
+    )
+    diagnostics.setdefault("base_tick_collapse", 0)
+    diagnostics.setdefault("base_fallback_used", False)
+    diagnostics.setdefault("rb_impulse_ok", False)
+
+    structure_events_window: List[Mapping[str, object]] = []
+    structure_tfs: set[str] = set()
+    for event in structure_events:
+        event_ts = int(event.get("t", 0))
+        if window_start_ms is not None and event_ts < window_start_ms:
+            continue
+        if window_end_ms is not None and event_ts > window_end_ms:
+            continue
+        kind = str(event.get("kind") or "")
+        if kind not in {"bos", "choch"}:
+            continue
+        event_tf = event.get("tf")
+        if event_tf:
+            structure_tfs.add(str(event_tf))
+        structure_events_window.append(event)
+    if structure_tfs:
+        assert structure_tfs == {timeframe}
+
+    choch_events_window = [
+        event for event in structure_events_window if str(event.get("kind")) == "choch"
+    ]
+    if not choch_events_window:
+        diagnostics["rb_reject_no_choch"] = max(diagnostics["rb_reject_no_choch"], 1)
+        reject_counters["no_choch"] = max(reject_counters.get("no_choch", 0), 1)
+
+    def _pivot_span_for_tf(label: str) -> int:
+        if label == "1h":
+            return 3
+        if label == "15m":
+            return 2
+        return 2
+
+    pivot_span = _pivot_span_for_tf(timeframe)
+    pivots_window: List[Dict[str, Any]] = []
+    if window_indices and len(candles) >= 2 * pivot_span + 1:
+        for idx in range(pivot_span, len(candles) - pivot_span):
+            ts_idx = int(candles[idx]["t"])
+            if window_start_ms is not None and ts_idx < window_start_ms:
+                continue
+            if window_end_ms is not None and ts_idx > window_end_ms:
+                continue
+            segment = candles[idx - pivot_span : idx + pivot_span + 1]
+            center = candles[idx]
+            high = float(center["h"])
+            low = float(center["l"])
+            if all(high >= float(bar["h"]) for bar in segment):
+                pivots_window.append({"type": "ph", "idx": idx, "price": high, "ts": ts_idx})
+            if all(low <= float(bar["l"]) for bar in segment):
+                pivots_window.append({"type": "pl", "idx": idx, "price": low, "ts": ts_idx})
+
+    separation = 5
+    eq_candidates: List[Dict[str, Any]] = []
+    sorted_pivots = sorted(pivots_window, key=lambda item: item["idx"])
+    for i, pivot in enumerate(sorted_pivots):
+        pivot_type = pivot.get("type")
+        if pivot_type not in {"ph", "pl"}:
+            continue
+        for j in range(i + 1, len(sorted_pivots)):
+            other = sorted_pivots[j]
+            if other.get("type") != pivot_type:
+                continue
+            if int(other["idx"]) - int(pivot["idx"]) < separation:
+                continue
+            price_a = float(pivot.get("price", 0.0))
+            price_b = float(other.get("price", 0.0))
+            reference_price = (price_a + price_b) / 2.0
+            tolerance = _eq_tolerance(reference_price or price_a, tick_size)
+            if abs(price_a - price_b) <= tolerance:
+                eq_candidates.append(
+                    {
+                        "type": "eqh" if pivot_type == "ph" else "eql",
+                        "price": reference_price,
+                        "first_idx": int(pivot["idx"]),
+                        "second_idx": int(other["idx"]),
+                        "first_ts": int(pivot["ts"]),
+                        "second_ts": int(other["ts"]),
+                    }
+                )
+                break
+
+    if not eq_candidates:
+        diagnostics["rb_reject_no_eq"] = max(diagnostics["rb_reject_no_eq"], 1)
+        reject_counters["no_eq"] = max(reject_counters.get("no_eq", 0), 1)
+
     def _range_block_base(end_idx: int) -> tuple[tuple[float, float], int] | None:
+        if end_idx < 0 or not candles:
+            return None
         max_length = min(4, end_idx + 1)
         for length in range(max_length, 0, -1):
             start_idx = end_idx - length + 1
-            body_ranges = [_candle_body_range(candles[idx]) for idx in range(start_idx, end_idx + 1)]
+            if start_idx < 0:
+                continue
+            start_ts = int(candles[start_idx]["t"])
+            end_ts = int(candles[end_idx]["t"])
+            if window_start_ms is not None and end_ts < window_start_ms:
+                continue
+            if window_end_ms is not None and start_ts > window_end_ms:
+                continue
+            body_ranges = [
+                _candle_body_range(candles[idx]) for idx in range(start_idx, end_idx + 1)
+            ]
             spans = [_range_size(body_range) for body_range in body_ranges]
             if any(span <= 0.0 for span in spans):
                 continue
             overlap_ok = True
             for left, right in zip(body_ranges, body_ranges[1:]):
                 min_span = min(_range_size(left), _range_size(right))
-                if min_span <= 0.0:
-                    overlap_ok = False
-                    break
-                if _overlap_size(left, right) < 0.5 * min_span:
+                if min_span <= 0.0 or _overlap_size(left, right) < 0.5 * min_span:
                     overlap_ok = False
                     break
             if not overlap_ok:
@@ -580,15 +711,19 @@ def detect_smc_blocks(
             combined_high = max(body[1] for body in body_ranges)
             span = combined_high - combined_low
             atr_val = _atr_value(end_idx)
-            if math.isfinite(atr_val) and atr_val > 0.0:
-                if span > 0.8 * atr_val + 1e-12:
-                    continue
+            if math.isfinite(atr_val) and atr_val > 0.0 and span > 0.8 * atr_val + 1e-12:
+                continue
             if span < cfg.min_block_size - 1e-12:
                 continue
             return ((combined_low, combined_high), end_idx)
         return None
 
-    def _fallback_ob_base(direction: str, impulse_idx: int, impulse_ts: int) -> tuple[tuple[float, float], int] | None:
+    def _fallback_ob_base(
+        direction: str, impulse_idx: int, impulse_ts: int, eq_price: float
+    ) -> tuple[tuple[float, float], int] | None:
+        atr_val = _atr_value(impulse_idx)
+        max_age = max(1, int(cfg.base_fallback_max_age))
+        distance_limit = float(cfg.base_fallback_max_distance_atr)
         for zone in reversed(base_ob_zones):
             if _direction_from_zone(zone.get("type")) != direction:
                 continue
@@ -609,57 +744,138 @@ def detect_smc_blocks(
             base_idx = _find_candle_index_by_ts(candles, created_at)
             if base_idx is None or base_idx >= impulse_idx:
                 base_idx = max(0, impulse_idx - 1)
+            if impulse_idx - base_idx > max_age:
+                continue
+            if (
+                atr_val
+                and math.isfinite(atr_val)
+                and atr_val > 0.0
+                and distance_limit > 0.0
+            ):
+                distance = min(
+                    abs(eq_price - base_range[0]),
+                    abs(eq_price - base_range[1]),
+                )
+                if distance > distance_limit * atr_val + 1e-12:
+                    continue
+            if base_idx < len(candles):
+                base_ts = int(candles[base_idx]["t"])
+                if window_start_ms is not None and base_ts < window_start_ms:
+                    continue
+                if window_end_ms is not None and base_ts > window_end_ms:
+                    continue
             return base_range, base_idx
         return None
 
-    sweep_events: List[tuple[int, str]] = []
-    for idx, candle in enumerate(candles):
-        low, high = _candle_range(candle)
-        close_price = float(candle.get("c", high))
-        for liquidity_key, price in liquidity:
-            if price <= 0.0:
-                continue
-            tolerance = _eq_tolerance(price, tick_size)
-            if liquidity_key in {"eqh", "pdh"}:
-                if high >= price + tolerance and close_price <= price:
-                    sweep_events.append((idx, "down"))
-            elif liquidity_key in {"eql", "pdl"}:
-                if low <= price - tolerance and close_price >= price:
-                    sweep_events.append((idx, "up"))
-    sweep_events.sort()
+    epsilon_tick = float(tick_size) if tick_size else 0.0
 
-    choch_events = [event for event in structure_events if event.get("kind") == "choch"]
-    if not choch_events:
-        diagnostics["rb_reject_no_choch"] = max(diagnostics["rb_reject_no_choch"], 1)
+    for eq_entry in eq_candidates:
+        flow_counters["eq_found"] = flow_counters.get("eq_found", 0) + 1
+        trend_direction = "up" if eq_entry["type"] == "eql" else "down"
+        block_direction = "demand" if trend_direction == "up" else "supply"
+        eq_price = float(eq_entry["price"])
 
-    for event in choch_events:
-        raw_direction = event.get("direction")
-        direction_label = _normalise_direction_label(raw_direction)
-        if direction_label not in {"up", "down", "demand", "supply"}:
-            continue
-        trend_direction = "up" if direction_label in {"up", "demand"} else "down"
-        event_idx = _find_candle_index_by_ts(candles, int(event["t"]))
-        if event_idx is None:
-            diagnostics["rb_reject_no_choch"] += 1
-            continue
-        sweep_match = None
-        for idx, sweep_dir in reversed(sweep_events):
-            if idx > event_idx:
-                continue
-            if (trend_direction == "up" and sweep_dir == "up") or (
-                trend_direction == "down" and sweep_dir == "down"
-            ):
-                sweep_match = (idx, sweep_dir)
+        sweep_idx: int | None = None
+        recovery_idx: int | None = None
+        start_idx = int(eq_entry["second_idx"]) + 1
+        for idx in range(start_idx, len(candles)):
+            ts_idx = int(candles[idx]["t"])
+            if window_end_ms is not None and ts_idx > window_end_ms:
                 break
-        if sweep_match is None:
+            low = float(candles[idx]["l"])
+            high = float(candles[idx]["h"])
+            close_val = float(candles[idx]["c"])
+            if trend_direction == "up":
+                if low >= eq_price - epsilon_tick:
+                    continue
+                max_recovery_idx = min(len(candles) - 1, idx + 3)
+                recovery_candidate: int | None = None
+                for rec_idx in range(idx, max_recovery_idx + 1):
+                    rec_ts = int(candles[rec_idx]["t"])
+                    if window_end_ms is not None and rec_ts > window_end_ms:
+                        break
+                    atr_val = _atr_value(rec_idx)
+                    if not math.isfinite(atr_val) or atr_val <= 0.0:
+                        continue
+                    close_rec = float(candles[rec_idx]["c"])
+                    if close_rec >= eq_price - 0.2 * atr_val:
+                        recovery_candidate = rec_idx
+                        break
+                if recovery_candidate is None:
+                    continue
+                sweep_idx = idx
+                recovery_idx = recovery_candidate
+                break
+            else:
+                if high <= eq_price + epsilon_tick:
+                    continue
+                max_recovery_idx = min(len(candles) - 1, idx + 3)
+                recovery_candidate = None
+                for rec_idx in range(idx, max_recovery_idx + 1):
+                    rec_ts = int(candles[rec_idx]["t"])
+                    if window_end_ms is not None and rec_ts > window_end_ms:
+                        break
+                    atr_val = _atr_value(rec_idx)
+                    if not math.isfinite(atr_val) or atr_val <= 0.0:
+                        continue
+                    close_rec = float(candles[rec_idx]["c"])
+                    if close_rec <= eq_price + 0.2 * atr_val:
+                        recovery_candidate = rec_idx
+                        break
+                if recovery_candidate is None:
+                    continue
+                sweep_idx = idx
+                recovery_idx = recovery_candidate
+                break
+
+        if sweep_idx is None or recovery_idx is None:
             diagnostics["rb_reject_no_sweep"] += 1
+            reject_counters["no_sweep"] = reject_counters.get("no_sweep", 0) + 1
             continue
+
+        flow_counters["sweep"] = flow_counters.get("sweep", 0) + 1
+
+        min_choch_idx = sweep_idx + 1
+        choch_event: Mapping[str, object] | None = None
+        choch_idx: int | None = None
+        for event in choch_events_window:
+            event_dir = _normalise_direction_label(event.get("direction"))
+            if trend_direction == "up" and event_dir not in {"up", "demand"}:
+                continue
+            if trend_direction == "down" and event_dir not in {"down", "supply"}:
+                continue
+            event_ts = int(event.get("t", 0))
+            event_idx = _find_candle_index_by_ts(candles, event_ts)
+            if event_idx is None or event_idx < min_choch_idx:
+                continue
+            if window_end_ms is not None and event_ts > window_end_ms:
+                continue
+            choch_event = event
+            choch_idx = event_idx
+            break
+
+        if choch_event is None or choch_idx is None:
+            diagnostics["rb_reject_no_choch"] += 1
+            reject_counters["no_choch"] = reject_counters.get("no_choch", 0) + 1
+            continue
+
+        if window_start_ms is not None:
+            assert window_start_ms <= int(choch_event.get("t", 0))
+        if window_end_ms is not None:
+            assert int(choch_event.get("t", 0)) <= window_end_ms
+
+        flow_counters["choch"] = flow_counters.get("choch", 0) + 1
 
         impulse_idx: int | None = None
-        for idx in range(event_idx + 1, len(candles)):
-            body_low, body_high = _candle_body_range(candles[idx])
-            close_price = float(candles[idx].get("c", body_high))
-            open_price = float(candles[idx].get("o", body_low))
+        for offset in (1, 2):
+            idx = choch_idx + offset
+            if idx >= len(candles):
+                break
+            ts_idx = int(candles[idx]["t"])
+            if window_end_ms is not None and ts_idx > window_end_ms:
+                break
+            open_price = float(candles[idx]["o"])
+            close_price = float(candles[idx]["c"])
             if trend_direction == "up" and close_price <= open_price:
                 continue
             if trend_direction == "down" and close_price >= open_price:
@@ -668,42 +884,59 @@ def detect_smc_blocks(
             if not math.isfinite(atr_val) or atr_val <= 0.0:
                 continue
             sigma_val = _sigma_value(idx)
-            k_body = displacement_body
-            k_range = displacement_range
+            k_body = 1.0
+            k_range = 1.5
             if sigma_val and math.isfinite(sigma_val) and sigma_val < 0.5 * atr_val:
-                k_body = max(0.7, k_body - 0.2)
-                k_range = max(1.1, k_range - 0.3)
-            body_sizes = [abs(float(candles[idx]["c"]) - float(candles[idx]["o"]))]
+                k_body = 0.8
+                k_range = 1.2
+            body_sizes = [abs(close_price - open_price)]
             range_sizes = [float(candles[idx]["h"]) - float(candles[idx]["l"])]
-            if idx + 1 < len(candles):
-                body_sizes.append(abs(float(candles[idx + 1]["c"]) - float(candles[idx + 1]["o"])) )
-                range_sizes.append(float(candles[idx + 1]["h"]) - float(candles[idx + 1]["l"]))
-            if max(body_sizes) < k_body * atr_val and max(range_sizes) < k_range * atr_val:
-                continue
-            impulse_idx = idx
-            break
+            next_idx = idx + 1
+            if next_idx < len(candles) and next_idx <= choch_idx + 2:
+                body_sizes.append(
+                    abs(float(candles[next_idx]["c"]) - float(candles[next_idx]["o"]))
+                )
+                range_sizes.append(float(candles[next_idx]["h"]) - float(candles[next_idx]["l"]))
+            if max(body_sizes) >= k_body * atr_val or max(range_sizes) >= k_range * atr_val:
+                impulse_idx = idx
+                diagnostics["rb_impulse_ok"] = True
+                flow_counters["impulse"] = flow_counters.get("impulse", 0) + 1
+                break
 
-        if impulse_idx is None or impulse_idx == 0:
+        if impulse_idx is None:
             diagnostics["rb_reject_no_impulse"] += 1
+            reject_counters["no_impulse"] = reject_counters.get("no_impulse", 0) + 1
             continue
 
         base_candidate = _range_block_base(impulse_idx - 1)
-        impulse_ts = int(candles[impulse_idx].get("t", event["t"]))
-        block_direction = "demand" if trend_direction == "up" else "supply"
-        if base_candidate is None:
-            base_candidate = _fallback_ob_base(block_direction, impulse_idx, impulse_ts)
+        impulse_ts = int(candles[impulse_idx].get("t", choch_event.get("t", 0)))
+        fallback_used = False
+        if base_candidate is None and cfg.allow_base_fallback:
+            base_candidate = _fallback_ob_base(
+                block_direction, impulse_idx, impulse_ts, eq_price
+            )
+            if base_candidate is not None:
+                fallback_used = True
+
         if base_candidate is None:
             diagnostics["rb_reject_no_base"] += 1
+            reject_counters["no_base"] = reject_counters.get("no_base", 0) + 1
             continue
 
+        flow_counters["base"] = flow_counters.get("base", 0) + 1
+        if fallback_used:
+            diagnostics["base_fallback_used"] = True
+
         base_range, base_idx = base_candidate
-        created_at = impulse_ts
+        if tick_size and abs(base_range[1] - base_range[0]) < float(tick_size) - 1e-12:
+            diagnostics["base_tick_collapse"] = int(diagnostics.get("base_tick_collapse", 0)) + 1
+
         _append_block(
             kind="rb",
             price_range=base_range,
             created_idx=base_idx,
             direction=block_direction,
-            created_at=created_at,
+            created_at=impulse_ts,
         )
         diagnostics["rb_raw_count"] += 1
 

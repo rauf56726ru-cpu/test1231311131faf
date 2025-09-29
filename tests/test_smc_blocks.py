@@ -20,6 +20,17 @@ def make_hour_candle(idx: int, o: float, h: float, l: float, c: float, v: float 
     }
 
 
+def make_15m_candle(idx: int, o: float, h: float, l: float, c: float, v: float = 1.0) -> dict[str, float]:
+    return {
+        "t": BASE_TS + idx * 900_000,
+        "o": float(o),
+        "h": float(h),
+        "l": float(l),
+        "c": float(c),
+        "v": float(v),
+    }
+
+
 def test_breaker_block_detected_after_bos_retest() -> None:
     candles = [
         make_hour_candle(0, 100.0, 102.0, 99.0, 99.0),
@@ -103,30 +114,40 @@ def test_mitigation_block_uses_unfilled_body() -> None:
 
 def test_reversal_block_after_liquidity_grab() -> None:
     candles = [
-        make_hour_candle(0, 100.0, 102.0, 99.0, 101.0),
-        make_hour_candle(1, 101.0, 102.0, 99.5, 100.0),
-        make_hour_candle(2, 100.0, 101.5, 94.5, 96.0),
-        make_hour_candle(3, 96.0, 100.0, 95.5, 99.0),
-        make_hour_candle(4, 99.0, 100.5, 98.5, 100.1),
-        make_hour_candle(5, 100.2, 110.0, 99.5, 108.0),
-        make_hour_candle(6, 103.0, 105.0, 98.8, 99.6),
+        make_15m_candle(0, 103.0, 104.0, 102.0, 103.2),
+        make_15m_candle(1, 103.1, 103.4, 101.2, 102.4),
+        make_15m_candle(2, 101.8, 102.0, 99.0, 99.8),
+        make_15m_candle(3, 100.2, 101.9, 100.0, 101.4),
+        make_15m_candle(4, 101.6, 103.2, 100.8, 102.6),
+        make_15m_candle(5, 102.7, 104.6, 101.6, 103.5),
+        make_15m_candle(6, 103.4, 104.0, 102.2, 103.2),
+        make_15m_candle(7, 102.6, 103.0, 101.2, 102.0),
+        make_15m_candle(8, 101.4, 102.4, 99.0, 100.5),
+        make_15m_candle(9, 100.6, 101.4, 99.6, 100.8),
+        make_15m_candle(10, 100.8, 101.2, 99.3, 100.4),
+        make_15m_candle(11, 100.4, 100.8, 98.8, 99.3),
+        make_15m_candle(12, 99.2, 99.9, 99.1, 99.8),
+        make_15m_candle(13, 99.3, 100.0, 99.25, 99.7),
+        make_15m_candle(14, 99.9, 101.8, 99.8, 101.6),
+        make_15m_candle(15, 101.5, 102.2, 100.9, 101.2),
     ]
 
     structure_flags = [
-        {"kind": "choch", "direction": "up", "t": candles[3]["t"]}
+        {"kind": "choch", "direction": "up", "t": candles[13]["t"], "tf": "15m"}
     ]
-    liquidity = {"eql": [{"price": 95.0}]}
 
-    config = SMCConfig(min_block_size=0.5, displacement_factor=1.5, displacement_lookback=3, ttl_bars=10)
-    atr_values = [5.0] * len(candles)
+    atr_values = [1.0] * len(candles)
+    sigma_values = [0.1] * len(candles)
+    config = SMCConfig(min_block_size=0.2, ttl_bars=20)
     blocks, stats = detect_smc_blocks(
         candles,
+        timeframe="15m",
         structure_flags=structure_flags,
         ob_zones=[],
-        liquidity_levels=liquidity,
+        liquidity_levels={},
         config=config,
         atr=atr_values,
-        returns_sigma=[0.2] * len(candles),
+        returns_sigma=sigma_values,
         tick_size=0.1,
     )
 
@@ -135,8 +156,9 @@ def test_reversal_block_after_liquidity_grab() -> None:
     assert block["kind"] == "rb"
     assert block["block_type"] == "reversal block"
     assert block["type"] == "demand"
-    assert block["status"] == "tapped"
-    assert block["range"][0] == pytest.approx(96.0, rel=1e-3)
-    assert block["range"][1] == pytest.approx(100.0, rel=1e-3)
-    assert block["created_at"] in {candles[4]["t"], candles[5]["t"]}
+    assert block["status"] == "fresh"
     assert stats["rb_raw_count"] == 1
+    flow = stats.get("rb_flow", {})
+    assert flow.get("eq_found", 0) >= 1
+    assert flow.get("impulse", 0) >= 1
+    assert not stats.get("base_fallback_used", False)
