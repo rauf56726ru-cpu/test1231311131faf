@@ -199,6 +199,7 @@ def _fvgs_for_tf(
     tick_size: float | None,
     atr: Sequence[float],
     bos_events: Sequence[Mapping[str, Any]],
+    stats: MutableMapping[str, int] | None = None,
 ) -> List[Dict[str, Any]]:
     zones: List[Dict[str, Any]] = []
     if len(candles) < 3:
@@ -207,6 +208,8 @@ def _fvgs_for_tf(
     epsilon = tick or 0.0
     bos_by_index = {event["idx"]: event for event in bos_events}
     for i in range(len(candles) - 2):
+        if stats is not None:
+            stats["triplets"] = stats.get("triplets", 0) + 1
         c0, c1, c2 = candles[i], candles[i + 1], candles[i + 2]
         low_mid = float(c1["l"])
         high_mid = float(c1["h"])
@@ -216,10 +219,14 @@ def _fvgs_for_tf(
         low_prev = float(c0["l"])
         atr_value = atr[i + 1] if i + 1 < len(atr) else math.nan
         if not atr_value or math.isnan(atr_value) or atr_value <= 0:
+            if stats is not None:
+                stats["atr_rejected"] = stats.get("atr_rejected", 0) + 1
             continue
         body = abs(float(c1["c"]) - float(c1["o"]))
         range_span = float(c1["h"]) - float(c1["l"])
         if body < cfg.displacement_body * atr_value and range_span < cfg.displacement_range * atr_value:
+            if stats is not None:
+                stats["displacement_rejected"] = stats.get("displacement_rejected", 0) + 1
             continue
         direction: str | None = None
         top: float | None = None
@@ -233,11 +240,17 @@ def _fvgs_for_tf(
             top = low_prev
             bot = high_mid
         if direction is None or top is None or bot is None:
+            if stats is not None:
+                stats["gap_rejected"] = stats.get("gap_rejected", 0) + 1
             continue
         width = top - bot
         if width <= 0:
+            if stats is not None:
+                stats["width_rejected"] = stats.get("width_rejected", 0) + 1
             continue
         if tick and width < tick:
+            if stats is not None:
+                stats["tick_rejected"] = stats.get("tick_rejected", 0) + 1
             continue
         created_idx = i + 2
         status = "open"
@@ -690,6 +703,7 @@ def detect_zones(
     rb_all: List[Dict[str, Any]] = []
     pb_all: List[Dict[str, Any]] = []
     sr_levels: List[Dict[str, Any]] = []
+    fvg_stats: Dict[str, Dict[str, int]] = {}
     for tf in ("15m", "1h", "4h"):
         candles = timeframes.get(tf, [])
         if len(candles) < 3:
@@ -704,6 +718,7 @@ def detect_zones(
                 tick_size=tick,
                 atr=atr,
                 bos_events=bos_events,
+                stats=fvg_stats.setdefault(tf, {}),
             )
         )
         ob_zones, metadata, smc_payload = _ob_for_tf(
@@ -743,4 +758,5 @@ def detect_zones(
             "profile_levels": _profile_levels(profile_levels),
         },
     }
+    payload["meta"] = {"fvg_stats": fvg_stats}
     return payload

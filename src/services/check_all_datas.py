@@ -2071,6 +2071,7 @@ def build_check_all_datas(
         candidate = zones_window_start_ms - required * interval_ms_tf
         if candidate < history_candidate:
             history_candidate = candidate
+    history_candidate = min(history_candidate, zones_window_start_ms - MS_IN_DAY)
     zones_history_start_ms = max(0, history_candidate)
     zones_history_start_ms = max(0, _align_to_interval(zones_history_start_ms, MINUTE_INTERVAL_MS))
 
@@ -2105,51 +2106,67 @@ def build_check_all_datas(
     frames["1m"] = [minute_index_all[ts] for ts in sorted(minute_index_all)]
     minute_candles = frames["1m"]
 
-    zone_frames: Dict[str, List[Dict[str, Any]]] = {}
-    minute_zone_series = _filter_candles(
+    minute_zone_history = _filter_candles(
         minute_candles, start_ms=zones_history_start_ms, end_ms=window_end_ms
     )
-    if minute_zone_series:
-        zone_frames["1m"] = minute_zone_series
+    minute_zone_window = [
+        candle for candle in minute_zone_history if int(candle["t"]) >= zones_window_start_ms
+    ]
 
-    for tf_key in ("15m", "1h", "4h"):
-        interval_ms_tf = TIMEFRAME_TO_MS.get(tf_key)
-        if interval_ms_tf is None or not minute_zone_series:
-            continue
-        aggregated = resample_ohlcv(minute_zone_series, interval_ms_tf)
-        if not aggregated:
-            continue
-        normalised: List[Dict[str, Any]] = []
-        for item in aggregated:
-            if not isinstance(item, Mapping):
+    def _build_zone_frames(source: Sequence[Mapping[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+        bundle: Dict[str, List[Dict[str, Any]]] = {}
+        if not source:
+            return bundle
+        ordered = sorted(source, key=lambda candle: int(candle["t"]))
+        bundle["1m"] = [dict(item) for item in ordered]
+        for tf_key in ("3m", "5m", "15m", "1h", "4h", "1d"):
+            interval_ms_tf = TIMEFRAME_TO_MS.get(tf_key)
+            if interval_ms_tf is None:
                 continue
-            ts = _safe_int(item.get("t"))
-            if ts is None:
+            aggregated = resample_ohlcv(ordered, interval_ms_tf)
+            if not aggregated:
                 continue
-            if ts > window_end_ms:
-                continue
-            normalised.append(
-                {
-                    "t": ts,
-                    "o": _coerce_float(item.get("o")),
-                    "h": _coerce_float(item.get("h")),
-                    "l": _coerce_float(item.get("l")),
-                    "c": _coerce_float(item.get("c")),
-                    "v": _coerce_float(item.get("v")),
-                }
-            )
-        if normalised:
-            normalised.sort(key=lambda candle: candle["t"])
-            zone_frames[tf_key] = normalised
+            normalised: List[Dict[str, Any]] = []
+            for item in aggregated:
+                if not isinstance(item, Mapping):
+                    continue
+                ts = _safe_int(item.get("t"))
+                if ts is None or ts > window_end_ms:
+                    continue
+                normalised.append(
+                    {
+                        "t": ts,
+                        "o": _coerce_float(item.get("o")),
+                        "h": _coerce_float(item.get("h")),
+                        "l": _coerce_float(item.get("l")),
+                        "c": _coerce_float(item.get("c")),
+                        "v": _coerce_float(item.get("v")),
+                    }
+                )
+            if normalised:
+                normalised.sort(key=lambda candle: candle["t"])
+                bundle[tf_key] = normalised
+        return bundle
 
-    zone_tf_lengths = {tf: len(zone_frames.get(tf, [])) for tf in ("15m", "1h", "4h")}
+    zone_frames_full = _build_zone_frames(minute_zone_history)
+    zone_frames_window = _build_zone_frames(minute_zone_window)
+
+    zone_tf_lengths = {
+        tf: len(zone_frames_window.get(tf, [])) for tf in ("15m", "1h", "4h", "1d")
+    }
+    warmup_bars_per_tf: Dict[str, int] = {}
+    for tf in ("15m", "1h", "4h", "1d"):
+        total = len(zone_frames_full.get(tf, []))
+        window_count = len(zone_frames_window.get(tf, []))
+        warmup_bars_per_tf[tf] = max(0, total - window_count)
     zones_diag = {
         "tf_lengths": zone_tf_lengths,
         "atr_period": zone_cfg.atr_period,
-        "warmup": warmup_bars_base,
+        "warmup_bars_per_tf": warmup_bars_per_tf,
         "window_hours": zones_window_hours,
+        "tick_size": zone_cfg.tick_size,
     }
-    liquidity_equal_levels = build_equal_liquidity_levels(zone_frames)
+    liquidity_equal_levels = build_equal_liquidity_levels(zone_frames_full)
 
     base_index_all = {candle["t"]: candle for candle in base_candles}
 
@@ -2397,11 +2414,12 @@ def build_check_all_datas(
 
     if tick_size_numeric and isinstance(tick_size_numeric, (int, float)):
         zone_cfg.tick_size = float(tick_size_numeric)
+    zones_diag["tick_size"] = zone_cfg.tick_size
 
-    if zone_frames:
+    if zone_frames_full:
         try:
             detected_zones = detect_zones(
-                zone_frames,
+                zone_frames_full,
                 symbol=symbol,
                 cfg=zone_cfg,
                 profile_levels=profile_level_map,
@@ -2464,6 +2482,35 @@ def build_check_all_datas(
                 if ts_ms is None or ts_ms >= zones_window_start_ms:
                     filtered.append(dict(item))
             zones_container[key] = filtered
+
+        fvg_series = zones_container.get("fvg")
+        if isinstance(fvg_series, Sequence) and not fvg_series:
+            meta_block = (
+                detected_zones.get("meta") if isinstance(detected_zones, Mapping) else None
+            )
+            fvg_stats: Dict[str, Any] = {}
+            if isinstance(meta_block, Mapping):
+                stats_payload = meta_block.get("fvg_stats")
+                if isinstance(stats_payload, Mapping):
+                    for tf_key, tf_stats in stats_payload.items():
+                        tf_name = str(tf_key)
+                        if isinstance(tf_stats, Mapping):
+                            fvg_stats[tf_name] = {
+                                str(metric): int(value)
+                                for metric, value in tf_stats.items()
+                                if isinstance(value, (int, float))
+                            }
+                        else:
+                            fvg_stats[tf_name] = tf_stats
+            logging.getLogger(__name__).info(
+                "FVG detection returned no zones for window",
+                extra={
+                    "symbol": symbol,
+                    "fvg_stats": fvg_stats,
+                    "zones_window_start": zones_window_start_ms,
+                    "window_hours": zones_window_hours,
+                },
+            )
 
     liquidity_payload = build_liquidity_snapshot(
         liquidity_frames,
