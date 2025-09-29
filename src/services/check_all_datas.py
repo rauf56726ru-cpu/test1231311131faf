@@ -2060,8 +2060,8 @@ def build_check_all_datas(
     if fifteen_min_ms:
         raw_zone_start = max(0, _align_to_interval(raw_zone_start, fifteen_min_ms))
     zones_window_start_ms = raw_zone_start
-    warmup_bars_base = zone_cfg.atr_period + 50
-    min_bars_per_tf = {"15m": 200, "1h": 60, "4h": 6}
+    warmup_bars_base = zone_cfg.atr_period + 10
+    min_bars_per_tf = {"15m": 200, "1h": 60, "4h": 24}
     history_candidate = zones_window_start_ms
     for tf_key, baseline in min_bars_per_tf.items():
         required = max(baseline, warmup_bars_base)
@@ -2152,7 +2152,7 @@ def build_check_all_datas(
     zone_frames_window = _build_zone_frames(minute_zone_window)
 
     zone_tf_lengths = {
-        tf: len(zone_frames_window.get(tf, [])) for tf in ("15m", "1h", "4h", "1d")
+        tf: len(zone_frames_full.get(tf, [])) for tf in ("15m", "1h", "4h", "1d")
     }
     warmup_bars_per_tf: Dict[str, int] = {}
     for tf in ("15m", "1h", "4h", "1d"):
@@ -2166,6 +2166,9 @@ def build_check_all_datas(
         "window_hours": zones_window_hours,
         "tick_size": zone_cfg.tick_size,
     }
+    zone_cfg.zones_window_start_ms = zones_window_start_ms
+    zone_cfg.window_end_ms_prev_closed = window_end_ms
+    zone_cfg.allow_base_fallback = True
     liquidity_equal_levels = build_equal_liquidity_levels(zone_frames_full)
 
     base_index_all = {candle["t"]: candle for candle in base_candles}
@@ -2460,6 +2463,63 @@ def build_check_all_datas(
         meta_block = detected_zones.setdefault("meta", {})
         if isinstance(meta_block, MutableMapping):
             meta_block["zones_diag"] = zones_diag
+            detection_diag = meta_block.get("diagnostics")
+            if isinstance(detection_diag, Mapping):
+                timeframes_diag = detection_diag.get("timeframes")
+                structure_map: Dict[str, Any] = {}
+                rb_counts: Dict[str, int] = {}
+                rb_raw_counts: Dict[str, int] = {}
+                rb_flow_map: Dict[str, Any] = {}
+                rb_reject_map: Dict[str, Any] = {}
+                rb_fallback_map: Dict[str, bool] = {}
+                if isinstance(timeframes_diag, Sequence):
+                    for frame_entry in timeframes_diag:
+                        if not isinstance(frame_entry, Mapping):
+                            continue
+                        tf_name = str(frame_entry.get("tf") or "")
+                        structure_info = frame_entry.get("structure_diag")
+                        if isinstance(structure_info, Mapping) and tf_name:
+                            structure_map[tf_name] = {
+                                "pivots": int(structure_info.get("pivots", 0)),
+                                "bos_up": int(structure_info.get("bos_up", 0)),
+                                "bos_down": int(structure_info.get("bos_down", 0)),
+                                "choch": int(structure_info.get("choch", 0)),
+                            }
+                        rb_info = frame_entry.get("rb")
+                        if isinstance(rb_info, Mapping) and tf_name:
+                            rb_counts[tf_name] = int(rb_info.get("count", 0))
+                            stats_payload = rb_info.get("stats")
+                            if isinstance(stats_payload, Mapping):
+                                rb_raw_counts[tf_name] = int(stats_payload.get("rb_raw_count", 0))
+                            flow_payload = rb_info.get("flow")
+                            if isinstance(flow_payload, Mapping):
+                                rb_flow_map[tf_name] = {
+                                    str(key): int(value)
+                                    for key, value in flow_payload.items()
+                                    if isinstance(value, (int, float))
+                                }
+                            reject_payload = rb_info.get("reject")
+                            if isinstance(reject_payload, Mapping):
+                                rb_reject_map[tf_name] = {
+                                    str(key): int(value)
+                                    for key, value in reject_payload.items()
+                                    if isinstance(value, (int, float))
+                                }
+                            if "base_fallback_used" in rb_info:
+                                rb_fallback_map[tf_name] = bool(rb_info.get("base_fallback_used"))
+                if structure_map:
+                    zones_diag["structure_diag"] = structure_map
+                if rb_raw_counts:
+                    zones_diag["rb_raw_count"] = rb_raw_counts
+                if rb_counts:
+                    zones_diag["rb_count"] = rb_counts
+                if rb_flow_map:
+                    zones_diag["rb_flow"] = rb_flow_map
+                if rb_reject_map:
+                    zones_diag["rb_reject"] = rb_reject_map
+                if rb_fallback_map:
+                    zones_diag["base_fallback_used"] = rb_fallback_map
+                zones_diag["detection"] = detection_diag
     if isinstance(zones_container, MutableMapping):
         timestamp_filters = {
             "fvg": "created_utc",
@@ -2573,7 +2633,7 @@ def build_check_all_datas(
         liquidity_source = liquidity_payload
     elif isinstance(snapshot.get("liquidity"), Mapping):
         liquidity_source = snapshot.get("liquidity")  # type: ignore[assignment]
-    smc_blocks = detect_smc_blocks(
+    smc_blocks_list, smc_stats = detect_smc_blocks(
         hourly_htf,
         timeframe="1h",
         structure_flags=structure_events,
@@ -2581,6 +2641,7 @@ def build_check_all_datas(
         liquidity_levels=liquidity_source,
         config=smc_config,
     )
+    smc_blocks = smc_blocks_list
     if smc_blocks and isinstance(zones_payload, MutableMapping):
         existing_ob = zones_payload.get("ob")
         merged = [dict(item) for item in existing_ob] if isinstance(existing_ob, list) else []

@@ -10,7 +10,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple
+from collections import deque
+from typing import Any, Deque, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple
 
 from .ohlc import TIMEFRAME_TO_MS, resample_ohlcv
 from .smc import SMCConfig, detect_smc_blocks
@@ -27,6 +28,11 @@ class Config:
     atr_period: int = 14
     displacement_body: float = 1.0
     displacement_range: float = 1.5
+    base_min_bars: int = 1
+    base_max_bars: int = 4
+    base_max_atr: float = 0.8
+    base_min_overlap: float = 0.5
+    impulse_min_cover: float = 0.6
     ob_body_max_atr: float = 0.7
     ob_overlap_ratio: float = 0.6
     ob_distance_atr: float = 0.5
@@ -34,6 +40,11 @@ class Config:
     epsilon_ticks: float = 1.0
     liquidity_window: int = 3
     sr_merge_pct: float = 0.0002
+    zones_window_start_ms: int | None = None
+    window_end_ms_prev_closed: int | None = None
+    allow_base_fallback: bool = False
+    base_fallback_max_age: int = 200
+    base_fallback_max_distance_atr: float = 3.0
 
 
 _PIVOT_WINDOWS: Dict[str, int] = {"15m": 2, "1h": 3, "4h": 4}
@@ -80,6 +91,59 @@ def _round_tick(value: float, tick_size: float | None) -> float:
     if tick_size is None or tick_size <= 0:
         return float(value)
     return round(value / tick_size) * tick_size
+
+
+def _rolling_return_sigma(
+    candles: Sequence[Candle],
+    *,
+    window: int = 20,
+) -> List[float]:
+    """Compute rolling standard deviation of percentage returns."""
+
+    if window <= 1 or len(candles) < 2:
+        return [math.nan] * len(candles)
+
+    normalised_window = max(2, int(window))
+    result: List[float] = [math.nan] * len(candles)
+    values: Deque[float | None] = deque()
+    window_sum = 0.0
+    window_sum_sq = 0.0
+    window_count = 0
+
+    for idx in range(len(candles)):
+        if idx == 0:
+            values.append(None)
+            continue
+
+        previous_close = float(candles[idx - 1].get("c", 0.0))
+        current_close = float(candles[idx].get("c", 0.0))
+        if not math.isfinite(previous_close) or previous_close == 0.0:
+            pct_return = math.nan
+        else:
+            pct_return = (current_close - previous_close) / previous_close
+        if math.isfinite(pct_return):
+            values.append(pct_return)
+            window_sum += pct_return
+            window_sum_sq += pct_return * pct_return
+            window_count += 1
+        else:
+            values.append(None)
+
+        if len(values) > normalised_window:
+            old = values.popleft()
+            if old is not None:
+                window_sum -= old
+                window_sum_sq -= old * old
+                window_count -= 1
+
+        if window_count >= 2:
+            mean = window_sum / window_count
+            variance = max(0.0, (window_sum_sq / window_count) - mean * mean)
+            result[idx] = math.sqrt(variance)
+        else:
+            result[idx] = math.nan
+
+    return result
 
 
 def _true_range(current: Candle, previous: Candle) -> float:
@@ -178,17 +242,42 @@ def _detect_structure(
         if bos_direction is None:
             continue
         bos_events.append(
-            {"idx": idx, "direction": bos_direction, "t": int(candle["t"]), "price": close_price}
+            {
+                "idx": idx,
+                "direction": bos_direction,
+                "t": int(candle["t"]),
+                "price": close_price,
+                "kind": "bos",
+            }
         )
         if trend is None:
             trend = bos_direction
             continue
         if bos_direction != trend:
             choch_events.append(
-                {"idx": idx, "direction": bos_direction, "t": int(candle["t"]), "price": close_price}
+                {
+                    "idx": idx,
+                    "direction": bos_direction,
+                    "t": int(candle["t"]),
+                    "price": close_price,
+                    "kind": "choch",
+                }
             )
         trend = bos_direction
     return pivots, bos_events, choch_events
+
+
+def _derive_fvg_reason(stats: Mapping[str, int]) -> str:
+    rejections = {
+        str(key): int(value)
+        for key, value in stats.items()
+        if str(key).startswith("fvg_reject_") and int(value) > 0
+    }
+    if rejections:
+        return max(rejections.items(), key=lambda item: item[1])[0]
+    if int(stats.get("fvg_triplets", 0)) > 0:
+        return "no_valid_zones_found"
+    return "no_candidates"
 
 
 def _fvgs_for_tf(
@@ -199,73 +288,93 @@ def _fvgs_for_tf(
     tick_size: float | None,
     atr: Sequence[float],
     bos_events: Sequence[Mapping[str, Any]],
+    returns_sigma: Sequence[float] | None = None,
     stats: MutableMapping[str, int] | None = None,
 ) -> List[Dict[str, Any]]:
     zones: List[Dict[str, Any]] = []
     if len(candles) < 3:
         return zones
+
     tick = tick_size or _infer_tick_size(candles)
-    epsilon = tick or 0.0
-    bos_by_index = {event["idx"]: event for event in bos_events}
+    seen_keys: set[tuple[str, float, float]] = set()
+
     for i in range(len(candles) - 2):
         if stats is not None:
-            stats["triplets"] = stats.get("triplets", 0) + 1
+            stats["fvg_triplets"] = stats.get("fvg_triplets", 0) + 1
         c0, c1, c2 = candles[i], candles[i + 1], candles[i + 2]
-        low_mid = float(c1["l"])
-        high_mid = float(c1["h"])
-        low_next = float(c2["l"])
         high_prev = float(c0["h"])
-        high_next = float(c2["h"])
         low_prev = float(c0["l"])
-        atr_value = atr[i + 1] if i + 1 < len(atr) else math.nan
+        high_next = float(c2["h"])
+        low_next = float(c2["l"])
+
+        bullish_gap = high_prev < low_next
+        bearish_gap = low_prev > high_next
+        if not bullish_gap and not bearish_gap:
+            if stats is not None:
+                stats["fvg_reject_no_gap"] = stats.get("fvg_reject_no_gap", 0) + 1
+            continue
+
+        direction = "up" if bullish_gap else "down"
+        bot_raw = high_prev if bullish_gap else high_next
+        top_raw = low_next if bullish_gap else low_prev
+        if top_raw - bot_raw <= 0:
+            if stats is not None:
+                stats["fvg_reject_no_gap"] = stats.get("fvg_reject_no_gap", 0) + 1
+            continue
+
+        if stats is not None:
+            stats["fvg_raw_count"] = stats.get("fvg_raw_count", 0) + 1
+
+        impulse_idx = i + 2
+        atr_value = atr[impulse_idx] if impulse_idx < len(atr) else math.nan
         if not atr_value or math.isnan(atr_value) or atr_value <= 0:
             if stats is not None:
-                stats["atr_rejected"] = stats.get("atr_rejected", 0) + 1
+                stats["fvg_reject_displacement"] = stats.get("fvg_reject_displacement", 0) + 1
             continue
-        body = abs(float(c1["c"]) - float(c1["o"]))
-        range_span = float(c1["h"]) - float(c1["l"])
-        if body < cfg.displacement_body * atr_value and range_span < cfg.displacement_range * atr_value:
+
+        sigma_value = (
+            returns_sigma[impulse_idx]
+            if returns_sigma is not None and impulse_idx < len(returns_sigma)
+            else math.nan
+        )
+        k_body = cfg.displacement_body
+        k_range = cfg.displacement_range
+        if sigma_value and math.isfinite(sigma_value) and sigma_value < 0.5 * atr_value:
+            k_body = max(0.7, k_body - 0.2)
+            k_range = max(1.1, k_range - 0.3)
+
+        body1 = abs(float(c1["c"]) - float(c1["o"]))
+        body2 = abs(float(c2["c"]) - float(c2["o"]))
+        range1 = float(c1["h"]) - float(c1["l"])
+        range2 = float(c2["h"]) - float(c2["l"])
+        impulse_body = max(body1, body2)
+        impulse_range = max(range1, range2)
+        if impulse_body < k_body * atr_value and impulse_range < k_range * atr_value:
             if stats is not None:
-                stats["displacement_rejected"] = stats.get("displacement_rejected", 0) + 1
+                stats["fvg_reject_displacement"] = stats.get("fvg_reject_displacement", 0) + 1
             continue
-        direction: str | None = None
-        top: float | None = None
-        bot: float | None = None
-        if low_mid > high_prev + epsilon:
-            direction = "up"
-            top = low_mid
-            bot = high_prev
-        elif high_mid < low_prev - epsilon:
-            direction = "down"
-            top = low_prev
-            bot = high_mid
-        if direction is None or top is None or bot is None:
-            if stats is not None:
-                stats["gap_rejected"] = stats.get("gap_rejected", 0) + 1
-            continue
-        width = top - bot
-        if width <= 0:
-            if stats is not None:
-                stats["width_rejected"] = stats.get("width_rejected", 0) + 1
-            continue
-        if tick and width < tick:
-            if stats is not None:
-                stats["tick_rejected"] = stats.get("tick_rejected", 0) + 1
-            continue
+
         created_idx = i + 2
         status = "open"
         fulfil_idx: int | None = None
         for j in range(created_idx + 1, len(candles)):
             low = float(candles[j]["l"])
             high = float(candles[j]["h"])
-            if direction == "up" and low <= bot:
+            if direction == "up" and low <= bot_raw:
                 status = "fulfilled"
                 fulfil_idx = j
                 break
-            if direction == "down" and high >= top:
+            if direction == "down" and high >= top_raw:
                 status = "fulfilled"
                 fulfil_idx = j
                 break
+        if fulfil_idx is not None and fulfil_idx <= created_idx:
+            if stats is not None:
+                stats["fvg_reject_fulfilled_same_leg"] = stats.get(
+                    "fvg_reject_fulfilled_same_leg", 0
+                ) + 1
+            continue
+
         if fulfil_idx is not None:
             opposite = "down" if direction == "up" else "up"
             inverted = False
@@ -278,23 +387,42 @@ def _fvgs_for_tf(
                     candle = candles[k]
                     body_low, body_high = _body_range(candle)
                     close_price = float(candle["c"])
-                    if body_low <= top and body_high >= bot:
-                        if direction == "up" and close_price < bot:
+                    if body_low <= top_raw and body_high >= bot_raw:
+                        if direction == "up" and close_price < bot_raw:
                             inverted = True
                             break
-                        if direction == "down" and close_price > top:
+                        if direction == "down" and close_price > top_raw:
                             inverted = True
                             break
                 if inverted:
                     break
             if inverted:
                 status = "inverted"
+
+        dedup_key = (direction, round(bot_raw, 8), round(top_raw, 8))
+        if dedup_key in seen_keys:
+            if stats is not None:
+                stats["fvg_reject_dedup"] = stats.get("fvg_reject_dedup", 0) + 1
+            continue
+        seen_keys.add(dedup_key)
+
+        top_value = _round_tick(top_raw, tick)
+        bot_value = _round_tick(bot_raw, tick)
+        if tick and top_value <= bot_value:
+            if stats is not None:
+                stats["fvg_reject_tick_collapse"] = stats.get(
+                    "fvg_reject_tick_collapse", 0
+                ) + 1
+            top_value = top_raw
+            bot_value = bot_raw
+        mid_value = _round_tick((top_raw + bot_raw) / 2.0, tick)
+
         zone = {
             "tf": tf,
             "direction": direction,
-            "top": _round_tick(top, tick),
-            "bot": _round_tick(bot, tick),
-            "mid": _round_tick((top + bot) / 2.0, tick),
+            "top": float(top_value),
+            "bot": float(bot_value),
+            "mid": float(mid_value),
             "created_utc": _ms_to_iso(int(c2["t"])),
             "status": status,
         }
@@ -381,6 +509,7 @@ def _ob_for_tf(
     tick_size: float | None,
     atr: Sequence[float],
     bos_events: Sequence[Mapping[str, Any]],
+    choch_events: Sequence[Mapping[str, Any]],
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
     zones: List[Dict[str, Any]] = []
     raw_metadata: List[Dict[str, Any]] = []
@@ -402,10 +531,36 @@ def _ob_for_tf(
         liquidity_levels["pdh"].append({"price": float(last_full_day["h"]), "t": int(last_full_day["t"])})
         liquidity_levels["pdl"].append({"price": float(last_full_day["l"]), "t": int(last_full_day["t"])})
     smc_payload["liquidity"] = liquidity_levels
-    smc_payload["structure"] = [
-        {"kind": "bos", "direction": event["direction"], "t": event["t"], "price": event["price"]}
-        for event in bos_events
-    ]
+    window_start = cfg.zones_window_start_ms
+    window_end = cfg.window_end_ms_prev_closed
+    if candles:
+        if window_start is None:
+            window_start = int(candles[0]["t"])
+        if window_end is None:
+            window_end = int(candles[-1]["t"])
+        else:
+            window_end = min(window_end, int(candles[-1]["t"]))
+    structure_events: List[Dict[str, Any]] = []
+    for event in list(bos_events) + list(choch_events):
+        event_ts = int(event.get("t", 0))
+        if window_start is not None and event_ts < window_start:
+            continue
+        if window_end is not None and event_ts > window_end:
+            continue
+        structure_events.append(
+            {
+                "kind": event.get("kind", ""),
+                "direction": event.get("direction"),
+                "t": event_ts,
+                "price": event.get("price"),
+                "idx": event.get("idx"),
+                "tf": tf,
+            }
+        )
+    structure_events.sort(key=lambda item: item.get("t", 0))
+    smc_payload["structure"] = structure_events
+    smc_payload["window"] = {"start": window_start, "end": window_end}
+    smc_payload["tf"] = tf
     for event in bos_events:
         direction = event["direction"]
         zone_type = "demand" if direction == "up" else "supply"
@@ -481,10 +636,19 @@ def _mb_bb_rb_from_smc(
     candles: Sequence[Candle],
     *,
     tf: str,
+    cfg: Config,
+    tick_size: float | None,
+    atr: Sequence[float],
+    returns_sigma: Sequence[float] | None,
     smc_data: Dict[str, Any],
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    if not smc_data.get("ob"):
-        return [], [], []
+) -> Tuple[
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    Dict[str, Any],
+]:
+    ob_series = smc_data.get("ob") or []
+    ob_count = len(ob_series) if isinstance(ob_series, Sequence) else 0
     structure_flags = smc_data.get("structure") or []
     liquidity_levels = {
         "eqh": smc_data.get("liquidity", {}).get("eqh", []),
@@ -492,36 +656,106 @@ def _mb_bb_rb_from_smc(
         "pdh": smc_data.get("liquidity", {}).get("pdh", []),
         "pdl": smc_data.get("liquidity", {}).get("pdl", []),
     }
-    blocks = detect_smc_blocks(
+    diagnostics: Dict[str, Any] = {
+        "ob_candidates": ob_count,
+        "structure_flags": len(structure_flags)
+        if isinstance(structure_flags, Sequence)
+        else 0,
+        "liquidity_levels": {
+            key: len(series) if isinstance(series, Sequence) else 0
+            for key, series in liquidity_levels.items()
+        },
+    }
+    if ob_count == 0:
+        diagnostics["reason"] = "missing_ob_zones"
+        return [], [], [], diagnostics
+    displacement_body = cfg.displacement_body
+    displacement_range = cfg.displacement_range
+    smc_config = SMCConfig(
+        min_block_size=0.0,
+        ttl_bars=0,
+        zones_window_start_ms=cfg.zones_window_start_ms,
+        window_end_ms_prev_closed=cfg.window_end_ms_prev_closed,
+        allow_base_fallback=cfg.allow_base_fallback,
+        base_fallback_max_age=cfg.base_fallback_max_age,
+        base_fallback_max_distance_atr=cfg.base_fallback_max_distance_atr,
+        base_min_bars=cfg.base_min_bars,
+        base_max_bars=cfg.base_max_bars,
+        base_max_atr=cfg.base_max_atr,
+        base_min_overlap=cfg.base_min_overlap,
+        impulse_min_cover=cfg.impulse_min_cover,
+    )
+    blocks, smc_stats = detect_smc_blocks(
         candles,
         timeframe=tf,
         structure_flags=structure_flags,
-        ob_zones=smc_data.get("ob"),
+        ob_zones=ob_series,
         liquidity_levels=liquidity_levels,
-        config=SMCConfig(min_block_size=0.0),
+        config=smc_config,
+        atr=atr,
+        returns_sigma=returns_sigma,
+        displacement_body=displacement_body,
+        displacement_range=displacement_range,
+        tick_size=tick_size,
     )
+    diagnostics["smc_blocks"] = len(blocks)
+    diagnostics.update({str(key): value for key, value in smc_stats.items()})
     mb: List[Dict[str, Any]] = []
     bb: List[Dict[str, Any]] = []
     rb: List[Dict[str, Any]] = []
     for block in blocks:
         kind = block.get("kind")
         range_low, range_high = block.get("range", [0.0, 0.0])[:2]
+        mean_price = (float(range_low) + float(range_high)) / 2.0
+        if kind == "rb":
+            bot_value = float(block.get("bot", range_low))
+            top_value = float(block.get("top", range_high))
+            mid_value = block.get("mid")
+            if mid_value is None:
+                mid_value = (bot_value + top_value) / 2.0
+            entry = {
+                "tf": tf,
+                "direction": block.get("direction")
+                or ("up" if block.get("type") == "demand" else "down"),
+                "type": block.get("type"),
+                "bot": float(bot_value),
+                "top": float(top_value),
+                "mid": _round_tick(float(mid_value), tick_size),
+                "origin_utc": _ms_to_iso(int(block.get("created_at", 0))),
+                "status": block.get("status", "fresh"),
+            }
+            shadow = block.get("shadowed_by")
+            if shadow:
+                entry["shadowed_by"] = shadow
+            rb.append(entry)
+            continue
+
         entry = {
             "tf": tf,
             "type": block.get("type"),
             "open": float(range_low),
             "close": float(range_high),
-            "mean": (float(range_low) + float(range_high)) / 2.0,
+            "mean": _round_tick(mean_price, tick_size),
             "origin_utc": _ms_to_iso(int(block.get("created_at", 0))),
             "status": block.get("status", "fresh"),
         }
+        shadow = block.get("shadowed_by")
+        if shadow:
+            entry["shadowed_by"] = shadow
         if kind == "mb":
             mb.append(entry)
         elif kind == "bb":
             bb.append(entry)
-        elif kind == "rb":
-            rb.append(entry)
-    return mb, bb, rb
+    diagnostics["mb_count"] = len(mb)
+    diagnostics["bb_count"] = len(bb)
+    diagnostics["rb_count"] = len(rb)
+    if not blocks:
+        diagnostics.setdefault("reason", "no_smc_blocks")
+    elif not rb:
+        existing_reason = diagnostics.get("reason")
+        fallback_reason = "no_reversal_blocks"
+        diagnostics.setdefault("reason", existing_reason or fallback_reason)
+    return mb, bb, rb, diagnostics
 
 
 def _pb_for_tf(
@@ -768,23 +1002,105 @@ def detect_zones(
     pb_all: List[Dict[str, Any]] = []
     sr_levels: List[Dict[str, Any]] = []
     fvg_stats: Dict[str, Dict[str, int]] = {}
+    diagnostics_timeframes: List[Dict[str, Any]] = []
     for tf in ("15m", "1h", "4h"):
         candles = timeframes.get(tf, [])
+        tf_diag: Dict[str, Any] = {"tf": tf, "candles": len(candles)}
+        stats_entry = fvg_stats.setdefault(tf, {})
         if len(candles) < 3:
+            stats_entry["skipped"] = len(candles)
+            reason = "insufficient_candles"
+            for key in ("fvg", "ob", "mb", "bb", "rb", "pb"):
+                tf_diag[key] = {"count": 0, "reason": reason}
+            tf_diag["skipped"] = reason
+            diagnostics_timeframes.append(tf_diag)
             continue
         atr = compute_atr(candles, cfg.atr_period)
+        returns_sigma = _rolling_return_sigma(candles, window=20)
+        valid_atr = sum(1 for value in atr if isinstance(value, (int, float)) and math.isfinite(value) and value > 0)
+        tf_diag["atr"] = {"length": len(atr), "valid_values": valid_atr}
         pivots, bos_events, choch_events = _detect_structure(candles, tf=tf, tick_size=tick, cfg=cfg)
-        fvg_all.extend(
-            _fvgs_for_tf(
-                candles,
-                tf=tf,
-                cfg=cfg,
-                tick_size=tick,
-                atr=atr,
-                bos_events=bos_events,
-                stats=fvg_stats.setdefault(tf, {}),
-            )
+        tf_window_start = cfg.zones_window_start_ms
+        tf_window_end = cfg.window_end_ms_prev_closed
+        if candles:
+            first_ts = int(candles[0]["t"])
+            last_ts = int(candles[-1]["t"])
+            if tf_window_start is None:
+                tf_window_start = first_ts
+            if tf_window_end is None:
+                tf_window_end = last_ts
+            else:
+                tf_window_end = min(tf_window_end, last_ts)
+        pivots_in_window: List[Dict[str, Any]] = []
+        if pivots:
+            for pivot in pivots:
+                idx = int(pivot.get("idx", -1))
+                if idx < 0 or idx >= len(candles):
+                    continue
+                pivot_ts = int(candles[idx]["t"])
+                if tf_window_start is not None and pivot_ts < tf_window_start:
+                    continue
+                if tf_window_end is not None and pivot_ts > tf_window_end:
+                    continue
+                pivots_in_window.append(dict(pivot))
+        bos_in_window: List[Dict[str, Any]] = []
+        for event in bos_events:
+            event_ts = int(event.get("t", 0))
+            if tf_window_start is not None and event_ts < tf_window_start:
+                continue
+            if tf_window_end is not None and event_ts > tf_window_end:
+                continue
+            bos_in_window.append(event)
+        choch_in_window: List[Dict[str, Any]] = []
+        for event in choch_events:
+            event_ts = int(event.get("t", 0))
+            if tf_window_start is not None and event_ts < tf_window_start:
+                continue
+            if tf_window_end is not None and event_ts > tf_window_end:
+                continue
+            choch_in_window.append(event)
+        bos_up_count = sum(1 for event in bos_in_window if event.get("direction") == "up")
+        bos_down_count = sum(1 for event in bos_in_window if event.get("direction") == "down")
+        tf_diag["structure"] = {
+            "pivots": len(pivots_in_window),
+            "bos": len(bos_in_window),
+            "bos_up": bos_up_count,
+            "bos_down": bos_down_count,
+            "choch": len(choch_in_window),
+        }
+        tf_diag["structure_diag"] = {
+            "tf": tf,
+            "pivots": len(pivots_in_window),
+            "bos_up": bos_up_count,
+            "bos_down": bos_down_count,
+            "choch": len(choch_in_window),
+        }
+        for key in (
+            "fvg_triplets",
+            "fvg_raw_count",
+            "fvg_reject_no_gap",
+            "fvg_reject_displacement",
+            "fvg_reject_fulfilled_same_leg",
+            "fvg_reject_tick_collapse",
+            "fvg_reject_dedup",
+        ):
+            stats_entry.setdefault(key, 0)
+        fvgs_tf = _fvgs_for_tf(
+            candles,
+            tf=tf,
+            cfg=cfg,
+            tick_size=tick,
+            atr=atr,
+            bos_events=bos_events,
+            returns_sigma=returns_sigma,
+            stats=stats_entry,
         )
+        stats_copy = {str(key): int(value) for key, value in stats_entry.items()}
+        fvg_entry: Dict[str, Any] = {"count": len(fvgs_tf), "stats": stats_copy}
+        if not fvgs_tf:
+            fvg_entry["reason"] = _derive_fvg_reason(stats_entry)
+        tf_diag["fvg"] = fvg_entry
+        fvg_all.extend(fvgs_tf)
         ob_zones, metadata, smc_payload = _ob_for_tf(
             candles,
             tf=tf,
@@ -792,7 +1108,12 @@ def detect_zones(
             tick_size=tick,
             atr=atr,
             bos_events=bos_events,
+            choch_events=choch_events,
         )
+        ob_entry: Dict[str, Any] = {"count": len(ob_zones)}
+        if not ob_zones:
+            ob_entry["reason"] = "no_bos_events" if not bos_events else "no_order_blocks"
+        tf_diag["ob"] = ob_entry
         ob_all.extend(ob_zones)
         if external_liquidity:
             combined = dict(smc_payload.get("liquidity", {}))
@@ -801,21 +1122,114 @@ def detect_zones(
                 existing.extend(items)
                 combined[key] = existing
             smc_payload["liquidity"] = combined
-        mb, bb, rb = _mb_bb_rb_from_smc(candles, tf=tf, smc_data=smc_payload)
+        mb, bb, rb, smc_diag = _mb_bb_rb_from_smc(
+            candles,
+            tf=tf,
+            cfg=cfg,
+            tick_size=tick,
+            atr=atr,
+            returns_sigma=returns_sigma,
+            smc_data=smc_payload,
+        )
+        for key in (
+            "rb_raw_count",
+            "rb_reject_no_eq",
+            "rb_reject_no_sweep",
+            "rb_reject_no_choch",
+            "rb_reject_no_base",
+            "rb_reject_no_impulse",
+        ):
+            smc_diag.setdefault(key, 0)
+        smc_diag.setdefault("rb_flow", {})
+        smc_diag.setdefault("rb_reject", {})
+        smc_diag.setdefault("base_tick_collapse", 0)
+        smc_diag.setdefault("base_fallback_used", False)
+        smc_diag.setdefault("rb_impulse_ok", False)
+        tf_diag["smc"] = smc_diag
+        tf_diag["mb"] = {"count": len(mb)}
+        if not mb and smc_diag.get("reason"):
+            tf_diag["mb"]["reason"] = smc_diag["reason"]
+        tf_diag["bb"] = {"count": len(bb)}
+        if not bb and smc_diag.get("reason"):
+            tf_diag["bb"]["reason"] = smc_diag["reason"]
+        rb_stats = {
+            key: int(smc_diag.get(key, 0))
+            for key in (
+                "rb_raw_count",
+                "rb_reject_no_eq",
+                "rb_reject_no_sweep",
+                "rb_reject_no_choch",
+                "rb_reject_no_base",
+                "rb_reject_no_impulse",
+            )
+        }
+        rb_entry: Dict[str, Any] = {"count": len(rb), "stats": rb_stats}
+        if smc_diag.get("reason"):
+            rb_entry["reason"] = smc_diag["reason"]
+        flow_diag = smc_diag.get("rb_flow")
+        if isinstance(flow_diag, Mapping):
+            rb_entry["flow"] = {str(k): int(v) for k, v in flow_diag.items() if isinstance(v, (int, float))}
+        reject_diag = smc_diag.get("rb_reject")
+        if isinstance(reject_diag, Mapping):
+            rb_entry["reject"] = {str(k): int(v) for k, v in reject_diag.items() if isinstance(v, (int, float))}
+        rb_entry["base_fallback_used"] = bool(smc_diag.get("base_fallback_used"))
+        rb_entry["impulse_ok"] = bool(smc_diag.get("rb_impulse_ok"))
+        rb_entry["base_tick_collapse"] = int(smc_diag.get("base_tick_collapse", 0))
+        tf_diag["rb"] = rb_entry
         mb_all.extend(mb)
         bb_all.extend(bb)
         rb_all.extend(rb)
-        pb_all.extend(
-            _pb_for_tf(
-                candles,
-                tf=tf,
-                cfg=cfg,
-                tick_size=tick,
-                atr=atr,
-                pivots=pivots,
-            )
+        pb_tf = _pb_for_tf(
+            candles,
+            tf=tf,
+            cfg=cfg,
+            tick_size=tick,
+            atr=atr,
+            pivots=pivots,
         )
+        tf_diag["pb"] = {"count": len(pb_tf)}
+        if not pb_tf:
+            tf_diag["pb"]["reason"] = "no_pivots" if not pivots else "no_pivot_blocks"
+        pb_all.extend(pb_tf)
+        diagnostics_timeframes.append(tf_diag)
     sr_levels = _sr_levels(timeframes.get("4h", []), timeframes.get("1d", []), cfg=cfg, tick_size=tick)
+    sr_reason: str | None = None
+    if not sr_levels:
+        if len(timeframes.get("4h", [])) < 3 and len(timeframes.get("1d", [])) < 3:
+            sr_reason = "insufficient_candles"
+    def _collect_reasons(zone_key: str) -> List[Dict[str, Any]]:
+        reasons: List[Dict[str, Any]] = []
+        for frame_diag in diagnostics_timeframes:
+            entry = frame_diag.get(zone_key)
+            if not isinstance(entry, Mapping):
+                continue
+            if int(entry.get("count", 0)) > 0:
+                continue
+            reason_value = entry.get("reason")
+            if reason_value:
+                reasons.append({"tf": frame_diag.get("tf"), "reason": reason_value})
+        return reasons
+
+    diagnostics_summary: Dict[str, Any] = {}
+    zone_collections = {
+        "fvg": fvg_all,
+        "ob": ob_all,
+        "mb": mb_all,
+        "bb": bb_all,
+        "rb": rb_all,
+        "pb": pb_all,
+    }
+    for zone_key, series in zone_collections.items():
+        entry: Dict[str, Any] = {"count": len(series)}
+        reasons = _collect_reasons(zone_key)
+        if not series and reasons:
+            entry["reasons"] = reasons
+        diagnostics_summary[zone_key] = entry
+    sr_entry: Dict[str, Any] = {"count": len(sr_levels)}
+    if not sr_levels and sr_reason:
+        sr_entry["reasons"] = [{"tf": "sr", "reason": sr_reason}]
+    diagnostics_summary["sr"] = sr_entry
+
     payload = {
         "zones": {
             "fvg": fvg_all,
@@ -828,5 +1242,11 @@ def detect_zones(
             "profile_levels": _profile_levels(profile_levels),
         }
     }
-    payload["meta"] = {"fvg_stats": fvg_stats}
+    payload["meta"] = {
+        "fvg_stats": fvg_stats,
+        "diagnostics": {
+            "timeframes": diagnostics_timeframes,
+            "summary": diagnostics_summary,
+        },
+    }
     return payload
