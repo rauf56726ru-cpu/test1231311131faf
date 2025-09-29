@@ -108,6 +108,26 @@ def test_detect_zones_propagates_profile_levels() -> None:
     )
 
 
+def test_fvg_preserves_raw_bounds_when_tick_collapses() -> None:
+    candles = [
+        make_candle(0, 100.0, 100.0, 99.6, 99.8),
+        make_candle(1, 99.8, 101.6, 99.5, 101.2),
+        make_candle(2, 101.5, 101.8, 100.3, 100.6),
+        make_candle(3, 100.5, 100.7, 99.8, 100.1),
+        make_candle(4, 100.0, 100.4, 99.7, 99.9),
+    ]
+    cfg = Config(tick_size=1.0, displacement_body=0.0, displacement_range=0.0, atr_period=1)
+    payload = detect_zones(frames={"15m": candles}, config=cfg)
+
+    zones = payload["zones"]
+    assert zones["fvg"], "Expected at least one FVG zone"
+    fvg = zones["fvg"][0]
+    assert fvg["top"] == pytest.approx(100.3)
+    assert fvg["bot"] == pytest.approx(100.0)
+    stats = payload["meta"]["fvg_stats"]["15m"]
+    assert stats.get("fvg_reject_tick_collapse", 0) >= 1
+
+
 def test_detect_zones_accepts_keyword_only_inputs() -> None:
     frames = {"15m": build_orderflow_sequence()}
     payload = detect_zones(frames=frames)

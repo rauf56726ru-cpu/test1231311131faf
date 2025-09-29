@@ -2060,8 +2060,8 @@ def build_check_all_datas(
     if fifteen_min_ms:
         raw_zone_start = max(0, _align_to_interval(raw_zone_start, fifteen_min_ms))
     zones_window_start_ms = raw_zone_start
-    warmup_bars_base = zone_cfg.atr_period + 50
-    min_bars_per_tf = {"15m": 200, "1h": 60, "4h": 6}
+    warmup_bars_base = zone_cfg.atr_period + 10
+    min_bars_per_tf = {"15m": 200, "1h": 60, "4h": 24}
     history_candidate = zones_window_start_ms
     for tf_key, baseline in min_bars_per_tf.items():
         required = max(baseline, warmup_bars_base)
@@ -2152,7 +2152,7 @@ def build_check_all_datas(
     zone_frames_window = _build_zone_frames(minute_zone_window)
 
     zone_tf_lengths = {
-        tf: len(zone_frames_window.get(tf, [])) for tf in ("15m", "1h", "4h", "1d")
+        tf: len(zone_frames_full.get(tf, [])) for tf in ("15m", "1h", "4h", "1d")
     }
     warmup_bars_per_tf: Dict[str, int] = {}
     for tf in ("15m", "1h", "4h", "1d"):
@@ -2576,7 +2576,7 @@ def build_check_all_datas(
         liquidity_source = liquidity_payload
     elif isinstance(snapshot.get("liquidity"), Mapping):
         liquidity_source = snapshot.get("liquidity")  # type: ignore[assignment]
-    smc_blocks = detect_smc_blocks(
+    smc_blocks_list, smc_stats = detect_smc_blocks(
         hourly_htf,
         timeframe="1h",
         structure_flags=structure_events,
@@ -2584,6 +2584,7 @@ def build_check_all_datas(
         liquidity_levels=liquidity_source,
         config=smc_config,
     )
+    smc_blocks = smc_blocks_list
     if smc_blocks and isinstance(zones_payload, MutableMapping):
         existing_ob = zones_payload.get("ob")
         merged = [dict(item) for item in existing_ob] if isinstance(existing_ob, list) else []

@@ -10,7 +10,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple
+from collections import deque
+from typing import Any, Deque, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple
 
 from .ohlc import TIMEFRAME_TO_MS, resample_ohlcv
 from .smc import SMCConfig, detect_smc_blocks
@@ -80,6 +81,59 @@ def _round_tick(value: float, tick_size: float | None) -> float:
     if tick_size is None or tick_size <= 0:
         return float(value)
     return round(value / tick_size) * tick_size
+
+
+def _rolling_return_sigma(
+    candles: Sequence[Candle],
+    *,
+    window: int = 20,
+) -> List[float]:
+    """Compute rolling standard deviation of percentage returns."""
+
+    if window <= 1 or len(candles) < 2:
+        return [math.nan] * len(candles)
+
+    normalised_window = max(2, int(window))
+    result: List[float] = [math.nan] * len(candles)
+    values: Deque[float | None] = deque()
+    window_sum = 0.0
+    window_sum_sq = 0.0
+    window_count = 0
+
+    for idx in range(len(candles)):
+        if idx == 0:
+            values.append(None)
+            continue
+
+        previous_close = float(candles[idx - 1].get("c", 0.0))
+        current_close = float(candles[idx].get("c", 0.0))
+        if not math.isfinite(previous_close) or previous_close == 0.0:
+            pct_return = math.nan
+        else:
+            pct_return = (current_close - previous_close) / previous_close
+        if math.isfinite(pct_return):
+            values.append(pct_return)
+            window_sum += pct_return
+            window_sum_sq += pct_return * pct_return
+            window_count += 1
+        else:
+            values.append(None)
+
+        if len(values) > normalised_window:
+            old = values.popleft()
+            if old is not None:
+                window_sum -= old
+                window_sum_sq -= old * old
+                window_count -= 1
+
+        if window_count >= 2:
+            mean = window_sum / window_count
+            variance = max(0.0, (window_sum_sq / window_count) - mean * mean)
+            result[idx] = math.sqrt(variance)
+        else:
+            result[idx] = math.nan
+
+    return result
 
 
 def _true_range(current: Candle, previous: Candle) -> float:
@@ -195,11 +249,11 @@ def _derive_fvg_reason(stats: Mapping[str, int]) -> str:
     rejections = {
         str(key): int(value)
         for key, value in stats.items()
-        if str(key).endswith("_rejected") and int(value) > 0
+        if str(key).startswith("fvg_reject_") and int(value) > 0
     }
     if rejections:
         return max(rejections.items(), key=lambda item: item[1])[0]
-    if int(stats.get("triplets", 0)) > 0:
+    if int(stats.get("fvg_triplets", 0)) > 0:
         return "no_valid_zones_found"
     return "no_candidates"
 
@@ -212,73 +266,93 @@ def _fvgs_for_tf(
     tick_size: float | None,
     atr: Sequence[float],
     bos_events: Sequence[Mapping[str, Any]],
+    returns_sigma: Sequence[float] | None = None,
     stats: MutableMapping[str, int] | None = None,
 ) -> List[Dict[str, Any]]:
     zones: List[Dict[str, Any]] = []
     if len(candles) < 3:
         return zones
+
     tick = tick_size or _infer_tick_size(candles)
-    epsilon = tick or 0.0
-    bos_by_index = {event["idx"]: event for event in bos_events}
+    seen_keys: set[tuple[str, float, float]] = set()
+
     for i in range(len(candles) - 2):
         if stats is not None:
-            stats["triplets"] = stats.get("triplets", 0) + 1
+            stats["fvg_triplets"] = stats.get("fvg_triplets", 0) + 1
         c0, c1, c2 = candles[i], candles[i + 1], candles[i + 2]
-        low_mid = float(c1["l"])
-        high_mid = float(c1["h"])
-        low_next = float(c2["l"])
         high_prev = float(c0["h"])
-        high_next = float(c2["h"])
         low_prev = float(c0["l"])
-        atr_value = atr[i + 1] if i + 1 < len(atr) else math.nan
+        high_next = float(c2["h"])
+        low_next = float(c2["l"])
+
+        bullish_gap = high_prev < low_next
+        bearish_gap = low_prev > high_next
+        if not bullish_gap and not bearish_gap:
+            if stats is not None:
+                stats["fvg_reject_no_gap"] = stats.get("fvg_reject_no_gap", 0) + 1
+            continue
+
+        direction = "up" if bullish_gap else "down"
+        bot_raw = high_prev if bullish_gap else high_next
+        top_raw = low_next if bullish_gap else low_prev
+        if top_raw - bot_raw <= 0:
+            if stats is not None:
+                stats["fvg_reject_no_gap"] = stats.get("fvg_reject_no_gap", 0) + 1
+            continue
+
+        if stats is not None:
+            stats["fvg_raw_count"] = stats.get("fvg_raw_count", 0) + 1
+
+        impulse_idx = i + 2
+        atr_value = atr[impulse_idx] if impulse_idx < len(atr) else math.nan
         if not atr_value or math.isnan(atr_value) or atr_value <= 0:
             if stats is not None:
-                stats["atr_rejected"] = stats.get("atr_rejected", 0) + 1
+                stats["fvg_reject_displacement"] = stats.get("fvg_reject_displacement", 0) + 1
             continue
-        body = abs(float(c1["c"]) - float(c1["o"]))
-        range_span = float(c1["h"]) - float(c1["l"])
-        if body < cfg.displacement_body * atr_value and range_span < cfg.displacement_range * atr_value:
+
+        sigma_value = (
+            returns_sigma[impulse_idx]
+            if returns_sigma is not None and impulse_idx < len(returns_sigma)
+            else math.nan
+        )
+        k_body = cfg.displacement_body
+        k_range = cfg.displacement_range
+        if sigma_value and math.isfinite(sigma_value) and sigma_value < 0.5 * atr_value:
+            k_body = max(0.7, k_body - 0.2)
+            k_range = max(1.1, k_range - 0.3)
+
+        body1 = abs(float(c1["c"]) - float(c1["o"]))
+        body2 = abs(float(c2["c"]) - float(c2["o"]))
+        range1 = float(c1["h"]) - float(c1["l"])
+        range2 = float(c2["h"]) - float(c2["l"])
+        impulse_body = max(body1, body2)
+        impulse_range = max(range1, range2)
+        if impulse_body < k_body * atr_value and impulse_range < k_range * atr_value:
             if stats is not None:
-                stats["displacement_rejected"] = stats.get("displacement_rejected", 0) + 1
+                stats["fvg_reject_displacement"] = stats.get("fvg_reject_displacement", 0) + 1
             continue
-        direction: str | None = None
-        top: float | None = None
-        bot: float | None = None
-        if low_mid > high_prev + epsilon:
-            direction = "up"
-            top = low_mid
-            bot = high_prev
-        elif high_mid < low_prev - epsilon:
-            direction = "down"
-            top = low_prev
-            bot = high_mid
-        if direction is None or top is None or bot is None:
-            if stats is not None:
-                stats["gap_rejected"] = stats.get("gap_rejected", 0) + 1
-            continue
-        width = top - bot
-        if width <= 0:
-            if stats is not None:
-                stats["width_rejected"] = stats.get("width_rejected", 0) + 1
-            continue
-        if tick and width < tick:
-            if stats is not None:
-                stats["tick_rejected"] = stats.get("tick_rejected", 0) + 1
-            continue
+
         created_idx = i + 2
         status = "open"
         fulfil_idx: int | None = None
         for j in range(created_idx + 1, len(candles)):
             low = float(candles[j]["l"])
             high = float(candles[j]["h"])
-            if direction == "up" and low <= bot:
+            if direction == "up" and low <= bot_raw:
                 status = "fulfilled"
                 fulfil_idx = j
                 break
-            if direction == "down" and high >= top:
+            if direction == "down" and high >= top_raw:
                 status = "fulfilled"
                 fulfil_idx = j
                 break
+        if fulfil_idx is not None and fulfil_idx <= created_idx:
+            if stats is not None:
+                stats["fvg_reject_fulfilled_same_leg"] = stats.get(
+                    "fvg_reject_fulfilled_same_leg", 0
+                ) + 1
+            continue
+
         if fulfil_idx is not None:
             opposite = "down" if direction == "up" else "up"
             inverted = False
@@ -291,23 +365,42 @@ def _fvgs_for_tf(
                     candle = candles[k]
                     body_low, body_high = _body_range(candle)
                     close_price = float(candle["c"])
-                    if body_low <= top and body_high >= bot:
-                        if direction == "up" and close_price < bot:
+                    if body_low <= top_raw and body_high >= bot_raw:
+                        if direction == "up" and close_price < bot_raw:
                             inverted = True
                             break
-                        if direction == "down" and close_price > top:
+                        if direction == "down" and close_price > top_raw:
                             inverted = True
                             break
                 if inverted:
                     break
             if inverted:
                 status = "inverted"
+
+        dedup_key = (direction, round(bot_raw, 8), round(top_raw, 8))
+        if dedup_key in seen_keys:
+            if stats is not None:
+                stats["fvg_reject_dedup"] = stats.get("fvg_reject_dedup", 0) + 1
+            continue
+        seen_keys.add(dedup_key)
+
+        top_value = _round_tick(top_raw, tick)
+        bot_value = _round_tick(bot_raw, tick)
+        if tick and top_value <= bot_value:
+            if stats is not None:
+                stats["fvg_reject_tick_collapse"] = stats.get(
+                    "fvg_reject_tick_collapse", 0
+                ) + 1
+            top_value = top_raw
+            bot_value = bot_raw
+        mid_value = _round_tick((top_raw + bot_raw) / 2.0, tick)
+
         zone = {
             "tf": tf,
             "direction": direction,
-            "top": _round_tick(top, tick),
-            "bot": _round_tick(bot, tick),
-            "mid": _round_tick((top + bot) / 2.0, tick),
+            "top": float(top_value),
+            "bot": float(bot_value),
+            "mid": float(mid_value),
             "created_utc": _ms_to_iso(int(c2["t"])),
             "status": status,
         }
@@ -494,6 +587,10 @@ def _mb_bb_rb_from_smc(
     candles: Sequence[Candle],
     *,
     tf: str,
+    cfg: Config,
+    tick_size: float | None,
+    atr: Sequence[float],
+    returns_sigma: Sequence[float] | None,
     smc_data: Dict[str, Any],
 ) -> Tuple[
     List[Dict[str, Any]],
@@ -523,15 +620,23 @@ def _mb_bb_rb_from_smc(
     if ob_count == 0:
         diagnostics["reason"] = "missing_ob_zones"
         return [], [], [], diagnostics
-    blocks = detect_smc_blocks(
+    displacement_body = cfg.displacement_body
+    displacement_range = cfg.displacement_range
+    blocks, smc_stats = detect_smc_blocks(
         candles,
         timeframe=tf,
         structure_flags=structure_flags,
         ob_zones=ob_series,
         liquidity_levels=liquidity_levels,
         config=SMCConfig(min_block_size=0.0),
+        atr=atr,
+        returns_sigma=returns_sigma,
+        displacement_body=displacement_body,
+        displacement_range=displacement_range,
+        tick_size=tick_size,
     )
     diagnostics["smc_blocks"] = len(blocks)
+    diagnostics.update({str(key): value for key, value in smc_stats.items()})
     mb: List[Dict[str, Any]] = []
     bb: List[Dict[str, Any]] = []
     rb: List[Dict[str, Any]] = []
@@ -821,6 +926,7 @@ def detect_zones(
             diagnostics_timeframes.append(tf_diag)
             continue
         atr = compute_atr(candles, cfg.atr_period)
+        returns_sigma = _rolling_return_sigma(candles, window=20)
         valid_atr = sum(1 for value in atr if isinstance(value, (int, float)) and math.isfinite(value) and value > 0)
         tf_diag["atr"] = {"length": len(atr), "valid_values": valid_atr}
         pivots, bos_events, choch_events = _detect_structure(candles, tf=tf, tick_size=tick, cfg=cfg)
@@ -829,6 +935,16 @@ def detect_zones(
             "bos": len(bos_events),
             "choch": len(choch_events),
         }
+        for key in (
+            "fvg_triplets",
+            "fvg_raw_count",
+            "fvg_reject_no_gap",
+            "fvg_reject_displacement",
+            "fvg_reject_fulfilled_same_leg",
+            "fvg_reject_tick_collapse",
+            "fvg_reject_dedup",
+        ):
+            stats_entry.setdefault(key, 0)
         fvgs_tf = _fvgs_for_tf(
             candles,
             tf=tf,
@@ -836,6 +952,7 @@ def detect_zones(
             tick_size=tick,
             atr=atr,
             bos_events=bos_events,
+            returns_sigma=returns_sigma,
             stats=stats_entry,
         )
         stats_copy = {str(key): int(value) for key, value in stats_entry.items()}
@@ -864,7 +981,24 @@ def detect_zones(
                 existing.extend(items)
                 combined[key] = existing
             smc_payload["liquidity"] = combined
-        mb, bb, rb, smc_diag = _mb_bb_rb_from_smc(candles, tf=tf, smc_data=smc_payload)
+        mb, bb, rb, smc_diag = _mb_bb_rb_from_smc(
+            candles,
+            tf=tf,
+            cfg=cfg,
+            tick_size=tick,
+            atr=atr,
+            returns_sigma=returns_sigma,
+            smc_data=smc_payload,
+        )
+        for key in (
+            "rb_raw_count",
+            "rb_reject_no_eq",
+            "rb_reject_no_sweep",
+            "rb_reject_no_choch",
+            "rb_reject_no_base",
+            "rb_reject_no_impulse",
+        ):
+            smc_diag.setdefault(key, 0)
         tf_diag["smc"] = smc_diag
         tf_diag["mb"] = {"count": len(mb)}
         if not mb and smc_diag.get("reason"):
@@ -872,7 +1006,18 @@ def detect_zones(
         tf_diag["bb"] = {"count": len(bb)}
         if not bb and smc_diag.get("reason"):
             tf_diag["bb"]["reason"] = smc_diag["reason"]
-        rb_entry: Dict[str, Any] = {"count": len(rb)}
+        rb_stats = {
+            key: int(smc_diag.get(key, 0))
+            for key in (
+                "rb_raw_count",
+                "rb_reject_no_eq",
+                "rb_reject_no_sweep",
+                "rb_reject_no_choch",
+                "rb_reject_no_base",
+                "rb_reject_no_impulse",
+            )
+        }
+        rb_entry: Dict[str, Any] = {"count": len(rb), "stats": rb_stats}
         if smc_diag.get("reason"):
             rb_entry["reason"] = smc_diag["reason"]
         tf_diag["rb"] = rb_entry

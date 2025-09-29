@@ -43,12 +43,13 @@ def test_breaker_block_detected_after_bos_retest() -> None:
     ]
 
     config = SMCConfig(min_block_size=0.5, ttl_bars=10)
-    blocks = detect_smc_blocks(
+    blocks, stats = detect_smc_blocks(
         candles,
         structure_flags=structure_flags,
         ob_zones=ob_zones,
         liquidity_levels={},
         config=config,
+        atr=[5.0] * len(candles),
     )
 
     assert len(blocks) == 1
@@ -81,12 +82,13 @@ def test_mitigation_block_uses_unfilled_body() -> None:
     ]
 
     config = SMCConfig(min_block_size=0.5, ttl_bars=10)
-    blocks = detect_smc_blocks(
+    blocks, stats = detect_smc_blocks(
         candles,
         structure_flags=[],
         ob_zones=ob_zones,
         liquidity_levels={},
         config=config,
+        atr=[5.0] * len(candles),
     )
 
     assert len(blocks) == 1
@@ -113,15 +115,19 @@ def test_reversal_block_after_liquidity_grab() -> None:
     structure_flags = [
         {"kind": "choch", "direction": "up", "t": candles[3]["t"]}
     ]
-    liquidity = {"pdl": {"price": 95.0}}
+    liquidity = {"eql": [{"price": 95.0}]}
 
     config = SMCConfig(min_block_size=0.5, displacement_factor=1.5, displacement_lookback=3, ttl_bars=10)
-    blocks = detect_smc_blocks(
+    atr_values = [5.0] * len(candles)
+    blocks, stats = detect_smc_blocks(
         candles,
         structure_flags=structure_flags,
         ob_zones=[],
         liquidity_levels=liquidity,
         config=config,
+        atr=atr_values,
+        returns_sigma=[0.2] * len(candles),
+        tick_size=0.1,
     )
 
     assert len(blocks) == 1
@@ -130,6 +136,7 @@ def test_reversal_block_after_liquidity_grab() -> None:
     assert block["block_type"] == "reversal block"
     assert block["type"] == "demand"
     assert block["status"] == "tapped"
-    assert block["range"][0] == pytest.approx(99.0, rel=1e-3)
-    assert block["range"][1] == pytest.approx(100.1, rel=1e-3)
-    assert block["created_at"] == candles[5]["t"]
+    assert block["range"][0] == pytest.approx(96.0, rel=1e-3)
+    assert block["range"][1] == pytest.approx(100.0, rel=1e-3)
+    assert block["created_at"] in {candles[4]["t"], candles[5]["t"]}
+    assert stats["rb_raw_count"] == 1
