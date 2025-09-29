@@ -605,10 +605,9 @@ async def profile_endpoint(
             if timeframe and timeframe != target_tf_key:
                 zone_frames[timeframe] = candles
             detected_zones = detect_zones(
-                zone_frames,
-                symbol=symbol,
-                cfg=zone_cfg,
+                frames=zone_frames,
                 profile_levels=profile_level_map,
+                config=zone_cfg,
             )
         except Exception as exc:
             logging.getLogger(__name__).exception(
@@ -621,7 +620,6 @@ async def profile_endpoint(
             )
 
             detected_zones = {
-                "symbol": symbol,
                 "zones": {
                     "fvg": [],
                     "ob": [],
@@ -632,6 +630,7 @@ async def profile_endpoint(
                     "sr": [],
                     "profile_levels": [],
                 },
+                "meta": {},
             }
         else:
             zones_container = detected_zones.get("zones") if isinstance(detected_zones, Mapping) else None
@@ -800,7 +799,7 @@ async def zones_endpoint(
     if candles_data:
         zone_frames[timeframe_value] = candles_data
     try:
-        result = detect_zones(zone_frames, symbol=symbol_value, cfg=zone_cfg)
+        result = detect_zones(frames=zone_frames, config=zone_cfg)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

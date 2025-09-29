@@ -2419,10 +2419,10 @@ def build_check_all_datas(
     if zone_frames_full:
         try:
             detected_zones = detect_zones(
-                zone_frames_full,
-                symbol=symbol,
-                cfg=zone_cfg,
+                frames=zone_frames_full,
                 profile_levels=profile_level_map,
+                liquidity_levels=liquidity_equal_levels,
+                config=zone_cfg,
             )
         except Exception:  # pragma: no cover - defensive logging guard
             logging.getLogger(__name__).exception(
@@ -2434,7 +2434,6 @@ def build_check_all_datas(
                 },
             )
             detected_zones = {
-                "symbol": symbol,
                 "zones": {
                     "fvg": [],
                     "ob": [],
@@ -2445,6 +2444,7 @@ def build_check_all_datas(
                     "sr": [],
                     "profile_levels": [],
                 },
+                "meta": {},
             }
 
     zones_container = detected_zones.get("zones") if isinstance(detected_zones, Mapping) else None

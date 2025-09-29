@@ -688,14 +688,78 @@ def _ensure_timeframes(
 
 
 def detect_zones(
-    frames: Mapping[str, Sequence[Candle]],
-    *,
-    symbol: str,
-    cfg: Config,
-    profile_levels: Mapping[str, Mapping[str, float]] | None = None,
+    *args: Any,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
+    """Detect price zones from multi-timeframe candle bundles.
+
+    The public interface expects keyword arguments.  A single positional
+    argument is still accepted for backwards compatibility and is interpreted as
+    the ``frames`` mapping.
+    """
+
+    frames_arg: Any | None = None
+    if args:
+        if len(args) == 1 and "frames" not in kwargs:
+            frames_arg = args[0]
+        else:  # pragma: no cover - guard for legacy positional usage
+            raise TypeError(
+                "detect_zones accepts only the candle frames as a positional "
+                "argument; all other inputs must be passed by keyword"
+            )
+
+    if frames_arg is None:
+        frames_arg = kwargs.get("frames")
+
+    if frames_arg is None:
+        raise TypeError("detect_zones() missing required argument: 'frames'")
+
+    if isinstance(frames_arg, Mapping):
+        frames: Mapping[str, Sequence[Candle]] = frames_arg
+    elif isinstance(frames_arg, Sequence):
+        frames = {"1m": list(frames_arg)}
+    else:
+        raise TypeError("frames must be a mapping of timeframe to candle series")
+
+    profile_levels: Mapping[str, Mapping[str, float]] | None = kwargs.get(
+        "profile_levels"
+    )
+    liquidity_levels: Mapping[str, Sequence[Mapping[str, Any]]] | None = kwargs.get(
+        "liquidity_levels"
+    )
+    cfg_arg = kwargs.get("config") or kwargs.get("cfg")
+    cfg: Config
+    if cfg_arg is None:
+        cfg = Config()
+    elif isinstance(cfg_arg, Config):
+        cfg = cfg_arg
+    else:
+        raise TypeError("config must be an instance of Config or None")
+
     timeframes = _ensure_timeframes(frames, ["15m", "1h", "4h", "1d"])
     tick = cfg.tick_size or _infer_tick_size(frames.get("1m", []))
+    external_liquidity: Dict[str, List[Dict[str, Any]]] = {}
+    if isinstance(liquidity_levels, Mapping):
+        for key in ("eqh", "eql", "pdh", "pdl"):
+            raw_series = liquidity_levels.get(key)
+            if not isinstance(raw_series, Sequence):
+                continue
+            cleaned: List[Dict[str, Any]] = []
+            for item in raw_series:
+                if not isinstance(item, Mapping):
+                    continue
+                price = item.get("price")
+                timestamp = item.get("ts")
+                try:
+                    price_value = float(price)
+                except (TypeError, ValueError):
+                    continue
+                entry: Dict[str, Any] = {"price": price_value}
+                if timestamp is not None:
+                    entry["ts"] = timestamp
+                cleaned.append(entry)
+            if cleaned:
+                external_liquidity[key] = cleaned
     fvg_all: List[Dict[str, Any]] = []
     ob_all: List[Dict[str, Any]] = []
     mb_all: List[Dict[str, Any]] = []
@@ -730,6 +794,13 @@ def detect_zones(
             bos_events=bos_events,
         )
         ob_all.extend(ob_zones)
+        if external_liquidity:
+            combined = dict(smc_payload.get("liquidity", {}))
+            for key, items in external_liquidity.items():
+                existing = list(combined.get(key, []))
+                existing.extend(items)
+                combined[key] = existing
+            smc_payload["liquidity"] = combined
         mb, bb, rb = _mb_bb_rb_from_smc(candles, tf=tf, smc_data=smc_payload)
         mb_all.extend(mb)
         bb_all.extend(bb)
@@ -746,7 +817,6 @@ def detect_zones(
         )
     sr_levels = _sr_levels(timeframes.get("4h", []), timeframes.get("1d", []), cfg=cfg, tick_size=tick)
     payload = {
-        "symbol": symbol,
         "zones": {
             "fvg": fvg_all,
             "ob": ob_all,
@@ -756,7 +826,7 @@ def detect_zones(
             "pb": pb_all,
             "sr": sr_levels,
             "profile_levels": _profile_levels(profile_levels),
-        },
+        }
     }
     payload["meta"] = {"fvg_stats": fvg_stats}
     return payload

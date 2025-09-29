@@ -1224,8 +1224,17 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
     tpo_zone_items: List[Dict[str, Any]] = []
     flattened_profile: List[Dict[str, float]] = []
     detected_zones: Dict[str, Any] = {
-        "symbol": symbol,
-        "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
+        "zones": {
+            "fvg": [],
+            "ob": [],
+            "mb": [],
+            "bb": [],
+            "rb": [],
+            "pb": [],
+            "sr": [],
+            "profile_levels": [],
+        },
+        "meta": {},
     }
     profile_candles: List[Dict[str, Any]] = []
 
@@ -1283,19 +1292,29 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
             flattened_profile = []
             tpo_zone_items = []
             detected_zones = {
-                "symbol": symbol,
-                "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
+                "zones": {
+                    "fvg": [],
+                    "ob": [],
+                    "mb": [],
+                    "bb": [],
+                    "rb": [],
+                    "pb": [],
+                    "sr": [],
+                    "profile_levels": [],
+                },
+                "meta": {},
             }
             profile_ready = False
 
     if profile_ready and profile_candles:
         try:
             zone_cfg = ZonesConfig(tick_size=tick_size_value)
+            zone_frames: Dict[str, Sequence[Mapping[str, Any]]] = {
+                target_tf_key: profile_candles
+            }
             detected_zones = detect_zones(
-                profile_candles,
-                target_tf_key,
-                symbol,
-                zone_cfg,
+                frames=zone_frames,
+                config=zone_cfg,
             )
         except Exception:  # pragma: no cover - defensive guard
             logging.getLogger(__name__).exception(
@@ -1307,8 +1326,17 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
                 },
             )
             detected_zones = {
-                "symbol": symbol,
-                "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
+                "zones": {
+                    "fvg": [],
+                    "ob": [],
+                    "mb": [],
+                    "bb": [],
+                    "rb": [],
+                    "pb": [],
+                    "sr": [],
+                    "profile_levels": [],
+                },
+                "meta": {},
             }
 
     raw_meta = snapshot.get("meta") if isinstance(snapshot.get("meta"), Mapping) else {}

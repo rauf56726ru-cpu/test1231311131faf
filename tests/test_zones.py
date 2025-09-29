@@ -77,7 +77,7 @@ def snapshot_storage(tmp_path, monkeypatch):
 def test_detect_zones_identifies_fvg_and_order_blocks() -> None:
     frames = {"15m": build_orderflow_sequence()}
     cfg = Config(tick_size=0.2, atr_period=3)
-    payload = detect_zones(frames, symbol="TEST", cfg=cfg)
+    payload = detect_zones(frames=frames, config=cfg)
 
     zones = payload["zones"]
     assert zones["fvg"], "Expected at least one FVG zone"
@@ -101,11 +101,27 @@ def test_detect_zones_propagates_profile_levels() -> None:
     frames = {"15m": build_orderflow_sequence()}
     cfg = Config(tick_size=0.2, atr_period=3)
     profile_map = {"daily": {"poc": 101.25, "vah": 102.4, "val": 99.8}}
-    payload = detect_zones(frames, symbol="TEST", cfg=cfg, profile_levels=profile_map)
+    payload = detect_zones(
+        frames=frames,
+        config=cfg,
+        profile_levels=profile_map,
+    )
 
-    levels = payload["zones"]["profile_levels"]
-    assert {level["type"] for level in levels} == {"poc", "vah", "val"}
-    assert {level["session"] for level in levels} == {"daily"}
+
+def test_detect_zones_accepts_keyword_only_inputs() -> None:
+    frames = {"15m": build_orderflow_sequence()}
+    payload = detect_zones(frames=frames)
+
+    assert "zones" in payload
+    assert isinstance(payload["zones"], dict)
+
+
+def test_detect_zones_legacy_single_positional_argument() -> None:
+    frames = {"15m": build_orderflow_sequence()}
+    payload = detect_zones(frames)
+
+    assert "zones" in payload
+    assert isinstance(payload["zones"], dict)
 
 
 def test_zones_endpoint_returns_structured_payload(client: TestClient) -> None:

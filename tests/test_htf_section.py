@@ -143,7 +143,6 @@ def test_build_inspection_payload_includes_htf(monkeypatch) -> None:
         inspection,
         "detect_zones",
         lambda *args, **kwargs: {
-            "symbol": "BTCUSDT",
             "zones": {
                 "fvg": [],
                 "ob": [],
@@ -154,6 +153,7 @@ def test_build_inspection_payload_includes_htf(monkeypatch) -> None:
                 "sr": [],
                 "profile_levels": [],
             },
+            "meta": {},
         },
     )
     monkeypatch.setattr(
