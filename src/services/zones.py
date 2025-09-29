@@ -673,6 +673,7 @@ def _mb_bb_rb_from_smc(
     displacement_range = cfg.displacement_range
     smc_config = SMCConfig(
         min_block_size=0.0,
+        ttl_bars=0,
         zones_window_start_ms=cfg.zones_window_start_ms,
         window_end_ms_prev_closed=cfg.window_end_ms_prev_closed,
         allow_base_fallback=cfg.allow_base_fallback,
@@ -706,6 +707,29 @@ def _mb_bb_rb_from_smc(
         kind = block.get("kind")
         range_low, range_high = block.get("range", [0.0, 0.0])[:2]
         mean_price = (float(range_low) + float(range_high)) / 2.0
+        if kind == "rb":
+            bot_value = float(block.get("bot", range_low))
+            top_value = float(block.get("top", range_high))
+            mid_value = block.get("mid")
+            if mid_value is None:
+                mid_value = (bot_value + top_value) / 2.0
+            entry = {
+                "tf": tf,
+                "direction": block.get("direction")
+                or ("up" if block.get("type") == "demand" else "down"),
+                "type": block.get("type"),
+                "bot": float(bot_value),
+                "top": float(top_value),
+                "mid": _round_tick(float(mid_value), tick_size),
+                "origin_utc": _ms_to_iso(int(block.get("created_at", 0))),
+                "status": block.get("status", "fresh"),
+            }
+            shadow = block.get("shadowed_by")
+            if shadow:
+                entry["shadowed_by"] = shadow
+            rb.append(entry)
+            continue
+
         entry = {
             "tf": tf,
             "type": block.get("type"),
@@ -715,12 +739,13 @@ def _mb_bb_rb_from_smc(
             "origin_utc": _ms_to_iso(int(block.get("created_at", 0))),
             "status": block.get("status", "fresh"),
         }
+        shadow = block.get("shadowed_by")
+        if shadow:
+            entry["shadowed_by"] = shadow
         if kind == "mb":
             mb.append(entry)
         elif kind == "bb":
             bb.append(entry)
-        elif kind == "rb":
-            rb.append(entry)
     diagnostics["mb_count"] = len(mb)
     diagnostics["bb_count"] = len(bb)
     diagnostics["rb_count"] = len(rb)

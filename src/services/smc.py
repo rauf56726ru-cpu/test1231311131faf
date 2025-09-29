@@ -66,6 +66,12 @@ def _eq_tolerance(price: float, tick_size: float | None) -> float:
     return max(base, adaptive, 0.0002)
 
 
+def _round_to_tick(value: float, tick_size: float | None) -> float:
+    if not tick_size or tick_size <= 0:
+        return float(value)
+    return round(float(value) / tick_size) * tick_size
+
+
 def _normalise_direction_label(value: str | None) -> str:
     label = str(value or "").lower()
     synonyms = {
@@ -332,17 +338,24 @@ def _timeframe_priority(timeframe: str | None) -> float:
     return magnitude * weight
 
 
-def _deduplicate_blocks(blocks: List[MutableMapping[str, object]], block: MutableMapping[str, object]) -> None:
+def _deduplicate_blocks(
+    blocks: List[MutableMapping[str, object]],
+    block: MutableMapping[str, object],
+    *,
+    priorities: Mapping[str, int] | None = None,
+    trace: List[Dict[str, object]] | None = None,
+) -> tuple[bool, str | None]:
     direction = block.get("type")
     new_range = tuple(block.get("range", (0.0, 0.0)))
     new_created = int(block.get("created_at", 0))
     new_len = _range_size((float(new_range[0]), float(new_range[1])))
     new_tf = block.get("tf")
     new_tf_rank = _timeframe_priority(str(new_tf) if new_tf is not None else None)
+    new_kind = str(block.get("kind") or "")
+    priority_map = priorities or {}
+    new_priority = priority_map.get(new_kind, 0)
     for idx, existing in enumerate(blocks):
         if existing.get("type") != direction:
-            continue
-        if existing.get("kind") != block.get("kind"):
             continue
         existing_range = tuple(existing.get("range", (0.0, 0.0)))
         overlap = _overlap_size(
@@ -354,26 +367,86 @@ def _deduplicate_blocks(blocks: List[MutableMapping[str, object]], block: Mutabl
         existing_len = _range_size(
             (float(existing_range[0]), float(existing_range[1]))
         )
-        coverage = overlap / max(1e-12, min(existing_len, new_len))
-        if coverage >= 0.8:
-            replace_existing = False
-            existing_tf = existing.get("tf")
-            existing_tf_rank = _timeframe_priority(
-                str(existing_tf) if existing_tf is not None else None
-            )
-            if new_tf_rank > existing_tf_rank:
+        min_span = min(existing_len, new_len)
+        if min_span <= 0.0:
+            continue
+        coverage = overlap / max(1e-12, min_span)
+        if coverage < 0.8:
+            continue
+
+        existing_kind = str(existing.get("kind") or "")
+        existing_priority = priority_map.get(existing_kind, 0)
+        kept_label = existing_kind.upper() or existing_kind
+
+        if existing_kind != new_kind:
+            if new_priority > existing_priority:
+                kept_label = new_kind.upper() or new_kind
+                existing["shadowed_by"] = new_kind.upper() or new_kind
+                if trace is not None:
+                    trace.append(
+                        {
+                            "type": existing_kind.upper() or existing_kind,
+                            "overlap_pct": float(coverage),
+                            "kept": kept_label,
+                        }
+                    )
+                continue
+            if new_priority < existing_priority:
+                block["shadowed_by"] = existing_kind.upper() or existing_kind
+                if trace is not None:
+                    trace.append(
+                        {
+                            "type": existing_kind.upper() or existing_kind,
+                            "overlap_pct": float(coverage),
+                            "kept": kept_label,
+                        }
+                    )
+                return False, "dedup_priority_loss" if new_kind == "rb" else None
+            if trace is not None:
+                trace.append(
+                    {
+                        "type": existing_kind.upper() or existing_kind,
+                        "overlap_pct": float(coverage),
+                        "kept": kept_label,
+                    }
+                )
+            return False, "dedup_priority_loss" if new_kind == "rb" else None
+
+        replace_existing = False
+        reject_reason: str | None = None
+        existing_tf = existing.get("tf")
+        existing_tf_rank = _timeframe_priority(
+            str(existing_tf) if existing_tf is not None else None
+        )
+        if new_tf_rank > existing_tf_rank:
+            kept_label = new_kind.upper() or new_kind
+            replace_existing = True
+        elif abs(new_tf_rank - existing_tf_rank) <= 1e-9:
+            if new_len > existing_len + 1e-12:
+                kept_label = new_kind.upper() or new_kind
                 replace_existing = True
-            elif abs(new_tf_rank - existing_tf_rank) <= 1e-9:
-                if new_len > existing_len + 1e-12:
-                    replace_existing = True
-                elif abs(new_len - existing_len) <= 1e-12 and new_created >= int(
-                    existing.get("created_at", 0)
-                ):
-                    replace_existing = True
-            if replace_existing:
-                blocks[idx] = block
-            return
+            elif abs(new_len - existing_len) <= 1e-12 and new_created >= int(
+                existing.get("created_at", 0)
+            ):
+                kept_label = new_kind.upper() or new_kind
+                replace_existing = True
+        if trace is not None:
+            trace.append(
+                {
+                    "type": existing_kind.upper() or existing_kind,
+                    "overlap_pct": float(coverage),
+                    "kept": kept_label,
+                }
+            )
+        if replace_existing:
+            blocks[idx] = block
+            return True, None
+        if new_kind == "rb":
+            reject_reason = "dedup_priority_loss"
+        return False, reject_reason
+
     blocks.append(block)
+    return True, None
 
 
 def detect_smc_blocks(
@@ -439,6 +512,7 @@ def detect_smc_blocks(
         "mb": "mitigation block",
         "rb": "reversal block",
     }
+    block_priorities = {"rb": 50, "bb": 40, "ob": 30, "mb": 20, "pb": 10}
 
     def _append_block(
         *,
@@ -447,10 +521,12 @@ def detect_smc_blocks(
         created_idx: int,
         direction: str,
         created_at: int,
-    ) -> None:
+        trace: List[Dict[str, object]] | None = None,
+        extra: Mapping[str, object] | None = None,
+    ) -> tuple[bool, str | None, List[Dict[str, object]] | None]:
         span = _range_size(price_range)
         if span < cfg.min_block_size - 1e-12:
-            return
+            return False, "min_block_size", None
         status = _block_status(candles, created_idx, price_range, direction)
         block: MutableMapping[str, object] = {
             "kind": kind,
@@ -462,7 +538,27 @@ def detect_smc_blocks(
             "block_type": block_type_labels.get(kind, kind),
             "_created_idx": created_idx,
         }
-        _deduplicate_blocks(blocks, block)
+        if extra:
+            for key, value in extra.items():
+                block[key] = value
+        trace_list: List[Dict[str, object]] | None = [] if trace is not None else None
+        appended, reject = _deduplicate_blocks(
+            blocks,
+            block,
+            priorities=block_priorities,
+            trace=trace_list,
+        )
+        if appended:
+            if trace is not None:
+                trace.clear()
+                if trace_list:
+                    trace.extend(trace_list)
+            return True, None, trace_list
+        if trace is not None:
+            trace.clear()
+            if trace_list:
+                trace.extend(trace_list)
+        return False, reject, trace_list
 
     # Breaker Blocks
     bb_flow: Dict[str, int] = diagnostics.get("bb_flow", {})
@@ -1050,21 +1146,77 @@ def detect_smc_blocks(
         impulse_ts = int(candles[impulse_idx].get("t", choch_ts))
         rb_debug["last_impulse_idx"] = impulse_idx
 
-        _append_block(
+        base_low = float(base_range[0])
+        base_high = float(base_range[1])
+        rb_direction = "up" if trend_direction == "up" else "down"
+        tick_value = float(tick_size) if tick_size else None
+        bot_round = _round_to_tick(base_low, tick_value)
+        top_round = _round_to_tick(base_high, tick_value)
+        use_raw_bounds = bool(tick_value and top_round <= bot_round)
+        rb_bot = base_low if use_raw_bounds else bot_round
+        rb_top = base_high if use_raw_bounds else top_round
+        rb_mid = _round_to_tick((base_low + base_high) / 2.0, tick_value)
+        atr_for_min_range = impulse_atr
+        if not (math.isfinite(atr_for_min_range) and atr_for_min_range > 0.0):
+            atr_for_min_range = _atr_value(impulse_idx)
+        if not (math.isfinite(atr_for_min_range) and atr_for_min_range > 0.0):
+            atr_for_min_range = _atr_value(base_idx)
+        min_rb_range = 0.0
+        if tick_value and tick_value > 0.0:
+            min_rb_range = max(min_rb_range, 2.0 * tick_value)
+        if math.isfinite(atr_for_min_range) and atr_for_min_range > 0.0:
+            min_rb_range = max(min_rb_range, 0.1 * atr_for_min_range)
+
+        rb_debug["emit_attempt"] = True
+        rb_debug["outside_window"] = False
+        rb_debug["rb_bounds_raw"] = [base_low, base_high]
+        rb_debug["rb_bounds_rounded"] = [bot_round, top_round]
+        rb_debug["min_rb_range"] = min_rb_range
+        rb_debug["overlap_with"] = []
+
+        span_below_min = bool(min_rb_range > 0.0 and base_span < min_rb_range - 1e-12)
+        allow_small_span = cover_max >= cfg.impulse_min_cover - 1e-12
+        if span_below_min and not allow_small_span:
+            rb_debug["emit_reason"] = "min_range"
+            diagnostics["reason"] = "min_range"
+            continue
+
+        overlap_entries: List[Dict[str, object]] = []
+        appended, reject_reason, _ = _append_block(
             kind="rb",
-            price_range=base_range,
+            price_range=(base_low, base_high),
             created_idx=impulse_idx,
             direction=block_direction,
             created_at=impulse_ts,
+            trace=overlap_entries,
+            extra={
+                "top": float(rb_top),
+                "bot": float(rb_bot),
+                "mid": float(rb_mid),
+                "direction": rb_direction,
+            },
         )
-        diagnostics["rb_raw_count"] += 1
+        rb_debug["overlap_with"] = overlap_entries
+        if appended:
+            diagnostics["rb_raw_count"] += 1
+            rb_debug["emit_reason"] = "emitted"
+            diagnostics.pop("reason", None)
+        else:
+            emit_reason = reject_reason or "dedup_priority_loss"
+            rb_debug["emit_reason"] = emit_reason
+            diagnostics["reason"] = emit_reason
+            continue
 
     has_rb = any(block.get("kind") == "rb" for block in blocks)
     has_bb = any(block.get("kind") == "bb" for block in blocks)
 
     if not has_rb:
         reason: str | None = None
-        if diagnostics.get("rb_reject_no_impulse"):
+        if diagnostics.get("reason"):
+            reason = str(diagnostics["reason"])
+        elif rb_debug.get("emit_attempt") and rb_debug.get("emit_reason"):
+            reason = str(rb_debug.get("emit_reason"))
+        elif diagnostics.get("rb_reject_no_impulse"):
             reason = "no_impulse"
         elif diagnostics.get("rb_reject_no_base"):
             reason = "no_base"

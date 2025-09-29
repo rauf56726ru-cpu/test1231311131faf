@@ -156,6 +156,9 @@ def test_reversal_block_after_liquidity_grab() -> None:
     assert block["kind"] == "rb"
     assert block["block_type"] == "reversal block"
     assert block["type"] == "demand"
+    assert block["direction"] == "up"
+    assert block["bot"] <= block["top"] + 1e-9
+    assert block["mid"] == pytest.approx((block["bot"] + block["top"]) / 2)
     assert block["status"] == "fresh"
     assert stats["rb_raw_count"] == 1
     flow = stats.get("rb_flow", {})
