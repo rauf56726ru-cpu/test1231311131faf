@@ -113,7 +113,7 @@ def test_zones_endpoint_returns_structured_payload(client: TestClient) -> None:
     response = client.request(
         "GET",
         "/zones",
-        params={"symbol": "TEST", "tf": "15m"},
+        params={"symbol": "TEST", "tf": "15m", "atr_period": 3},
         json={"candles": candles, "tick_size": 0.2},
     )
     assert response.status_code == 200
@@ -122,3 +122,7 @@ def test_zones_endpoint_returns_structured_payload(client: TestClient) -> None:
     for key in ("fvg", "ob", "mb", "bb", "rb", "pb", "sr", "profile_levels"):
         assert key in zones
         assert isinstance(zones[key], list)
+    assert zones["ob"], "Expected non-empty OB list for synthetic sequence"
+    assert any(zones[key] for key in ("fvg", "ob", "mb", "bb", "rb", "pb", "sr")), (
+        "Expected at least one populated zone list"
+    )

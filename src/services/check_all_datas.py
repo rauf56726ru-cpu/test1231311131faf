@@ -99,6 +99,22 @@ def _isoformat_utc(timestamp_ms: int) -> str:
     return dt.isoformat().replace("+00:00", "Z")
 
 
+def _iso_to_ms(value: Any) -> int | None:
+    """Parse an ISO-8601 string into a UTC millisecond timestamp."""
+
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    else:
+        parsed = parsed.astimezone(UTC)
+    return int(parsed.timestamp() * 1000)
+
+
 def _round_float_value(value: float, ndigits: int = 3) -> float:
     """Round a floating-point value to a stable number of decimal places."""
 
@@ -1889,6 +1905,7 @@ def build_check_all_datas(
             "profile_levels": [],
         },
     }
+    zone_cfg = ZonesConfig(tick_size=profile_config.get("tick_size"))
 
     target_tf_key = profile_config.get("target_tf_key", "1m")
     base_candidates = frames.get(target_tf_key, [])
@@ -2036,6 +2053,104 @@ def build_check_all_datas(
     frames["1m"] = [minute_index_all[ts] for ts in sorted(minute_index_all)]
     minute_candles = frames["1m"]
 
+    zones_window_hours = max(48, hours_window)
+    fifteen_min_ms = TIMEFRAME_TO_MS.get("15m") or 15 * MINUTE_INTERVAL_MS
+    zone_window_ms = zones_window_hours * MS_IN_HOUR
+    raw_zone_start = max(0, window_end_ms - zone_window_ms)
+    if fifteen_min_ms:
+        raw_zone_start = max(0, _align_to_interval(raw_zone_start, fifteen_min_ms))
+    zones_window_start_ms = raw_zone_start
+    warmup_bars_base = zone_cfg.atr_period + 50
+    min_bars_per_tf = {"15m": 200, "1h": 60, "4h": 6}
+    history_candidate = zones_window_start_ms
+    for tf_key, baseline in min_bars_per_tf.items():
+        required = max(baseline, warmup_bars_base)
+        interval_ms_tf = TIMEFRAME_TO_MS.get(tf_key)
+        if not interval_ms_tf:
+            continue
+        candidate = zones_window_start_ms - required * interval_ms_tf
+        if candidate < history_candidate:
+            history_candidate = candidate
+    zones_history_start_ms = max(0, history_candidate)
+    zones_history_start_ms = max(0, _align_to_interval(zones_history_start_ms, MINUTE_INTERVAL_MS))
+
+    zone_expected_minutes = _build_expected_times(
+        zones_history_start_ms, window_end_ms, MINUTE_INTERVAL_MS
+    )
+    zone_history_gaps = _summarise_missing_times(zone_expected_minutes, minute_index_all)
+    if zone_history_gaps:
+        try:
+            zone_downloaded_minutes = _download_missing_minutes(
+                symbol,
+                zones_history_start_ms,
+                window_end_ms,
+                zone_history_gaps,
+            )
+        except BinanceDownloadError as exc:
+            detail = {
+                "tf": target_tf_key,
+                "window": {"start_ms": zones_history_start_ms, "end_ms": window_end_ms},
+                "stage": "zones_history",
+                "minute_missing_before": sum(gap["count"] for gap in zone_history_gaps),
+                "fetched_1m_count": exc.downloaded,
+                "time_gaps": zone_history_gaps,
+            }
+            raise DataQualityError(detail) from exc
+        for candle in zone_downloaded_minutes:
+            ts = candle["t"]
+            if ts < zones_history_start_ms or ts > window_end_ms:
+                continue
+            minute_index_all[ts] = candle
+
+    frames["1m"] = [minute_index_all[ts] for ts in sorted(minute_index_all)]
+    minute_candles = frames["1m"]
+
+    zone_frames: Dict[str, List[Dict[str, Any]]] = {}
+    minute_zone_series = _filter_candles(
+        minute_candles, start_ms=zones_history_start_ms, end_ms=window_end_ms
+    )
+    if minute_zone_series:
+        zone_frames["1m"] = minute_zone_series
+
+    for tf_key in ("15m", "1h", "4h"):
+        interval_ms_tf = TIMEFRAME_TO_MS.get(tf_key)
+        if interval_ms_tf is None or not minute_zone_series:
+            continue
+        aggregated = resample_ohlcv(minute_zone_series, interval_ms_tf)
+        if not aggregated:
+            continue
+        normalised: List[Dict[str, Any]] = []
+        for item in aggregated:
+            if not isinstance(item, Mapping):
+                continue
+            ts = _safe_int(item.get("t"))
+            if ts is None:
+                continue
+            if ts > window_end_ms:
+                continue
+            normalised.append(
+                {
+                    "t": ts,
+                    "o": _coerce_float(item.get("o")),
+                    "h": _coerce_float(item.get("h")),
+                    "l": _coerce_float(item.get("l")),
+                    "c": _coerce_float(item.get("c")),
+                    "v": _coerce_float(item.get("v")),
+                }
+            )
+        if normalised:
+            normalised.sort(key=lambda candle: candle["t"])
+            zone_frames[tf_key] = normalised
+
+    zone_tf_lengths = {tf: len(zone_frames.get(tf, [])) for tf in ("15m", "1h", "4h")}
+    zones_diag = {
+        "tf_lengths": zone_tf_lengths,
+        "atr_period": zone_cfg.atr_period,
+        "warmup": warmup_bars_base,
+        "window_hours": zones_window_hours,
+    }
+    liquidity_equal_levels = build_equal_liquidity_levels(zone_frames)
+
     base_index_all = {candle["t"]: candle for candle in base_candles}
 
     if target_interval_ms <= MINUTE_INTERVAL_MS:
@@ -2086,55 +2201,6 @@ def build_check_all_datas(
     reference_ts = window_end_ms + MINUTE_INTERVAL_MS
     reference_dt = datetime.fromtimestamp(reference_ts / 1000.0, tz=UTC)
     detailed_start_ts = window_start_ms
-
-    zone_frames: Dict[str, List[Dict[str, Any]]] = {}
-    for tf_key, candles in frames.items():
-        filtered = _filter_candles(candles, start_ms=detailed_start_ts, end_ms=window_end_ms)
-        if filtered:
-            zone_frames[tf_key] = filtered
-
-    liquidity_equal_levels = build_equal_liquidity_levels(zone_frames)
-
-    if zone_frames:
-        try:
-            zone_cfg = ZonesConfig(tick_size=profile_config.get("tick_size"))
-            detected_zones = detect_zones(
-                zone_frames,
-                symbol=symbol,
-                cfg=zone_cfg,
-                profile_levels=profile_level_map,
-            )
-        except Exception:  # pragma: no cover - defensive logging guard
-            logging.getLogger(__name__).exception(
-                "Failed to detect zones for check-all payload",
-                extra={
-                    "snapshot_id": snapshot.get("id"),
-                    "symbol": symbol,
-                    "timeframe": target_tf_key,
-                },
-            )
-            detected_zones = {
-                "symbol": symbol,
-                "zones": {
-                    "fvg": [],
-                    "ob": [],
-                    "mb": [],
-                    "bb": [],
-                    "rb": [],
-                    "pb": [],
-                    "sr": [],
-                    "profile_levels": [],
-                },
-            }
-
-    zones_container = detected_zones.get("zones") if isinstance(detected_zones, Mapping) else None
-    if isinstance(zones_container, MutableMapping) and profile_level_map:
-        if not zones_container.get("profile_levels"):
-            zones_container["profile_levels"] = [
-                {"type": level, "price": price, "session": session}
-                for session, level_map in profile_level_map.items()
-                for level, price in level_map.items()
-            ]
 
     movement_anchor_ts = detailed_start_ts
     movement_start_ts = min(selection_start, movement_anchor_ts)
@@ -2328,6 +2394,76 @@ def build_check_all_datas(
             "tick_size_source": tick_size_source,
         },
     )
+
+    if tick_size_numeric and isinstance(tick_size_numeric, (int, float)):
+        zone_cfg.tick_size = float(tick_size_numeric)
+
+    if zone_frames:
+        try:
+            detected_zones = detect_zones(
+                zone_frames,
+                symbol=symbol,
+                cfg=zone_cfg,
+                profile_levels=profile_level_map,
+            )
+        except Exception:  # pragma: no cover - defensive logging guard
+            logging.getLogger(__name__).exception(
+                "Failed to detect zones for check-all payload",
+                extra={
+                    "snapshot_id": snapshot.get("id"),
+                    "symbol": symbol,
+                    "timeframe": target_tf_key,
+                },
+            )
+            detected_zones = {
+                "symbol": symbol,
+                "zones": {
+                    "fvg": [],
+                    "ob": [],
+                    "mb": [],
+                    "bb": [],
+                    "rb": [],
+                    "pb": [],
+                    "sr": [],
+                    "profile_levels": [],
+                },
+            }
+
+    zones_container = detected_zones.get("zones") if isinstance(detected_zones, Mapping) else None
+    if isinstance(zones_container, MutableMapping) and profile_level_map:
+        if not zones_container.get("profile_levels"):
+            zones_container["profile_levels"] = [
+                {"type": level, "price": price, "session": session}
+                for session, level_map in profile_level_map.items()
+                for level, price in level_map.items()
+            ]
+
+    if isinstance(detected_zones, MutableMapping):
+        meta_block = detected_zones.setdefault("meta", {})
+        if isinstance(meta_block, MutableMapping):
+            meta_block["zones_diag"] = zones_diag
+    if isinstance(zones_container, MutableMapping):
+        timestamp_filters = {
+            "fvg": "created_utc",
+            "ob": "origin_utc",
+            "mb": "origin_utc",
+            "bb": "origin_utc",
+            "rb": "origin_utc",
+            "pb": "origin_utc",
+            "sr": "ts",
+        }
+        for key, field in timestamp_filters.items():
+            series = zones_container.get(key)
+            if not isinstance(series, Sequence):
+                continue
+            filtered: List[Dict[str, Any]] = []
+            for item in series:
+                if not isinstance(item, Mapping):
+                    continue
+                ts_ms = _iso_to_ms(item.get(field))
+                if ts_ms is None or ts_ms >= zones_window_start_ms:
+                    filtered.append(dict(item))
+            zones_container[key] = filtered
 
     liquidity_payload = build_liquidity_snapshot(
         liquidity_frames,
