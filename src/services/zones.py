@@ -28,6 +28,11 @@ class Config:
     atr_period: int = 14
     displacement_body: float = 1.0
     displacement_range: float = 1.5
+    base_min_bars: int = 1
+    base_max_bars: int = 4
+    base_max_atr: float = 0.8
+    base_min_overlap: float = 0.5
+    impulse_min_cover: float = 0.6
     ob_body_max_atr: float = 0.7
     ob_overlap_ratio: float = 0.6
     ob_distance_atr: float = 0.5
@@ -673,6 +678,11 @@ def _mb_bb_rb_from_smc(
         allow_base_fallback=cfg.allow_base_fallback,
         base_fallback_max_age=cfg.base_fallback_max_age,
         base_fallback_max_distance_atr=cfg.base_fallback_max_distance_atr,
+        base_min_bars=cfg.base_min_bars,
+        base_max_bars=cfg.base_max_bars,
+        base_max_atr=cfg.base_max_atr,
+        base_min_overlap=cfg.base_min_overlap,
+        impulse_min_cover=cfg.impulse_min_cover,
     )
     blocks, smc_stats = detect_smc_blocks(
         candles,
@@ -717,7 +727,9 @@ def _mb_bb_rb_from_smc(
     if not blocks:
         diagnostics.setdefault("reason", "no_smc_blocks")
     elif not rb:
-        diagnostics.setdefault("reason", "no_range_blocks")
+        existing_reason = diagnostics.get("reason")
+        fallback_reason = "no_reversal_blocks"
+        diagnostics.setdefault("reason", existing_reason or fallback_reason)
     return mb, bb, rb, diagnostics
 
 
