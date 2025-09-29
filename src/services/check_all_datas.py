@@ -2460,6 +2460,9 @@ def build_check_all_datas(
         meta_block = detected_zones.setdefault("meta", {})
         if isinstance(meta_block, MutableMapping):
             meta_block["zones_diag"] = zones_diag
+            detection_diag = meta_block.get("diagnostics")
+            if isinstance(detection_diag, Mapping):
+                zones_diag["detection"] = detection_diag
     if isinstance(zones_container, MutableMapping):
         timestamp_filters = {
             "fvg": "created_utc",

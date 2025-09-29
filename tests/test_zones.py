@@ -124,6 +124,34 @@ def test_detect_zones_legacy_single_positional_argument() -> None:
     assert isinstance(payload["zones"], dict)
 
 
+def test_detect_zones_diagnostics_include_reasons_for_empty_results() -> None:
+    payload = detect_zones(frames={"15m": []})
+
+    diagnostics = payload["meta"].get("diagnostics")
+    assert isinstance(diagnostics, dict)
+
+    summary = diagnostics.get("summary")
+    assert isinstance(summary, dict)
+
+    fvg_summary = summary.get("fvg")
+    assert isinstance(fvg_summary, dict)
+    assert fvg_summary.get("count") == 0
+    reasons = fvg_summary.get("reasons")
+    assert reasons and any(item.get("reason") == "insufficient_candles" for item in reasons)
+
+    rb_summary = summary.get("rb")
+    assert isinstance(rb_summary, dict)
+    assert rb_summary.get("count") == 0
+    rb_reasons = rb_summary.get("reasons")
+    assert rb_reasons and any(item.get("reason") for item in rb_reasons)
+
+    timeframes = diagnostics.get("timeframes")
+    assert isinstance(timeframes, list) and timeframes
+    first_tf = timeframes[0]
+    assert first_tf.get("fvg", {}).get("reason") == "insufficient_candles"
+    assert first_tf.get("rb", {}).get("reason") == "insufficient_candles"
+
+
 def test_zones_endpoint_returns_structured_payload(client: TestClient) -> None:
     candles = build_orderflow_sequence()
     response = client.request(

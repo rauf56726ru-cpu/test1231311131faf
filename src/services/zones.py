@@ -191,6 +191,19 @@ def _detect_structure(
     return pivots, bos_events, choch_events
 
 
+def _derive_fvg_reason(stats: Mapping[str, int]) -> str:
+    rejections = {
+        str(key): int(value)
+        for key, value in stats.items()
+        if str(key).endswith("_rejected") and int(value) > 0
+    }
+    if rejections:
+        return max(rejections.items(), key=lambda item: item[1])[0]
+    if int(stats.get("triplets", 0)) > 0:
+        return "no_valid_zones_found"
+    return "no_candidates"
+
+
 def _fvgs_for_tf(
     candles: Sequence[Candle],
     *,
@@ -482,9 +495,14 @@ def _mb_bb_rb_from_smc(
     *,
     tf: str,
     smc_data: Dict[str, Any],
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    if not smc_data.get("ob"):
-        return [], [], []
+) -> Tuple[
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    Dict[str, Any],
+]:
+    ob_series = smc_data.get("ob") or []
+    ob_count = len(ob_series) if isinstance(ob_series, Sequence) else 0
     structure_flags = smc_data.get("structure") or []
     liquidity_levels = {
         "eqh": smc_data.get("liquidity", {}).get("eqh", []),
@@ -492,14 +510,28 @@ def _mb_bb_rb_from_smc(
         "pdh": smc_data.get("liquidity", {}).get("pdh", []),
         "pdl": smc_data.get("liquidity", {}).get("pdl", []),
     }
+    diagnostics: Dict[str, Any] = {
+        "ob_candidates": ob_count,
+        "structure_flags": len(structure_flags)
+        if isinstance(structure_flags, Sequence)
+        else 0,
+        "liquidity_levels": {
+            key: len(series) if isinstance(series, Sequence) else 0
+            for key, series in liquidity_levels.items()
+        },
+    }
+    if ob_count == 0:
+        diagnostics["reason"] = "missing_ob_zones"
+        return [], [], [], diagnostics
     blocks = detect_smc_blocks(
         candles,
         timeframe=tf,
         structure_flags=structure_flags,
-        ob_zones=smc_data.get("ob"),
+        ob_zones=ob_series,
         liquidity_levels=liquidity_levels,
         config=SMCConfig(min_block_size=0.0),
     )
+    diagnostics["smc_blocks"] = len(blocks)
     mb: List[Dict[str, Any]] = []
     bb: List[Dict[str, Any]] = []
     rb: List[Dict[str, Any]] = []
@@ -521,7 +553,14 @@ def _mb_bb_rb_from_smc(
             bb.append(entry)
         elif kind == "rb":
             rb.append(entry)
-    return mb, bb, rb
+    diagnostics["mb_count"] = len(mb)
+    diagnostics["bb_count"] = len(bb)
+    diagnostics["rb_count"] = len(rb)
+    if not blocks:
+        diagnostics.setdefault("reason", "no_smc_blocks")
+    elif not rb:
+        diagnostics.setdefault("reason", "no_range_blocks")
+    return mb, bb, rb, diagnostics
 
 
 def _pb_for_tf(
@@ -768,23 +807,43 @@ def detect_zones(
     pb_all: List[Dict[str, Any]] = []
     sr_levels: List[Dict[str, Any]] = []
     fvg_stats: Dict[str, Dict[str, int]] = {}
+    diagnostics_timeframes: List[Dict[str, Any]] = []
     for tf in ("15m", "1h", "4h"):
         candles = timeframes.get(tf, [])
+        tf_diag: Dict[str, Any] = {"tf": tf, "candles": len(candles)}
+        stats_entry = fvg_stats.setdefault(tf, {})
         if len(candles) < 3:
+            stats_entry["skipped"] = len(candles)
+            reason = "insufficient_candles"
+            for key in ("fvg", "ob", "mb", "bb", "rb", "pb"):
+                tf_diag[key] = {"count": 0, "reason": reason}
+            tf_diag["skipped"] = reason
+            diagnostics_timeframes.append(tf_diag)
             continue
         atr = compute_atr(candles, cfg.atr_period)
+        valid_atr = sum(1 for value in atr if isinstance(value, (int, float)) and math.isfinite(value) and value > 0)
+        tf_diag["atr"] = {"length": len(atr), "valid_values": valid_atr}
         pivots, bos_events, choch_events = _detect_structure(candles, tf=tf, tick_size=tick, cfg=cfg)
-        fvg_all.extend(
-            _fvgs_for_tf(
-                candles,
-                tf=tf,
-                cfg=cfg,
-                tick_size=tick,
-                atr=atr,
-                bos_events=bos_events,
-                stats=fvg_stats.setdefault(tf, {}),
-            )
+        tf_diag["structure"] = {
+            "pivots": len(pivots),
+            "bos": len(bos_events),
+            "choch": len(choch_events),
+        }
+        fvgs_tf = _fvgs_for_tf(
+            candles,
+            tf=tf,
+            cfg=cfg,
+            tick_size=tick,
+            atr=atr,
+            bos_events=bos_events,
+            stats=stats_entry,
         )
+        stats_copy = {str(key): int(value) for key, value in stats_entry.items()}
+        fvg_entry: Dict[str, Any] = {"count": len(fvgs_tf), "stats": stats_copy}
+        if not fvgs_tf:
+            fvg_entry["reason"] = _derive_fvg_reason(stats_entry)
+        tf_diag["fvg"] = fvg_entry
+        fvg_all.extend(fvgs_tf)
         ob_zones, metadata, smc_payload = _ob_for_tf(
             candles,
             tf=tf,
@@ -793,6 +852,10 @@ def detect_zones(
             atr=atr,
             bos_events=bos_events,
         )
+        ob_entry: Dict[str, Any] = {"count": len(ob_zones)}
+        if not ob_zones:
+            ob_entry["reason"] = "no_bos_events" if not bos_events else "no_order_blocks"
+        tf_diag["ob"] = ob_entry
         ob_all.extend(ob_zones)
         if external_liquidity:
             combined = dict(smc_payload.get("liquidity", {}))
@@ -801,21 +864,72 @@ def detect_zones(
                 existing.extend(items)
                 combined[key] = existing
             smc_payload["liquidity"] = combined
-        mb, bb, rb = _mb_bb_rb_from_smc(candles, tf=tf, smc_data=smc_payload)
+        mb, bb, rb, smc_diag = _mb_bb_rb_from_smc(candles, tf=tf, smc_data=smc_payload)
+        tf_diag["smc"] = smc_diag
+        tf_diag["mb"] = {"count": len(mb)}
+        if not mb and smc_diag.get("reason"):
+            tf_diag["mb"]["reason"] = smc_diag["reason"]
+        tf_diag["bb"] = {"count": len(bb)}
+        if not bb and smc_diag.get("reason"):
+            tf_diag["bb"]["reason"] = smc_diag["reason"]
+        rb_entry: Dict[str, Any] = {"count": len(rb)}
+        if smc_diag.get("reason"):
+            rb_entry["reason"] = smc_diag["reason"]
+        tf_diag["rb"] = rb_entry
         mb_all.extend(mb)
         bb_all.extend(bb)
         rb_all.extend(rb)
-        pb_all.extend(
-            _pb_for_tf(
-                candles,
-                tf=tf,
-                cfg=cfg,
-                tick_size=tick,
-                atr=atr,
-                pivots=pivots,
-            )
+        pb_tf = _pb_for_tf(
+            candles,
+            tf=tf,
+            cfg=cfg,
+            tick_size=tick,
+            atr=atr,
+            pivots=pivots,
         )
+        tf_diag["pb"] = {"count": len(pb_tf)}
+        if not pb_tf:
+            tf_diag["pb"]["reason"] = "no_pivots" if not pivots else "no_pivot_blocks"
+        pb_all.extend(pb_tf)
+        diagnostics_timeframes.append(tf_diag)
     sr_levels = _sr_levels(timeframes.get("4h", []), timeframes.get("1d", []), cfg=cfg, tick_size=tick)
+    sr_reason: str | None = None
+    if not sr_levels:
+        if len(timeframes.get("4h", [])) < 3 and len(timeframes.get("1d", [])) < 3:
+            sr_reason = "insufficient_candles"
+    def _collect_reasons(zone_key: str) -> List[Dict[str, Any]]:
+        reasons: List[Dict[str, Any]] = []
+        for frame_diag in diagnostics_timeframes:
+            entry = frame_diag.get(zone_key)
+            if not isinstance(entry, Mapping):
+                continue
+            if int(entry.get("count", 0)) > 0:
+                continue
+            reason_value = entry.get("reason")
+            if reason_value:
+                reasons.append({"tf": frame_diag.get("tf"), "reason": reason_value})
+        return reasons
+
+    diagnostics_summary: Dict[str, Any] = {}
+    zone_collections = {
+        "fvg": fvg_all,
+        "ob": ob_all,
+        "mb": mb_all,
+        "bb": bb_all,
+        "rb": rb_all,
+        "pb": pb_all,
+    }
+    for zone_key, series in zone_collections.items():
+        entry: Dict[str, Any] = {"count": len(series)}
+        reasons = _collect_reasons(zone_key)
+        if not series and reasons:
+            entry["reasons"] = reasons
+        diagnostics_summary[zone_key] = entry
+    sr_entry: Dict[str, Any] = {"count": len(sr_levels)}
+    if not sr_levels and sr_reason:
+        sr_entry["reasons"] = [{"tf": "sr", "reason": sr_reason}]
+    diagnostics_summary["sr"] = sr_entry
+
     payload = {
         "zones": {
             "fvg": fvg_all,
@@ -828,5 +942,11 @@ def detect_zones(
             "profile_levels": _profile_levels(profile_levels),
         }
     }
-    payload["meta"] = {"fvg_stats": fvg_stats}
+    payload["meta"] = {
+        "fvg_stats": fvg_stats,
+        "diagnostics": {
+            "timeframes": diagnostics_timeframes,
+            "summary": diagnostics_summary,
+        },
+    }
     return payload
