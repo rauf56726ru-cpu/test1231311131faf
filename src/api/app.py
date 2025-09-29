@@ -290,6 +290,14 @@ async def analyze_from_inspection(payload: Dict[str, Any] = Body(...)) -> JSONRe
     if check_payload is None:
         raise HTTPException(status_code=400, detail="Snapshot does not contain analyzable data")
 
+    if not isinstance(check_payload, Mapping):
+        raise HTTPException(status_code=400, detail="Snapshot payload is invalid")
+
+    check_payload = dict(check_payload)
+    check_payload.setdefault("symbol", target_snapshot.get("symbol"))
+    check_payload["snapshot_id"] = snapshot_id
+    check_payload["selection"] = {"start": selection_start, "end": selection_end}
+
     symbol = str(
         check_payload.get("symbol")
         or target_snapshot.get("symbol")
@@ -310,40 +318,25 @@ async def analyze_from_inspection(payload: Dict[str, Any] = Body(...)) -> JSONRe
                 if isinstance(label, str) and label.strip():
                     period = label.strip()
     if period is None:
-        requested_meta = (
-            check_payload.get("profile_preset")
-            if isinstance(check_payload, Mapping)
-            else None
-        )
-        if isinstance(requested_meta, Mapping):
-            key = requested_meta.get("preset_key") or requested_meta.get("period")
-            if isinstance(key, str) and key.strip():
-                period = key.strip()
-    if period is None:
         period = "custom_range"
 
-    latest_candle = check_payload.get("latest_candle") if isinstance(check_payload, Mapping) else None
-    price_candidates = []
-    if isinstance(latest_candle, Mapping):
-        for key in ("c", "close", "price", "close_price", "last_price"):
-            value = latest_candle.get(key)
-            if isinstance(value, (int, float)):
-                price_candidates.append(float(value))
-    if not price_candidates:
-        maybe_series = check_payload.get("datas_for_last_N_hours") if isinstance(check_payload, Mapping) else None
-        if isinstance(maybe_series, Mapping):
-            frame = maybe_series.get("frames")
-            if isinstance(frame, Mapping):
-                minute_frame = frame.get("1m")
-                if isinstance(minute_frame, Mapping):
-                    candles = minute_frame.get("candles")
-                    if isinstance(candles, Sequence) and candles:
-                        tail = candles[-1]
-                        if isinstance(tail, Mapping):
-                            value = tail.get("c") or tail.get("close")
+    def _extract_last_price(payload: Mapping[str, Any]) -> float | None:
+        ohlcv_block = payload.get("ohlcv")
+        if isinstance(ohlcv_block, Mapping):
+            minute_block = ohlcv_block.get("1m")
+            if isinstance(minute_block, Mapping):
+                candles = minute_block.get("candles")
+                if isinstance(candles, Sequence) and candles:
+                    tail = candles[-1]
+                    if isinstance(tail, Mapping):
+                        for key in ("c", "close", "price"):
+                            value = tail.get(key)
                             if isinstance(value, (int, float)):
-                                price_candidates.append(float(value))
-    last_price = price_candidates[0] if price_candidates else 0.0
+                                return float(value)
+        return None
+
+    last_price_value = _extract_last_price(check_payload)
+    last_price = last_price_value if last_price_value is not None else 0.0
 
     api_key: str | None = None
     api_key_raw = payload.get("api_key")
@@ -564,7 +557,16 @@ async def profile_endpoint(
 
     detected_zones = {
         "symbol": symbol,
-        "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
+        "zones": {
+            "fvg": [],
+            "ob": [],
+            "mb": [],
+            "bb": [],
+            "rb": [],
+            "pb": [],
+            "sr": [],
+            "profile_levels": [],
+        },
     }
 
     if candles and sessions:
@@ -583,13 +585,29 @@ async def profile_endpoint(
             cache_token=cache_token,
             tf_key=target_tf_key,
         )
+        profile_level_map: Dict[str, Dict[str, float]] = {}
+        for entry in tpo_entries:
+            if not isinstance(entry, Mapping):
+                continue
+            session = str(entry.get("session") or "daily").lower()
+            session_levels = profile_level_map.setdefault(session, {})
+            for key, target in (("POC", "poc"), ("VAH", "vah"), ("VAL", "val")):
+                value = entry.get(key)
+                if value is None:
+                    continue
+                try:
+                    session_levels[target] = float(value)
+                except (TypeError, ValueError):
+                    continue
         try:
             zone_cfg = ZonesConfig(tick_size=tick_size_value)
+            zone_frames = {target_tf_key: candles}
+            if timeframe and timeframe != target_tf_key:
+                zone_frames[timeframe] = candles
             detected_zones = detect_zones(
-                candles,
-                target_tf_key,
-                symbol,
-                zone_cfg,
+                frames=zone_frames,
+                profile_levels=profile_level_map,
+                config=zone_cfg,
             )
         except Exception as exc:
             logging.getLogger(__name__).exception(
@@ -602,9 +620,26 @@ async def profile_endpoint(
             )
 
             detected_zones = {
-                "symbol": symbol,
-                "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
+                "zones": {
+                    "fvg": [],
+                    "ob": [],
+                    "mb": [],
+                    "bb": [],
+                    "rb": [],
+                    "pb": [],
+                    "sr": [],
+                    "profile_levels": [],
+                },
+                "meta": {},
             }
+        else:
+            zones_container = detected_zones.get("zones") if isinstance(detected_zones, Mapping) else None
+            if isinstance(zones_container, dict) and profile_level_map and not zones_container.get("profile_levels"):
+                zones_container["profile_levels"] = [
+                    {"type": level, "price": price, "session": session}
+                    for session, mapping in profile_level_map.items()
+                    for level, price in mapping.items()
+                ]
 
     payload = {
         "symbol": symbol,
@@ -760,8 +795,11 @@ async def zones_endpoint(
 
     zone_cfg = ZonesConfig(**cfg_kwargs)
 
+    zone_frames: Dict[str, Sequence[Mapping[str, Any]]] = {}
+    if candles_data:
+        zone_frames[timeframe_value] = candles_data
     try:
-        result = detect_zones(candles_data or [], timeframe_value, symbol_value, zone_cfg)
+        result = detect_zones(frames=zone_frames, config=zone_cfg)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
