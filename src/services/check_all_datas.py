@@ -10,6 +10,9 @@ from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence,
 
 import httpx
 
+BINANCE_FAPI_FUNDING = "https://fapi.binance.com/fapi/v1/fundingRate"
+BINANCE_FAPI_OPEN_INTEREST = "https://fapi.binance.com/fapi/v1/openInterest"
+
 import src.services.inspection as inspection
 from .binance import BINANCE_FAPI_REST
 from .inspection import build_htf_section
@@ -74,6 +77,20 @@ VWAP_TPO_SESSIONS: Tuple[Tuple[str, dtime, dtime], ...] = (
 
 _RETRYABLE_STATUS = {418, 429, 500, 502, 503, 504}
 _MAX_RETRIES = 5
+
+
+@dataclass(slots=True)
+class ProfileScope:
+    candles: List[Dict[str, Any]]
+    vwap: float
+    start_bin: float | None
+    bin_size: float | None
+    histogram: List[float]
+    session_high: float | None
+    session_high_ts: int | None
+    session_low: float | None
+    session_low_ts: int | None
+    sum_volume: float
 
 class DataQualityError(RuntimeError):
     """Raised when the inspected snapshot fails deterministic data checks."""
@@ -353,6 +370,51 @@ def _download_missing_minutes(
     return fetched
 
 
+def _fetch_latest_funding(symbol: str) -> tuple[float | None, int | None]:
+    params = {"symbol": symbol.upper(), "limit": 1}
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            response = client.get(BINANCE_FAPI_FUNDING, params=params)
+            response.raise_for_status()
+            data = response.json()
+    except Exception as exc:  # pragma: no cover - network fallback
+        logging.getLogger(__name__).warning(
+            "Failed to fetch latest funding rate",
+            exc_info=exc,
+            extra={"symbol": symbol},
+        )
+        return None, None
+
+    if isinstance(data, Sequence) and data:
+        entry = data[-1]
+        if isinstance(entry, Mapping):
+            rate = _safe_float(entry.get("fundingRate"))
+            ts = _safe_int(entry.get("fundingTime"))
+            if rate is not None:
+                return float(rate), ts
+    return None, None
+
+
+def _fetch_open_interest(symbol: str) -> float | None:
+    params = {"symbol": symbol.upper()}
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            response = client.get(BINANCE_FAPI_OPEN_INTEREST, params=params)
+            response.raise_for_status()
+            data = response.json()
+    except Exception as exc:  # pragma: no cover - network fallback
+        logging.getLogger(__name__).warning(
+            "Failed to fetch open interest",
+            exc_info=exc,
+            extra={"symbol": symbol},
+        )
+        return None
+
+    if isinstance(data, Mapping):
+        return _safe_float(data.get("openInterest"))
+    return None
+
+
 def _aggregate_from_minutes(
     minute_index: Mapping[int, Mapping[str, Any]],
     open_time: int,
@@ -389,6 +451,20 @@ def _coerce_float(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _round_to_tick(value: float | None, tick_size: float | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric):
+        return None
+    if not tick_size or tick_size <= 0:
+        return numeric
+    return round(numeric / tick_size) * tick_size
 
 
 def _safe_float(value: Any) -> float | None:
@@ -1314,47 +1390,22 @@ def _typical_price(candle: Mapping[str, Any]) -> float:
     return (high + low + close) / 3.0
 
 
-def _determine_bin_size(prices: Sequence[float], tick_size: float | None) -> float | None:
-    finite_prices = [price for price in prices if math.isfinite(price)]
-    if not finite_prices:
-        return float(tick_size) if tick_size and tick_size > 0 else None
-
-    average_price = sum(finite_prices) / len(finite_prices)
-    adaptive_step = abs(average_price) * 1e-4
-    if adaptive_step <= 0:
-        adaptive_step = max(abs(finite_prices[0]) * 1e-4, 1e-6)
-
-    tick = float(tick_size) if tick_size and tick_size > 0 else None
-    step = adaptive_step if adaptive_step > 0 else None
-    if tick is not None:
-        if step is None:
-            return tick
-        return max(tick, step)
-    return step
-
-
-def _build_volume_profile_stats(
+def _profile_scope(
     candles: Sequence[Mapping[str, Any]],
     *,
     start_ms: int,
     end_ms: int,
     tick_size: float | None,
-    value_area_pct: float = VALUE_AREA_PCT,
-) -> Dict[str, Any]:
-    window_start_iso = datetime.fromtimestamp(start_ms / 1000.0, tz=UTC).isoformat()
-    window_end_iso = datetime.fromtimestamp(end_ms / 1000.0, tz=UTC).isoformat()
-
-    if end_ms < start_ms:
-        return {
-            "vwap": 0.0,
-            "poc": None,
-            "vah": None,
-            "val": None,
-            "window": {"start": window_start_iso, "end": window_end_iso},
+) -> ProfileScope:
+    scoped: List[Dict[str, Any]] = [
+        {
+            "t": ts,
+            "o": _coerce_float(candle.get("o")),
+            "h": _coerce_float(candle.get("h")),
+            "l": _coerce_float(candle.get("l")),
+            "c": _coerce_float(candle.get("c")),
+            "v": _coerce_float(candle.get("v")),
         }
-
-    scoped = [
-        candle
         for candle in candles
         if isinstance(candle, Mapping)
         and (ts := _safe_int(candle.get("t"))) is not None
@@ -1362,74 +1413,85 @@ def _build_volume_profile_stats(
     ]
 
     if not scoped:
-        return {
-            "vwap": 0.0,
-            "poc": None,
-            "vah": None,
-            "val": None,
-            "window": {"start": window_start_iso, "end": window_end_iso},
-        }
+        return ProfileScope(
+            candles=[],
+            vwap=0.0,
+            start_bin=None,
+            bin_size=None,
+            histogram=[],
+            session_high=None,
+            session_high_ts=None,
+            session_low=None,
+            session_low_ts=None,
+            sum_volume=0.0,
+        )
 
     session_high: float | None = None
+    session_high_ts: int | None = None
     session_low: float | None = None
-
-    def _attach_extrema(payload: Dict[str, Any]) -> Dict[str, Any]:
-        if session_high is not None and session_low is not None:
-            payload["session_high"] = session_high
-            payload["session_low"] = session_low
-        return payload
-
-    vwap_value = _compute_vwap(scoped)
+    session_low_ts: int | None = None
     prices: List[float] = []
     volumes: List[float] = []
+    sum_volume = 0.0
+
     for candle in scoped:
-        high_value = _safe_float(candle.get("h") or candle.get("high"))
-        low_value = _safe_float(candle.get("l") or candle.get("low"))
+        ts = int(candle["t"])
+        high_value = _safe_float(candle.get("h"))
+        low_value = _safe_float(candle.get("l"))
         if high_value is not None:
-            session_high = (
-                high_value if session_high is None else max(session_high, high_value)
-            )
+            if session_high is None or high_value > session_high or math.isclose(high_value, session_high):
+                session_high = high_value
+                session_high_ts = ts
         if low_value is not None:
-            session_low = low_value if session_low is None else min(session_low, low_value)
+            if session_low is None or low_value < session_low or math.isclose(low_value, session_low):
+                session_low = low_value
+                session_low_ts = ts
 
         volume = float(candle.get("v", 0.0))
-        if volume <= 0:
-            continue
-        price = _typical_price(candle)
-        if not math.isfinite(price):
-            continue
-        prices.append(price)
-        volumes.append(volume)
+        if volume > 0:
+            price = _typical_price(candle)
+            if math.isfinite(price):
+                prices.append(price)
+                volumes.append(volume)
+        sum_volume += max(volume, 0.0)
+
+    vwap_value = _compute_vwap(scoped)
 
     if not prices or not volumes:
-        return _attach_extrema(
-            {
-                "vwap": vwap_value,
-                "poc": None,
-                "vah": None,
-                "val": None,
-                "window": {"start": window_start_iso, "end": window_end_iso},
-            }
+        return ProfileScope(
+            candles=scoped,
+            vwap=vwap_value,
+            start_bin=None,
+            bin_size=None,
+            histogram=[],
+            session_high=session_high,
+            session_high_ts=session_high_ts,
+            session_low=session_low,
+            session_low_ts=session_low_ts,
+            sum_volume=sum_volume,
         )
 
     bin_size = _determine_bin_size(prices, tick_size)
     if not bin_size or bin_size <= 0:
-        return _attach_extrema(
-            {
-                "vwap": vwap_value,
-                "poc": None,
-                "vah": None,
-                "val": None,
-                "window": {"start": window_start_iso, "end": window_end_iso},
-            }
+        return ProfileScope(
+            candles=scoped,
+            vwap=vwap_value,
+            start_bin=None,
+            bin_size=None,
+            histogram=[],
+            session_high=session_high,
+            session_high_ts=session_high_ts,
+            session_low=session_low,
+            session_low_ts=session_low_ts,
+            sum_volume=sum_volume,
         )
 
     min_price = min(prices)
     max_price = max(prices)
     start_bin = math.floor(min_price / bin_size) * bin_size
     bins_count = max(1, int(math.floor((max_price - start_bin) / bin_size)) + 1)
-
     histogram = [0.0 for _ in range(bins_count)]
+
     for price, volume in zip(prices, volumes):
         index = int(math.floor((price - start_bin) / bin_size + 1e-9))
         if index < 0:
@@ -1438,11 +1500,50 @@ def _build_volume_profile_stats(
             index = bins_count - 1
         histogram[index] += volume
 
-    total_volume = sum(histogram)
-    if total_volume <= 0:
+    return ProfileScope(
+        candles=scoped,
+        vwap=vwap_value,
+        start_bin=start_bin,
+        bin_size=bin_size,
+        histogram=histogram,
+        session_high=session_high,
+        session_high_ts=session_high_ts,
+        session_low=session_low,
+        session_low_ts=session_low_ts,
+        sum_volume=sum_volume,
+    )
+
+
+def _profile_scope_to_payload(
+    scope: ProfileScope,
+    *,
+    start_ms: int,
+    end_ms: int,
+    value_area_pct: float,
+) -> Dict[str, Any]:
+    window_start_iso = datetime.fromtimestamp(start_ms / 1000.0, tz=UTC).isoformat()
+    window_end_iso = datetime.fromtimestamp(end_ms / 1000.0, tz=UTC).isoformat()
+
+    if not scope.candles:
+        return {
+            "vwap": 0.0,
+            "poc": None,
+            "vah": None,
+            "val": None,
+            "window": {"start": window_start_iso, "end": window_end_iso},
+        }
+
+    def _attach_extrema(payload: Dict[str, Any]) -> Dict[str, Any]:
+        if scope.session_high is not None and scope.session_low is not None:
+            payload["session_high"] = scope.session_high
+            payload["session_low"] = scope.session_low
+        return payload
+
+    histogram = scope.histogram
+    if not histogram:
         return _attach_extrema(
             {
-                "vwap": vwap_value,
+                "vwap": scope.vwap,
                 "poc": None,
                 "vah": None,
                 "val": None,
@@ -1450,6 +1551,20 @@ def _build_volume_profile_stats(
             }
         )
 
+    total_volume = sum(histogram)
+    if total_volume <= 0:
+        return _attach_extrema(
+            {
+                "vwap": scope.vwap,
+                "poc": None,
+                "vah": None,
+                "val": None,
+                "window": {"start": window_start_iso, "end": window_end_iso},
+            }
+        )
+
+    start_bin = scope.start_bin if scope.start_bin is not None else 0.0
+    bin_size = scope.bin_size if scope.bin_size is not None else 1.0
     poc_index = max(range(len(histogram)), key=lambda idx: histogram[idx])
     poc_price = start_bin + poc_index * bin_size
 
@@ -1483,12 +1598,64 @@ def _build_volume_profile_stats(
 
     return _attach_extrema(
         {
-            "vwap": vwap_value,
+            "vwap": scope.vwap,
             "poc": round(poc_price, 12),
             "vah": round(vah_price, 12),
             "val": round(val_price, 12),
             "window": {"start": window_start_iso, "end": window_end_iso},
         }
+    )
+
+
+def _determine_bin_size(prices: Sequence[float], tick_size: float | None) -> float | None:
+    finite_prices = [price for price in prices if math.isfinite(price)]
+    if not finite_prices:
+        return float(tick_size) if tick_size and tick_size > 0 else None
+
+    average_price = sum(finite_prices) / len(finite_prices)
+    adaptive_step = abs(average_price) * 1e-4
+    if adaptive_step <= 0:
+        adaptive_step = max(abs(finite_prices[0]) * 1e-4, 1e-6)
+
+    tick = float(tick_size) if tick_size and tick_size > 0 else None
+    step = adaptive_step if adaptive_step > 0 else None
+    if tick is not None:
+        if step is None:
+            return tick
+        return max(tick, step)
+    return step
+
+
+def _build_volume_profile_stats(
+    candles: Sequence[Mapping[str, Any]],
+    *,
+    start_ms: int,
+    end_ms: int,
+    tick_size: float | None,
+    value_area_pct: float = VALUE_AREA_PCT,
+) -> Dict[str, Any]:
+    if end_ms < start_ms:
+        window_start_iso = datetime.fromtimestamp(start_ms / 1000.0, tz=UTC).isoformat()
+        window_end_iso = datetime.fromtimestamp(end_ms / 1000.0, tz=UTC).isoformat()
+        return {
+            "vwap": 0.0,
+            "poc": None,
+            "vah": None,
+            "val": None,
+            "window": {"start": window_start_iso, "end": window_end_iso},
+        }
+
+    scope = _profile_scope(
+        candles,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        tick_size=tick_size,
+    )
+    return _profile_scope_to_payload(
+        scope,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        value_area_pct=value_area_pct,
     )
 
 
@@ -2050,10 +2217,47 @@ def build_check_all_datas(
         data_quality["downloaded"] = fetched_unique
         raise DataQualityError(data_quality)
 
+    zones_window_hours = max(48, hours_window)
+
+    ohlcv_history_hours = max(96, zones_window_hours, hours_window)
+    history_start_candidate = window_end_ms - ohlcv_history_hours * MS_IN_HOUR
+    ohlcv_history_start_ms = max(0, _align_to_interval(history_start_candidate, MINUTE_INTERVAL_MS))
+    history_expected = _build_expected_times(
+        ohlcv_history_start_ms,
+        window_end_ms,
+        MINUTE_INTERVAL_MS,
+    )
+    history_gaps = _summarise_missing_times(history_expected, minute_index_all)
+    if history_gaps:
+        try:
+            history_minutes = _download_missing_minutes(
+                symbol,
+                ohlcv_history_start_ms,
+                window_end_ms,
+                history_gaps,
+            )
+        except BinanceDownloadError as exc:
+            detail = {
+                "tf": target_tf_key,
+                "window": {"start_ms": ohlcv_history_start_ms, "end_ms": window_end_ms},
+                "stage": "ohlcv_history",
+                "minute_missing_before": sum(gap["count"] for gap in history_gaps),
+                "fetched_1m_count": exc.downloaded,
+                "time_gaps": history_gaps,
+            }
+            raise DataQualityError(detail) from exc
+        for candle in history_minutes:
+            ts = candle["t"]
+            if ts < ohlcv_history_start_ms or ts > window_end_ms:
+                continue
+            minute_index_all[ts] = candle
+            if ts not in minute_window_index and ts >= window_start_ms:
+                minute_window_index[ts] = candle
+    else:
+        ohlcv_history_start_ms = max(0, ohlcv_history_start_ms)
+
     frames["1m"] = [minute_index_all[ts] for ts in sorted(minute_index_all)]
     minute_candles = frames["1m"]
-
-    zones_window_hours = max(48, hours_window)
     fifteen_min_ms = TIMEFRAME_TO_MS.get("15m") or 15 * MINUTE_INTERVAL_MS
     zone_window_ms = zones_window_hours * MS_IN_HOUR
     raw_zone_start = max(0, window_end_ms - zone_window_ms)
@@ -2598,9 +2802,9 @@ def build_check_all_datas(
     minute_frame_present = "1m" in frames
     if minute_frame_present:
         minute_htf_source = [
-            minute_window_index[ts]
-            for ts in sorted(minute_window_index)
-            if ts in minute_window_index
+            minute_index_all[ts]
+            for ts in sorted(minute_index_all)
+            if ts >= ohlcv_history_start_ms
         ]
 
     orderflow_config = _resolve_orderflow_config(raw_meta)
@@ -2657,28 +2861,38 @@ def build_check_all_datas(
     daily_filtered_minutes = _filter_candles(
         minute_series, start_ms=daily_start_ms, end_ms=window_end_ms
     )
-    daily_vwap_profile = _build_volume_profile_stats(
+    daily_scope = _profile_scope(
         minute_series,
         start_ms=daily_start_ms,
         end_ms=window_end_ms,
         tick_size=tick_size_numeric,
+    )
+    daily_vwap_profile = _profile_scope_to_payload(
+        daily_scope,
+        start_ms=daily_start_ms,
+        end_ms=window_end_ms,
         value_area_pct=VALUE_AREA_PCT,
     )
 
     composite_day_end_ms = daily_start_ms + MS_IN_DAY - MINUTE_INTERVAL_MS
     if composite_day_end_ms < daily_start_ms:
         composite_day_end_ms = daily_start_ms
-    composite_day_profile = _build_volume_profile_stats(
+    composite_scope = _profile_scope(
         minute_series,
         start_ms=daily_start_ms,
         end_ms=min(window_end_ms, composite_day_end_ms),
         tick_size=tick_size_numeric,
+    )
+    composite_day_profile = _profile_scope_to_payload(
+        composite_scope,
+        start_ms=daily_start_ms,
+        end_ms=min(window_end_ms, composite_day_end_ms),
         value_area_pct=VALUE_AREA_PCT,
     )
 
     session_profiles: Dict[str, Dict[str, Any]] = {}
-    session_sigma_blocks: Dict[str, Dict[str, Any]] = {}
     session_boundaries: Dict[str, Dict[str, Any]] = {}
+    session_scopes: Dict[str, ProfileScope] = {}
     for session_name, session_start, session_end in sessions:
         (
             session_start_ms,
@@ -2691,11 +2905,16 @@ def build_check_all_datas(
         ib_high, ib_low = _compute_initial_balance_extrema(
             session_filtered, session_start_ms=session_start_ms
         )
-        profile_entry = _build_volume_profile_stats(
+        scope = _profile_scope(
             minute_series,
             start_ms=session_start_ms,
             end_ms=session_end_ms,
             tick_size=tick_size_numeric,
+        )
+        profile_entry = _profile_scope_to_payload(
+            scope,
+            start_ms=session_start_ms,
+            end_ms=session_end_ms,
             value_area_pct=VALUE_AREA_PCT,
         )
         if isinstance(profile_entry, MutableMapping):
@@ -2708,9 +2927,7 @@ def build_check_all_datas(
             profile_entry["ib_high"] = ib_high
             profile_entry["ib_low"] = ib_low
         session_profiles[session_name] = profile_entry
-        session_sigma_blocks[session_name] = _build_vwap_sigma_block(
-            session_filtered, basis="session"
-        )
+        session_scopes[session_name] = scope
         session_boundaries[session_name] = {
             "start_ms": session_start_ms,
             "end_ms": session_end_ms,
@@ -2718,16 +2935,6 @@ def build_check_all_datas(
             "ib_high": ib_high,
             "ib_low": ib_low,
         }
-
-    vwap_payload = {
-        "daily": daily_vwap_profile,
-        "sessions": session_profiles,
-    }
-
-    vwap_sigma_payload = {
-        "daily": _build_vwap_sigma_block(daily_filtered_minutes, basis="daily"),
-        "sessions": session_sigma_blocks,
-    }
 
     session_time_lookup = {
         str(name).lower(): (start_time, end_time)
@@ -2773,73 +2980,117 @@ def build_check_all_datas(
         entry["ib_high"] = ib_high
         entry["ib_low"] = ib_low
 
-    def _sigma_levels_map(block: Mapping[str, Any] | None) -> Dict[int, Dict[str, float | None]]:
-        levels: Dict[int, Dict[str, float | None]] = {}
-        if not isinstance(block, Mapping):
-            return levels
-        sigma_entries = block.get("sigma")
-        if not isinstance(sigma_entries, Sequence):
-            return levels
-        for entry in sigma_entries:
-            if not isinstance(entry, Mapping):
-                continue
+    def _rounded(value: float | None) -> float | None:
+        rounded = _round_to_tick(value, tick_size_numeric)
+        if rounded is None and value is not None:
             try:
-                key = int(entry.get("k"))
+                numeric = float(value)
             except (TypeError, ValueError):
-                continue
-            minus_val = _safe_float(entry.get("price_minus"))
-            plus_val = _safe_float(entry.get("price_plus"))
-            levels[key] = {"minus": minus_val, "plus": plus_val}
-        return levels
+                return None
+            return numeric
+        return rounded
 
-    def _sd_payload(levels: Mapping[int, Mapping[str, float | None]], order: int) -> Dict[str, float | None]:
-        payload = levels.get(order, {}) if isinstance(levels, Mapping) else {}
-        minus_value = payload.get("minus") if isinstance(payload, Mapping) else None
-        plus_value = payload.get("plus") if isinstance(payload, Mapping) else None
-        return {"minus": minus_value, "plus": plus_value}
+    def _profile_float(entry: Mapping[str, Any] | None, key: str) -> float | None:
+        if not isinstance(entry, Mapping):
+            return None
+        for candidate in (key, key.lower(), key.upper()):
+            if candidate in entry and entry[candidate] is not None:
+                return _safe_float(entry[candidate])
+        return None
 
-    daily_sigma_levels = _sigma_levels_map(vwap_sigma_payload.get("daily"))
-    vwap_tpo_daily = None
-    if isinstance(daily_vwap_profile, Mapping) and daily_vwap_profile:
-        vwap_tpo_daily = {
-            "open_utc": _isoformat_utc(daily_start_ms),
-            "vwap": daily_vwap_profile.get("vwap"),
-            "sd1": _sd_payload(daily_sigma_levels, 1),
-            "sd2": _sd_payload(daily_sigma_levels, 2),
-        }
+    def _sigma_entries(center_value: float, sigma_value: float) -> List[Dict[str, float | None]]:
+        if not math.isfinite(center_value):
+            center = 0.0
+        else:
+            center = float(center_value)
+        sigma = float(sigma_value) if math.isfinite(sigma_value) else 0.0
+        entries: List[Dict[str, float | None]] = []
+        for k in (1, 2):
+            minus_val = _rounded(center - sigma * k)
+            plus_val = _rounded(center + sigma * k)
+            entries.append({"k": k, "minus": minus_val, "plus": plus_val})
+        return entries
 
-    vwap_tpo_sessions: Dict[str, Dict[str, Any]] = {}
-    session_sigma_levels: Dict[str, Dict[int, Dict[str, float | None]]] = {
-        name: _sigma_levels_map(block)
-        for name, block in session_sigma_blocks.items()
+    daily_stats = _compute_vwap_stats(daily_scope.candles)
+    daily_sigma_value = daily_stats[1] if daily_stats else 0.0
+    daily_center = daily_stats[0] if daily_stats else daily_scope.vwap
+    daily_price = _rounded(daily_center)
+    if daily_price is None:
+        daily_price = float(daily_center)
+    vwap_tpo_daily_public = {
+        "price": daily_price,
+        "sigma": _sigma_entries(daily_center, daily_sigma_value),
     }
-    for session_name, profile_entry in session_profiles.items():
+    daily_diag = {"sum_v": daily_scope.sum_volume, "sigma": daily_sigma_value}
+
+    sessions_public: Dict[str, Dict[str, Any]] = {}
+    session_diag_map: Dict[str, Dict[str, float | int]] = {}
+    for session_name, _, _ in sessions:
+        profile_entry = session_profiles.get(session_name)
+        scope = session_scopes.get(session_name)
         boundary = session_boundaries.get(session_name, {})
-        sigma_levels = session_sigma_levels.get(session_name, {})
         open_ms = boundary.get("start_ms")
         close_ms = boundary.get("close_ms")
         ib_high = boundary.get("ib_high")
         ib_low = boundary.get("ib_low")
-        session_payload = {
+
+        poc_value = _rounded(_profile_float(profile_entry, "poc"))
+        vah_value = _rounded(_profile_float(profile_entry, "vah"))
+        val_value = _rounded(_profile_float(profile_entry, "val"))
+
+        session_high_value = _rounded(scope.session_high if scope else _profile_float(profile_entry, "session_high"))
+        session_low_value = _rounded(scope.session_low if scope else _profile_float(profile_entry, "session_low"))
+
+        ib_payload: List[float] = []
+        ib_low_value = _rounded(ib_low) if ib_low is not None else None
+        ib_high_value = _rounded(ib_high) if ib_high is not None else None
+        if ib_low_value is not None and ib_high_value is not None:
+            ib_payload = [ib_low_value, ib_high_value]
+
+        vwap_value = _rounded(scope.vwap if scope else _profile_float(profile_entry, "vwap"))
+
+        if poc_value is None and vwap_value is not None:
+            poc_value = vwap_value
+        if vah_value is None and session_high_value is not None:
+            vah_value = session_high_value
+        if val_value is None and session_low_value is not None:
+            val_value = session_low_value
+        if session_high_value is None:
+            session_high_value = vah_value if vah_value is not None else vwap_value
+        if session_low_value is None:
+            session_low_value = val_value if val_value is not None else vwap_value
+        if not ib_payload:
+            lower_bound = session_low_value if session_low_value is not None else val_value
+            upper_bound = session_high_value if session_high_value is not None else vah_value
+            if lower_bound is None:
+                lower_bound = vwap_value
+            if upper_bound is None:
+                upper_bound = vwap_value
+            if lower_bound is None:
+                lower_bound = 0.0
+            if upper_bound is None:
+                upper_bound = lower_bound
+            ib_payload = [lower_bound, upper_bound]
+
+        sessions_public[session_name] = {
+            "vwap": vwap_value,
+            "POC": poc_value,
+            "VAH": vah_value,
+            "VAL": val_value,
+            "IB": ib_payload,
+            "sessionHigh": session_high_value,
+            "sessionLow": session_low_value,
             "open_utc": _isoformat_utc(open_ms) if open_ms is not None else None,
             "close_utc": _isoformat_utc(close_ms) if close_ms is not None else None,
-            "vwap": profile_entry.get("vwap") if isinstance(profile_entry, Mapping) else None,
-            "sd1": _sd_payload(sigma_levels, 1),
-            "sd2": _sd_payload(sigma_levels, 2),
-            "poc": profile_entry.get("poc") if isinstance(profile_entry, Mapping) else None,
-            "vah": profile_entry.get("vah") if isinstance(profile_entry, Mapping) else None,
-            "val": profile_entry.get("val") if isinstance(profile_entry, Mapping) else None,
-            "ib_high": ib_high,
-            "ib_low": ib_low,
-            "high": profile_entry.get("session_high") if isinstance(profile_entry, Mapping) else None,
-            "low": profile_entry.get("session_low") if isinstance(profile_entry, Mapping) else None,
         }
-        if isinstance(profile_entry, Mapping):
-            if profile_entry.get("high") is not None:
-                session_payload["high"] = profile_entry.get("high")
-            if profile_entry.get("low") is not None:
-                session_payload["low"] = profile_entry.get("low")
-        vwap_tpo_sessions[session_name] = session_payload
+
+        if scope is not None:
+            session_diag_map[session_name] = {
+                "sum_v": scope.sum_volume,
+                "bins": len(scope.histogram),
+            }
+        else:
+            session_diag_map[session_name] = {"sum_v": 0.0, "bins": 0}
 
     composite_day_payload = None
     if isinstance(composite_day_profile, Mapping):
@@ -2850,8 +3101,8 @@ def build_check_all_datas(
         }
 
     vwap_tpo_block = {
-        "daily": vwap_tpo_daily,
-        "sessions": vwap_tpo_sessions,
+        "daily_vwap": vwap_tpo_daily_public,
+        "sessions": sessions_public,
     }
 
     prev_day_block = _build_prev_day_block(
@@ -2869,55 +3120,7 @@ def build_check_all_datas(
         "val": _float_or_none((composite_day_payload or {}).get("val")),
     }
 
-    def _normalise_sd(sd_block: Mapping[str, Any] | None) -> Dict[str, float | None]:
-        if not isinstance(sd_block, Mapping):
-            return {"minus": None, "plus": None}
-        return {
-            "minus": _float_or_none(sd_block.get("minus")),
-            "plus": _float_or_none(sd_block.get("plus")),
-        }
-
-    daily_sd1 = _normalise_sd((vwap_tpo_daily or {}).get("sd1") if isinstance(vwap_tpo_daily, Mapping) else None)
-    daily_sd2 = _normalise_sd((vwap_tpo_daily or {}).get("sd2") if isinstance(vwap_tpo_daily, Mapping) else None)
-    daily_open = None
-    daily_vwap_value = None
-    if isinstance(vwap_tpo_daily, Mapping):
-        daily_open = vwap_tpo_daily.get("open_utc")
-        daily_vwap_value = _float_or_none(vwap_tpo_daily.get("vwap"))
-    if daily_open is None:
-        daily_open = _isoformat_utc(daily_start_ms)
-
-    vwap_tpo_daily_public = {
-        "open_utc": daily_open,
-        "vwap": daily_vwap_value,
-        "sd1": daily_sd1,
-        "sd2": daily_sd2,
-    }
-
-    ordered_sessions: Dict[str, Dict[str, Any]] = {}
-    for session_name, _, _ in sessions:
-        raw_payload = vwap_tpo_sessions.get(session_name, {})
-        open_utc = raw_payload.get("open_utc") if isinstance(raw_payload, Mapping) else None
-        close_utc = raw_payload.get("close_utc") if isinstance(raw_payload, Mapping) else None
-        ordered_sessions[session_name] = {
-            "open_utc": open_utc,
-            "close_utc": close_utc,
-            "vwap": _float_or_none(raw_payload.get("vwap")) if isinstance(raw_payload, Mapping) else None,
-            "sd1": _normalise_sd(raw_payload.get("sd1") if isinstance(raw_payload, Mapping) else None),
-            "sd2": _normalise_sd(raw_payload.get("sd2") if isinstance(raw_payload, Mapping) else None),
-            "poc": _float_or_none(raw_payload.get("poc")) if isinstance(raw_payload, Mapping) else None,
-            "vah": _float_or_none(raw_payload.get("vah")) if isinstance(raw_payload, Mapping) else None,
-            "val": _float_or_none(raw_payload.get("val")) if isinstance(raw_payload, Mapping) else None,
-            "ib_high": _float_or_none(raw_payload.get("ib_high")) if isinstance(raw_payload, Mapping) else None,
-            "ib_low": _float_or_none(raw_payload.get("ib_low")) if isinstance(raw_payload, Mapping) else None,
-            "high": _float_or_none(raw_payload.get("high")) if isinstance(raw_payload, Mapping) else None,
-            "low": _float_or_none(raw_payload.get("low")) if isinstance(raw_payload, Mapping) else None,
-        }
-
-    vwap_tpo_public = {
-        "daily": vwap_tpo_daily_public,
-        "sessions": ordered_sessions,
-    }
+    vwap_tpo_public = vwap_tpo_block
 
     ohlcv_public: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
     for tf in ("1m", "3m", "5m", "15m", "1h", "4h", "1d"):
@@ -2955,6 +3158,114 @@ def build_check_all_datas(
         "eql": list(liquidity_equal_levels.get("eql", [])),
     }
 
+    def _ensure_iso_timestamp(value: Any) -> str | None:
+        if isinstance(value, str) and value:
+            return value
+        ts_ms = _safe_int(value)
+        if ts_ms is None:
+            return None
+        return _isoformat_utc(ts_ms)
+
+    liquidity_levels_list: List[Dict[str, Any]] = []
+
+    for level in liquidity_equal_levels.get("eqh", []):
+        if not isinstance(level, Mapping):
+            continue
+        price_value = _rounded(_safe_float(level.get("price")))
+        if price_value is None:
+            continue
+        ts_iso = _ensure_iso_timestamp(level.get("ts")) or _ensure_iso_timestamp(level.get("t"))
+        if ts_iso is None:
+            ts_iso = _isoformat_utc(window_end_ms)
+        liquidity_levels_list.append({"type": "EQH", "price": price_value, "ts": ts_iso})
+
+    for level in liquidity_equal_levels.get("eql", []):
+        if not isinstance(level, Mapping):
+            continue
+        price_value = _rounded(_safe_float(level.get("price")))
+        if price_value is None:
+            continue
+        ts_iso = _ensure_iso_timestamp(level.get("ts")) or _ensure_iso_timestamp(level.get("t"))
+        if ts_iso is None:
+            ts_iso = _isoformat_utc(window_end_ms)
+        liquidity_levels_list.append({"type": "EQL", "price": price_value, "ts": ts_iso})
+
+    pdh_price = _rounded(_safe_float((prev_day_block or {}).get("pdh")))
+    if pdh_price is not None:
+        pdh_ts = _isoformat_utc(daily_start_ms - MINUTE_INTERVAL_MS)
+        liquidity_levels_list.append({"type": "PDH", "price": pdh_price, "ts": pdh_ts})
+
+    pdl_price = _rounded(_safe_float((prev_day_block or {}).get("pdl")))
+    if pdl_price is not None:
+        pdl_ts = _isoformat_utc(daily_start_ms - MINUTE_INTERVAL_MS)
+        liquidity_levels_list.append({"type": "PDL", "price": pdl_price, "ts": pdl_ts})
+
+    active_session_name: str | None = None
+    active_scope: ProfileScope | None = None
+    active_bounds: Mapping[str, Any] | None = None
+    for session_name, bounds in session_boundaries.items():
+        start = _safe_int(bounds.get("start_ms"))
+        close = _safe_int(bounds.get("close_ms"))
+        if start is None or close is None:
+            continue
+        if start <= window_end_ms <= close:
+            active_session_name = session_name
+            active_scope = session_scopes.get(session_name)
+            active_bounds = bounds
+            break
+    if active_session_name is None:
+        latest: tuple[int, str] | None = None
+        for session_name, bounds in session_boundaries.items():
+            close = _safe_int(bounds.get("close_ms"))
+            if close is None or close > window_end_ms:
+                continue
+            if latest is None or close > latest[0]:
+                latest = (close, session_name)
+        if latest is not None:
+            active_session_name = latest[1]
+            active_scope = session_scopes.get(active_session_name)
+            active_bounds = session_boundaries.get(active_session_name)
+
+    if active_scope is not None and active_session_name is not None:
+        if active_scope.session_high is not None:
+            high_price = _rounded(active_scope.session_high)
+            if high_price is not None:
+                high_ts = _ensure_iso_timestamp(active_scope.session_high_ts)
+                if high_ts is None and active_bounds is not None:
+                    high_ts = _ensure_iso_timestamp(active_bounds.get("close_ms"))
+                if high_ts is None:
+                    high_ts = _isoformat_utc(window_end_ms)
+                liquidity_levels_list.append(
+                    {"type": "STB", "price": high_price, "ts": high_ts}
+                )
+        if active_scope.session_low is not None:
+            low_price = _rounded(active_scope.session_low)
+            if low_price is not None:
+                low_ts = _ensure_iso_timestamp(active_scope.session_low_ts)
+                if low_ts is None and active_bounds is not None:
+                    low_ts = _ensure_iso_timestamp(active_bounds.get("close_ms"))
+                if low_ts is None:
+                    low_ts = _isoformat_utc(window_end_ms)
+                liquidity_levels_list.append(
+                    {"type": "BTS", "price": low_price, "ts": low_ts}
+                )
+
+    zones_public["liquidity"] = liquidity_levels_list
+
+    funding_rate, funding_ts = _fetch_latest_funding(symbol)
+    funding_value = funding_rate if funding_rate is not None else 0.0
+    funding_iso = _isoformat_utc(funding_ts) if funding_ts is not None else None
+
+    oi_value_raw = _fetch_open_interest(symbol)
+    oi_ok = oi_value_raw is not None and math.isfinite(float(oi_value_raw)) if oi_value_raw is not None else False
+    oi_value = float(oi_value_raw) if oi_value_raw is not None and math.isfinite(float(oi_value_raw)) else 0.0
+
+    market_extras_public = {
+        "funding": funding_value,
+        "oi": oi_value,
+        "liq_levels": [],
+    }
+
     risk_prefs_public = {"rr_min": 2.5, "risk_per_trade_pct": 1.0}
 
     context_meta = raw_meta.get("context") if isinstance(raw_meta, Mapping) else None
@@ -2981,6 +3292,61 @@ def build_check_all_datas(
         "openOppositeZones": bool(raw_open_opposite) if isinstance(raw_open_opposite, bool) else False,
     }
 
+    tf_lengths: Dict[str, int] = {}
+    if isinstance(ohlcv_block, Mapping):
+        for tf in ("3m", "5m", "15m", "1h", "4h", "1d"):
+            tf_payload = ohlcv_block.get(tf)
+            if isinstance(tf_payload, Mapping):
+                candles = tf_payload.get("candles")
+                tf_lengths[tf] = len(candles) if isinstance(candles, Sequence) else 0
+            else:
+                tf_lengths[tf] = 0
+    else:
+        tf_lengths = {tf: 0 for tf in ("3m", "5m", "15m", "1h", "4h", "1d")}
+
+    vwap_sessions_diag = {}
+    for session_name, _, _ in sessions:
+        diag = session_diag_map.get(session_name, {"sum_v": 0.0, "bins": 0})
+        vwap_sessions_diag[session_name] = {
+            "sum_v": float(diag.get("sum_v", 0.0) or 0.0),
+            "bins": int(diag.get("bins", 0) or 0),
+        }
+
+    vwap_tpo_diag = {
+        "daily": {
+            "sum_v": float(daily_diag.get("sum_v", 0.0)),
+            "sigma": float(daily_diag.get("sigma", 0.0)),
+        },
+        "sessions": vwap_sessions_diag,
+    }
+
+    eqh_count = sum(1 for entry in liquidity_levels_list if entry.get("type") == "EQH")
+    eql_count = sum(1 for entry in liquidity_levels_list if entry.get("type") == "EQL")
+    pdh_present = any(entry.get("type") == "PDH" for entry in liquidity_levels_list)
+    pdl_present = any(entry.get("type") == "PDL" for entry in liquidity_levels_list)
+    session_hl_present = any(
+        entry.get("type") in {"STB", "BTS"} for entry in liquidity_levels_list
+    )
+    liq_diag = {
+        "eqh": eqh_count,
+        "eql": eql_count,
+        "pdh_pdl": bool(pdh_present and pdl_present),
+        "session_hl": bool(session_hl_present),
+    }
+
+    market_extras_diag = {
+        "funding_ts": funding_iso,
+        "oi_ok": bool(oi_ok),
+        "liq_levels": len(market_extras_public.get("liq_levels", [])),
+    }
+
+    meta_payload = {
+        "tf_lengths": tf_lengths,
+        "vwap_tpo_diag": vwap_tpo_diag,
+        "liq_diag": liq_diag,
+        "market_extras_diag": market_extras_diag,
+    }
+
     response_payload = {
         "symbol": symbol,
         "ohlcv": ohlcv_public,
@@ -2990,8 +3356,10 @@ def build_check_all_datas(
         "prev_day": prev_day_block,
         "zones": zones_public,
         "liquidity": liquidity_public,
+        "market_extras": market_extras_public,
         "risk_prefs": risk_prefs_public,
         "context": context_public,
+        "meta": meta_payload,
     }
 
     return round_floats(response_payload)

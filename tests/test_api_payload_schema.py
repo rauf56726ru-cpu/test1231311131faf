@@ -143,8 +143,8 @@ def test_check_all_sessions_include_extrema(client: TestClient) -> None:
 
     vwap_sessions = body["vwap_tpo"]["sessions"]
     for session_name, session_payload in vwap_sessions.items():
-        assert session_payload["high"] is not None
-        assert session_payload["low"] is not None
+        assert session_payload["sessionHigh"] is not None
+        assert session_payload["sessionLow"] is not None
 
     composite_day = body["tpo"]["composite_day"]
     assert set(composite_day.keys()) == {"poc", "vah", "val"}
