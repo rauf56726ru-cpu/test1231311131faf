@@ -32,6 +32,11 @@ from .presets import (
 from .liquidity import build_liquidity_snapshot
 from .zones import Config as ZonesConfig, detect_zones
 from .collection_state import get_last_collection_time, set_last_collection_time
+from .shared_candles_store import (
+    clear_shared_candles,
+    get_shared_candles,
+    merge_shared_candles,
+)
 from .ohlc import (
     TIMEFRAME_WINDOWS,
     fetch_ohlcv,
@@ -84,4 +89,7 @@ __all__ = [
     "detect_zones",
     "get_last_collection_time",
     "set_last_collection_time",
+    "get_shared_candles",
+    "merge_shared_candles",
+    "clear_shared_candles",
 ]

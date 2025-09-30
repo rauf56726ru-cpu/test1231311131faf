@@ -21,18 +21,20 @@ from ..services import (
     build_profile_package,
     DEFAULT_SYMBOL,
     delete_preset,
+    get_last_collection_time,
+    get_shared_candles,
     get_snapshot,
     list_presets_configs,
     list_snapshots,
+    merge_shared_candles,
     normalise_ohlcv,
     preset_to_payload,
     register_snapshot,
     render_inspection_page,
     resolve_profile_config,
     save_preset,
-    update_preset,
-    get_last_collection_time,
     set_last_collection_time,
+    update_preset,
 )
 from ..services.zones import Config as ZonesConfig, detect_zones
 from ..version import APP_VERSION
@@ -121,6 +123,69 @@ async def register_inspection_snapshot(payload: Dict[str, Any] = Body(...)) -> D
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"snapshot_id": snapshot_id}
+
+
+@app.get("/shared-candles")
+async def fetch_shared_candles(
+    symbol: str = Query(..., description="Trading symbol, e.g. BTCUSDT"),
+    interval: str = Query(..., description="Interval identifier, e.g. 1m"),
+) -> JSONResponse:
+    if not isinstance(symbol, str) or not symbol.strip():
+        raise HTTPException(status_code=400, detail="symbol is required")
+    if not isinstance(interval, str) or not interval.strip():
+        raise HTTPException(status_code=400, detail="interval is required")
+
+    stored = get_shared_candles(symbol, interval) or {}
+    payload = {
+        "symbol": symbol.strip().upper(),
+        "interval": interval.strip().lower(),
+        "candles": stored.get("candles", []),
+        "intervalMs": stored.get("intervalMs"),
+        "lastUpdateMs": stored.get("lastUpdateMs"),
+        "updatedAt": stored.get("updatedAt"),
+    }
+    return JSONResponse(payload)
+
+
+@app.post("/shared-candles")
+async def update_shared_candles(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
+    symbol = payload.get("symbol")
+    interval = payload.get("interval")
+    candles = payload.get("candles", [])
+    reset_flag = bool(payload.get("reset", False))
+    interval_ms = payload.get("intervalMs")
+    last_update_ms = payload.get("lastUpdateMs")
+    max_bars = payload.get("maxBars")
+
+    if not isinstance(symbol, str) or not symbol.strip():
+        raise HTTPException(status_code=400, detail="symbol is required")
+    if not isinstance(interval, str) or not interval.strip():
+        raise HTTPException(status_code=400, detail="interval is required")
+    if isinstance(candles, (str, bytes)) or not isinstance(candles, Sequence):
+        raise HTTPException(status_code=400, detail="candles must be an array")
+
+    try:
+        result = merge_shared_candles(
+            symbol,
+            interval,
+            candles,
+            interval_ms=interval_ms,
+            last_update_ms=last_update_ms,
+            reset=reset_flag,
+            max_bars=max_bars,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    response_payload = {
+        "symbol": symbol.strip().upper(),
+        "interval": interval.strip().lower(),
+        "candles": result.get("candles", []),
+        "intervalMs": result.get("intervalMs"),
+        "lastUpdateMs": result.get("lastUpdateMs"),
+        "updatedAt": result.get("updatedAt"),
+    }
+    return JSONResponse(response_payload)
 
 
 @app.get("/inspection", response_class=HTMLResponse)

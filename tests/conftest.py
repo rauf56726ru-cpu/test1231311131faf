@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.services import collection_state
+from src.services import collection_state, shared_candles_store
 
 
 @pytest.fixture(autouse=True)
@@ -23,3 +23,16 @@ def _reset_collection_state(tmp_path, monkeypatch):
     collection_state.reset_state()
     yield
     collection_state.reset_state()
+
+
+@pytest.fixture(autouse=True)
+def _reset_shared_candles(tmp_path, monkeypatch):
+    """Ensure shared candle persistence does not leak between tests."""
+
+    store_dir = tmp_path / "shared_candles"
+    store_file = store_dir / "shared_candles.json"
+    monkeypatch.setattr(shared_candles_store, "STORE_DIR", store_dir)
+    monkeypatch.setattr(shared_candles_store, "STORE_FILE", store_file)
+    shared_candles_store.reset_store()
+    yield
+    shared_candles_store.reset_store()
