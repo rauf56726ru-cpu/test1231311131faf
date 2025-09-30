@@ -4852,3 +4852,88 @@ def render_inspection_page(
     </html>
     """
     return page_html
+
+
+
+def validate_enhanced_snapshot(snapshot: Mapping[str, Any]) -> tuple[bool, List[str]]:
+    """Run strict validation over inspection snapshot payloads."""
+
+    errors: List[str] = []
+    candles = snapshot.get("candles")
+    if isinstance(candles, Mapping):
+        candles = candles.get("candles")
+    if not isinstance(candles, Sequence):
+        candles = []
+    candles = list(candles)[:1000]
+
+    last_ts: int | None = None
+    for index, row in enumerate(candles):
+        candle = _parse_minute_row(row) if isinstance(row, Mapping) else _parse_minute_row(row)
+        if candle is None:
+            errors.append(f"Invalid candle at index {index}")
+            continue
+        ts = int(candle["t"])
+        if last_ts is not None and ts <= last_ts:
+            errors.append("Candles must be strictly sorted by time")
+            break
+        if last_ts is not None and ts - last_ts > MINUTE_INTERVAL_MS * 3:
+            logging.getLogger(__name__).debug("Gap detected between %s and %s", last_ts, ts)
+        if candle["h"] < max(candle["o"], candle["c"]):
+            candle["h"] = max(candle["o"], candle["c"])
+        if candle["l"] > min(candle["o"], candle["c"]):
+            candle["l"] = min(candle["o"], candle["c"])
+        if candle["v"] <= 0:
+            candle["v"] = 1e-9
+        last_ts = ts
+
+    orderflow = snapshot.get("orderflow") if isinstance(snapshot.get("orderflow"), Mapping) else {}
+    footprint = orderflow.get("footprint") if isinstance(orderflow, Mapping) else None
+    if isinstance(footprint, Sequence):
+        for item in footprint:
+            if not isinstance(item, Mapping):
+                errors.append("Footprint rows must be objects")
+                continue
+            bid = _coerce_float(item.get("bid")) or 0.0
+            ask = _coerce_float(item.get("ask")) or 0.0
+            delta = _coerce_float(item.get("delta")) or 0.0
+            if abs((ask - bid) - delta) > 1e-3:
+                errors.append("Footprint delta mismatch")
+                break
+
+    cvd = orderflow.get("cvd") if isinstance(orderflow, Mapping) else None
+    if isinstance(cvd, Sequence):
+        for row in cvd:
+            if not isinstance(row, Mapping):
+                errors.append("CVD rows must be objects")
+                break
+            buy = _coerce_float(row.get("cvd_buy")) or 0.0
+            sell = _coerce_float(row.get("cvd_sell")) or 0.0
+            net = _coerce_float(row.get("cvd_net")) or 0.0
+            if abs((buy - sell) - net) > 1e-3:
+                errors.append("CVD net mismatch")
+                break
+
+    derivatives = snapshot.get("derivatives")
+    if isinstance(derivatives, Sequence):
+        for item in derivatives:
+            if not isinstance(item, Mapping):
+                errors.append("Derivative rows must be objects")
+                break
+            oi = _coerce_float(item.get("oi"))
+            funding = _coerce_float(item.get("funding"))
+            if oi is None or oi <= 0:
+                errors.append("Open interest must be positive")
+            if funding is None:
+                errors.append("Funding rate missing")
+
+    book = snapshot.get("book")
+    if isinstance(book, Mapping):
+        if not isinstance(book.get("top_levels"), Sequence):
+            errors.append("Orderbook top_levels missing")
+
+    valid = not errors
+    if valid:
+        logging.getLogger(__name__).info("Snapshot validation succeeded")
+    else:
+        logging.getLogger(__name__).warning("Snapshot validation failed: %s", errors)
+    return valid, errors

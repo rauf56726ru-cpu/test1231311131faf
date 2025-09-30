@@ -1557,3 +1557,100 @@ def build_liquidity_snapshot(
         "diagnostics": diagnostics_payload,
     }
 
+
+
+
+async def generate_liquidity_map(
+    candles: Sequence[Mapping[str, Any]],
+    window_days: int,
+) -> Dict[str, object]:
+    """Build liquidity map metrics including PDH/PDL and session extremes."""
+
+    if window_days <= 0:
+        raise ValueError("window_days must be positive")
+    if not candles:
+        return {
+            "PDH": None,
+            "PDL": None,
+            "EQH": [],
+            "EQL": [],
+            "session_highs_lows": [],
+            "resting_liquidity": [],
+        }
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+    daily_highs: Dict[str, float] = {}
+    daily_lows: Dict[str, float] = {}
+    session_highs_lows: List[Dict[str, object]] = []
+
+    by_session: Dict[str, List[float]] = {"asia": [], "london": [], "ny": []}
+    by_session_low: Dict[str, List[float]] = {"asia": [], "london": [], "ny": []}
+
+    eq_highs: List[float] = []
+    eq_lows: List[float] = []
+    resting: List[Dict[str, float]] = []
+
+    for row in candles:
+        if not isinstance(row, Mapping):
+            continue
+        ts_value = row.get("t") or row.get("time")
+        if isinstance(ts_value, str):
+            try:
+                ts = datetime.fromisoformat(ts_value.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+        elif isinstance(ts_value, (int, float)):
+            ts = datetime.fromtimestamp(float(ts_value) / 1000, tz=timezone.utc)
+        else:
+            continue
+        if ts < cutoff:
+            continue
+        date_key = ts.date().isoformat()
+        high = _coerce_float(row.get("h")) or 0.0
+        low = _coerce_float(row.get("l")) or 0.0
+        volume = _coerce_float(row.get("v")) or 0.0
+        daily_highs[date_key] = max(daily_highs.get(date_key, high), high)
+        if date_key not in daily_lows:
+            daily_lows[date_key] = low
+        else:
+            daily_lows[date_key] = min(daily_lows[date_key], low)
+        session_name = "asia"
+        hour = ts.hour
+        if 8 <= hour < 16:
+            session_name = "london"
+        elif hour >= 16 or hour < 0:
+            session_name = "ny"
+        by_session[session_name].append(high)
+        by_session_low[session_name].append(low)
+        if volume > 0:
+            resting.append({"price": float(row.get("c", high)), "volume": volume})
+        if abs(high - low) <= 1e-8:
+            eq_highs.append(high)
+            eq_lows.append(low)
+
+    pdh = max(daily_highs.values()) if daily_highs else None
+    pdl = min(daily_lows.values()) if daily_lows else None
+
+    for session_name in ("asia", "london", "ny"):
+        highs = by_session.get(session_name, [])
+        lows = by_session_low.get(session_name, [])
+        if highs and lows:
+            session_highs_lows.append(
+                {
+                    "session": session_name,
+                    "high": max(highs),
+                    "low": min(lows),
+                }
+            )
+
+    resting.sort(key=lambda item: item["volume"], reverse=True)
+    resting_liquidity = resting[:10]
+
+    return {
+        "PDH": pdh,
+        "PDL": pdl,
+        "EQH": sorted(set(eq_highs))[-10:],
+        "EQL": sorted(set(eq_lows))[:10],
+        "session_highs_lows": session_highs_lows,
+        "resting_liquidity": resting_liquidity,
+    }

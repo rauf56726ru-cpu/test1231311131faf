@@ -4,8 +4,8 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
-from math import isfinite
-from typing import Dict, List, Mapping, MutableMapping, Tuple
+from math import isfinite, sqrt
+from typing import Dict, List, Mapping, MutableMapping, Sequence, Tuple
 
 import httpx
 
@@ -228,3 +228,154 @@ def fetch_tpo_profile_sync(
 
     return asyncio.run(fetch_tpo_profile(symbol, session=session, sessions=sessions))
 
+
+
+class TPOCalculationError(RuntimeError):
+    """Raised when TPO inputs are invalid."""
+
+
+def _parse_candle(row: Mapping[str, object]) -> tuple[datetime, float, float, float, float, float]:
+    time_value = row.get("t") or row.get("time") or row.get("ts") or row.get("timestamp")
+    if isinstance(time_value, str):
+        ts = datetime.fromisoformat(str(time_value).replace("Z", "+00:00"))
+    elif isinstance(time_value, (int, float)):
+        ts = datetime.fromtimestamp(float(time_value) / 1000, tz=timezone.utc)
+    else:
+        raise TPOCalculationError("Candle timestamp missing")
+    high = float(row.get("h"))
+    low = float(row.get("l"))
+    close = float(row.get("c"))
+    open_price = float(row.get("o", close))
+    volume = float(row.get("v", 0.0))
+    return ts, open_price, high, low, close, volume
+
+
+def calculate_tpo(
+    candles: Sequence[Mapping[str, object]],
+    preset: Mapping[str, object] | None = None,
+) -> Dict[str, object]:
+    """Calculate VWAP-based TPO metrics for multiple days."""
+
+    if not candles:
+        raise TPOCalculationError("Candles are required for TPO")
+
+    grouped: MutableMapping[str, List[tuple[datetime, float, float, float, float, float]]] = defaultdict(list)
+    for row in candles:
+        if not isinstance(row, Mapping):
+            continue
+        try:
+            parsed = _parse_candle(row)
+        except Exception:
+            continue
+        grouped[parsed[0].date().isoformat()].append(parsed)
+
+    results: List[Dict[str, object]] = []
+    for date_key, rows in sorted(grouped.items())[-3:]:
+        rows.sort(key=lambda item: item[0])
+        total_volume = sum(item[5] for item in rows)
+        if total_volume <= 0:
+            continue
+        typical_prices = [(item[2] + item[3] + item[4]) / 3 for item in rows]
+        vwap_numerator = sum(tp * item[5] for tp, item in zip(typical_prices, rows))
+        vwap = vwap_numerator / total_volume
+        variance = sum(((tp - vwap) ** 2) * item[5] for tp, item in zip(typical_prices, rows)) / total_volume
+        std_dev = sqrt(max(variance, 0.0))
+        poc_price = max(rows, key=lambda item: item[5])[4]
+        vah = vwap + std_dev
+        val = vwap - std_dev
+
+        first_hour = [item for item in rows if (item[0] - rows[0][0]).total_seconds() <= 3_600]
+        ibh = max(item[2] for item in first_hour) if first_hour else None
+        ibl = min(item[3] for item in first_hour) if first_hour else None
+
+        inducement = []
+        for item in rows:
+            wick_up = item[2] - item[4]
+            wick_down = item[4] - item[3]
+            body = abs(item[4] - item[1])
+            if body <= 0:
+                continue
+            if wick_up > body * 1.5:
+                inducement.append({"time": item[0].isoformat().replace("+00:00", "Z"), "type": "bullish"})
+            if wick_down > body * 1.5:
+                inducement.append({"time": item[0].isoformat().replace("+00:00", "Z"), "type": "bearish"})
+
+        bias = "bullish" if poc_price >= vwap else "bearish"
+
+        results.append(
+            {
+                "date": date_key,
+                "vwap": vwap,
+                "sd1_plus": vwap + std_dev,
+                "sd1_minus": vwap - std_dev,
+                "sd2_plus": vwap + 2 * std_dev,
+                "sd2_minus": vwap - 2 * std_dev,
+                "POC": poc_price,
+                "VAH": vah,
+                "VAL": val,
+                "IBH": ibh,
+                "IBL": ibl,
+                "inducement": inducement,
+                "risk_assessment": {"bias": bias},
+            }
+        )
+
+    return {"days": results}
+
+
+def calculate_session_tpo(
+    candles: Sequence[Mapping[str, object]],
+    session: str,
+) -> Dict[str, object]:
+    """Calculate VWAP metrics for a specific session."""
+
+    session = session.lower().strip()
+    if session not in {"asia", "london", "ny"}:
+        raise TPOCalculationError("Unsupported session")
+
+    grouped: List[tuple[datetime, float, float, float, float, float]] = []
+    for row in candles:
+        if not isinstance(row, Mapping):
+            continue
+        try:
+            parsed = _parse_candle(row)
+        except Exception:
+            continue
+        hour = parsed[0].hour
+        if session == "asia" and 0 <= hour < 8:
+            grouped.append(parsed)
+        elif session == "london" and 8 <= hour < 16:
+            grouped.append(parsed)
+        elif session == "ny" and (hour >= 16 or hour < 0):
+            grouped.append(parsed)
+
+    if not grouped:
+        return {"session": session, "vwap": None}
+
+    grouped.sort(key=lambda item: item[0])
+    total_volume = sum(item[5] for item in grouped)
+    if total_volume <= 0:
+        return {"session": session, "vwap": None}
+    typical_prices = [(item[2] + item[3] + item[4]) / 3 for item in grouped]
+    vwap = sum(tp * item[5] for tp, item in zip(typical_prices, grouped)) / total_volume
+    variance = sum(((tp - vwap) ** 2) * item[5] for tp, item in zip(typical_prices, grouped)) / total_volume
+    std_dev = sqrt(max(variance, 0.0))
+    poc_price = max(grouped, key=lambda item: item[5])[4]
+    vah = vwap + std_dev
+    val = vwap - std_dev
+    high = max(item[2] for item in grouped)
+    low = min(item[3] for item in grouped)
+    ibh = max(item[2] for item in grouped)
+    ibl = min(item[3] for item in grouped)
+
+    return {
+        "session": session,
+        "vwap": vwap,
+        "POC": poc_price,
+        "VAH": vah,
+        "VAL": val,
+        "High": high,
+        "Low": low,
+        "IBH": ibh,
+        "IBL": ibl,
+    }
