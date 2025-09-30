@@ -2227,7 +2227,7 @@ def render_inspection_page(
   const PREVIEW_MINUTE_LOOKBACK_MS = MINUTE_INTERVAL_MS * 120;
   const PREVIEW_MINUTE_MAX_BARS = 5000;
 
-  const LightweightCharts = window.LightweightCharts || null;
+  let LightweightCharts = window.LightweightCharts || null;
   const BinanceCandles = window.BinanceCandles || null;
   const ChartGapWatcher = window.ChartGapWatcher || null;
   const SharedCandles = window.SharedCandles || null;
@@ -3407,11 +3407,17 @@ def render_inspection_page(
       if (!chartContainer) return;
       const ensureLibrary = () => {
         if (window.LightweightCharts) {
+          LightweightCharts = window.LightweightCharts;
           initialiseChart();
         }
       };
 
       function initialiseChart() {
+        LightweightCharts = window.LightweightCharts || LightweightCharts;
+        if (!LightweightCharts) {
+          updateStatus("Библиотека графика недоступна", "error");
+          return;
+        }
         if (state.chart) return;
         const baseHeight = Math.max(
           320,
@@ -3497,6 +3503,7 @@ def render_inspection_page(
       }
 
       if (window.LightweightCharts) {
+        LightweightCharts = window.LightweightCharts;
         initialiseChart();
         return;
       }
@@ -3507,7 +3514,10 @@ def render_inspection_page(
         loader.src = "https://unpkg.com/lightweight-charts@4.0.0/dist/lightweight-charts.standalone.production.js";
         loader.id = "lw-chart-loader";
         loader.async = false;
-        loader.onload = ensureLibrary;
+        loader.onload = () => {
+          LightweightCharts = window.LightweightCharts || LightweightCharts;
+          ensureLibrary();
+        };
         loader.onerror = () => updateStatus("Не удалось загрузить библиотеку графика", "error");
         document.head.appendChild(loader);
       }
@@ -3515,6 +3525,11 @@ def render_inspection_page(
 
     function renderChart() {
       if (!chartContainer) return;
+      LightweightCharts = window.LightweightCharts || LightweightCharts;
+      if (!LightweightCharts) {
+        updateStatus("Библиотека графика недоступна", "error");
+        return;
+      }
       ensureChart();
       if (!state.series) return;
       updateChartDataFromFrame();
@@ -4388,13 +4403,14 @@ def render_inspection_page(
       }
 
       function ensurePreviewChart() {
-        if (previewState.chart || !chartEl || !LightweightCharts) return;
-        previewState.chart = LightweightCharts.createChart(chartEl, {
+        const chartsLib = window.LightweightCharts || LightweightCharts;
+        if (previewState.chart || !chartEl || !chartsLib) return;
+        previewState.chart = chartsLib.createChart(chartEl, {
           autoSize: true,
           layout: { background: { color: "#0f172a" }, textColor: "#e2e8f0" },
           rightPriceScale: { borderColor: "rgba(148, 163, 184, 0.4)" },
           timeScale: { borderColor: "rgba(148, 163, 184, 0.4)", timeVisible: true, secondsVisible: true },
-          crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+          crosshair: { mode: chartsLib.CrosshairMode.Normal },
           grid: {
             vertLines: { color: "rgba(15, 23, 42, 0.6)" },
             horzLines: { color: "rgba(15, 23, 42, 0.6)" },
