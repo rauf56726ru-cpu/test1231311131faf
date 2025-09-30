@@ -30,6 +30,7 @@
   const progressBar = document.getElementById("inspection-progress");
   const dashboardEl = document.getElementById("dashboard");
   const presetBadge = document.getElementById("preset-badge");
+  const symbolButtons = Array.from(document.querySelectorAll("[data-symbol-option]"));
 
   if (!chartContainer || !form || !symbolInput || !intervalInput) {
     console.error("Chart container or controls are missing in the DOM");
@@ -54,6 +55,15 @@
     inspectProgressTimer: null,
     lastSnapshotId: null,
   };
+
+  function setActiveSymbolButton(symbol) {
+    if (!symbolButtons.length) return;
+    symbolButtons.forEach((button) => {
+      const isActive = button.dataset.symbolOption === symbol;
+      button.classList.toggle("is-active", isActive);
+      button.setAttribute("aria-pressed", isActive ? "true" : "false");
+    });
+  }
 
   function intervalToMs(value) {
     const numeric = Number(value);
@@ -91,9 +101,9 @@
     const date = new Date(Number(tsMs));
     if (Number.isNaN(date.getTime())) return "—";
     const pad = (num) => String(num).padStart(2, "0");
-    return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(
-      date.getUTCMinutes()
-    )}:${pad(date.getUTCSeconds())}`;
+    const datePart = `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}`;
+    const timePart = `${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`;
+    return `${datePart} ${timePart}`;
   }
 
   function showToast(message, variant = "info", timeout = 4000) {
@@ -561,6 +571,8 @@
     const normalizedInterval = interval.trim();
     state.symbol = normalizedSymbol;
     state.interval = normalizedInterval;
+    symbolInput.value = normalizedSymbol;
+    setActiveSymbolButton(normalizedSymbol);
     fetchPreset(normalizedSymbol);
     initChart();
     const restored = await restoreFromSharedStore(normalizedSymbol, normalizedInterval);
@@ -832,6 +844,21 @@
     loadSymbol(symbol, interval);
   });
 
+  if (symbolButtons.length) {
+    symbolButtons.forEach((button) => {
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        const nextSymbol = (button.dataset.symbolOption || "").toUpperCase();
+        if (!nextSymbol) return;
+        if (state.symbol === nextSymbol) {
+          symbolInput.value = nextSymbol;
+          return;
+        }
+        loadSymbol(nextSymbol, state.interval);
+      });
+    });
+  }
+
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible" && !state.ws) {
       connectWs();
@@ -863,5 +890,6 @@
 
   fetchVersion();
   fetchPreset(state.symbol);
+  setActiveSymbolButton(state.symbol);
   loadSymbol(state.symbol, state.interval);
 })();
