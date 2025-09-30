@@ -14,18 +14,13 @@
   <body>
     <header class="page-header">
       <div class="header-top">
-        <div>
-          <h1>Интерактивный свечной график</h1>
-          <span id="preset-badge" class="badge">Preset: —</span>
-        </div>
+        <h1>Интерактивный свечной график</h1>
         <div class="header-controls">
           <div class="app-meta" aria-live="polite">
             <span class="app-meta__label">Версия:</span>
             <span id="app-version" class="app-meta__value">—</span>
           </div>
-          <button id="show-inspection" class="btn-secondary" type="button" data-role="inspection-btn">Inspection</button>
-          <button id="analyze-btn" class="btn-secondary" type="button">Analyze</button>
-          <button id="export-zones" class="btn-secondary" type="button">Export Zones</button>
+          <button id="show-inspection" class="btn-secondary" type="button">Inspection</button>
         </div>
       </div>
       <p>Выберите тикер и интервал, чтобы отобразить историю Binance с авто-заполнением гэпов и живым обновлением.</p>
@@ -38,12 +33,6 @@
             <span>Тикер</span>
             <input id="input-symbol" type="text" value="BTCUSDT" required autocomplete="off" />
           </label>
-
-          <div class="symbol-quick-list" role="group" aria-label="Популярные тикеры">
-            <button type="button" class="btn-secondary" data-symbol-option="BTCUSDT">BTCUSDT</button>
-            <button type="button" class="btn-secondary" data-symbol-option="SOLUSDT">SOLUSDT</button>
-            <button type="button" class="btn-secondary" data-symbol-option="ETHUSDT">ETHUSDT</button>
-          </div>
 
           <label class="form-field">
             <span>Интервал</span>
@@ -62,7 +51,6 @@
 
           <button type="submit" class="btn-primary">Построить график</button>
         </form>
-        <progress id="inspection-progress" class="hidden" max="100" value="0" aria-hidden="true"></progress>
       </section>
 
       <section class="chart-card">
@@ -85,26 +73,6 @@
         </aside>
         <div id="status-message" class="status-banner" hidden></div>
       </section>
-
-      <section class="dashboard-card">
-        <h2>Dashboard</h2>
-        <div id="dashboard" class="dashboard-content">
-          <p class="empty">Нет данных анализа</p>
-        </div>
-      </section>
     </main>
-
-    <div id="toast-container" class="toast-container" aria-live="assertive" aria-atomic="true"></div>
-
-    <div id="modal-confirm" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="modal-title">
-      <div class="modal__content">
-        <h2 id="modal-title">Создать snapshot?</h2>
-        <p>Генерация займет около 5 секунд. Продолжить?</p>
-        <div class="modal__actions">
-          <button type="button" class="btn-secondary" data-action="cancel">Отмена</button>
-          <button type="button" class="btn-primary" data-action="confirm">Создать</button>
-        </div>
-      </div>
-    </div>
   </body>
 </html>
