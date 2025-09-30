@@ -1475,14 +1475,6 @@ def render_inspection_page(
     timeframe_value = html_utils.escape(timeframe)
     snapshot_value = html_utils.escape(snapshot_id or "")
 
-    timeframe_options = []
-    for tf_key in TIMEFRAME_WINDOWS:
-        selected = " selected" if tf_key == timeframe else ""
-        timeframe_options.append(
-            f'<option value="{html_utils.escape(tf_key)}"{selected}>{html_utils.escape(tf_key)}</option>'
-        )
-
-
     data_section = payload.get("DATA") if isinstance(payload, Mapping) else None
     diagnostics_section = payload.get("DIAGNOSTICS") if isinstance(payload, Mapping) else None
 
@@ -1509,8 +1501,6 @@ def render_inspection_page(
     diagnostics_json_initial = _format_json_block(diagnostics_section)
     metric_json_initial = _format_json_block(metric_section)
     check_all_json_initial = _format_json_block(None)
-    analysis_json_initial = _format_json_block(None)
-    analysis_debug_json_initial = _format_json_block(None)
 
     style_block = """
     :root {
@@ -1667,16 +1657,37 @@ def render_inspection_page(
       display: flex;
       justify-content: space-between;
       align-items: center;
-      gap: 0.75rem;
+      gap: 1rem;
       flex-wrap: wrap;
+    }
+    .chart-toolbar__symbol {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.25rem 0.6rem;
+      border-radius: 999px;
+      background: rgba(15, 23, 42, 0.6);
+      border: 1px solid rgba(148, 163, 184, 0.25);
+    }
+    .chart-toolbar__symbol strong {
+      font-size: 1.05rem;
+      letter-spacing: 0.08em;
+      color: #f8fafc;
+    }
+    .chart-toolbar__frames {
+      display: flex;
+      flex-direction: column;
+      gap: 0.45rem;
+      align-items: flex-start;
     }
     .tf-toggle {
       display: inline-flex;
-      gap: 0.4rem;
+      gap: 0.35rem;
       padding: 0.2rem;
       border-radius: 999px;
       background: rgba(30, 41, 59, 0.6);
       border: 1px solid rgba(148, 163, 184, 0.24);
+      flex-wrap: wrap;
     }
     .tf-toggle button {
       border-radius: 999px;
@@ -1782,110 +1793,6 @@ def render_inspection_page(
       padding: 0.4rem 0.7rem;
       color: var(--fg);
       min-width: 110px;
-    }
-    .analysis-actions {
-      display: flex;
-      align-items: flex-end;
-      gap: 0.75rem;
-      padding: 0.75rem 0.25rem 0.25rem;
-      flex-wrap: wrap;
-    }
-    .analysis-credentials {
-      display: flex;
-      flex: 1 1 280px;
-      min-width: min(100%, 340px);
-      flex-direction: column;
-      gap: 0.45rem;
-    }
-    .analysis-credentials span {
-      font-size: 0.75rem;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      color: rgba(148, 163, 184, 0.78);
-    }
-    .analysis-input-row {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-    }
-    #analysis-api-key {
-      flex: 1;
-      border-radius: 12px;
-      border: 1px solid rgba(148, 163, 184, 0.3);
-      padding: 0.55rem 0.75rem;
-      background: rgba(15, 23, 42, 0.65);
-      color: var(--fg);
-      letter-spacing: 0.02em;
-    }
-    #analysis-api-key:focus {
-      outline: none;
-      border-color: rgba(56, 189, 248, 0.65);
-      box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.15);
-    }
-    .analysis-key-toggle {
-      min-width: auto;
-      padding: 0.5rem 0.75rem;
-      white-space: nowrap;
-    }
-    .analysis-actions__controls {
-      display: flex;
-      align-items: center;
-      flex-wrap: wrap;
-      gap: 0.75rem;
-    }
-    .analysis-actions__controls > button {
-      min-width: 220px;
-    }
-    .analysis-status {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      min-width: 140px;
-      padding: 0.45rem 0.85rem;
-      border-radius: 999px;
-      font-size: 0.85rem;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-      border: 1px solid rgba(148, 163, 184, 0.2);
-      background: rgba(15, 23, 42, 0.6);
-      color: var(--muted);
-      transition: background 0.2s ease, color 0.2s ease, border-color 0.2s ease;
-    }
-    .analysis-status[data-status="pending"],
-    .analysis-status[data-status="sent"] {
-      background: rgba(14, 116, 144, 0.3);
-      border-color: rgba(45, 212, 191, 0.35);
-      color: #2dd4bf;
-    }
-    .analysis-status[data-status="succeeded"] {
-      background: rgba(21, 128, 61, 0.28);
-      border-color: rgba(34, 197, 94, 0.45);
-      color: #4ade80;
-    }
-    .analysis-status[data-status="insufficient"] {
-      background: rgba(202, 138, 4, 0.28);
-      border-color: rgba(250, 204, 21, 0.4);
-      color: #facc15;
-    }
-    .analysis-status[data-status="failed"] {
-      background: rgba(185, 28, 28, 0.28);
-      border-color: rgba(248, 113, 113, 0.45);
-      color: #f87171;
-    }
-    .analysis-panel {
-      display: grid;
-      gap: 1rem;
-      padding: 1rem;
-      background: rgba(15, 23, 42, 0.85);
-      border-top: 1px solid rgba(148, 163, 184, 0.18);
-    }
-    .analysis-panel > div > span.badge {
-      margin-bottom: 0.5rem;
-    }
-    .analysis-panel pre {
-      max-height: 320px;
-      overflow: auto;
-      background: rgba(2, 6, 23, 0.9);
     }
     .collapse pre {
       margin: 0;
@@ -2303,9 +2210,6 @@ def render_inspection_page(
     }
     """
 
-    analysis_configured = bool(os.environ.get("OPENAI_API_KEY"))
-    model_id_default = "gpt-5"
-
     script_block = (
         "window.__INSPECTION_INITIAL__ = {\n"
         f"  payload: {payload_json},\n"
@@ -2313,9 +2217,7 @@ def render_inspection_page(
         f"  symbol: {json.dumps(symbol_value)},\n"
         f"  timeframe: {json.dumps(timeframe_value)},\n"
         f"  snapshots: {snapshots_json},\n"
-        f"  defaultSymbol: {json.dumps(DEFAULT_SYMBOL)},\n"
-        f"  analysisConfigured: {json.dumps(analysis_configured)},\n"
-        f"  modelId: {json.dumps(model_id_default)}\n"
+        f"  defaultSymbol: {json.dumps(DEFAULT_SYMBOL)}\n"
         "};\n"
     )
 
@@ -2529,32 +2431,6 @@ def render_inspection_page(
     pre.textContent = JSON.stringify(data ?? null, null, 2);
   }
 
-  const API_KEY_STORAGE_KEY = "inspection.openai_api_key";
-
-  function loadStoredApiKey() {
-    try {
-      if (!window || !window.localStorage) return "";
-      const value = window.localStorage.getItem(API_KEY_STORAGE_KEY);
-      return typeof value === "string" ? value : "";
-    } catch (error) {
-      console.warn("Failed to read OpenAI API key from storage", error);
-      return "";
-    }
-  }
-
-  function persistStoredApiKey(value) {
-    try {
-      if (!window || !window.localStorage) return;
-      if (value) {
-        window.localStorage.setItem(API_KEY_STORAGE_KEY, value);
-      } else {
-        window.localStorage.removeItem(API_KEY_STORAGE_KEY);
-      }
-    } catch (error) {
-      console.warn("Failed to persist OpenAI API key", error);
-    }
-  }
-
   function selectionLabel(start, end) {
     if (!start || !end) return "Выделите диапазон";
     const from = formatTs(start);
@@ -2735,16 +2611,10 @@ def render_inspection_page(
     const topupButton = document.getElementById("collect-topup");
     const collectSelectionButton = document.getElementById("collect-selection");
     const checkAllHours = document.getElementById("checkall-hours");
-    const analysisButton = document.getElementById("analysis-send");
-    const analysisStatusEl = document.getElementById("analysis-status");
-    const analysisPre = document.getElementById("analysis-json");
-    const analysisDebugPre = document.getElementById("analysis-debug-json");
-    const analysisApiKeyInput = document.getElementById("analysis-api-key");
-    const analysisApiKeyToggle = document.getElementById("analysis-api-key-toggle");
     const snapshotMeta = document.getElementById("snapshot-meta");
-    const frameSelect = document.getElementById("frame-select");
     const chartContainer = document.getElementById("inspection-chart");
     const selectionInfo = document.getElementById("selection-info");
+    const chartSymbolLabel = document.getElementById("chart-symbol");
     const buildButton = document.getElementById("build-session");
     const clearSelection = document.getElementById("clear-selection");
     const timeframeCheckboxes = Array.from(document.querySelectorAll("[data-tf-checkbox]"));
@@ -2780,14 +2650,13 @@ def render_inspection_page(
 
     initCollapsibles();
 
-    const storedApiKey = loadStoredApiKey().trim();
     const resolveHours = (value) => {
       const parsed = Number(value);
       if (!Number.isFinite(parsed)) return 1;
       return Math.min(4, Math.max(1, Math.floor(parsed)));
     };
 
-    const PREFERRED_CHART_FRAMES = ["15m", "1h", "1m"];
+    const PREFERRED_CHART_FRAMES = ["1m", "3m", "15m", "30m", "1h", "4h", "1d", "1w"];
 
     function frameHasCandles(frames, tf) {
       if (!frames || !tf) return false;
@@ -2824,20 +2693,8 @@ def render_inspection_page(
       frame: defaultFrame,
       chart: null,
       series: null,
+      availableFrames: initialFrameMap,
       checkAll: null,
-      analysis: {
-        status: "idle",
-        resultStatus: null,
-        trade: null,
-        debug: null,
-        requestId: null,
-        apiConfigured: Boolean(initial.analysisConfigured),
-        apiKey: storedApiKey,
-        modelId:
-          typeof initial.modelId === "string" && initial.modelId.trim().toLowerCase() === "gpt-5"
-            ? "gpt-5"
-            : "gpt-5",
-      },
       hours: checkAllHours ? resolveHours(checkAllHours.value) : 1,
       profilePreset: initial.payload?.DATA?.profile_preset || null,
       presetRequired: Boolean(initial.payload?.DATA?.profile_preset_required),
@@ -2848,25 +2705,6 @@ def render_inspection_page(
       presetModalOpen: false,
     };
 
-    if (analysisApiKeyInput) {
-      analysisApiKeyInput.value = storedApiKey;
-      analysisApiKeyInput.addEventListener("input", () => {
-        const cleaned = analysisApiKeyInput.value.trim();
-        state.analysis.apiKey = cleaned;
-        persistStoredApiKey(cleaned);
-        updateAnalysisControls();
-      });
-    }
-
-    if (analysisApiKeyToggle && analysisApiKeyInput) {
-      analysisApiKeyToggle.addEventListener("click", () => {
-        const currentType = analysisApiKeyInput.getAttribute("type") === "text" ? "text" : "password";
-        const nextType = currentType === "password" ? "text" : "password";
-        analysisApiKeyInput.setAttribute("type", nextType);
-        analysisApiKeyToggle.textContent = nextType === "text" ? "Скрыть" : "Показать";
-      });
-    }
-
     const AUTO_PRESET_SYMBOLS = new Set(["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
 
     function autoPresetSymbol(symbol) {
@@ -2876,6 +2714,7 @@ def render_inspection_page(
 
     function activeSymbol() {
       return (
+        (symbolInput && normaliseSymbol(symbolInput.value)) ||
         normaliseSymbol(state.payload?.DATA?.symbol) ||
         normaliseSymbol(initial.payload?.DATA?.symbol) ||
         normaliseSymbol(initial.symbol) ||
@@ -2883,66 +2722,9 @@ def render_inspection_page(
       );
     }
 
-    function resolveAnalysisPeriod() {
-      const source = state.payload?.DATA?.meta?.source;
-      const requested = state.payload?.DATA?.meta?.requested;
-      const preset = state.payload?.DATA?.profile_preset;
-      const candidates = [
-        source && typeof source.period === "string" ? source.period : null,
-        source && typeof source?.window?.label === "string" ? source.window.label : null,
-        requested && typeof requested?.period === "string" ? requested.period : null,
-        preset && typeof preset?.period === "string" ? preset.period : null,
-        preset && typeof preset?.preset_key === "string" ? preset.preset_key : null,
-      ];
-      for (const candidate of candidates) {
-        if (candidate && typeof candidate === "string" && candidate.trim()) {
-          return candidate.trim();
-        }
-      }
-      return "custom_range";
-    }
-
-    function updateAnalysisIndicator() {
-      if (!analysisStatusEl) return;
-      const status = state.analysis.status || "idle";
-      analysisStatusEl.dataset.status = status;
-      const labels = {
-        idle: "—",
-        pending: "Подготовка",
-        sent: "Отправлено",
-        succeeded: "Готово",
-        insufficient: "Недостаточно данных",
-        failed: "Ошибка",
-      };
-      analysisStatusEl.textContent = labels[status] || "—";
-    }
-
-    function updateAnalysisControls() {
-      if (!analysisButton) return;
-      const start = Number(state.selection?.start ?? Number.NaN);
-      const end = Number(state.selection?.end ?? Number.NaN);
-      const hasSelection = Number.isFinite(start) && Number.isFinite(end) && start !== end;
-      const busy = state.analysis.status === "pending" || state.analysis.status === "sent";
-      const hasApiAccess =
-        state.analysis.apiConfigured || Boolean((state.analysis.apiKey || "").trim());
-      analysisButton.disabled = !state.snapshotId || !hasSelection || busy || !hasApiAccess;
-    }
-
-    function resetAnalysisState() {
-      state.analysis.status = "idle";
-      state.analysis.resultStatus = null;
-      state.analysis.trade = null;
-      state.analysis.debug = null;
-      state.analysis.requestId = null;
-      setJson(analysisPre, null);
-      setJson(analysisDebugPre, null);
-      updateAnalysisIndicator();
-      updateAnalysisControls();
-    }
-
-    function applyAnalysisResult(trade, debug) {
-      setJson(analysisPre, trade);
-      setJson(analysisDebugPre, debug);
+    function renderChartSymbol() {
+      if (!chartSymbolLabel) return;
+      chartSymbolLabel.textContent = activeSymbol();
     }
 
     function renderPresetChip() {
@@ -3211,14 +2993,18 @@ def render_inspection_page(
       }
     }
 
-    resetAnalysisState();
     renderPresetState();
     updateCheckAllState();
+    renderChartSymbol();
 
     if (symbolInput) {
       const initialSymbol =
         normaliseSymbol(initial.payload?.DATA?.symbol) || normaliseSymbol(initial.symbol) || defaultSymbol;
       symbolInput.value = initialSymbol;
+      renderChartSymbol();
+      symbolInput.addEventListener("input", () => {
+        renderChartSymbol();
+      });
     }
 
     function updateStatus(message, tone = "info") {
@@ -3253,7 +3039,6 @@ def render_inspection_page(
       if (topupButton) {
         topupButton.disabled = !state.snapshotId || !presetReady;
       }
-      updateAnalysisControls();
     }
 
     function populateSnapshots(list) {
@@ -3276,34 +3061,16 @@ def render_inspection_page(
     }
 
     function populateFrames(payload) {
-      if (!frameSelect) return;
-      frameSelect.innerHTML = "";
       const frames = payload?.DATA?.frames || {};
-      const keys = Object.keys(frames).sort((a, b) => {
-        const weight = (key) => {
-          const idx = PREFERRED_CHART_FRAMES.indexOf(key);
-          return idx === -1 ? PREFERRED_CHART_FRAMES.length : idx;
-        };
-        const diff = weight(a) - weight(b);
-        return diff !== 0 ? diff : a.localeCompare(b);
-      });
-      for (const key of keys) {
-        const option = document.createElement("option");
-        option.value = key;
-        option.textContent = key;
-        frameSelect.append(option);
-      }
-      if (keys.length) {
-        const target = selectPreferredFrame(frames, state.frame);
-        frameSelect.value = target;
-        state.frame = target;
-      }
+      state.availableFrames = frames;
+      const target = selectPreferredFrame(frames, state.frame);
+      state.frame = target;
       updateTimeframeToggle();
     }
 
     function updateTimeframeToggle() {
       if (!timeframeToggle) return;
-      const frames = state.payload?.DATA?.frames || {};
+      const frames = state.availableFrames || state.payload?.DATA?.frames || {};
       const buttons = Array.from(timeframeToggle.querySelectorAll("[data-tf]"));
       for (const button of buttons) {
         const tf = button.dataset.tf;
@@ -3480,120 +3247,6 @@ def render_inspection_page(
       }
     }
 
-    async function requestTradeAnalysis() {
-      if (!state.snapshotId) {
-        updateStatus("Выберите снэпшот перед анализом сделки", "warning");
-        return;
-      }
-
-      const rawStart = Number(state.selection?.start ?? Number.NaN);
-      const rawEnd = Number(state.selection?.end ?? Number.NaN);
-      if (!Number.isFinite(rawStart) || !Number.isFinite(rawEnd) || rawStart === rawEnd) {
-        updateStatus("Выберите диапазон свечей для анализа сделки", "warning");
-        updateAnalysisControls();
-        return;
-      }
-
-      const selectionStart = Math.floor(Math.min(rawStart, rawEnd));
-      const selectionEnd = Math.floor(Math.max(rawStart, rawEnd));
-      const hoursValue = Number.isFinite(state.hours) ? state.hours : 1;
-      const period = resolveAnalysisPeriod();
-      const apiKeyValue = (state.analysis.apiKey || "").trim();
-      if (!state.analysis.apiConfigured && !apiKeyValue) {
-        updateStatus("Укажите OpenAI API key перед анализом сделки", "warning");
-        updateAnalysisControls();
-        if (analysisApiKeyInput) {
-          analysisApiKeyInput.focus();
-        }
-        return;
-      }
-
-      state.analysis.status = "pending";
-      state.analysis.resultStatus = null;
-      state.analysis.requestId = null;
-      state.analysis.trade = null;
-      state.analysis.debug = null;
-      applyAnalysisResult(null, null);
-      updateAnalysisIndicator();
-      updateAnalysisControls();
-      updateStatus("Готовим данные для анализа сделки...", "info");
-
-      try {
-        const modelId =
-          typeof state.analysis.modelId === "string" && state.analysis.modelId.trim().toLowerCase() === "gpt-5"
-            ? "gpt-5"
-            : "gpt-5";
-        state.analysis.modelId = modelId;
-
-        const requestBody = {
-          snapshot_id: state.snapshotId,
-          selection_start: selectionStart,
-          selection_end: selectionEnd,
-          hours: hoursValue,
-          period,
-          model: modelId,
-        };
-        if (apiKeyValue) {
-          requestBody.api_key = apiKeyValue;
-        }
-
-        const response = await fetch("/api/analyze-from-inspection", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Accept: "application/json" },
-          body: JSON.stringify(requestBody),
-        });
-
-        state.analysis.status = "sent";
-        updateAnalysisIndicator();
-
-        let payload;
-        if (!response.ok) {
-          let detail = `HTTP ${response.status}`;
-          try {
-            const errorBody = await response.json();
-            if (typeof errorBody?.detail === "string") {
-              detail = errorBody.detail;
-            } else if (errorBody?.detail?.message) {
-              detail = String(errorBody.detail.message);
-            }
-          } catch (error) {
-            // Ignore body parsing errors
-          }
-          throw new Error(detail);
-        } else {
-          payload = await response.json();
-        }
-
-        state.analysis.requestId = typeof payload?.request_id === "string" ? payload.request_id : null;
-        state.analysis.trade = payload?.trade_json || null;
-        state.analysis.debug = payload?.debug || null;
-        state.analysis.resultStatus = typeof payload?.status === "string" ? payload.status : null;
-        applyAnalysisResult(state.analysis.trade, state.analysis.debug);
-
-        if (state.analysis.resultStatus === "ok") {
-          state.analysis.status = "succeeded";
-          updateStatus("Сделка проанализирована", "success");
-        } else if (state.analysis.resultStatus === "insufficient_data") {
-          state.analysis.status = "insufficient";
-          updateStatus("Модели не хватает данных для сделки", "warning");
-        } else {
-          state.analysis.status = "failed";
-          updateStatus("Анализ сделки завершился с ошибкой", "error");
-        }
-      } catch (error) {
-        console.error(error);
-        const message = error && typeof error.message === "string" ? error.message : "Неизвестная ошибка";
-        state.analysis.status = "failed";
-        state.analysis.trade = null;
-        state.analysis.debug = { error: message };
-        applyAnalysisResult(null, state.analysis.debug);
-        updateStatus(`Ошибка отправки сделки${message ? `: ${message}` : ""}`, "error");
-      } finally {
-        updateAnalysisIndicator();
-        updateAnalysisControls();
-      }
-    }
-
     function ensureChart() {
       if (!chartContainer) return;
       const ensureLibrary = () => {
@@ -3688,7 +3341,6 @@ def render_inspection_page(
               state.selection.end = tmp;
             }
           }
-          resetAnalysisState();
           updateSelectionLabel();
           updateCheckAllState();
         });
@@ -3747,7 +3399,6 @@ def render_inspection_page(
         state.selection = payload?.DATA?.selection || null;
         state.checkAll = null;
         setJson(checkAllPre, null);
-        resetAnalysisState();
         updateCheckAllState();
         state.profilePreset = payload?.DATA?.profile_preset || null;
         state.presetRequired = Boolean(payload?.DATA?.profile_preset_required);
@@ -3757,6 +3408,7 @@ def render_inspection_page(
         if (symbolInput) {
           const resolved = normaliseSymbol(nextSymbol) || normaliseSymbol(initial.symbol) || defaultSymbol;
           symbolInput.value = resolved;
+          renderChartSymbol();
         }
         populateFrames(payload);
         renderJson(payload);
@@ -3777,14 +3429,6 @@ def render_inspection_page(
       });
     }
 
-    if (frameSelect) {
-      frameSelect.addEventListener("change", () => {
-        state.frame = frameSelect.value;
-        renderChart();
-        updateTimeframeToggle();
-      });
-    }
-
     if (timeframeToggle) {
       timeframeToggle.addEventListener("click", (event) => {
         const button = event.target.closest("[data-tf]");
@@ -3792,9 +3436,6 @@ def render_inspection_page(
         const tf = button.dataset.tf;
         if (!tf) return;
         state.frame = tf;
-        if (frameSelect) {
-          frameSelect.value = tf;
-        }
         renderChart();
         updateTimeframeToggle();
       });
@@ -3881,20 +3522,9 @@ def render_inspection_page(
       });
     }
 
-    if (analysisButton) {
-      analysisButton.addEventListener("click", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        requestTradeAnalysis();
-      });
-    }
-
-    updateAnalysisControls();
-
     if (clearSelection) {
       clearSelection.addEventListener("click", () => {
         state.selection = null;
-        resetAnalysisState();
         updateSelectionLabel();
         updateCheckAllState();
       });
@@ -4881,10 +4511,6 @@ def render_inspection_page(
                 <option value=\"SOLUSDT\"></option>
                 <option value=\"XRPUSDT\"></option>
               </datalist>
-              <label>
-                <span>Таймфрейм для отображения</span>
-                <select id=\"frame-select\">{''.join(timeframe_options)}</select>
-              </label>
             </div>
             <div class=\"selection-bar\">
               <span class=\"badge\">Выделенный диапазон</span>
@@ -4899,12 +4525,23 @@ def render_inspection_page(
 
           <section class=\"panel\">
             <h2>Просмотр данных</h2>
-            <div class=\"chart-toolbar\">
-              <span class=\"badge\">Таймфрейм</span>
-              <div class=\"tf-toggle\" id=\"chart-tf-toggle\">
-                <button type=\"button\" data-tf=\"1m\">1m</button>
-                <button type=\"button\" data-tf=\"15m\">15m</button>
-                <button type=\"button\" data-tf=\"1h\">1h</button>
+            <div class="chart-toolbar">
+              <div class="chart-toolbar__symbol">
+                <span class="badge">Символ</span>
+                <strong id="chart-symbol">{symbol_value}</strong>
+              </div>
+              <div class="chart-toolbar__frames">
+                <span class="badge">Таймфрейм</span>
+                <div class="tf-toggle" id="chart-tf-toggle">
+                  <button type="button" data-tf="1m">1m</button>
+                  <button type="button" data-tf="3m">3m</button>
+                  <button type="button" data-tf="15m">15m</button>
+                  <button type="button" data-tf="30m">30m</button>
+                  <button type="button" data-tf="1h">1h</button>
+                  <button type="button" data-tf="4h">4h</button>
+                  <button type="button" data-tf="1d">1d</button>
+                  <button type="button" data-tf="1w">1w</button>
+                </div>
               </div>
             </div>
             <div id=\"inspection-chart\" class=\"chart-shell\" data-selection-label=\"—\"></div>
@@ -4916,78 +4553,45 @@ def render_inspection_page(
               <button class=\"secondary\" type=\"button\" data-metric=\"smt\">SMT</button>
               <button class=\"secondary\" type=\"button\" data-metric=\"agg\">Agg Trades</button>
             </div>
-            <div class=\"json-panels\">
-              <div class=\"collapse\">
+            <div class="json-panels">
+              <div class="collapse">
                 <header data-collapse-toggle>
                   <h3>DATA</h3>
-                  <button class=\"secondary\" type=\"button\" data-copy-target=\"data-json\">Copy JSON</button>
+                  <button class="secondary" type="button" data-copy-target="data-json">Copy JSON</button>
                 </header>
-                <pre id=\"data-json\">{data_json_initial}</pre>
+                <pre id="data-json">{data_json_initial}</pre>
               </div>
-              <div class=\"collapse\">
+              <div class="collapse">
                 <header data-collapse-toggle>
                   <h3>DIAGNOSTICS</h3>
-                  <button class=\"secondary\" type=\"button\" data-copy-target=\"diagnostics-json\">Copy JSON</button>
+                  <button class="secondary" type="button" data-copy-target="diagnostics-json">Copy JSON</button>
                 </header>
-                <pre id=\"diagnostics-json\">{diagnostics_json_initial}</pre>
+                <pre id="diagnostics-json">{diagnostics_json_initial}</pre>
               </div>
-              <div class=\"collapse\">
+              <div class="collapse">
                 <header data-collapse-toggle>
                   <h3>CHECK ALL DATAS</h3>
-                  <div class=\"actions\">
-                    <button class=\"secondary\" type=\"button\" data-copy-target=\"checkall-json\">Copy JSON</button>
-                  </div>
+                  <button class="secondary" type="button" data-copy-target="checkall-json">Copy JSON</button>
                 </header>
-                <div class=\"checkall-control\">
-                  <div class=\"checkall-control__row\">
+                <div class="checkall-control">
+                  <div class="checkall-control__row">
                     <span>Часов для подробного сбора</span>
-                      <select id=\"checkall-hours\">
-                        <option value=\"1\">1 час</option>
-                        <option value=\"2\">2 часа</option>
-                        <option value=\"3\">3 часа</option>
-                        <option value=\"4\">4 часа</option>
-                      </select>
-                    </div>
-                <pre id=\"checkall-json\">{check_all_json_initial}</pre>
-              </div>
-              <div class="analysis-actions">
-                <label class="analysis-credentials" for="analysis-api-key">
-                  <span>OpenAI API Key</span>
-                  <div class="analysis-input-row">
-                    <input id="analysis-api-key" type="password" placeholder="sk-..." autocomplete="off" spellcheck="false" />
-                    <button id="analysis-api-key-toggle" class="secondary analysis-key-toggle" type="button" data-api-key-visibility>Показать</button>
-                  </div>
-                </label>
-                <div class="analysis-actions__controls">
-                  <button id="analysis-send" class="primary" type="button">Отправить сделку на анализ</button>
-                  <span id="analysis-status" class="analysis-status" data-status="idle">—</span>
-                </div>
-              </div>
-              <div class="collapse" data-analysis-panel>
-                <header data-collapse-toggle>
-                  <h3>Сделка</h3>
-                  <div class="actions">
-                    <button class="secondary" type="button" data-copy-target="analysis-json">Скопировать JSON</button>
-                    <button class="secondary" type="button" data-copy-target="analysis-debug-json">Скопировать debug</button>
-                  </div>
-                </header>
-                <div class="analysis-panel">
-                  <div>
-                    <span class="badge">Ответ модели</span>
-                    <pre id="analysis-json">{analysis_json_initial}</pre>
-                  </div>
-                  <div>
-                    <span class="badge">Debug</span>
-                    <pre id="analysis-debug-json">{analysis_debug_json_initial}</pre>
+                    <select id="checkall-hours">
+                      <option value="1">1 час</option>
+                      <option value="2">2 часа</option>
+                      <option value="3">3 часа</option>
+                      <option value="4">4 часа</option>
+                    </select>
                   </div>
                 </div>
+                <pre id="checkall-json">{check_all_json_initial}</pre>
               </div>
-              <div class=\"collapse\">
+              <div class="collapse">
                 <header data-collapse-toggle>
                   <h3>METRIC</h3>
-                  <button class=\"secondary\" type=\"button\" data-copy-target=\"metric-json\">Copy JSON</button>
+                  <button class="secondary" type="button" data-copy-target="metric-json">Copy JSON</button>
                 </header>
-                <pre id=\"metric-json\">{metric_json_initial}</pre>
+                <pre id="metric-json">{metric_json_initial}</pre>
               </div>
             </div>
           </section>

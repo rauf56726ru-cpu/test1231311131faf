@@ -2,14 +2,12 @@
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 from typing import Any, Dict, Mapping, Sequence
 
 from datetime import datetime, timezone
 from math import ceil
 
-import httpx
 from fastapi import Body, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -20,7 +18,6 @@ from ..services import (
     build_check_all_datas,
     build_inspection_payload,
     build_placeholder_snapshot,
-    dispatch_trade_analysis,
     build_profile_package,
     DEFAULT_SYMBOL,
     delete_preset,
@@ -58,61 +55,62 @@ if PUBLIC_DIR.is_dir():
     app.mount("/public", StaticFiles(directory=PUBLIC_DIR), name="public")
 
 
-def _extract_openai_error(response: httpx.Response) -> Any | None:
-    """Return a sanitised representation of an OpenAI error payload."""
-
-    if response is None:
-        return None
-
-    try:
-        payload = response.json()
-    except ValueError:
-        text = response.text
-        if not text:
-            return None
-        stripped = text.strip()
-        return stripped[:500] if len(stripped) > 500 else stripped
-
-    if isinstance(payload, Mapping):
-        error_node = payload.get("error")
-        if isinstance(error_node, Mapping):
-            cleaned: Dict[str, Any] = {}
-            for key in ("message", "type", "code", "param"):
-                value = error_node.get(key)
-                if isinstance(value, str):
-                    trimmed = value.strip()
-                    if trimmed:
-                        cleaned[key] = trimmed[:500] if len(trimmed) > 500 else trimmed
-                elif value is not None:
-                    cleaned[key] = value
-            if cleaned:
-                return cleaned
-            return {
-                key: error_node[key]
-                for key in error_node.keys()
-                if key in {"message", "type", "code", "param"} and error_node[key] is not None
-            } or str(error_node)[:500]
-        message = payload.get("message")
-        if isinstance(message, str) and message.strip():
-            trimmed = message.strip()
-            return trimmed[:500] if len(trimmed) > 500 else trimmed
-        return str(payload)[:500]
-
-    if isinstance(payload, Sequence) and not isinstance(payload, (str, bytes, bytearray)):
-        return [payload[index] for index in range(min(len(payload), 5))]
-
-    return payload
-
-
-def _condense_payload_to_hourly(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Limit OHLCV output to hourly candles for summary mode."""
+def _prepare_summary_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Reduce payload weight while keeping hourly context and fresh minute data."""
 
     ohlcv_section = payload.get("ohlcv")
-    if isinstance(ohlcv_section, Mapping):
-        hourly_block = ohlcv_section.get("1h")
-        if isinstance(hourly_block, Mapping):
-            ohlcv_section = {"1h": dict(hourly_block)}
-            payload["ohlcv"] = ohlcv_section
+    if not isinstance(ohlcv_section, Mapping):
+        return payload
+
+    summary_section: Dict[str, Any] = {}
+
+    hour_block = ohlcv_section.get("1h")
+    if isinstance(hour_block, Mapping):
+        summary_section["1h"] = dict(hour_block)
+
+    four_hour_block = ohlcv_section.get("4h")
+    if isinstance(four_hour_block, Mapping):
+        summary_section["4h"] = dict(four_hour_block)
+
+    minute_block = ohlcv_section.get("1m")
+    if isinstance(minute_block, Mapping):
+        candles = minute_block.get("candles")
+        if isinstance(candles, Sequence):
+            trimmed: list[Dict[str, Any]] = []
+            last_ts: int | None = None
+            normalised_candles: list[Dict[str, Any]] = []
+            for entry in candles:
+                if not isinstance(entry, Mapping):
+                    continue
+                normalised_candles.append(dict(entry))
+                candidate_ts = None
+                for key in ("t", "time", "ts", "timestamp"):
+                    raw_value = entry.get(key)
+                    if isinstance(raw_value, (int, float)):
+                        candidate_ts = int(raw_value)
+                        break
+                if candidate_ts is not None:
+                    last_ts = candidate_ts if last_ts is None else max(last_ts, candidate_ts)
+            if normalised_candles and last_ts is not None:
+                cutoff = last_ts - 59 * 60_000
+                for item in normalised_candles:
+                    ts_value = None
+                    for key in ("t", "time", "ts", "timestamp"):
+                        raw_value = item.get(key)
+                        if isinstance(raw_value, (int, float)):
+                            ts_value = int(raw_value)
+                            break
+                    if ts_value is None or ts_value >= cutoff:
+                        trimmed.append(item)
+            else:
+                trimmed = normalised_candles
+            minute_section = dict(minute_block)
+            minute_section["candles"] = trimmed[-60:]
+            summary_section["1m"] = minute_section
+
+    if summary_section:
+        payload["ohlcv"] = summary_section
+
     return payload
 
 
@@ -270,7 +268,7 @@ async def inspection_check_all(
             ) from exc
         if payload is None:
             return Response(status_code=204)
-        payload = _condense_payload_to_hourly(dict(payload))
+        payload = _prepare_summary_payload(dict(payload))
         set_last_collection_time(collection_reference)
         return JSONResponse(payload)
 
@@ -320,203 +318,6 @@ async def inspection_check_all(
         return Response(status_code=204)
 
     return JSONResponse(payload)
-
-
-@app.post("/api/analyze-from-inspection")
-async def analyze_from_inspection(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
-    snapshot_id = payload.get("snapshot_id")
-    if not snapshot_id or not isinstance(snapshot_id, str):
-        raise HTTPException(status_code=400, detail="snapshot_id is required")
-
-    selection_start_raw = payload.get("selection_start")
-    selection_end_raw = payload.get("selection_end")
-    hours_raw = payload.get("hours")
-    period_raw = payload.get("period")
-
-    try:
-        selection_start = int(selection_start_raw)
-        selection_end = int(selection_end_raw)
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="selection_start and selection_end must be integers")
-
-    if selection_end < selection_start:
-        selection_start, selection_end = selection_end, selection_start
-
-    try:
-        hours = int(hours_raw)
-    except (TypeError, ValueError):
-        hours = 1
-    hours = max(1, min(4, hours))
-
-    target_snapshot = get_snapshot(snapshot_id)
-    if target_snapshot is None:
-        raise HTTPException(status_code=404, detail="Snapshot not found")
-
-    try:
-        check_payload = build_check_all_datas(
-            target_snapshot,
-            selection_start_ms=selection_start,
-            selection_end_ms=selection_end,
-            hours=hours,
-        )
-    except DataQualityError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail={"message": str(exc), "data_quality": exc.detail},
-        ) from exc
-
-    if check_payload is None:
-        raise HTTPException(status_code=400, detail="Snapshot does not contain analyzable data")
-
-    if not isinstance(check_payload, Mapping):
-        raise HTTPException(status_code=400, detail="Snapshot payload is invalid")
-
-    check_payload = dict(check_payload)
-    check_payload.setdefault("symbol", target_snapshot.get("symbol"))
-    check_payload["snapshot_id"] = snapshot_id
-    check_payload["selection"] = {"start": selection_start, "end": selection_end}
-
-    symbol = str(
-        check_payload.get("symbol")
-        or target_snapshot.get("symbol")
-        or target_snapshot.get("pair")
-        or "UNKNOWN"
-    )
-
-    period = None
-    if isinstance(period_raw, str) and period_raw.strip():
-        period = period_raw.strip()
-    else:
-        meta_source = target_snapshot.get("meta")
-        if isinstance(meta_source, Mapping):
-            if isinstance(meta_source.get("period"), str) and meta_source.get("period").strip():
-                period = str(meta_source.get("period")).strip()
-            elif isinstance(meta_source.get("window"), Mapping):
-                label = meta_source["window"].get("label")
-                if isinstance(label, str) and label.strip():
-                    period = label.strip()
-    if period is None:
-        period = "custom_range"
-
-    def _extract_last_price(payload: Mapping[str, Any]) -> float | None:
-        ohlcv_block = payload.get("ohlcv")
-        if isinstance(ohlcv_block, Mapping):
-            minute_block = ohlcv_block.get("1m")
-            if isinstance(minute_block, Mapping):
-                candles = minute_block.get("candles")
-                if isinstance(candles, Sequence) and candles:
-                    tail = candles[-1]
-                    if isinstance(tail, Mapping):
-                        for key in ("c", "close", "price"):
-                            value = tail.get(key)
-                            if isinstance(value, (int, float)):
-                                return float(value)
-        return None
-
-    last_price_value = _extract_last_price(check_payload)
-    last_price = last_price_value if last_price_value is not None else 0.0
-
-    api_key: str | None = None
-    api_key_raw = payload.get("api_key")
-    if isinstance(api_key_raw, str):
-        candidate = api_key_raw.strip()
-        if candidate:
-            api_key = candidate
-
-    if not api_key:
-        env_key = os.environ.get("OPENAI_API_KEY")
-        if isinstance(env_key, str):
-            candidate = env_key.strip()
-            if candidate:
-                api_key = candidate
-
-    if not api_key:
-        raise HTTPException(status_code=400, detail="OpenAI API key is required")
-
-    model_candidate = payload.get("model")
-    model_id = "gpt-5"
-    if isinstance(model_candidate, str) and model_candidate.strip().lower() == "gpt-5":
-        model_id = "gpt-5"
-    else:
-        env_model = os.environ.get("OPENAI_MODEL_ID")
-        if isinstance(env_model, str) and env_model.strip().lower() == "gpt-5":
-            model_id = "gpt-5"
-
-    upload_dir = Path(
-        os.environ.get(
-            "ANALYSIS_UPLOAD_DIR",
-            str(PROJECT_ROOT / "var" / "analysis_uploads"),
-        )
-    ).expanduser()
-
-    api_base = os.environ.get("OPENAI_API_BASE")
-
-    try:
-        analysis_result = await dispatch_trade_analysis(
-            check_payload,
-            symbol=symbol,
-            period=period,
-            last_price=last_price,
-            upload_dir=upload_dir,
-            api_key=api_key,
-            model=model_id,
-            api_base=api_base,
-        )
-    except httpx.HTTPStatusError as exc:
-        openai_error_details = _extract_openai_error(exc.response)
-        logging.getLogger(__name__).exception(
-            "OpenAI request returned an error",
-            extra={
-                "snapshot_id": snapshot_id,
-                "status_code": exc.response.status_code,
-                "openai_error": openai_error_details,
-            },
-        )
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "message": "OpenAI returned an error",
-                "status_code": exc.response.status_code,
-                "openai_error": openai_error_details,
-            },
-        ) from exc
-    except httpx.RequestError as exc:
-        logging.getLogger(__name__).exception(
-            "Failed to reach OpenAI",
-            extra={"snapshot_id": snapshot_id},
-        )
-        raise HTTPException(
-            status_code=502,
-            detail="Failed to reach OpenAI",
-        ) from exc
-    except Exception as exc:  # pragma: no cover - defensive logging
-        logging.getLogger(__name__).exception(
-            "Unexpected error during trade analysis",
-            extra={"snapshot_id": snapshot_id},
-        )
-        raise HTTPException(status_code=502, detail="Trade analysis failed") from exc
-
-    debug_block: Dict[str, Any] = {
-        "symbol": symbol,
-        "period": period,
-        "last_price": last_price,
-        "model": model_id,
-        "attachment_file": analysis_result.file_path.name,
-        "attachment_size_bytes": analysis_result.attachment_size,
-        "attachment_sha256": analysis_result.attachment_sha256,
-        "latency_ms": analysis_result.latency_ms,
-    }
-    if analysis_result.raw_text and analysis_result.status != "ok":
-        debug_block["raw_text"] = analysis_result.raw_text
-
-    response_payload = {
-        "status": analysis_result.status,
-        "request_id": analysis_result.request_id,
-        "trade_json": analysis_result.trade_json,
-        "debug": debug_block,
-    }
-
-    return JSONResponse(response_payload)
 
 
 @app.get("/presets")

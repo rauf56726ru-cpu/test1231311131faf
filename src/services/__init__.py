@@ -2,7 +2,6 @@
 
 from .binance import BINANCE_FAPI_REST
 from .check_all_datas import build_check_all_datas, DataQualityError
-from .analysis import dispatch_trade_analysis
 from .inspection import (
     build_inspection_payload,
     build_placeholder_snapshot,
@@ -50,7 +49,6 @@ __all__ = [
     "build_inspection_payload",
     "build_liquidity_snapshot",
     "build_check_all_datas",
-    "dispatch_trade_analysis",
     "build_placeholder_snapshot",
     "DEFAULT_SYMBOL",
     "get_snapshot",

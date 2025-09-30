@@ -1218,17 +1218,12 @@ def _build_orderflow_block(
         large_trade_threshold=threshold,
     )
 
-    result: Dict[str, Dict[str, List[Dict[str, Any]]]] = {
-        "1m": {"per_bar": minute_series},
-    }
+    result: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
 
-    for tf in ("3m", "5m", "15m"):
+    for tf in ("15m", "1h"):
         interval_ms = TIMEFRAME_TO_MS.get(tf)
         if not interval_ms or interval_ms <= minute_interval:
-            if interval_ms == minute_interval:
-                result[tf] = {"per_bar": minute_series[:]}
-            else:
-                result[tf] = {"per_bar": []}
+            result[tf] = {"per_bar": minute_series[:] if interval_ms == minute_interval else []}
             continue
         aggregated = _aggregate_orderflow_series(
             minute_series,
@@ -2938,7 +2933,7 @@ def build_check_all_datas(
         ohlcv_public[tf] = {"candles": candles}
 
     orderflow_public: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
-    for tf in ("1m", "3m", "5m", "15m"):
+    for tf in ("15m", "1h"):
         tf_payload = orderflow_block.get(tf) if isinstance(orderflow_block, Mapping) else None
         per_bar: List[Dict[str, Any]] = []
         if isinstance(tf_payload, Mapping):
