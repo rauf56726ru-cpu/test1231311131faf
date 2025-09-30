@@ -2693,6 +2693,12 @@ def render_inspection_page(
       frame: defaultFrame,
       chart: null,
       series: null,
+      candles: [],
+      gapWatcher: null,
+      gapSymbol: null,
+      gapInterval: null,
+      intervalMs: intervalToMs(defaultFrame),
+      lastUpdateMs: null,
       availableFrames: initialFrameMap,
       checkAll: null,
       hours: checkAllHours ? resolveHours(checkAllHours.value) : 1,
@@ -3247,6 +3253,183 @@ def render_inspection_page(
       }
     }
 
+    function barsEqual(a, b) {
+      if (!a || !b) return false;
+      return (
+        Number(a.time) === Number(b.time) &&
+        Number(a.open) === Number(b.open) &&
+        Number(a.high) === Number(b.high) &&
+        Number(a.low) === Number(b.low) &&
+        Number(a.close) === Number(b.close)
+      );
+    }
+
+    function ensureChartBar(input) {
+      if (!input) return null;
+      const time = Number(
+        input.time ??
+          input.t ??
+          (Number.isFinite(input.ts_ms_utc) ? Math.floor(Number(input.ts_ms_utc) / 1000) : null),
+      );
+      const open = Number(input.open ?? input.o ?? Number.NaN);
+      const high = Number(input.high ?? input.h ?? open);
+      const low = Number(input.low ?? input.l ?? open);
+      const close = Number(input.close ?? input.c ?? open);
+      if (
+        !Number.isFinite(time) ||
+        !Number.isFinite(open) ||
+        !Number.isFinite(high) ||
+        !Number.isFinite(low) ||
+        !Number.isFinite(close)
+      ) {
+        const normalised = normaliseBar(input);
+        if (!normalised) return null;
+        return ensureChartBar(normalised);
+      }
+      let tsMs = Number(input.ts_ms_utc ?? input.t ?? Number.NaN);
+      if (!Number.isFinite(tsMs) && Number.isFinite(time)) {
+        tsMs = Math.floor(time * 1000);
+      }
+      return {
+        time: Math.floor(time),
+        open,
+        high,
+        low,
+        close,
+        ts_ms_utc: Number.isFinite(tsMs) ? Math.floor(tsMs) : Math.floor(time * 1000),
+      };
+    }
+
+    function mergeChartBars(bars, { reset = false } = {}) {
+      const incoming = (bars || []).map((bar) => ensureChartBar(bar)).filter((bar) => bar !== null);
+      if (reset) {
+        const changed =
+          incoming.length !== state.candles.length ||
+          incoming.some((bar, idx) => !barsEqual(bar, state.candles[idx]));
+        state.candles = incoming;
+        if (state.series) {
+          state.series.setData(state.candles);
+        }
+        return changed;
+      }
+
+      if (!incoming.length) {
+        return false;
+      }
+
+      const index = new Map();
+      state.candles.forEach((bar, idx) => {
+        const key = Number(bar.time);
+        if (Number.isFinite(key)) {
+          index.set(key, idx);
+        }
+      });
+
+      let changed = false;
+      for (const bar of incoming) {
+        const key = Number(bar.time);
+        if (!Number.isFinite(key)) continue;
+        if (index.has(key)) {
+          const idx = index.get(key);
+          if (!barsEqual(state.candles[idx], bar)) {
+            state.candles[idx] = bar;
+            changed = true;
+          }
+        } else {
+          index.set(key, state.candles.length);
+          state.candles.push(bar);
+          changed = true;
+        }
+      }
+
+      if (changed) {
+        state.candles.sort((a, b) => Number(a.time) - Number(b.time));
+        if (state.series) {
+          state.series.setData(state.candles);
+        }
+      }
+      return changed;
+    }
+
+    function ensureGapWatcher(options = {}) {
+      if (!ChartGapWatcher || typeof ChartGapWatcher.attach !== "function") return;
+      if (!state.chart) return;
+      const symbol = activeSymbol();
+      const interval = state.frame || "1m";
+      const intervalMs = intervalToMs(interval);
+      const contextChanged = state.gapSymbol !== symbol || state.gapInterval !== interval;
+      const resetRequestedKeys = Boolean(options.resetRequestedKeys) || contextChanged;
+
+      if (!state.gapWatcher) {
+        state.gapWatcher = ChartGapWatcher.attach({
+          chart: state.chart,
+          interval,
+          intervalMs,
+          getCandles: () => state.candles,
+          requestGap: handleChartGapRequest,
+        });
+      } else if (typeof state.gapWatcher.updateContext === "function") {
+        state.gapWatcher.updateContext({
+          symbol,
+          interval,
+          intervalMs,
+          getCandles: () => state.candles,
+          requestGap: handleChartGapRequest,
+          resetRequestedKeys,
+        });
+      }
+
+      state.gapSymbol = symbol;
+      state.gapInterval = interval;
+      state.intervalMs = intervalMs;
+
+      if (state.gapWatcher && typeof state.gapWatcher.notifyData === "function") {
+        state.gapWatcher.notifyData();
+      }
+    }
+
+    async function handleChartGapRequest(gap) {
+      if (!gap) return false;
+      const symbol = activeSymbol();
+      const interval = state.frame || "1m";
+      if (!symbol || !interval) return false;
+      try {
+        const startMs = Number(gap.startMs);
+        const endMs = Number(gap.endMs);
+        if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) {
+          return false;
+        }
+        const intervalMs = intervalToMs(interval);
+        const rangeWidth = Math.max(intervalMs, endMs - startMs);
+        const approxBars = Math.ceil(rangeWidth / intervalMs) + 2;
+        const buffer = intervalMs;
+        const bars = await fetchRange(
+          symbol,
+          interval,
+          Math.max(0, startMs - buffer),
+          endMs + buffer,
+          Math.min(1000, Math.max(approxBars, 50)),
+        );
+        const changed = mergeChartBars(bars);
+        if (changed && state.gapWatcher && typeof state.gapWatcher.notifyData === "function") {
+          state.gapWatcher.notifyData();
+        }
+        return true;
+      } catch (error) {
+        console.error("Failed to fetch missing candles for inspection chart", error);
+        updateStatus("Не удалось загрузить недостающие свечи", "error");
+        return false;
+      }
+    }
+
+    function updateChartDataFromFrame(options = {}) {
+      const frameCandles = state.payload?.DATA?.frames?.[state.frame]?.candles || [];
+      const bars = toChartBars(frameCandles);
+      mergeChartBars(bars, { reset: true });
+      state.intervalMs = intervalToMs(state.frame || "1m");
+      ensureGapWatcher({ resetRequestedKeys: options.resetRequestedKeys });
+    }
+
     function ensureChart() {
       if (!chartContainer) return;
       const ensureLibrary = () => {
@@ -3297,16 +3480,10 @@ def render_inspection_page(
           borderVisible: true,
         });
 
-        const seedInitialFrame = () => {
-          const frameKey = state.frame;
-          const frameCandles = state.payload?.DATA?.frames?.[frameKey]?.candles || [];
-          const bars = toChartBars(frameCandles);
-          state.series.setData(bars);
-          if (bars.length && state.chart) {
-            state.chart.timeScale().fitContent();
-          }
-        };
-        seedInitialFrame();
+        updateChartDataFromFrame({ resetRequestedKeys: true });
+        if (state.candles.length && state.chart) {
+          state.chart.timeScale().fitContent();
+        }
 
         const resize = () => {
           if (!state.chart) return;
@@ -3367,11 +3544,8 @@ def render_inspection_page(
       if (!chartContainer) return;
       ensureChart();
       if (!state.series) return;
-      const frame = state.frame;
-      const candles = state.payload?.DATA?.frames?.[frame]?.candles || [];
-      const bars = toChartBars(candles);
-      state.series.setData(bars);
-      if (bars.length && state.chart) {
+      updateChartDataFromFrame();
+      if (state.candles.length && state.chart) {
         state.chart.timeScale().fitContent();
       }
       updateSelectionLabel();
