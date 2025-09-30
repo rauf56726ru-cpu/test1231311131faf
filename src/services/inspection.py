@@ -1475,14 +1475,6 @@ def render_inspection_page(
     timeframe_value = html_utils.escape(timeframe)
     snapshot_value = html_utils.escape(snapshot_id or "")
 
-    timeframe_options = []
-    for tf_key in TIMEFRAME_WINDOWS:
-        selected = " selected" if tf_key == timeframe else ""
-        timeframe_options.append(
-            f'<option value="{html_utils.escape(tf_key)}"{selected}>{html_utils.escape(tf_key)}</option>'
-        )
-
-
     data_section = payload.get("DATA") if isinstance(payload, Mapping) else None
     diagnostics_section = payload.get("DIAGNOSTICS") if isinstance(payload, Mapping) else None
 
@@ -1493,24 +1485,8 @@ def render_inspection_page(
             formatted = json.dumps(None, ensure_ascii=False, indent=2)
         return html_utils.escape(formatted)
 
-    frames_section: Dict[str, Any] = {}
-    if isinstance(data_section, Mapping):
-        raw_frames = data_section.get("frames")
-        if isinstance(raw_frames, Mapping):
-            frames_section = dict(raw_frames)
-
-    timeframe_key = str(timeframe) if timeframe is not None else ""
-    metric_section = None
-    if frames_section:
-        candidate = frames_section.get(timeframe_key)
-        metric_section = candidate if candidate else frames_section
-
-    data_json_initial = _format_json_block(data_section)
     diagnostics_json_initial = _format_json_block(diagnostics_section)
-    metric_json_initial = _format_json_block(metric_section)
     check_all_json_initial = _format_json_block(None)
-    analysis_json_initial = _format_json_block(None)
-    analysis_debug_json_initial = _format_json_block(None)
 
     style_block = """
     :root {
@@ -1622,39 +1598,82 @@ def render_inspection_page(
       transform: translateY(-1px);
       box-shadow: 0 14px 30px rgba(8, 47, 73, 0.4);
     }
+    .panel-lead {
+      margin: 0 0 1rem;
+      color: rgba(148, 163, 184, 0.8);
+      font-size: 0.95rem;
+    }
+    .collection-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      margin-bottom: 1rem;
+    }
+    .collection-actions .primary {
+      min-width: 260px;
+    }
+    .collection-actions .secondary {
+      min-width: 200px;
+    }
+    .preset-chip-bar {
+      min-height: 1.6rem;
+      display: flex;
+      align-items: center;
+      margin-bottom: 0.5rem;
+    }
     .controls-grid {
       display: grid;
       gap: 1rem;
     }
-    .timeframes {
-      display: grid;
-      gap: 0.4rem;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-    }
-    .timeframes label {
-      display: inline-flex;
+    .selection-bar {
+      display: flex;
       align-items: center;
-      gap: 0.35rem;
-      padding: 0.4rem 0.6rem;
-      border-radius: 10px;
-      background: rgba(30, 41, 59, 0.6);
-      border: 1px solid rgba(148, 163, 184, 0.18);
-      font-size: 0.85rem;
+      justify-content: space-between;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+      margin-top: 1rem;
+    }
+    .selection-bar > div {
+      display: inline-flex;
+      gap: 0.6rem;
+      align-items: center;
+      flex-wrap: wrap;
     }
     .chart-toolbar {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      gap: 0.75rem;
+      gap: 1rem;
       flex-wrap: wrap;
+    }
+    .chart-toolbar__symbol {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.25rem 0.6rem;
+      border-radius: 999px;
+      background: rgba(15, 23, 42, 0.6);
+      border: 1px solid rgba(148, 163, 184, 0.25);
+    }
+    .chart-toolbar__symbol strong {
+      font-size: 1.05rem;
+      letter-spacing: 0.08em;
+      color: #f8fafc;
+    }
+    .chart-toolbar__frames {
+      display: flex;
+      flex-direction: column;
+      gap: 0.45rem;
+      align-items: flex-start;
     }
     .tf-toggle {
       display: inline-flex;
-      gap: 0.4rem;
+      gap: 0.35rem;
       padding: 0.2rem;
       border-radius: 999px;
       background: rgba(30, 41, 59, 0.6);
       border: 1px solid rgba(148, 163, 184, 0.24);
+      flex-wrap: wrap;
     }
     .tf-toggle button {
       border-radius: 999px;
@@ -1678,16 +1697,6 @@ def render_inspection_page(
       font-size: 0.75rem;
       background: rgba(148, 163, 184, 0.18);
       color: var(--muted);
-    }
-    .snapshot-select {
-      display: flex;
-      gap: 0.65rem;
-      align-items: center;
-      flex-wrap: wrap;
-    }
-    .snapshot-select select {
-      flex: 1;
-      min-width: 200px;
     }
     .chart-shell {
       height: 420px;
@@ -1771,110 +1780,6 @@ def render_inspection_page(
       color: var(--fg);
       min-width: 110px;
     }
-    .analysis-actions {
-      display: flex;
-      align-items: flex-end;
-      gap: 0.75rem;
-      padding: 0.75rem 0.25rem 0.25rem;
-      flex-wrap: wrap;
-    }
-    .analysis-credentials {
-      display: flex;
-      flex: 1 1 280px;
-      min-width: min(100%, 340px);
-      flex-direction: column;
-      gap: 0.45rem;
-    }
-    .analysis-credentials span {
-      font-size: 0.75rem;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      color: rgba(148, 163, 184, 0.78);
-    }
-    .analysis-input-row {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-    }
-    #analysis-api-key {
-      flex: 1;
-      border-radius: 12px;
-      border: 1px solid rgba(148, 163, 184, 0.3);
-      padding: 0.55rem 0.75rem;
-      background: rgba(15, 23, 42, 0.65);
-      color: var(--fg);
-      letter-spacing: 0.02em;
-    }
-    #analysis-api-key:focus {
-      outline: none;
-      border-color: rgba(56, 189, 248, 0.65);
-      box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.15);
-    }
-    .analysis-key-toggle {
-      min-width: auto;
-      padding: 0.5rem 0.75rem;
-      white-space: nowrap;
-    }
-    .analysis-actions__controls {
-      display: flex;
-      align-items: center;
-      flex-wrap: wrap;
-      gap: 0.75rem;
-    }
-    .analysis-actions__controls > button {
-      min-width: 220px;
-    }
-    .analysis-status {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      min-width: 140px;
-      padding: 0.45rem 0.85rem;
-      border-radius: 999px;
-      font-size: 0.85rem;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-      border: 1px solid rgba(148, 163, 184, 0.2);
-      background: rgba(15, 23, 42, 0.6);
-      color: var(--muted);
-      transition: background 0.2s ease, color 0.2s ease, border-color 0.2s ease;
-    }
-    .analysis-status[data-status="pending"],
-    .analysis-status[data-status="sent"] {
-      background: rgba(14, 116, 144, 0.3);
-      border-color: rgba(45, 212, 191, 0.35);
-      color: #2dd4bf;
-    }
-    .analysis-status[data-status="succeeded"] {
-      background: rgba(21, 128, 61, 0.28);
-      border-color: rgba(34, 197, 94, 0.45);
-      color: #4ade80;
-    }
-    .analysis-status[data-status="insufficient"] {
-      background: rgba(202, 138, 4, 0.28);
-      border-color: rgba(250, 204, 21, 0.4);
-      color: #facc15;
-    }
-    .analysis-status[data-status="failed"] {
-      background: rgba(185, 28, 28, 0.28);
-      border-color: rgba(248, 113, 113, 0.45);
-      color: #f87171;
-    }
-    .analysis-panel {
-      display: grid;
-      gap: 1rem;
-      padding: 1rem;
-      background: rgba(15, 23, 42, 0.85);
-      border-top: 1px solid rgba(148, 163, 184, 0.18);
-    }
-    .analysis-panel > div > span.badge {
-      margin-bottom: 0.5rem;
-    }
-    .analysis-panel pre {
-      max-height: 320px;
-      overflow: auto;
-      background: rgba(2, 6, 23, 0.9);
-    }
     .collapse pre {
       margin: 0;
       padding: 1rem;
@@ -1886,15 +1791,6 @@ def render_inspection_page(
     }
     .collapse.collapsed pre {
       display: none;
-    }
-    .metrics-bar {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 0.6rem;
-    }
-    .metrics-bar button.active {
-      background: rgba(56, 189, 248, 0.22);
-      color: #f8fafc;
     }
     .meta-grid {
       display: grid;
@@ -2291,9 +2187,6 @@ def render_inspection_page(
     }
     """
 
-    analysis_configured = bool(os.environ.get("OPENAI_API_KEY"))
-    model_id_default = "gpt-5"
-
     script_block = (
         "window.__INSPECTION_INITIAL__ = {\n"
         f"  payload: {payload_json},\n"
@@ -2301,9 +2194,7 @@ def render_inspection_page(
         f"  symbol: {json.dumps(symbol_value)},\n"
         f"  timeframe: {json.dumps(timeframe_value)},\n"
         f"  snapshots: {snapshots_json},\n"
-        f"  defaultSymbol: {json.dumps(DEFAULT_SYMBOL)},\n"
-        f"  analysisConfigured: {json.dumps(analysis_configured)},\n"
-        f"  modelId: {json.dumps(model_id_default)}\n"
+        f"  defaultSymbol: {json.dumps(DEFAULT_SYMBOL)}\n"
         "};\n"
     )
 
@@ -2517,32 +2408,6 @@ def render_inspection_page(
     pre.textContent = JSON.stringify(data ?? null, null, 2);
   }
 
-  const API_KEY_STORAGE_KEY = "inspection.openai_api_key";
-
-  function loadStoredApiKey() {
-    try {
-      if (!window || !window.localStorage) return "";
-      const value = window.localStorage.getItem(API_KEY_STORAGE_KEY);
-      return typeof value === "string" ? value : "";
-    } catch (error) {
-      console.warn("Failed to read OpenAI API key from storage", error);
-      return "";
-    }
-  }
-
-  function persistStoredApiKey(value) {
-    try {
-      if (!window || !window.localStorage) return;
-      if (value) {
-        window.localStorage.setItem(API_KEY_STORAGE_KEY, value);
-      } else {
-        window.localStorage.removeItem(API_KEY_STORAGE_KEY);
-      }
-    } catch (error) {
-      console.warn("Failed to persist OpenAI API key", error);
-    }
-  }
-
   function selectionLabel(start, end) {
     if (!start || !end) return "Выделите диапазон";
     const from = formatTs(start);
@@ -2715,28 +2580,21 @@ def render_inspection_page(
     const defaultSymbol = normaliseSymbol(initial.defaultSymbol) || "BTCUSDT";
     const snapshotSelect = document.getElementById("snapshot-select");
     const refreshButton = document.getElementById("refresh-snapshot");
-    const dataPre = document.getElementById("data-json");
     const diagnosticsPre = document.getElementById("diagnostics-json");
-    const metricPre = document.getElementById("metric-json");
     const checkAllPre = document.getElementById("checkall-json");
-    const checkAllButton = document.getElementById("fetch-check-all");
+    const summaryButton = document.getElementById("collect-summary");
+    const topupButton = document.getElementById("collect-topup");
+    const collectSelectionButton = document.getElementById("collect-selection");
     const checkAllHours = document.getElementById("checkall-hours");
-    const analysisButton = document.getElementById("analysis-send");
-    const analysisStatusEl = document.getElementById("analysis-status");
-    const analysisPre = document.getElementById("analysis-json");
-    const analysisDebugPre = document.getElementById("analysis-debug-json");
-    const analysisApiKeyInput = document.getElementById("analysis-api-key");
-    const analysisApiKeyToggle = document.getElementById("analysis-api-key-toggle");
     const snapshotMeta = document.getElementById("snapshot-meta");
-    const frameSelect = document.getElementById("frame-select");
     const chartContainer = document.getElementById("inspection-chart");
     const selectionInfo = document.getElementById("selection-info");
+    const chartSymbolLabel = document.getElementById("chart-symbol");
     const buildButton = document.getElementById("build-session");
     const clearSelection = document.getElementById("clear-selection");
     const timeframeCheckboxes = Array.from(document.querySelectorAll("[data-tf-checkbox]"));
     const timeframeToggle = document.getElementById("chart-tf-toggle");
     const statusEl = document.getElementById("inspection-status");
-    const metricButtons = Array.from(document.querySelectorAll("[data-metric]"));
     const symbolInput = document.getElementById("symbol-input");
     const presetChip = document.getElementById("preset-chip");
     const managePresetsButton = document.getElementById("manage-presets");
@@ -2766,14 +2624,13 @@ def render_inspection_page(
 
     initCollapsibles();
 
-    const storedApiKey = loadStoredApiKey().trim();
     const resolveHours = (value) => {
       const parsed = Number(value);
       if (!Number.isFinite(parsed)) return 1;
       return Math.min(4, Math.max(1, Math.floor(parsed)));
     };
 
-    const PREFERRED_CHART_FRAMES = ["15m", "1h", "1m"];
+    const PREFERRED_CHART_FRAMES = ["1m", "3m", "15m", "30m", "1h", "4h", "1d", "1w"];
 
     function frameHasCandles(frames, tf) {
       if (!frames || !tf) return false;
@@ -2810,20 +2667,14 @@ def render_inspection_page(
       frame: defaultFrame,
       chart: null,
       series: null,
+      candles: [],
+      gapWatcher: null,
+      gapSymbol: null,
+      gapInterval: null,
+      intervalMs: intervalToMs(defaultFrame),
+      lastUpdateMs: null,
+      availableFrames: initialFrameMap,
       checkAll: null,
-      analysis: {
-        status: "idle",
-        resultStatus: null,
-        trade: null,
-        debug: null,
-        requestId: null,
-        apiConfigured: Boolean(initial.analysisConfigured),
-        apiKey: storedApiKey,
-        modelId:
-          typeof initial.modelId === "string" && initial.modelId.trim().toLowerCase() === "gpt-5"
-            ? "gpt-5"
-            : "gpt-5",
-      },
       hours: checkAllHours ? resolveHours(checkAllHours.value) : 1,
       profilePreset: initial.payload?.DATA?.profile_preset || null,
       presetRequired: Boolean(initial.payload?.DATA?.profile_preset_required),
@@ -2834,25 +2685,6 @@ def render_inspection_page(
       presetModalOpen: false,
     };
 
-    if (analysisApiKeyInput) {
-      analysisApiKeyInput.value = storedApiKey;
-      analysisApiKeyInput.addEventListener("input", () => {
-        const cleaned = analysisApiKeyInput.value.trim();
-        state.analysis.apiKey = cleaned;
-        persistStoredApiKey(cleaned);
-        updateAnalysisControls();
-      });
-    }
-
-    if (analysisApiKeyToggle && analysisApiKeyInput) {
-      analysisApiKeyToggle.addEventListener("click", () => {
-        const currentType = analysisApiKeyInput.getAttribute("type") === "text" ? "text" : "password";
-        const nextType = currentType === "password" ? "text" : "password";
-        analysisApiKeyInput.setAttribute("type", nextType);
-        analysisApiKeyToggle.textContent = nextType === "text" ? "Скрыть" : "Показать";
-      });
-    }
-
     const AUTO_PRESET_SYMBOLS = new Set(["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
 
     function autoPresetSymbol(symbol) {
@@ -2862,6 +2694,7 @@ def render_inspection_page(
 
     function activeSymbol() {
       return (
+        (symbolInput && normaliseSymbol(symbolInput.value)) ||
         normaliseSymbol(state.payload?.DATA?.symbol) ||
         normaliseSymbol(initial.payload?.DATA?.symbol) ||
         normaliseSymbol(initial.symbol) ||
@@ -2869,66 +2702,9 @@ def render_inspection_page(
       );
     }
 
-    function resolveAnalysisPeriod() {
-      const source = state.payload?.DATA?.meta?.source;
-      const requested = state.payload?.DATA?.meta?.requested;
-      const preset = state.payload?.DATA?.profile_preset;
-      const candidates = [
-        source && typeof source.period === "string" ? source.period : null,
-        source && typeof source?.window?.label === "string" ? source.window.label : null,
-        requested && typeof requested?.period === "string" ? requested.period : null,
-        preset && typeof preset?.period === "string" ? preset.period : null,
-        preset && typeof preset?.preset_key === "string" ? preset.preset_key : null,
-      ];
-      for (const candidate of candidates) {
-        if (candidate && typeof candidate === "string" && candidate.trim()) {
-          return candidate.trim();
-        }
-      }
-      return "custom_range";
-    }
-
-    function updateAnalysisIndicator() {
-      if (!analysisStatusEl) return;
-      const status = state.analysis.status || "idle";
-      analysisStatusEl.dataset.status = status;
-      const labels = {
-        idle: "—",
-        pending: "Подготовка",
-        sent: "Отправлено",
-        succeeded: "Готово",
-        insufficient: "Недостаточно данных",
-        failed: "Ошибка",
-      };
-      analysisStatusEl.textContent = labels[status] || "—";
-    }
-
-    function updateAnalysisControls() {
-      if (!analysisButton) return;
-      const start = Number(state.selection?.start ?? Number.NaN);
-      const end = Number(state.selection?.end ?? Number.NaN);
-      const hasSelection = Number.isFinite(start) && Number.isFinite(end) && start !== end;
-      const busy = state.analysis.status === "pending" || state.analysis.status === "sent";
-      const hasApiAccess =
-        state.analysis.apiConfigured || Boolean((state.analysis.apiKey || "").trim());
-      analysisButton.disabled = !state.snapshotId || !hasSelection || busy || !hasApiAccess;
-    }
-
-    function resetAnalysisState() {
-      state.analysis.status = "idle";
-      state.analysis.resultStatus = null;
-      state.analysis.trade = null;
-      state.analysis.debug = null;
-      state.analysis.requestId = null;
-      setJson(analysisPre, null);
-      setJson(analysisDebugPre, null);
-      updateAnalysisIndicator();
-      updateAnalysisControls();
-    }
-
-    function applyAnalysisResult(trade, debug) {
-      setJson(analysisPre, trade);
-      setJson(analysisDebugPre, debug);
+    function renderChartSymbol() {
+      if (!chartSymbolLabel) return;
+      chartSymbolLabel.textContent = activeSymbol();
     }
 
     function renderPresetChip() {
@@ -3179,8 +2955,8 @@ def render_inspection_page(
         closePresetModal();
         renderPresetState();
         updateCheckAllState();
-        if (checkAllButton && !checkAllButton.disabled) {
-          checkAllButton.click();
+        if (collectSelectionButton && !collectSelectionButton.disabled) {
+          collectSelectionButton.click();
         }
       } catch (error) {
         console.error("Failed to save preset", error);
@@ -3197,14 +2973,18 @@ def render_inspection_page(
       }
     }
 
-    resetAnalysisState();
     renderPresetState();
     updateCheckAllState();
+    renderChartSymbol();
 
     if (symbolInput) {
       const initialSymbol =
         normaliseSymbol(initial.payload?.DATA?.symbol) || normaliseSymbol(initial.symbol) || defaultSymbol;
       symbolInput.value = initialSymbol;
+      renderChartSymbol();
+      symbolInput.addEventListener("input", () => {
+        renderChartSymbol();
+      });
     }
 
     function updateStatus(message, tone = "info") {
@@ -3229,10 +3009,16 @@ def render_inspection_page(
         checkAllHours.value = String(state.hours);
       }
       const presetReady = !state.presetRequired;
-      if (checkAllButton) {
-        checkAllButton.disabled = !state.snapshotId || !hasSelection || !hoursValid || !presetReady;
+      if (collectSelectionButton) {
+        collectSelectionButton.disabled =
+          !state.snapshotId || !hasSelection || !hoursValid || !presetReady;
       }
-      updateAnalysisControls();
+      if (summaryButton) {
+        summaryButton.disabled = !state.snapshotId || !presetReady;
+      }
+      if (topupButton) {
+        topupButton.disabled = !state.snapshotId || !presetReady;
+      }
     }
 
     function populateSnapshots(list) {
@@ -3255,34 +3041,16 @@ def render_inspection_page(
     }
 
     function populateFrames(payload) {
-      if (!frameSelect) return;
-      frameSelect.innerHTML = "";
       const frames = payload?.DATA?.frames || {};
-      const keys = Object.keys(frames).sort((a, b) => {
-        const weight = (key) => {
-          const idx = PREFERRED_CHART_FRAMES.indexOf(key);
-          return idx === -1 ? PREFERRED_CHART_FRAMES.length : idx;
-        };
-        const diff = weight(a) - weight(b);
-        return diff !== 0 ? diff : a.localeCompare(b);
-      });
-      for (const key of keys) {
-        const option = document.createElement("option");
-        option.value = key;
-        option.textContent = key;
-        frameSelect.append(option);
-      }
-      if (keys.length) {
-        const target = selectPreferredFrame(frames, state.frame);
-        frameSelect.value = target;
-        state.frame = target;
-      }
+      state.availableFrames = frames;
+      const target = selectPreferredFrame(frames, state.frame);
+      state.frame = target;
       updateTimeframeToggle();
     }
 
     function updateTimeframeToggle() {
       if (!timeframeToggle) return;
-      const frames = state.payload?.DATA?.frames || {};
+      const frames = state.availableFrames || state.payload?.DATA?.frames || {};
       const buttons = Array.from(timeframeToggle.querySelectorAll("[data-tf]"));
       for (const button of buttons) {
         const tf = button.dataset.tf;
@@ -3312,12 +3080,11 @@ def render_inspection_page(
     }
 
     function renderJson(payload) {
-      setJson(dataPre, payload?.DATA);
       setJson(diagnosticsPre, payload?.DIAGNOSTICS);
       setJson(checkAllPre, state.checkAll);
     }
 
-    async function requestCheckAllData() {
+    async function requestSelectionData() {
       if (!state.snapshotId) {
         updateStatus("Выберите снэпшот для запроса check-all данных", "warning");
         return;
@@ -3338,14 +3105,15 @@ def render_inspection_page(
         checkAllHours.value = String(state.hours);
       }
 
-      if (checkAllButton) {
-        checkAllButton.disabled = true;
+      if (collectSelectionButton) {
+        collectSelectionButton.disabled = true;
       }
 
       try {
         updateStatus("Загружаем check-all данные...", "info");
         const url = new URL("/inspection/check-all", window.location.origin);
         url.searchParams.set("snapshot", state.snapshotId);
+        url.searchParams.set("mode", "selection");
         url.searchParams.set("selection_start", String(selectionStart));
         url.searchParams.set("selection_end", String(selectionEnd));
         url.searchParams.set("hours", String(state.hours));
@@ -3375,118 +3143,264 @@ def render_inspection_page(
       }
     }
 
-    async function requestTradeAnalysis() {
+    async function requestSummaryData() {
       if (!state.snapshotId) {
-        updateStatus("Выберите снэпшот перед анализом сделки", "warning");
+        updateStatus("Выберите снэпшот для сбора контекста", "warning");
         return;
       }
 
-      const rawStart = Number(state.selection?.start ?? Number.NaN);
-      const rawEnd = Number(state.selection?.end ?? Number.NaN);
-      if (!Number.isFinite(rawStart) || !Number.isFinite(rawEnd) || rawStart === rawEnd) {
-        updateStatus("Выберите диапазон свечей для анализа сделки", "warning");
-        updateAnalysisControls();
-        return;
+      if (summaryButton) {
+        summaryButton.disabled = true;
       }
-
-      const selectionStart = Math.floor(Math.min(rawStart, rawEnd));
-      const selectionEnd = Math.floor(Math.max(rawStart, rawEnd));
-      const hoursValue = Number.isFinite(state.hours) ? state.hours : 1;
-      const period = resolveAnalysisPeriod();
-      const apiKeyValue = (state.analysis.apiKey || "").trim();
-      if (!state.analysis.apiConfigured && !apiKeyValue) {
-        updateStatus("Укажите OpenAI API key перед анализом сделки", "warning");
-        updateAnalysisControls();
-        if (analysisApiKeyInput) {
-          analysisApiKeyInput.focus();
-        }
-        return;
-      }
-
-      state.analysis.status = "pending";
-      state.analysis.resultStatus = null;
-      state.analysis.requestId = null;
-      state.analysis.trade = null;
-      state.analysis.debug = null;
-      applyAnalysisResult(null, null);
-      updateAnalysisIndicator();
-      updateAnalysisControls();
-      updateStatus("Готовим данные для анализа сделки...", "info");
 
       try {
-        const modelId =
-          typeof state.analysis.modelId === "string" && state.analysis.modelId.trim().toLowerCase() === "gpt-5"
-            ? "gpt-5"
-            : "gpt-5";
-        state.analysis.modelId = modelId;
-
-        const requestBody = {
-          snapshot_id: state.snapshotId,
-          selection_start: selectionStart,
-          selection_end: selectionEnd,
-          hours: hoursValue,
-          period,
-          model: modelId,
-        };
-        if (apiKeyValue) {
-          requestBody.api_key = apiKeyValue;
-        }
-
-        const response = await fetch("/api/analyze-from-inspection", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Accept: "application/json" },
-          body: JSON.stringify(requestBody),
+        updateStatus("Собираем данные за последние 3 дня...", "info");
+        const url = new URL("/inspection/check-all", window.location.origin);
+        url.searchParams.set("snapshot", state.snapshotId);
+        url.searchParams.set("mode", "summary");
+        url.searchParams.set("summary_days", "3");
+        const response = await fetch(url.toString(), {
+          headers: { Accept: "application/json" },
         });
-
-        state.analysis.status = "sent";
-        updateAnalysisIndicator();
-
-        let payload;
+        if (response.status === 204) {
+          state.checkAll = null;
+          setJson(checkAllPre, null);
+          updateStatus("Не удалось собрать 3-дневный контекст", "warning");
+          return;
+        }
         if (!response.ok) {
-          let detail = `HTTP ${response.status}`;
-          try {
-            const errorBody = await response.json();
-            if (typeof errorBody?.detail === "string") {
-              detail = errorBody.detail;
-            } else if (errorBody?.detail?.message) {
-              detail = String(errorBody.detail.message);
-            }
-          } catch (error) {
-            // Ignore body parsing errors
-          }
-          throw new Error(detail);
-        } else {
-          payload = await response.json();
+          throw new Error(`HTTP ${response.status}`);
         }
-
-        state.analysis.requestId = typeof payload?.request_id === "string" ? payload.request_id : null;
-        state.analysis.trade = payload?.trade_json || null;
-        state.analysis.debug = payload?.debug || null;
-        state.analysis.resultStatus = typeof payload?.status === "string" ? payload.status : null;
-        applyAnalysisResult(state.analysis.trade, state.analysis.debug);
-
-        if (state.analysis.resultStatus === "ok") {
-          state.analysis.status = "succeeded";
-          updateStatus("Сделка проанализирована", "success");
-        } else if (state.analysis.resultStatus === "insufficient_data") {
-          state.analysis.status = "insufficient";
-          updateStatus("Модели не хватает данных для сделки", "warning");
-        } else {
-          state.analysis.status = "failed";
-          updateStatus("Анализ сделки завершился с ошибкой", "error");
-        }
+        const payload = await response.json();
+        state.checkAll = payload;
+        setJson(checkAllPre, payload);
+        updateStatus("3-дневный контекст готов", "success");
       } catch (error) {
         console.error(error);
-        const message = error && typeof error.message === "string" ? error.message : "Неизвестная ошибка";
-        state.analysis.status = "failed";
-        state.analysis.trade = null;
-        state.analysis.debug = { error: message };
-        applyAnalysisResult(null, state.analysis.debug);
-        updateStatus(`Ошибка отправки сделки${message ? `: ${message}` : ""}`, "error");
+        state.checkAll = null;
+        setJson(checkAllPre, null);
+        updateStatus("Ошибка при сборе 3-дневного контекста", "error");
       } finally {
-        updateAnalysisIndicator();
-        updateAnalysisControls();
+        updateCheckAllState();
       }
+    }
+
+    async function requestTopupData() {
+      if (!state.snapshotId) {
+        updateStatus("Выберите снэпшот для досбора", "warning");
+        return;
+      }
+
+      if (topupButton) {
+        topupButton.disabled = true;
+      }
+
+      try {
+        updateStatus("Дособираем свежие данные...", "info");
+        const url = new URL("/inspection/check-all", window.location.origin);
+        url.searchParams.set("snapshot", state.snapshotId);
+        url.searchParams.set("mode", "topup");
+        const response = await fetch(url.toString(), {
+          headers: { Accept: "application/json" },
+        });
+        if (response.status === 204) {
+          state.checkAll = null;
+          setJson(checkAllPre, null);
+          updateStatus("Свежие данные отсутствуют", "warning");
+          return;
+        }
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const payload = await response.json();
+        state.checkAll = payload;
+        setJson(checkAllPre, payload);
+        updateStatus("Данные успешно дособраны", "success");
+      } catch (error) {
+        console.error(error);
+        state.checkAll = null;
+        setJson(checkAllPre, null);
+        updateStatus("Ошибка при досборе данных", "error");
+      } finally {
+        updateCheckAllState();
+      }
+    }
+
+    function barsEqual(a, b) {
+      if (!a || !b) return false;
+      return (
+        Number(a.time) === Number(b.time) &&
+        Number(a.open) === Number(b.open) &&
+        Number(a.high) === Number(b.high) &&
+        Number(a.low) === Number(b.low) &&
+        Number(a.close) === Number(b.close)
+      );
+    }
+
+    function ensureChartBar(input) {
+      if (!input) return null;
+      const time = Number(
+        input.time ??
+          input.t ??
+          (Number.isFinite(input.ts_ms_utc) ? Math.floor(Number(input.ts_ms_utc) / 1000) : null),
+      );
+      const open = Number(input.open ?? input.o ?? Number.NaN);
+      const high = Number(input.high ?? input.h ?? open);
+      const low = Number(input.low ?? input.l ?? open);
+      const close = Number(input.close ?? input.c ?? open);
+      if (
+        !Number.isFinite(time) ||
+        !Number.isFinite(open) ||
+        !Number.isFinite(high) ||
+        !Number.isFinite(low) ||
+        !Number.isFinite(close)
+      ) {
+        const normalised = normaliseBar(input);
+        if (!normalised) return null;
+        return ensureChartBar(normalised);
+      }
+      let tsMs = Number(input.ts_ms_utc ?? input.t ?? Number.NaN);
+      if (!Number.isFinite(tsMs) && Number.isFinite(time)) {
+        tsMs = Math.floor(time * 1000);
+      }
+      return {
+        time: Math.floor(time),
+        open,
+        high,
+        low,
+        close,
+        ts_ms_utc: Number.isFinite(tsMs) ? Math.floor(tsMs) : Math.floor(time * 1000),
+      };
+    }
+
+    function mergeChartBars(bars, { reset = false } = {}) {
+      const incoming = (bars || []).map((bar) => ensureChartBar(bar)).filter((bar) => bar !== null);
+      if (reset) {
+        const changed =
+          incoming.length !== state.candles.length ||
+          incoming.some((bar, idx) => !barsEqual(bar, state.candles[idx]));
+        state.candles = incoming;
+        if (state.series) {
+          state.series.setData(state.candles);
+        }
+        return changed;
+      }
+
+      if (!incoming.length) {
+        return false;
+      }
+
+      const index = new Map();
+      state.candles.forEach((bar, idx) => {
+        const key = Number(bar.time);
+        if (Number.isFinite(key)) {
+          index.set(key, idx);
+        }
+      });
+
+      let changed = false;
+      for (const bar of incoming) {
+        const key = Number(bar.time);
+        if (!Number.isFinite(key)) continue;
+        if (index.has(key)) {
+          const idx = index.get(key);
+          if (!barsEqual(state.candles[idx], bar)) {
+            state.candles[idx] = bar;
+            changed = true;
+          }
+        } else {
+          index.set(key, state.candles.length);
+          state.candles.push(bar);
+          changed = true;
+        }
+      }
+
+      if (changed) {
+        state.candles.sort((a, b) => Number(a.time) - Number(b.time));
+        if (state.series) {
+          state.series.setData(state.candles);
+        }
+      }
+      return changed;
+    }
+
+    function ensureGapWatcher(options = {}) {
+      if (!ChartGapWatcher || typeof ChartGapWatcher.attach !== "function") return;
+      if (!state.chart) return;
+      const symbol = activeSymbol();
+      const interval = state.frame || "1m";
+      const intervalMs = intervalToMs(interval);
+      const contextChanged = state.gapSymbol !== symbol || state.gapInterval !== interval;
+      const resetRequestedKeys = Boolean(options.resetRequestedKeys) || contextChanged;
+
+      if (!state.gapWatcher) {
+        state.gapWatcher = ChartGapWatcher.attach({
+          chart: state.chart,
+          interval,
+          intervalMs,
+          getCandles: () => state.candles,
+          requestGap: handleChartGapRequest,
+        });
+      } else if (typeof state.gapWatcher.updateContext === "function") {
+        state.gapWatcher.updateContext({
+          symbol,
+          interval,
+          intervalMs,
+          getCandles: () => state.candles,
+          requestGap: handleChartGapRequest,
+          resetRequestedKeys,
+        });
+      }
+
+      state.gapSymbol = symbol;
+      state.gapInterval = interval;
+      state.intervalMs = intervalMs;
+
+      if (state.gapWatcher && typeof state.gapWatcher.notifyData === "function") {
+        state.gapWatcher.notifyData();
+      }
+    }
+
+    async function handleChartGapRequest(gap) {
+      if (!gap) return false;
+      const symbol = activeSymbol();
+      const interval = state.frame || "1m";
+      if (!symbol || !interval) return false;
+      try {
+        const startMs = Number(gap.startMs);
+        const endMs = Number(gap.endMs);
+        if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) {
+          return false;
+        }
+        const intervalMs = intervalToMs(interval);
+        const rangeWidth = Math.max(intervalMs, endMs - startMs);
+        const approxBars = Math.ceil(rangeWidth / intervalMs) + 2;
+        const buffer = intervalMs;
+        const bars = await fetchRange(
+          symbol,
+          interval,
+          Math.max(0, startMs - buffer),
+          endMs + buffer,
+          Math.min(1000, Math.max(approxBars, 50)),
+        );
+        const changed = mergeChartBars(bars);
+        if (changed && state.gapWatcher && typeof state.gapWatcher.notifyData === "function") {
+          state.gapWatcher.notifyData();
+        }
+        return true;
+      } catch (error) {
+        console.error("Failed to fetch missing candles for inspection chart", error);
+        updateStatus("Не удалось загрузить недостающие свечи", "error");
+        return false;
+      }
+    }
+
+    function updateChartDataFromFrame(options = {}) {
+      const frameCandles = state.payload?.DATA?.frames?.[state.frame]?.candles || [];
+      const bars = toChartBars(frameCandles);
+      mergeChartBars(bars, { reset: true });
+      state.intervalMs = intervalToMs(state.frame || "1m");
+      ensureGapWatcher({ resetRequestedKeys: options.resetRequestedKeys });
     }
 
     function ensureChart() {
@@ -3539,16 +3453,10 @@ def render_inspection_page(
           borderVisible: true,
         });
 
-        const seedInitialFrame = () => {
-          const frameKey = state.frame;
-          const frameCandles = state.payload?.DATA?.frames?.[frameKey]?.candles || [];
-          const bars = toChartBars(frameCandles);
-          state.series.setData(bars);
-          if (bars.length && state.chart) {
-            state.chart.timeScale().fitContent();
-          }
-        };
-        seedInitialFrame();
+        updateChartDataFromFrame({ resetRequestedKeys: true });
+        if (state.candles.length && state.chart) {
+          state.chart.timeScale().fitContent();
+        }
 
         const resize = () => {
           if (!state.chart) return;
@@ -3583,7 +3491,6 @@ def render_inspection_page(
               state.selection.end = tmp;
             }
           }
-          resetAnalysisState();
           updateSelectionLabel();
           updateCheckAllState();
         });
@@ -3610,11 +3517,8 @@ def render_inspection_page(
       if (!chartContainer) return;
       ensureChart();
       if (!state.series) return;
-      const frame = state.frame;
-      const candles = state.payload?.DATA?.frames?.[frame]?.candles || [];
-      const bars = toChartBars(candles);
-      state.series.setData(bars);
-      if (bars.length && state.chart) {
+      updateChartDataFromFrame();
+      if (state.candles.length && state.chart) {
         state.chart.timeScale().fitContent();
       }
       updateSelectionLabel();
@@ -3642,7 +3546,6 @@ def render_inspection_page(
         state.selection = payload?.DATA?.selection || null;
         state.checkAll = null;
         setJson(checkAllPre, null);
-        resetAnalysisState();
         updateCheckAllState();
         state.profilePreset = payload?.DATA?.profile_preset || null;
         state.presetRequired = Boolean(payload?.DATA?.profile_preset_required);
@@ -3652,6 +3555,7 @@ def render_inspection_page(
         if (symbolInput) {
           const resolved = normaliseSymbol(nextSymbol) || normaliseSymbol(initial.symbol) || defaultSymbol;
           symbolInput.value = resolved;
+          renderChartSymbol();
         }
         populateFrames(payload);
         renderJson(payload);
@@ -3672,14 +3576,6 @@ def render_inspection_page(
       });
     }
 
-    if (frameSelect) {
-      frameSelect.addEventListener("change", () => {
-        state.frame = frameSelect.value;
-        renderChart();
-        updateTimeframeToggle();
-      });
-    }
-
     if (timeframeToggle) {
       timeframeToggle.addEventListener("click", (event) => {
         const button = event.target.closest("[data-tf]");
@@ -3687,9 +3583,6 @@ def render_inspection_page(
         const tf = button.dataset.tf;
         if (!tf) return;
         state.frame = tf;
-        if (frameSelect) {
-          frameSelect.value = tf;
-        }
         renderChart();
         updateTimeframeToggle();
       });
@@ -3752,28 +3645,33 @@ def render_inspection_page(
       });
     }
 
-    if (checkAllButton) {
-      checkAllButton.addEventListener("click", (event) => {
+    if (summaryButton) {
+      summaryButton.addEventListener("click", (event) => {
         event.preventDefault();
         event.stopPropagation();
-        requestCheckAllData();
+        requestSummaryData();
       });
     }
 
-    if (analysisButton) {
-      analysisButton.addEventListener("click", (event) => {
+    if (topupButton) {
+      topupButton.addEventListener("click", (event) => {
         event.preventDefault();
         event.stopPropagation();
-        requestTradeAnalysis();
+        requestTopupData();
       });
     }
 
-    updateAnalysisControls();
+    if (collectSelectionButton) {
+      collectSelectionButton.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        requestSelectionData();
+      });
+    }
 
     if (clearSelection) {
       clearSelection.addEventListener("click", () => {
         state.selection = null;
-        resetAnalysisState();
         updateSelectionLabel();
         updateCheckAllState();
       });
@@ -4681,29 +4579,6 @@ def render_inspection_page(
 
     initPreviewPanel();
 
-    metricButtons.forEach((button) => {
-      button.addEventListener("click", () => {
-        metricButtons.forEach((btn) => btn.classList.remove("active"));
-        button.classList.add("active");
-        const metric = button.dataset.metric;
-        let part = null;
-        if (metric === "ohlcv") {
-          part = state.payload?.DATA?.frames?.[state.frame] || state.payload?.DATA?.frames;
-        } else if (metric === "delta") {
-          part = state.payload?.DATA?.delta_cvd?.[state.frame] || state.payload?.DATA?.delta_cvd;
-        } else if (metric === "vwap") {
-          part = state.payload?.DATA?.vwap_tpo?.[state.frame] || state.payload?.DATA?.vwap_tpo;
-        } else if (metric === "zones") {
-          part = state.payload?.DATA?.zones;
-        } else if (metric === "smt") {
-          part = state.payload?.DATA?.smt;
-        } else if (metric === "agg") {
-          part = state.payload?.DATA?.agg_trades;
-        }
-        setJson(metricPre, part);
-      });
-    });
-
     renderJson(state.payload);
     populateFrames(state.payload);
     populateSnapshots(initial.snapshots || []);
@@ -4713,9 +4588,6 @@ def render_inspection_page(
     await refreshSnapshots();
     if (state.snapshotId && snapshotSelect) {
       snapshotSelect.value = state.snapshotId;
-    }
-    if (metricButtons.length) {
-      metricButtons[0].click();
     }
   });
 })();
@@ -4733,22 +4605,20 @@ def render_inspection_page(
       <body>
         <header>
           <h1>Панель тестирования данных графика</h1>
-          <p>Создание тестовых окружений из собранных свечей, выбор диапазона и проверка расчётов.</p>
+          <p>Сбор свежих свечей, выбор диапазона и проверка расчётов без сохранения данных на сервере.</p>
         </header>
         <main>
           <section class=\"panel\">
-            <h2>Управление</h2>
-            <div class=\"snapshot-select\">
-              <label style=\"flex:1;\">
-                <span>Снэпшоты</span>
-                <select id=\"snapshot-select\"></select>
-              </label>
-              <button id=\"refresh-snapshot\" class=\"secondary\" type=\"button\">Refresh</button>
+            <h2>Сбор данных</h2>
+            <p class=\"panel-lead\">Собирайте актуальную информацию без сохранения снэпшотов на сервере.</p>
+            <div class=\"collection-actions\">
+              <button id=\"collect-summary\" class=\"primary\" type=\"button\">Собрать информацию за последние 3 дня</button>
+              <button id=\"collect-topup\" class=\"secondary\" type=\"button\">Дособрать данные</button>
+              <button id=\"collect-selection\" class=\"secondary\" type=\"button\" disabled>Собрать информацию за выбранный период</button>
             </div>
             <div class=\"status-banner\" id=\"inspection-status\" hidden data-tone=\"info\"></div>
-            <div class=\"preset-controls\">
+            <div class=\"preset-chip-bar\">
               <span id=\"preset-chip\" class=\"preset-chip\" hidden></span>
-              <button id=\"manage-presets\" class=\"secondary\" type=\"button\">Управление пресетами</button>
             </div>
             <div class=\"controls-grid\">
               <label>
@@ -4762,204 +4632,65 @@ def render_inspection_page(
                 <option value=\"SOLUSDT\"></option>
                 <option value=\"XRPUSDT\"></option>
               </datalist>
-              <label>
-                <span>Таймфрейм для отображения</span>
-                <select id=\"frame-select\">{''.join(timeframe_options)}</select>
-              </label>
             </div>
-            <div>
+            <div class=\"selection-bar\">
               <span class=\"badge\">Выделенный диапазон</span>
-              <div style=\"margin-top:0.4rem;display:flex;gap:0.6rem;align-items:center;flex-wrap:wrap;\">
+              <div>
                 <span id=\"selection-info\">—</span>
                 <button id=\"clear-selection\" class=\"secondary\" type=\"button\">Сбросить выделение</button>
               </div>
             </div>
-            <div>
-              <span class=\"badge\">Таймфреймы для теста</span>
-              <div class=\"timeframes\">
-                <label><input type=\"checkbox\" data-tf-checkbox value=\"1m\" checked />1m</label>
-                <label><input type=\"checkbox\" data-tf-checkbox value=\"3m\" />3m</label>
-                <label><input type=\"checkbox\" data-tf-checkbox value=\"5m\" />5m</label>
-                <label><input type=\"checkbox\" data-tf-checkbox value=\"15m\" />15m</label>
-                <label><input type=\"checkbox\" data-tf-checkbox value=\"1h\" />1h</label>
-                <label><input type=\"checkbox\" data-tf-checkbox value=\"4h\" />4h</label>
-                <label><input type=\"checkbox\" data-tf-checkbox value=\"1d\" />1d</label>
-              </div>
-            </div>
-            <button id=\"build-session\" class=\"primary\" type=\"button\">Создать тестовую среду</button>
             <div id=\"snapshot-meta\"></div>
-          </section>
-
-          <section class='panel main-preview-panel' data-preview-root>
-            <h2>Main Chart Preview</h2>
-            <div class='index-preview'>
-              <header class='page-header'>
-                <div class='header-top'>
-                  <h3>Interactive Candlestick Chart</h3>
-                  <div class='header-controls'>
-                    <div class='app-meta' aria-live='polite'>
-                      <span class='app-meta__label'>Version:</span>
-                      <span id='preview-app-version' class='app-meta__value'>-</span>
-                    </div>
-                    <button id='preview-open-inspection' class='btn-secondary' type='button'>Open /inspection</button>
-                  </div>
-                </div>
-                <p>This block mirrors the landing page chart so you can select a range and spawn a test environment directly from the inspection panel.</p>
-              </header>
-              <main class='page-main'>
-                <section class='controls-card'>
-                  <form id='preview-chart-controls' class='controls-form'>
-                    <label class='form-field'>
-                      <span>Symbol</span>
-                      <input id='preview-symbol' type='text' value='BTCUSDT' required autocomplete='off' />
-                    </label>
-
-                    <label class='form-field'>
-                      <span>Interval</span>
-                      <select id='preview-interval'>
-                        <option value='1s'>1s</option>
-                        <option value='1m' selected>1m</option>
-                        <option value='3m'>3m</option>
-                        <option value='5m'>5m</option>
-                        <option value='15m'>15m</option>
-                        <option value='30m'>30m</option>
-                        <option value='1h'>1h</option>
-                        <option value='4h'>4h</option>
-                        <option value='1d'>1d</option>
-                      </select>
-                    </label>
-
-                    <button type='submit' class='btn-primary'>Load Chart</button>
-                  </form>
-                </section>
-
-                <section class='chart-card'>
-                  <div class='chart-wrapper'>
-                    <div id='preview-chart' class='chart-area' aria-label='Preview candlestick chart'></div>
-                  </div>
-                  <aside class='chart-info'>
-                    <div>
-                      <span class='info-label'>Last candle:</span>
-                      <span id='preview-last-time' class='info-value'>-</span>
-                    </div>
-                    <div>
-                      <span class='info-label'>Close price:</span>
-                      <span id='preview-last-price' class='info-value'>-</span>
-                    </div>
-                    <div>
-                      <span class='info-label'>Candle range:</span>
-                      <span id='preview-last-range' class='info-value'>-</span>
-                    </div>
-                  </aside>
-                  <div class='preview-selection'>
-                    <span class='badge'>Selection</span>
-                    <div class='preview-selection__controls'>
-                      <span id='preview-selection-label'>-</span>
-                      <button id='preview-clear-selection' class='btn-secondary' type='button'>Reset</button>
-                    </div>
-                  </div>
-                  <div class='preview-actions'>
-                    <button id='preview-create-session' class='btn-primary' type='button'>Create Test Environment</button>
-                    <div id='preview-status' class='status-banner' hidden></div>
-                  </div>
-                </section>
-              </main>
-            </div>
           </section>
 
 
           <section class=\"panel\">
             <h2>Просмотр данных</h2>
-            <div class=\"chart-toolbar\">
-              <span class=\"badge\">Таймфрейм</span>
-              <div class=\"tf-toggle\" id=\"chart-tf-toggle\">
-                <button type=\"button\" data-tf=\"1m\">1m</button>
-                <button type=\"button\" data-tf=\"15m\">15m</button>
-                <button type=\"button\" data-tf=\"1h\">1h</button>
+            <div class="chart-toolbar">
+              <div class="chart-toolbar__symbol">
+                <span class="badge">Символ</span>
+                <strong id="chart-symbol">{symbol_value}</strong>
+              </div>
+              <div class="chart-toolbar__frames">
+                <span class="badge">Таймфрейм</span>
+                <div class="tf-toggle" id="chart-tf-toggle">
+                  <button type="button" data-tf="1m">1m</button>
+                  <button type="button" data-tf="3m">3m</button>
+                  <button type="button" data-tf="15m">15m</button>
+                  <button type="button" data-tf="30m">30m</button>
+                  <button type="button" data-tf="1h">1h</button>
+                  <button type="button" data-tf="4h">4h</button>
+                  <button type="button" data-tf="1d">1d</button>
+                  <button type="button" data-tf="1w">1w</button>
+                </div>
               </div>
             </div>
             <div id=\"inspection-chart\" class=\"chart-shell\" data-selection-label=\"—\"></div>
-            <div class=\"metrics-bar\">
-              <button class=\"secondary\" type=\"button\" data-metric=\"ohlcv\">OHLCV</button>
-              <button class=\"secondary\" type=\"button\" data-metric=\"delta\">Delta / CVD</button>
-              <button class=\"secondary\" type=\"button\" data-metric=\"vwap\">VWAP</button>
-              <button class=\"secondary\" type=\"button\" data-metric=\"zones\">Zones</button>
-              <button class=\"secondary\" type=\"button\" data-metric=\"smt\">SMT</button>
-              <button class=\"secondary\" type=\"button\" data-metric=\"agg\">Agg Trades</button>
-            </div>
-            <div class=\"json-panels\">
-              <div class=\"collapse\">
-                <header data-collapse-toggle>
-                  <h3>DATA</h3>
-                  <button class=\"secondary\" type=\"button\" data-copy-target=\"data-json\">Copy JSON</button>
-                </header>
-                <pre id=\"data-json\">{data_json_initial}</pre>
-              </div>
-              <div class=\"collapse\">
+            <div class="json-panels">
+              <div class="collapse">
                 <header data-collapse-toggle>
                   <h3>DIAGNOSTICS</h3>
-                  <button class=\"secondary\" type=\"button\" data-copy-target=\"diagnostics-json\">Copy JSON</button>
+                  <button class="secondary" type="button" data-copy-target="diagnostics-json">Copy JSON</button>
                 </header>
-                <pre id=\"diagnostics-json\">{diagnostics_json_initial}</pre>
+                <pre id="diagnostics-json">{diagnostics_json_initial}</pre>
               </div>
-                <div class=\"collapse\">
-                  <header data-collapse-toggle>
-                    <h3>CHECK ALL DATAS</h3>
-                    <div class=\"actions\">
-                      <button id=\"fetch-check-all\" class=\"secondary\" type=\"button\">Check all datas</button>
-                      <button class=\"secondary\" type=\"button\" data-copy-target=\"checkall-json\">Copy JSON</button>
-                    </div>
-                  </header>
-                  <div class=\"checkall-control\">
-                    <div class=\"checkall-control__row\">
-                      <span>Собрать подробно информацию за N часов</span>
-                      <select id=\"checkall-hours\">
-                        <option value=\"1\">1 час</option>
-                        <option value=\"2\">2 часа</option>
-                        <option value=\"3\">3 часа</option>
-                        <option value=\"4\">4 часа</option>
-                      </select>
-                    </div>
-                <pre id=\"checkall-json\">{check_all_json_initial}</pre>
-              </div>
-              <div class="analysis-actions">
-                <label class="analysis-credentials" for="analysis-api-key">
-                  <span>OpenAI API Key</span>
-                  <div class="analysis-input-row">
-                    <input id="analysis-api-key" type="password" placeholder="sk-..." autocomplete="off" spellcheck="false" />
-                    <button id="analysis-api-key-toggle" class="secondary analysis-key-toggle" type="button" data-api-key-visibility>Показать</button>
-                  </div>
-                </label>
-                <div class="analysis-actions__controls">
-                  <button id="analysis-send" class="primary" type="button">Отправить сделку на анализ</button>
-                  <span id="analysis-status" class="analysis-status" data-status="idle">—</span>
-                </div>
-              </div>
-              <div class="collapse" data-analysis-panel>
+              <div class="collapse">
                 <header data-collapse-toggle>
-                  <h3>Сделка</h3>
-                  <div class="actions">
-                    <button class="secondary" type="button" data-copy-target="analysis-json">Скопировать JSON</button>
-                    <button class="secondary" type="button" data-copy-target="analysis-debug-json">Скопировать debug</button>
-                  </div>
+                  <h3>CHECK ALL DATAS</h3>
+                  <button class="secondary" type="button" data-copy-target="checkall-json">Copy JSON</button>
                 </header>
-                <div class="analysis-panel">
-                  <div>
-                    <span class="badge">Ответ модели</span>
-                    <pre id="analysis-json">{analysis_json_initial}</pre>
-                  </div>
-                  <div>
-                    <span class="badge">Debug</span>
-                    <pre id="analysis-debug-json">{analysis_debug_json_initial}</pre>
+                <div class="checkall-control">
+                  <div class="checkall-control__row">
+                    <span>Часов для подробного сбора</span>
+                    <select id="checkall-hours">
+                      <option value="1">1 час</option>
+                      <option value="2">2 часа</option>
+                      <option value="3">3 часа</option>
+                      <option value="4">4 часа</option>
+                    </select>
                   </div>
                 </div>
-              </div>
-              <div class=\"collapse\">
-                <header data-collapse-toggle>
-                  <h3>METRIC</h3>
-                  <button class=\"secondary\" type=\"button\" data-copy-target=\"metric-json\">Copy JSON</button>
-                </header>
-                <pre id=\"metric-json\">{metric_json_initial}</pre>
+                <pre id="checkall-json">{check_all_json_initial}</pre>
               </div>
             </div>
           </section>

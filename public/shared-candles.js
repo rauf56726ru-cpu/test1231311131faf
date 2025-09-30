@@ -3,8 +3,11 @@
 
   const STORAGE_KEY = "shared-candles-store";
   const DEFAULT_MAX_BARS = 2000;
+  const REMOTE_ENDPOINT = "/shared-candles";
   const memoryCache = new Map();
+  const remoteQueue = new Map();
   let storageAvailable = null;
+  let remoteTimer = null;
 
   function canUseLocalStorage() {
     if (storageAvailable !== null) {
@@ -146,6 +149,135 @@
     saveStore(store);
   }
 
+  function scheduleRemoteFlush() {
+    if (remoteTimer) return;
+    remoteTimer = setTimeout(() => {
+      remoteTimer = null;
+      flushRemoteQueue().catch((error) => {
+        console.warn("SharedCandles: remote sync failed", error);
+      });
+    }, 250);
+  }
+
+  function queueRemoteSync(symbol, interval, candles, options = {}) {
+    if (!Array.isArray(candles) || !candles.length) return;
+    if (!symbol || !interval) return;
+    const key = makeKey(symbol, interval);
+    const normalizedSymbol = symbol.trim().toUpperCase();
+    const normalizedInterval = interval.trim().toLowerCase();
+    const intervalMs = Number.isFinite(Number(options.intervalMs))
+      ? Number(options.intervalMs)
+      : null;
+    const lastUpdateMs = Number.isFinite(Number(options.lastUpdateMs))
+      ? Number(options.lastUpdateMs)
+      : null;
+    const maxBars = Number.isFinite(Number(options.maxBars))
+      ? Number(options.maxBars)
+      : null;
+    const reset = Boolean(options.reset);
+
+    const existing = remoteQueue.get(key);
+    if (reset) {
+      remoteQueue.set(key, {
+        symbol: normalizedSymbol,
+        interval: normalizedInterval,
+        candles: candles.slice(),
+        reset: true,
+        intervalMs,
+        lastUpdateMs,
+        maxBars,
+      });
+    } else if (existing) {
+      const mergedCandles = mergeBars(
+        existing.candles,
+        candles,
+        maxBars || existing.maxBars || DEFAULT_MAX_BARS,
+      );
+      remoteQueue.set(key, {
+        symbol: existing.symbol,
+        interval: existing.interval,
+        candles: mergedCandles,
+        reset: existing.reset,
+        intervalMs: intervalMs ?? existing.intervalMs ?? null,
+        lastUpdateMs: lastUpdateMs ?? existing.lastUpdateMs ?? null,
+        maxBars: maxBars ?? existing.maxBars ?? null,
+      });
+    } else {
+      remoteQueue.set(key, {
+        symbol: normalizedSymbol,
+        interval: normalizedInterval,
+        candles: candles.slice(),
+        reset: false,
+        intervalMs,
+        lastUpdateMs,
+        maxBars,
+      });
+    }
+
+    scheduleRemoteFlush();
+  }
+
+  async function flushRemoteQueue() {
+    if (!remoteQueue.size) return;
+    const entries = Array.from(remoteQueue.values());
+    remoteQueue.clear();
+    for (const entry of entries) {
+      const body = {
+        symbol: entry.symbol,
+        interval: entry.interval,
+        candles: entry.candles,
+        reset: Boolean(entry.reset),
+        intervalMs: entry.intervalMs,
+        lastUpdateMs: entry.lastUpdateMs,
+      };
+      if (Number.isFinite(Number(entry.maxBars))) {
+        body.maxBars = Number(entry.maxBars);
+      }
+      try {
+        const response = await fetch(REMOTE_ENDPOINT, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+      } catch (error) {
+        console.warn("SharedCandles: remote sync error", error);
+      }
+    }
+  }
+
+  async function fetchRemote(symbol, interval) {
+    if (!symbol || !interval) return null;
+    const params = new URLSearchParams();
+    params.set("symbol", symbol.trim().toUpperCase());
+    params.set("interval", interval.trim().toLowerCase());
+    try {
+      const response = await fetch(`${REMOTE_ENDPOINT}?${params.toString()}`, {
+        cache: "no-store",
+      });
+      if (!response.ok) {
+        if (response.status === 404) return null;
+        throw new Error(`HTTP ${response.status}`);
+      }
+      const data = await response.json();
+      if (!data || typeof data !== "object") return null;
+      const bars = Array.isArray(data.candles)
+        ? data.candles.map((bar) => normaliseBar(bar)).filter(Boolean)
+        : [];
+      return {
+        candles: bars,
+        intervalMs: Number(data.intervalMs) || null,
+        lastUpdateMs: Number(data.lastUpdateMs) || null,
+        updatedAt: Number(data.updatedAt) || null,
+      };
+    } catch (error) {
+      console.warn("SharedCandles: remote fetch failed", error);
+      return null;
+    }
+  }
+
   function get(symbol, interval) {
     const key = makeKey(symbol, interval);
     const entry = readEntry(key);
@@ -171,6 +303,7 @@
       return get(symbol, interval)?.candles || [];
     }
     const reset = Boolean(options.reset);
+    const syncRemote = options.syncRemote !== false;
     const existingEntry = reset ? null : readEntry(key);
     const existingBars = existingEntry && Array.isArray(existingEntry.candles)
       ? existingEntry.candles.map((bar) => normaliseBar(bar)).filter(Boolean)
@@ -187,6 +320,14 @@
       updatedAt: Date.now(),
     };
     writeEntry(key, nextEntry);
+    if (syncRemote) {
+      queueRemoteSync(symbol, interval, normalizedIncoming, {
+        reset,
+        intervalMs: nextEntry.intervalMs,
+        lastUpdateMs: nextEntry.lastUpdateMs,
+        maxBars: options.maxBars,
+      });
+    }
     return mergedBars;
   }
 
@@ -206,5 +347,6 @@
     get,
     merge,
     clear,
+    fetchRemote,
   };
 })(typeof window !== "undefined" ? window : globalThis);

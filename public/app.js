@@ -249,27 +249,59 @@
     return changed;
   }
 
-  function restoreFromSharedStore(symbol, interval) {
-    if (!SharedCandles || typeof SharedCandles.get !== "function") {
-      return false;
+  async function restoreFromSharedStore(symbol, interval) {
+    let restored = false;
+    let applied = false;
+
+    if (SharedCandles && typeof SharedCandles.get === "function") {
+      try {
+        const stored = SharedCandles.get(symbol, interval);
+        if (stored && Array.isArray(stored.candles) && stored.candles.length) {
+          const bars = stored.candles.map((bar) => normaliseBar(bar)).filter(Boolean);
+          if (bars.length) {
+            const lastUpdate = Number(stored.lastUpdateMs) || Number(stored.updatedAt) || Date.now();
+            mergeCandles(bars, { reset: true, lastUpdateMs: lastUpdate });
+            restored = true;
+            applied = true;
+          }
+        }
+      } catch (error) {
+        console.warn("SharedCandles restore failed", error);
+      }
     }
-    try {
-      const stored = SharedCandles.get(symbol, interval);
-      if (!stored || !Array.isArray(stored.candles) || !stored.candles.length) {
-        return false;
+
+    if (SharedCandles && typeof SharedCandles.fetchRemote === "function") {
+      try {
+        const remote = await SharedCandles.fetchRemote(symbol, interval);
+        if (remote && Array.isArray(remote.candles) && remote.candles.length) {
+          const lastUpdate = Number(remote.lastUpdateMs) || Number(remote.updatedAt) || Date.now();
+          const shouldReset = !restored;
+          mergeCandles(remote.candles, { reset: shouldReset, lastUpdateMs: lastUpdate });
+          if (SharedCandles && typeof SharedCandles.merge === "function") {
+            try {
+              SharedCandles.merge(symbol, interval, remote.candles, {
+                intervalMs: Number(remote.intervalMs) || intervalToMs(interval),
+                lastUpdateMs: lastUpdate,
+                maxBars: 2000,
+                reset: shouldReset,
+                syncRemote: false,
+              });
+            } catch (error) {
+              console.warn("SharedCandles local cache sync failed", error);
+            }
+          }
+          restored = true;
+          applied = true;
+        }
+      } catch (error) {
+        console.warn("SharedCandles remote restore failed", error);
       }
-      const bars = stored.candles.map((bar) => normaliseBar(bar)).filter(Boolean);
-      if (!bars.length) {
-        return false;
-      }
-      const lastUpdate = Number(stored.lastUpdateMs) || Number(stored.updatedAt) || Date.now();
-      mergeCandles(bars, { reset: true, lastUpdateMs: lastUpdate });
+    }
+
+    if (applied) {
       applyCandles();
-      return true;
-    } catch (error) {
-      console.warn("SharedCandles restore failed", error);
-      return false;
     }
+    return restored;
   }
 
   function updateInfo(lastBar) {
@@ -530,7 +562,7 @@
     state.symbol = normalizedSymbol;
     state.interval = normalizedInterval;
     initChart();
-    const restored = restoreFromSharedStore(normalizedSymbol, normalizedInterval);
+    const restored = await restoreFromSharedStore(normalizedSymbol, normalizedInterval);
     if (restored && state.gapWatcher && typeof state.gapWatcher.notifyData === "function") {
       state.gapWatcher.notifyData();
     }

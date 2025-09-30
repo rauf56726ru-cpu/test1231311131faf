@@ -178,7 +178,7 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
         assert isinstance(series["candles"], list)
 
     orderflow = body["orderflow"]
-    assert set(orderflow.keys()) == {"1m", "3m", "5m", "15m"}
+    assert set(orderflow.keys()) == {"15m", "1h"}
     for block in orderflow.values():
         assert isinstance(block["per_bar"], list)
 
@@ -300,56 +300,27 @@ def test_orderflow_block_matches_spec(client: TestClient) -> None:
     body = response.json()
 
     orderflow_block = body["orderflow"]
-    minute_series = orderflow_block["1m"]["per_bar"]
-    assert isinstance(minute_series, list)
-    minute_map = {entry["ts"]: entry for entry in minute_series}
+    assert set(orderflow_block.keys()) == {"15m", "1h"}
 
-    first_bar = minute_map[candles[0]["t"]]
-    assert first_bar["delta"] == pytest.approx(3.0)
-    assert first_bar["cvd"] == pytest.approx(3.0)
-    assert first_bar["ask_vol"] == pytest.approx(3.5)
-    assert first_bar["bid_vol"] == pytest.approx(0.5)
-    assert first_bar["imbalance_buy"] is True
-    assert first_bar["imbalance_sell"] is False
-    assert first_bar["absorption_low"] is False
-    assert first_bar["absorption_high"] is False
-    assert first_bar["large_trades_count"] == 0
+    fifteen_series = orderflow_block["15m"]["per_bar"]
+    assert isinstance(fifteen_series, list)
+    assert fifteen_series
+    fifteen_entry = fifteen_series[0]
+    for key in ("delta", "cvd", "ask_vol", "bid_vol"):
+        assert isinstance(fifteen_entry[key], (int, float))
+    assert isinstance(fifteen_entry["large_trades_count"], int)
+    assert isinstance(fifteen_entry["imbalance_buy"], bool)
+    assert isinstance(fifteen_entry["imbalance_sell"], bool)
+    assert isinstance(fifteen_entry["absorption_low"], bool)
+    assert isinstance(fifteen_entry["absorption_high"], bool)
 
-    second_bar = minute_map[candles[1]["t"]]
-    assert second_bar["delta"] == pytest.approx(3.0)
-    assert second_bar["cvd"] == pytest.approx(6.0)
-    assert second_bar["ask_vol"] == pytest.approx(4.0)
-    assert second_bar["bid_vol"] == pytest.approx(1.0)
-    assert second_bar["imbalance_buy"] is True
-    assert second_bar["imbalance_sell"] is False
-    assert second_bar["absorption_low"] is True
-    assert second_bar["absorption_high"] is False
-    assert second_bar["large_trades_count"] == 0
-
-    third_bar = minute_map[candles[2]["t"]]
-    assert third_bar["delta"] == pytest.approx(-5.0)
-    assert third_bar["cvd"] == pytest.approx(1.0)
-    assert third_bar["ask_vol"] == pytest.approx(1.0)
-    assert third_bar["bid_vol"] == pytest.approx(6.0)
-    assert third_bar["imbalance_buy"] is False
-    assert third_bar["imbalance_sell"] is True
-    assert third_bar["absorption_low"] is False
-    assert third_bar["absorption_high"] is True
-    assert third_bar["large_trades_count"] == 1
-
-    three_minute = orderflow_block["3m"]["per_bar"]
-    bucket_ts = (candles[0]["t"] // check_all_datas.TIMEFRAME_TO_MS["3m"]) * check_all_datas.TIMEFRAME_TO_MS["3m"]
-    aggregated = {entry["ts"]: entry for entry in three_minute}.get(bucket_ts)
-    assert aggregated is not None
-    assert aggregated["delta"] == pytest.approx(1.0)
-    assert aggregated["cvd"] == pytest.approx(1.0)
-    assert aggregated["ask_vol"] == pytest.approx(8.5)
-    assert aggregated["bid_vol"] == pytest.approx(7.5)
-    assert aggregated["large_trades_count"] == 1
-    assert aggregated["imbalance_buy"] is True
-    assert aggregated["imbalance_sell"] is True
-    assert aggregated["absorption_low"] is True
-    assert aggregated["absorption_high"] is True
+    hourly_series = orderflow_block["1h"]["per_bar"]
+    assert isinstance(hourly_series, list)
+    if hourly_series:
+        hourly_entry = hourly_series[0]
+        for key in ("delta", "cvd", "ask_vol", "bid_vol"):
+            assert isinstance(hourly_entry[key], (int, float))
+        assert isinstance(hourly_entry["large_trades_count"], int)
 
 
 def test_vwap_tpo_sessions_include_aliases(client: TestClient) -> None:

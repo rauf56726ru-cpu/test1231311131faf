@@ -1218,17 +1218,12 @@ def _build_orderflow_block(
         large_trade_threshold=threshold,
     )
 
-    result: Dict[str, Dict[str, List[Dict[str, Any]]]] = {
-        "1m": {"per_bar": minute_series},
-    }
+    result: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
 
-    for tf in ("3m", "5m", "15m"):
+    for tf in ("15m", "1h"):
         interval_ms = TIMEFRAME_TO_MS.get(tf)
         if not interval_ms or interval_ms <= minute_interval:
-            if interval_ms == minute_interval:
-                result[tf] = {"per_bar": minute_series[:]}
-            else:
-                result[tf] = {"per_bar": []}
+            result[tf] = {"per_bar": minute_series[:] if interval_ms == minute_interval else []}
             continue
         aggregated = _aggregate_orderflow_series(
             minute_series,
@@ -1862,6 +1857,7 @@ def build_check_all_datas(
     selection_start_ms: int | None = None,
     selection_end_ms: int | None = None,
     hours: int | None = None,
+    window_hours: int | None = None,
 ) -> Dict[str, Any] | None:
     """Create an enriched payload for the snapshot health endpoint."""
 
@@ -1961,7 +1957,14 @@ def build_check_all_datas(
     if selection_start > selection_end:
         selection_start, selection_end = selection_end, selection_start
 
-    hours_window = hours if hours in VALID_HOUR_WINDOWS else min(VALID_HOUR_WINDOWS)
+    if window_hours is not None:
+        try:
+            hours_candidate = int(window_hours)
+        except (TypeError, ValueError):
+            hours_candidate = 0
+        hours_window = max(1, hours_candidate)
+    else:
+        hours_window = hours if hours in VALID_HOUR_WINDOWS else min(VALID_HOUR_WINDOWS)
 
     if now_utc is not None:
         if now_utc.tzinfo is None:
@@ -2930,7 +2933,7 @@ def build_check_all_datas(
         ohlcv_public[tf] = {"candles": candles}
 
     orderflow_public: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
-    for tf in ("1m", "3m", "5m", "15m"):
+    for tf in ("15m", "1h"):
         tf_payload = orderflow_block.get(tf) if isinstance(orderflow_block, Mapping) else None
         per_bar: List[Dict[str, Any]] = []
         if isinstance(tf_payload, Mapping):

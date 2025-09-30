@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+import sys
 
 import pytest
 from fastapi.testclient import TestClient
@@ -37,7 +38,9 @@ def test_inspection_placeholder_has_default_symbol(client: TestClient) -> None:
     response = client.get("/inspection")
     assert response.status_code == 200
     assert "value=\"BTCUSDT\"" in response.text
-    assert "Отправить сделку на анализ" in response.text
+    assert 'id="chart-symbol"' in response.text
+    for tf in ("data-tf=\"1m\"", "data-tf=\"3m\"", "data-tf=\"30m\"", "data-tf=\"1w\""):
+        assert tf in response.text
 
 
 def test_inspection_snapshot_roundtrip(client: TestClient) -> None:
