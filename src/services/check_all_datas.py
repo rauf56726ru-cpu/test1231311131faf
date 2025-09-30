@@ -1862,6 +1862,7 @@ def build_check_all_datas(
     selection_start_ms: int | None = None,
     selection_end_ms: int | None = None,
     hours: int | None = None,
+    window_hours: int | None = None,
 ) -> Dict[str, Any] | None:
     """Create an enriched payload for the snapshot health endpoint."""
 
@@ -1961,7 +1962,14 @@ def build_check_all_datas(
     if selection_start > selection_end:
         selection_start, selection_end = selection_end, selection_start
 
-    hours_window = hours if hours in VALID_HOUR_WINDOWS else min(VALID_HOUR_WINDOWS)
+    if window_hours is not None:
+        try:
+            hours_candidate = int(window_hours)
+        except (TypeError, ValueError):
+            hours_candidate = 0
+        hours_window = max(1, hours_candidate)
+    else:
+        hours_window = hours if hours in VALID_HOUR_WINDOWS else min(VALID_HOUR_WINDOWS)
 
     if now_utc is not None:
         if now_utc.tzinfo is None:

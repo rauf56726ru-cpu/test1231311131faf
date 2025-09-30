@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Sequence
 
 from datetime import datetime, timezone
+from math import ceil
 
 import httpx
 from fastapi import Body, FastAPI, HTTPException, Query, Request, Response
@@ -33,6 +34,8 @@ from ..services import (
     resolve_profile_config,
     save_preset,
     update_preset,
+    get_last_collection_time,
+    set_last_collection_time,
 )
 from ..services.zones import Config as ZonesConfig, detect_zones
 from ..version import APP_VERSION
@@ -98,6 +101,18 @@ def _extract_openai_error(response: httpx.Response) -> Any | None:
     if isinstance(payload, Sequence) and not isinstance(payload, (str, bytes, bytearray)):
         return [payload[index] for index in range(min(len(payload), 5))]
 
+    return payload
+
+
+def _condense_payload_to_hourly(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Limit OHLCV output to hourly candles for summary mode."""
+
+    ohlcv_section = payload.get("ohlcv")
+    if isinstance(ohlcv_section, Mapping):
+        hourly_block = ohlcv_section.get("1h")
+        if isinstance(hourly_block, Mapping):
+            ohlcv_section = {"1h": dict(hourly_block)}
+            payload["ohlcv"] = ohlcv_section
     return payload
 
 
@@ -199,6 +214,14 @@ async def inspection_check_all(
         None,
         description="Number of recent hours to collect detailed data for (1-4)",
     ),
+    mode: str | None = Query(
+        None,
+        description="Collection mode: selection (default), summary or topup",
+    ),
+    summary_days: int | None = Query(
+        None,
+        description="Number of days to include for summary mode (defaults to 3)",
+    ),
 ) -> Response:
     snapshots = list_snapshots()
 
@@ -224,6 +247,61 @@ async def inspection_check_all(
         else:
             parsed = parsed.astimezone(timezone.utc)
         now_override = parsed
+
+    mode_value = (mode or "selection").strip().lower()
+    if mode_value not in {"selection", "summary", "topup"}:
+        mode_value = "selection"
+
+    collection_reference = now_override or datetime.now(timezone.utc)
+
+    if mode_value == "summary":
+        days = summary_days if summary_days and summary_days > 0 else 3
+        window_hours = max(1, days * 24)
+        try:
+            payload = build_check_all_datas(
+                target_snapshot,
+                now_utc=now_override,
+                window_hours=window_hours,
+            )
+        except DataQualityError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={"message": str(exc), "data_quality": exc.detail},
+            ) from exc
+        if payload is None:
+            return Response(status_code=204)
+        payload = _condense_payload_to_hourly(dict(payload))
+        set_last_collection_time(collection_reference)
+        return JSONResponse(payload)
+
+    if mode_value == "topup":
+        last_collection = get_last_collection_time()
+        window_hours = 4
+        if last_collection is not None:
+            delta = collection_reference - last_collection
+            delta_seconds = max(delta.total_seconds(), 0)
+            delta_hours = delta_seconds / 3600 if delta_seconds else 0
+            if delta_hours < 1:
+                window_hours = 1
+            elif delta_hours > 4:
+                window_hours = 4
+            else:
+                window_hours = max(1, int(ceil(delta_hours)))
+        try:
+            payload = build_check_all_datas(
+                target_snapshot,
+                now_utc=now_override,
+                window_hours=window_hours,
+            )
+        except DataQualityError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={"message": str(exc), "data_quality": exc.detail},
+            ) from exc
+        if payload is None:
+            return Response(status_code=204)
+        set_last_collection_time(collection_reference)
+        return JSONResponse(payload)
 
     try:
         payload = build_check_all_datas(

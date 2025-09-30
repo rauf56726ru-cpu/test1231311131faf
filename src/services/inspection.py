@@ -1622,24 +1622,46 @@ def render_inspection_page(
       transform: translateY(-1px);
       box-shadow: 0 14px 30px rgba(8, 47, 73, 0.4);
     }
+    .panel-lead {
+      margin: 0 0 1rem;
+      color: rgba(148, 163, 184, 0.8);
+      font-size: 0.95rem;
+    }
+    .collection-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      margin-bottom: 1rem;
+    }
+    .collection-actions .primary {
+      min-width: 260px;
+    }
+    .collection-actions .secondary {
+      min-width: 200px;
+    }
+    .preset-chip-bar {
+      min-height: 1.6rem;
+      display: flex;
+      align-items: center;
+      margin-bottom: 0.5rem;
+    }
     .controls-grid {
       display: grid;
       gap: 1rem;
     }
-    .timeframes {
-      display: grid;
-      gap: 0.4rem;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-    }
-    .timeframes label {
-      display: inline-flex;
+    .selection-bar {
+      display: flex;
       align-items: center;
-      gap: 0.35rem;
-      padding: 0.4rem 0.6rem;
-      border-radius: 10px;
-      background: rgba(30, 41, 59, 0.6);
-      border: 1px solid rgba(148, 163, 184, 0.18);
-      font-size: 0.85rem;
+      justify-content: space-between;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+      margin-top: 1rem;
+    }
+    .selection-bar > div {
+      display: inline-flex;
+      gap: 0.6rem;
+      align-items: center;
+      flex-wrap: wrap;
     }
     .chart-toolbar {
       display: flex;
@@ -1678,16 +1700,6 @@ def render_inspection_page(
       font-size: 0.75rem;
       background: rgba(148, 163, 184, 0.18);
       color: var(--muted);
-    }
-    .snapshot-select {
-      display: flex;
-      gap: 0.65rem;
-      align-items: center;
-      flex-wrap: wrap;
-    }
-    .snapshot-select select {
-      flex: 1;
-      min-width: 200px;
     }
     .chart-shell {
       height: 420px;
@@ -2719,7 +2731,9 @@ def render_inspection_page(
     const diagnosticsPre = document.getElementById("diagnostics-json");
     const metricPre = document.getElementById("metric-json");
     const checkAllPre = document.getElementById("checkall-json");
-    const checkAllButton = document.getElementById("fetch-check-all");
+    const summaryButton = document.getElementById("collect-summary");
+    const topupButton = document.getElementById("collect-topup");
+    const collectSelectionButton = document.getElementById("collect-selection");
     const checkAllHours = document.getElementById("checkall-hours");
     const analysisButton = document.getElementById("analysis-send");
     const analysisStatusEl = document.getElementById("analysis-status");
@@ -3179,8 +3193,8 @@ def render_inspection_page(
         closePresetModal();
         renderPresetState();
         updateCheckAllState();
-        if (checkAllButton && !checkAllButton.disabled) {
-          checkAllButton.click();
+        if (collectSelectionButton && !collectSelectionButton.disabled) {
+          collectSelectionButton.click();
         }
       } catch (error) {
         console.error("Failed to save preset", error);
@@ -3229,8 +3243,15 @@ def render_inspection_page(
         checkAllHours.value = String(state.hours);
       }
       const presetReady = !state.presetRequired;
-      if (checkAllButton) {
-        checkAllButton.disabled = !state.snapshotId || !hasSelection || !hoursValid || !presetReady;
+      if (collectSelectionButton) {
+        collectSelectionButton.disabled =
+          !state.snapshotId || !hasSelection || !hoursValid || !presetReady;
+      }
+      if (summaryButton) {
+        summaryButton.disabled = !state.snapshotId || !presetReady;
+      }
+      if (topupButton) {
+        topupButton.disabled = !state.snapshotId || !presetReady;
       }
       updateAnalysisControls();
     }
@@ -3317,7 +3338,7 @@ def render_inspection_page(
       setJson(checkAllPre, state.checkAll);
     }
 
-    async function requestCheckAllData() {
+    async function requestSelectionData() {
       if (!state.snapshotId) {
         updateStatus("Выберите снэпшот для запроса check-all данных", "warning");
         return;
@@ -3338,14 +3359,15 @@ def render_inspection_page(
         checkAllHours.value = String(state.hours);
       }
 
-      if (checkAllButton) {
-        checkAllButton.disabled = true;
+      if (collectSelectionButton) {
+        collectSelectionButton.disabled = true;
       }
 
       try {
         updateStatus("Загружаем check-all данные...", "info");
         const url = new URL("/inspection/check-all", window.location.origin);
         url.searchParams.set("snapshot", state.snapshotId);
+        url.searchParams.set("mode", "selection");
         url.searchParams.set("selection_start", String(selectionStart));
         url.searchParams.set("selection_end", String(selectionEnd));
         url.searchParams.set("hours", String(state.hours));
@@ -3370,6 +3392,89 @@ def render_inspection_page(
         state.checkAll = null;
         setJson(checkAllPre, null);
         updateStatus("Ошибка запроса check-all данных", "error");
+      } finally {
+        updateCheckAllState();
+      }
+    }
+
+    async function requestSummaryData() {
+      if (!state.snapshotId) {
+        updateStatus("Выберите снэпшот для сбора контекста", "warning");
+        return;
+      }
+
+      if (summaryButton) {
+        summaryButton.disabled = true;
+      }
+
+      try {
+        updateStatus("Собираем данные за последние 3 дня...", "info");
+        const url = new URL("/inspection/check-all", window.location.origin);
+        url.searchParams.set("snapshot", state.snapshotId);
+        url.searchParams.set("mode", "summary");
+        url.searchParams.set("summary_days", "3");
+        const response = await fetch(url.toString(), {
+          headers: { Accept: "application/json" },
+        });
+        if (response.status === 204) {
+          state.checkAll = null;
+          setJson(checkAllPre, null);
+          updateStatus("Не удалось собрать 3-дневный контекст", "warning");
+          return;
+        }
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const payload = await response.json();
+        state.checkAll = payload;
+        setJson(checkAllPre, payload);
+        updateStatus("3-дневный контекст готов", "success");
+      } catch (error) {
+        console.error(error);
+        state.checkAll = null;
+        setJson(checkAllPre, null);
+        updateStatus("Ошибка при сборе 3-дневного контекста", "error");
+      } finally {
+        updateCheckAllState();
+      }
+    }
+
+    async function requestTopupData() {
+      if (!state.snapshotId) {
+        updateStatus("Выберите снэпшот для досбора", "warning");
+        return;
+      }
+
+      if (topupButton) {
+        topupButton.disabled = true;
+      }
+
+      try {
+        updateStatus("Дособираем свежие данные...", "info");
+        const url = new URL("/inspection/check-all", window.location.origin);
+        url.searchParams.set("snapshot", state.snapshotId);
+        url.searchParams.set("mode", "topup");
+        const response = await fetch(url.toString(), {
+          headers: { Accept: "application/json" },
+        });
+        if (response.status === 204) {
+          state.checkAll = null;
+          setJson(checkAllPre, null);
+          updateStatus("Свежие данные отсутствуют", "warning");
+          return;
+        }
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const payload = await response.json();
+        state.checkAll = payload;
+        setJson(checkAllPre, payload);
+        updateStatus("Данные успешно дособраны", "success");
+      } catch (error) {
+        console.error(error);
+        state.checkAll = null;
+        setJson(checkAllPre, null);
+        updateStatus("Ошибка при досборе данных", "error");
       } finally {
         updateCheckAllState();
       }
@@ -3752,11 +3857,27 @@ def render_inspection_page(
       });
     }
 
-    if (checkAllButton) {
-      checkAllButton.addEventListener("click", (event) => {
+    if (summaryButton) {
+      summaryButton.addEventListener("click", (event) => {
         event.preventDefault();
         event.stopPropagation();
-        requestCheckAllData();
+        requestSummaryData();
+      });
+    }
+
+    if (topupButton) {
+      topupButton.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        requestTopupData();
+      });
+    }
+
+    if (collectSelectionButton) {
+      collectSelectionButton.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        requestSelectionData();
       });
     }
 
@@ -4733,22 +4854,20 @@ def render_inspection_page(
       <body>
         <header>
           <h1>Панель тестирования данных графика</h1>
-          <p>Создание тестовых окружений из собранных свечей, выбор диапазона и проверка расчётов.</p>
+          <p>Сбор свежих свечей, выбор диапазона и проверка расчётов без сохранения данных на сервере.</p>
         </header>
         <main>
           <section class=\"panel\">
-            <h2>Управление</h2>
-            <div class=\"snapshot-select\">
-              <label style=\"flex:1;\">
-                <span>Снэпшоты</span>
-                <select id=\"snapshot-select\"></select>
-              </label>
-              <button id=\"refresh-snapshot\" class=\"secondary\" type=\"button\">Refresh</button>
+            <h2>Сбор данных</h2>
+            <p class=\"panel-lead\">Собирайте актуальную информацию без сохранения снэпшотов на сервере.</p>
+            <div class=\"collection-actions\">
+              <button id=\"collect-summary\" class=\"primary\" type=\"button\">Собрать информацию за последние 3 дня</button>
+              <button id=\"collect-topup\" class=\"secondary\" type=\"button\">Дособрать данные</button>
+              <button id=\"collect-selection\" class=\"secondary\" type=\"button\" disabled>Собрать информацию за выбранный период</button>
             </div>
             <div class=\"status-banner\" id=\"inspection-status\" hidden data-tone=\"info\"></div>
-            <div class=\"preset-controls\">
+            <div class=\"preset-chip-bar\">
               <span id=\"preset-chip\" class=\"preset-chip\" hidden></span>
-              <button id=\"manage-presets\" class=\"secondary\" type=\"button\">Управление пресетами</button>
             </div>
             <div class=\"controls-grid\">
               <label>
@@ -4767,104 +4886,14 @@ def render_inspection_page(
                 <select id=\"frame-select\">{''.join(timeframe_options)}</select>
               </label>
             </div>
-            <div>
+            <div class=\"selection-bar\">
               <span class=\"badge\">Выделенный диапазон</span>
-              <div style=\"margin-top:0.4rem;display:flex;gap:0.6rem;align-items:center;flex-wrap:wrap;\">
+              <div>
                 <span id=\"selection-info\">—</span>
                 <button id=\"clear-selection\" class=\"secondary\" type=\"button\">Сбросить выделение</button>
               </div>
             </div>
-            <div>
-              <span class=\"badge\">Таймфреймы для теста</span>
-              <div class=\"timeframes\">
-                <label><input type=\"checkbox\" data-tf-checkbox value=\"1m\" checked />1m</label>
-                <label><input type=\"checkbox\" data-tf-checkbox value=\"3m\" />3m</label>
-                <label><input type=\"checkbox\" data-tf-checkbox value=\"5m\" />5m</label>
-                <label><input type=\"checkbox\" data-tf-checkbox value=\"15m\" />15m</label>
-                <label><input type=\"checkbox\" data-tf-checkbox value=\"1h\" />1h</label>
-                <label><input type=\"checkbox\" data-tf-checkbox value=\"4h\" />4h</label>
-                <label><input type=\"checkbox\" data-tf-checkbox value=\"1d\" />1d</label>
-              </div>
-            </div>
-            <button id=\"build-session\" class=\"primary\" type=\"button\">Создать тестовую среду</button>
             <div id=\"snapshot-meta\"></div>
-          </section>
-
-          <section class='panel main-preview-panel' data-preview-root>
-            <h2>Main Chart Preview</h2>
-            <div class='index-preview'>
-              <header class='page-header'>
-                <div class='header-top'>
-                  <h3>Interactive Candlestick Chart</h3>
-                  <div class='header-controls'>
-                    <div class='app-meta' aria-live='polite'>
-                      <span class='app-meta__label'>Version:</span>
-                      <span id='preview-app-version' class='app-meta__value'>-</span>
-                    </div>
-                    <button id='preview-open-inspection' class='btn-secondary' type='button'>Open /inspection</button>
-                  </div>
-                </div>
-                <p>This block mirrors the landing page chart so you can select a range and spawn a test environment directly from the inspection panel.</p>
-              </header>
-              <main class='page-main'>
-                <section class='controls-card'>
-                  <form id='preview-chart-controls' class='controls-form'>
-                    <label class='form-field'>
-                      <span>Symbol</span>
-                      <input id='preview-symbol' type='text' value='BTCUSDT' required autocomplete='off' />
-                    </label>
-
-                    <label class='form-field'>
-                      <span>Interval</span>
-                      <select id='preview-interval'>
-                        <option value='1s'>1s</option>
-                        <option value='1m' selected>1m</option>
-                        <option value='3m'>3m</option>
-                        <option value='5m'>5m</option>
-                        <option value='15m'>15m</option>
-                        <option value='30m'>30m</option>
-                        <option value='1h'>1h</option>
-                        <option value='4h'>4h</option>
-                        <option value='1d'>1d</option>
-                      </select>
-                    </label>
-
-                    <button type='submit' class='btn-primary'>Load Chart</button>
-                  </form>
-                </section>
-
-                <section class='chart-card'>
-                  <div class='chart-wrapper'>
-                    <div id='preview-chart' class='chart-area' aria-label='Preview candlestick chart'></div>
-                  </div>
-                  <aside class='chart-info'>
-                    <div>
-                      <span class='info-label'>Last candle:</span>
-                      <span id='preview-last-time' class='info-value'>-</span>
-                    </div>
-                    <div>
-                      <span class='info-label'>Close price:</span>
-                      <span id='preview-last-price' class='info-value'>-</span>
-                    </div>
-                    <div>
-                      <span class='info-label'>Candle range:</span>
-                      <span id='preview-last-range' class='info-value'>-</span>
-                    </div>
-                  </aside>
-                  <div class='preview-selection'>
-                    <span class='badge'>Selection</span>
-                    <div class='preview-selection__controls'>
-                      <span id='preview-selection-label'>-</span>
-                      <button id='preview-clear-selection' class='btn-secondary' type='button'>Reset</button>
-                    </div>
-                  </div>
-                  <div class='preview-actions'>
-                    <button id='preview-create-session' class='btn-primary' type='button'>Create Test Environment</button>
-                    <div id='preview-status' class='status-banner' hidden></div>
-                  </div>
-                </section>
-              </main>
-            </div>
           </section>
 
 
@@ -4902,17 +4931,16 @@ def render_inspection_page(
                 </header>
                 <pre id=\"diagnostics-json\">{diagnostics_json_initial}</pre>
               </div>
-                <div class=\"collapse\">
-                  <header data-collapse-toggle>
-                    <h3>CHECK ALL DATAS</h3>
-                    <div class=\"actions\">
-                      <button id=\"fetch-check-all\" class=\"secondary\" type=\"button\">Check all datas</button>
-                      <button class=\"secondary\" type=\"button\" data-copy-target=\"checkall-json\">Copy JSON</button>
-                    </div>
-                  </header>
-                  <div class=\"checkall-control\">
-                    <div class=\"checkall-control__row\">
-                      <span>Собрать подробно информацию за N часов</span>
+              <div class=\"collapse\">
+                <header data-collapse-toggle>
+                  <h3>CHECK ALL DATAS</h3>
+                  <div class=\"actions\">
+                    <button class=\"secondary\" type=\"button\" data-copy-target=\"checkall-json\">Copy JSON</button>
+                  </div>
+                </header>
+                <div class=\"checkall-control\">
+                  <div class=\"checkall-control__row\">
+                    <span>Часов для подробного сбора</span>
                       <select id=\"checkall-hours\">
                         <option value=\"1\">1 час</option>
                         <option value=\"2\">2 часа</option>
