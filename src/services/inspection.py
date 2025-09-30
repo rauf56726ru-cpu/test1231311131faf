@@ -1485,21 +1485,7 @@ def render_inspection_page(
             formatted = json.dumps(None, ensure_ascii=False, indent=2)
         return html_utils.escape(formatted)
 
-    frames_section: Dict[str, Any] = {}
-    if isinstance(data_section, Mapping):
-        raw_frames = data_section.get("frames")
-        if isinstance(raw_frames, Mapping):
-            frames_section = dict(raw_frames)
-
-    timeframe_key = str(timeframe) if timeframe is not None else ""
-    metric_section = None
-    if frames_section:
-        candidate = frames_section.get(timeframe_key)
-        metric_section = candidate if candidate else frames_section
-
-    data_json_initial = _format_json_block(data_section)
     diagnostics_json_initial = _format_json_block(diagnostics_section)
-    metric_json_initial = _format_json_block(metric_section)
     check_all_json_initial = _format_json_block(None)
 
     style_block = """
@@ -1805,15 +1791,6 @@ def render_inspection_page(
     }
     .collapse.collapsed pre {
       display: none;
-    }
-    .metrics-bar {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 0.6rem;
-    }
-    .metrics-bar button.active {
-      background: rgba(56, 189, 248, 0.22);
-      color: #f8fafc;
     }
     .meta-grid {
       display: grid;
@@ -2603,9 +2580,7 @@ def render_inspection_page(
     const defaultSymbol = normaliseSymbol(initial.defaultSymbol) || "BTCUSDT";
     const snapshotSelect = document.getElementById("snapshot-select");
     const refreshButton = document.getElementById("refresh-snapshot");
-    const dataPre = document.getElementById("data-json");
     const diagnosticsPre = document.getElementById("diagnostics-json");
-    const metricPre = document.getElementById("metric-json");
     const checkAllPre = document.getElementById("checkall-json");
     const summaryButton = document.getElementById("collect-summary");
     const topupButton = document.getElementById("collect-topup");
@@ -2620,7 +2595,6 @@ def render_inspection_page(
     const timeframeCheckboxes = Array.from(document.querySelectorAll("[data-tf-checkbox]"));
     const timeframeToggle = document.getElementById("chart-tf-toggle");
     const statusEl = document.getElementById("inspection-status");
-    const metricButtons = Array.from(document.querySelectorAll("[data-metric]"));
     const symbolInput = document.getElementById("symbol-input");
     const presetChip = document.getElementById("preset-chip");
     const managePresetsButton = document.getElementById("manage-presets");
@@ -3106,7 +3080,6 @@ def render_inspection_page(
     }
 
     function renderJson(payload) {
-      setJson(dataPre, payload?.DATA);
       setJson(diagnosticsPre, payload?.DIAGNOSTICS);
       setJson(checkAllPre, state.checkAll);
     }
@@ -4606,29 +4579,6 @@ def render_inspection_page(
 
     initPreviewPanel();
 
-    metricButtons.forEach((button) => {
-      button.addEventListener("click", () => {
-        metricButtons.forEach((btn) => btn.classList.remove("active"));
-        button.classList.add("active");
-        const metric = button.dataset.metric;
-        let part = null;
-        if (metric === "ohlcv") {
-          part = state.payload?.DATA?.frames?.[state.frame] || state.payload?.DATA?.frames;
-        } else if (metric === "delta") {
-          part = state.payload?.DATA?.delta_cvd?.[state.frame] || state.payload?.DATA?.delta_cvd;
-        } else if (metric === "vwap") {
-          part = state.payload?.DATA?.vwap_tpo?.[state.frame] || state.payload?.DATA?.vwap_tpo;
-        } else if (metric === "zones") {
-          part = state.payload?.DATA?.zones;
-        } else if (metric === "smt") {
-          part = state.payload?.DATA?.smt;
-        } else if (metric === "agg") {
-          part = state.payload?.DATA?.agg_trades;
-        }
-        setJson(metricPre, part);
-      });
-    });
-
     renderJson(state.payload);
     populateFrames(state.payload);
     populateSnapshots(initial.snapshots || []);
@@ -4638,9 +4588,6 @@ def render_inspection_page(
     await refreshSnapshots();
     if (state.snapshotId && snapshotSelect) {
       snapshotSelect.value = state.snapshotId;
-    }
-    if (metricButtons.length) {
-      metricButtons[0].click();
     }
   });
 })();
@@ -4719,22 +4666,7 @@ def render_inspection_page(
               </div>
             </div>
             <div id=\"inspection-chart\" class=\"chart-shell\" data-selection-label=\"—\"></div>
-            <div class=\"metrics-bar\">
-              <button class=\"secondary\" type=\"button\" data-metric=\"ohlcv\">OHLCV</button>
-              <button class=\"secondary\" type=\"button\" data-metric=\"delta\">Delta / CVD</button>
-              <button class=\"secondary\" type=\"button\" data-metric=\"vwap\">VWAP</button>
-              <button class=\"secondary\" type=\"button\" data-metric=\"zones\">Zones</button>
-              <button class=\"secondary\" type=\"button\" data-metric=\"smt\">SMT</button>
-              <button class=\"secondary\" type=\"button\" data-metric=\"agg\">Agg Trades</button>
-            </div>
             <div class="json-panels">
-              <div class="collapse">
-                <header data-collapse-toggle>
-                  <h3>DATA</h3>
-                  <button class="secondary" type="button" data-copy-target="data-json">Copy JSON</button>
-                </header>
-                <pre id="data-json">{data_json_initial}</pre>
-              </div>
               <div class="collapse">
                 <header data-collapse-toggle>
                   <h3>DIAGNOSTICS</h3>
@@ -4759,13 +4691,6 @@ def render_inspection_page(
                   </div>
                 </div>
                 <pre id="checkall-json">{check_all_json_initial}</pre>
-              </div>
-              <div class="collapse">
-                <header data-collapse-toggle>
-                  <h3>METRIC</h3>
-                  <button class="secondary" type="button" data-copy-target="metric-json">Copy JSON</button>
-                </header>
-                <pre id="metric-json">{metric_json_initial}</pre>
               </div>
             </div>
           </section>
