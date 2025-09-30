@@ -166,8 +166,10 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
         "prev_day",
         "zones",
         "liquidity",
+        "market_extras",
         "risk_prefs",
         "context",
+        "meta",
     ]
     assert list(body.keys()) == expected_order
     assert body["symbol"] == payload["symbol"]
@@ -183,23 +185,23 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
         assert isinstance(block["per_bar"], list)
 
     vwap_tpo = body["vwap_tpo"]
-    assert vwap_tpo["daily"]["open_utc"].startswith("2024-01-02T00:00:00")
+    assert vwap_tpo["daily_vwap"]["price"] is not None
+    sigma_bands = vwap_tpo["daily_vwap"]["sigma"]
+    assert isinstance(sigma_bands, list) and len(sigma_bands) == 2
     assert set(vwap_tpo["sessions"].keys()) == {"asia", "london", "ny"}
     for session_payload in vwap_tpo["sessions"].values():
         assert set(session_payload.keys()) == {
             "open_utc",
             "close_utc",
             "vwap",
-            "sd1",
-            "sd2",
-            "poc",
-            "vah",
-            "val",
-            "ib_high",
-            "ib_low",
-            "high",
-            "low",
+            "POC",
+            "VAH",
+            "VAL",
+            "IB",
+            "sessionHigh",
+            "sessionLow",
         }
+        assert isinstance(session_payload["IB"], list)
 
     composite_day = body["tpo"]["composite_day"]
     assert set(composite_day.keys()) == {"poc", "vah", "val"}
@@ -215,9 +217,15 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
     assert prev_day["close"] == pytest.approx(expected_close)
 
     zones = body["zones"]
-    assert set(zones.keys()) == {"fvg", "ob", "mb", "bb", "rb", "pb", "sr", "profile_levels"}
+    assert set(zones.keys()) == {"fvg", "ob", "mb", "bb", "rb", "pb", "sr", "profile_levels", "liquidity"}
     for zone_series in zones.values():
         assert isinstance(zone_series, list)
+
+    market_extras = body["market_extras"]
+    assert set(market_extras.keys()) == {"funding", "oi", "liq_levels"}
+
+    meta = body["meta"]
+    assert set(meta.keys()) == {"tf_lengths", "vwap_tpo_diag", "liq_diag", "market_extras_diag"}
 
     liquidity = body["liquidity"]
     assert set(liquidity.keys()) == {"eqh", "eql"}
@@ -371,10 +379,10 @@ def test_vwap_tpo_sessions_include_aliases(client: TestClient) -> None:
     ny_session = sessions["ny"]
     assert ny_session["open_utc"].endswith("13:30:00Z")
     assert ny_session["close_utc"].endswith("16:30:00Z")
-    assert ny_session["sd2"]["plus"] >= ny_session["sd1"]["plus"]
-    assert "poc" in ny_session
-    assert "ib_high" in ny_session
-    assert "ib_low" in ny_session
+    assert ny_session["POC"] is not None
+    assert len(ny_session["IB"]) == 2
+    assert ny_session["sessionHigh"] is not None
+    assert ny_session["sessionLow"] is not None
 
     composite_day = body["tpo"]["composite_day"]
     assert composite_day["poc"] is not None
