@@ -37,6 +37,7 @@ from ..services import (
 from ..services.zones import Config as ZonesConfig, detect_zones
 from ..version import APP_VERSION
 from ..meta import Meta
+from ..services.runtime import runtime_session
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PUBLIC_DIR = PROJECT_ROOT / "public"
@@ -115,64 +116,33 @@ async def inspection(
     request: Request,
     snapshot: str | None = Query(None, description="Snapshot identifier"),
 ) -> HTMLResponse:
-    snapshots = list_snapshots()
-
-    target_snapshot = None
-
-    if snapshot:
-        target_snapshot = get_snapshot(snapshot)
-        if target_snapshot is None:
-            raise HTTPException(status_code=404, detail="Snapshot not found")
-    elif snapshots:
-        target_snapshot = get_snapshot(snapshots[0]["id"])  # type: ignore[index]
-
-    if target_snapshot is None:
-        profile_config = resolve_profile_config(DEFAULT_SYMBOL, None)
-        placeholder_payload = {
-            "DATA": {
-                "symbol": DEFAULT_SYMBOL,
-                "frames": {},
-                "selection": None,
-                "delta_cvd": {},
-                "vwap_tpo": {},
-                "zones": {
-                    "symbol": DEFAULT_SYMBOL,
-                    "zones": {"fvg": [], "ob": [], "inducement": [], "cisd": []},
-                },
-                "tpo": {"sessions": [], "zones": []},
-                "zones_raw": None,
-                "profile": [],
-                "profile_preset": profile_config.get("preset_payload"),
-                "profile_preset_required": bool(profile_config.get("preset_required", False)),
-                "profile_defaults": None,
-                "smt": {"status": "waiting", "detail": "Создайте первый снэпшот"},
-                "meta": {"requested": {"symbol": DEFAULT_SYMBOL, "frames": []}, "source": {}},
-            },
-            "DIAGNOSTICS": {"generated_at": None, "snapshot_id": None, "captured_at": None, "frames": {}},
-        }
-        html = render_inspection_page(
-            placeholder_payload,
-            snapshot_id=None,
-            symbol=DEFAULT_SYMBOL,
-            timeframe="1m",
-            snapshots=snapshots,
-        )
-        return HTMLResponse(content=html)
-
-    payload = build_inspection_payload(target_snapshot)
-
-    accept_header = request.headers.get("accept", "").lower()
-    if "application/json" in accept_header:
-        return JSONResponse(payload)
-
+    runtime_payload = runtime_session.snapshot()
+    page_payload = {
+        "DATA": runtime_payload.get("check_all"),
+        "DIAGNOSTICS": runtime_payload.get("diagnostics"),
+        "interval": runtime_payload.get("interval"),
+        "CHECK_ALL_DATAS": runtime_payload.get("check_all"),
+    }
     html = render_inspection_page(
-        payload,
-        snapshot_id=target_snapshot.get("id"),
-        symbol=target_snapshot.get("symbol", "UNKNOWN"),
-        timeframe=target_snapshot.get("tf", "1m"),
-        snapshots=snapshots,
+        page_payload,
+        snapshot_id=None,
+        symbol=DEFAULT_SYMBOL,
+        timeframe="1m",
+        snapshots=[],
     )
     return HTMLResponse(content=html)
+
+
+@app.post("/inspection/runtime/previous-3d")
+async def inspection_previous_three_days() -> JSONResponse:
+    payload = runtime_session.run_previous_three_days()
+    return JSONResponse(payload)
+
+
+@app.post("/inspection/runtime/resume")
+async def inspection_resume() -> JSONResponse:
+    payload = runtime_session.run_resume()
+    return JSONResponse(payload)
 
 
 @app.get("/inspection/snapshots")

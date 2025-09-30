@@ -43,6 +43,7 @@ from .ohlc import (
 )
 from .vwap import fetch_daily_vwap, fetch_daily_vwap_sync
 from .trades import AggTradeCollector
+from .runtime import runtime_session
 
 __all__ = [
     "BINANCE_FAPI_REST",
@@ -62,6 +63,7 @@ __all__ = [
     "render_inspection_page",
     "TIMEFRAME_WINDOWS",
     "AggTradeCollector",
+    "runtime_session",
     "fetch_daily_vwap",
     "fetch_daily_vwap_sync",
     "build_volume_profile",
