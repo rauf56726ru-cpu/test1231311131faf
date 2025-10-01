@@ -106,6 +106,24 @@ body {
   align-items: flex-end;
 }
 
+.symbol-quick-list {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.symbol-quick-list .btn-secondary {
+  min-width: 110px;
+}
+
+.symbol-quick-list .btn-secondary.is-active {
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%);
+  color: #0b1120;
+  border-color: var(--accent-strong);
+  box-shadow: 0 10px 24px rgba(14, 165, 233, 0.35);
+}
+
 .form-field {
   display: flex;
   flex-direction: column;

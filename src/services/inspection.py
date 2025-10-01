@@ -1530,8 +1530,9 @@ def render_inspection_page(
       margin: 0 auto 3rem;
       flex: 1;
       display: grid;
-      grid-template-columns: minmax(320px, 360px) 1fr;
+      grid-template-columns: minmax(320px, 360px) minmax(580px, 1fr);
       gap: 1.5rem;
+      align-items: start;
     }
     .panel {
       background: var(--panel);
@@ -1542,6 +1543,26 @@ def render_inspection_page(
       display: flex;
       flex-direction: column;
       gap: 1.2rem;
+    }
+    .panel--collection {
+      grid-column: 1;
+    }
+    .panel--view {
+      grid-column: 2;
+      justify-self: center;
+      width: min(100%, 920px);
+    }
+    @media (max-width: 960px) {
+      main {
+        grid-template-columns: 1fr;
+      }
+      .panel--collection,
+      .panel--view {
+        grid-column: 1;
+      }
+      .panel--view {
+        justify-self: stretch;
+      }
     }
     h2 {
       margin: 0;
@@ -1608,6 +1629,7 @@ def render_inspection_page(
       flex-wrap: wrap;
       gap: 0.75rem;
       margin-bottom: 1rem;
+      justify-content: flex-start;
     }
     .collection-actions .primary {
       min-width: 260px;
@@ -1983,199 +2005,6 @@ def render_inspection_page(
       cursor: not-allowed;
     }
 
-    .main-preview-panel {
-      border: 1px solid rgba(148, 163, 184, 0.18);
-      background: rgba(8, 15, 32, 0.6);
-    }
-    .index-preview {
-      display: flex;
-      flex-direction: column;
-      gap: 1.4rem;
-      border-radius: 16px;
-      border: 1px solid rgba(148, 163, 184, 0.22);
-      background: rgba(15, 23, 42, 0.72);
-      padding: 1.4rem;
-    }
-    .index-preview .page-header {
-      display: flex;
-      flex-direction: column;
-      gap: 1rem;
-      padding-bottom: 0.6rem;
-      border-bottom: 1px solid rgba(148, 163, 184, 0.12);
-    }
-    .index-preview .header-top {
-      display: flex;
-      align-items: flex-end;
-      justify-content: space-between;
-      gap: 1rem;
-      flex-wrap: wrap;
-    }
-    .index-preview .header-controls {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.75rem;
-      flex-wrap: wrap;
-    }
-    .index-preview .app-meta {
-      display: inline-flex;
-      gap: 0.45rem;
-      align-items: center;
-      padding: 0.4rem 0.75rem;
-      border-radius: 999px;
-      background: rgba(15, 23, 42, 0.65);
-      border: 1px solid rgba(148, 163, 184, 0.22);
-      font-variant-numeric: tabular-nums;
-    }
-    .index-preview .app-meta__label {
-      font-size: 0.75rem;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      color: rgba(148, 163, 184, 0.75);
-    }
-    .index-preview .app-meta__value {
-      font-weight: 600;
-      font-size: 0.95rem;
-    }
-    .index-preview .page-header p {
-      margin: 0;
-      color: rgba(148, 163, 184, 0.75);
-    }
-    .index-preview .page-main {
-      display: flex;
-      flex-direction: column;
-      gap: 1.2rem;
-    }
-    .index-preview .controls-card,
-    .index-preview .chart-card {
-      border-radius: 16px;
-      border: 1px solid rgba(148, 163, 184, 0.2);
-      background: rgba(11, 22, 38, 0.78);
-      padding: 1.25rem;
-      box-shadow: inset 0 1px 0 rgba(148, 163, 184, 0.12);
-    }
-    .index-preview .controls-form {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 1rem 1.4rem;
-      align-items: flex-end;
-    }
-    .index-preview .form-field {
-      display: flex;
-      flex-direction: column;
-      gap: 0.5rem;
-      min-width: 160px;
-      flex: 1 1 220px;
-    }
-    .index-preview .form-field span {
-      font-size: 0.85rem;
-      color: rgba(148, 163, 184, 0.78);
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-    }
-    .index-preview .form-field input,
-    .index-preview .form-field select {
-      padding: 0.7rem 0.9rem;
-      border-radius: 12px;
-      border: 1px solid rgba(148, 163, 184, 0.28);
-      background: rgba(15, 23, 42, 0.68);
-      color: var(--fg);
-      font: inherit;
-    }
-    .index-preview .btn-primary,
-    .index-preview .btn-secondary {
-      cursor: pointer;
-      font-weight: 600;
-      border-radius: 0.85rem;
-      border: none;
-      transition: transform 0.15s ease, box-shadow 0.15s ease;
-    }
-    .index-preview .btn-primary {
-      padding: 0.8rem 1.6rem;
-      background: linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%);
-      color: #0b1120;
-      box-shadow: 0 12px 32px rgba(56, 189, 248, 0.35);
-    }
-    .index-preview .btn-secondary {
-      padding: 0.65rem 1.3rem;
-      background: rgba(148, 163, 184, 0.16);
-      color: var(--fg);
-    }
-    .index-preview .btn-primary:hover,
-    .index-preview .btn-secondary:hover {
-      transform: translateY(-1px);
-      box-shadow: 0 12px 30px rgba(8, 47, 73, 0.45);
-    }
-    .index-preview .chart-wrapper {
-      width: 100%;
-      height: 420px;
-      border-radius: 16px;
-      border: 1px solid rgba(148, 163, 184, 0.24);
-      background: rgba(7, 14, 30, 0.85);
-      overflow: hidden;
-    }
-    .index-preview .chart-area {
-      width: 100%;
-      height: 100%;
-    }
-    .index-preview .chart-info {
-      margin-top: 1.1rem;
-      display: grid;
-      gap: 0.85rem;
-      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-    }
-    .index-preview .chart-info > div {
-      padding: 0.75rem 1rem;
-      border-radius: 12px;
-      background: rgba(15, 23, 42, 0.68);
-      border: 1px solid rgba(148, 163, 184, 0.2);
-      display: flex;
-      flex-direction: column;
-      gap: 0.35rem;
-    }
-    .preview-selection {
-      margin-top: 1.1rem;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 0.75rem;
-      flex-wrap: wrap;
-    }
-    .preview-selection__controls {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.6rem;
-      font-size: 0.95rem;
-      font-variant-numeric: tabular-nums;
-    }
-    .preview-actions {
-      margin-top: 1.1rem;
-      display: flex;
-      flex-wrap: wrap;
-      gap: 0.75rem;
-      align-items: center;
-    }
-    #preview-status {
-      flex: 1 1 260px;
-      min-height: 0;
-    }
-    .index-preview .info-label {
-      color: rgba(148, 163, 184, 0.75);
-      font-size: 0.8rem;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-    }
-    .index-preview .info-value {
-      font-size: 1.05rem;
-      font-variant-numeric: tabular-nums;
-    }
-    .index-preview #status-message {
-      margin-top: 1.2rem;
-      padding: 0.85rem 1rem;
-      border-radius: 12px;
-      border-left: 4px solid rgba(148, 163, 184, 0.25);
-      background: rgba(148, 163, 184, 0.14);
-      font-weight: 600;
-    }
     @media (max-width: 960px) {
       main {
         grid-template-columns: 1fr;
@@ -2220,14 +2049,8 @@ def render_inspection_page(
     "1d": 86400000,
   };
   const DEFAULT_TEST_TIMEFRAMES = ["1m", "3m", "5m", "15m", "1h", "4h", "1d"];
-  const PREVIEW_REFRESH_INTERVAL_MS = 10_000;
-  const PREVIEW_SHARED_MAX_BARS = 2000;
-  const MINUTE_INTERVAL_KEY = "1m";
-  const MINUTE_INTERVAL_MS = TIMEFRAME_TO_MS[MINUTE_INTERVAL_KEY] || 60_000;
-  const PREVIEW_MINUTE_LOOKBACK_MS = MINUTE_INTERVAL_MS * 120;
-  const PREVIEW_MINUTE_MAX_BARS = 5000;
-
-  const LightweightCharts = window.LightweightCharts || null;
+  const SHARED_MAX_BARS = 5000;
+  let LightweightCharts = window.LightweightCharts || null;
   const BinanceCandles = window.BinanceCandles || null;
   const ChartGapWatcher = window.ChartGapWatcher || null;
   const SharedCandles = window.SharedCandles || null;
@@ -3273,7 +3096,92 @@ def render_inspection_page(
       };
     }
 
-    function mergeChartBars(bars, { reset = false } = {}) {
+    function persistChartCandles({ bars = null, reset = false, lastUpdateMs = null } = {}) {
+      if (!SharedCandles || typeof SharedCandles.merge !== "function") return;
+      const symbol = activeSymbol();
+      const timeframe = state.frame || "1m";
+      if (!symbol || !timeframe) return;
+      const payload = Array.isArray(bars) && bars.length ? bars : state.candles;
+      if (!payload.length) return;
+      const effectiveUpdate = Number.isFinite(lastUpdateMs)
+        ? Number(lastUpdateMs)
+        : Number.isFinite(state.lastUpdateMs)
+        ? Number(state.lastUpdateMs)
+        : Date.now();
+      try {
+        SharedCandles.merge(symbol, timeframe, payload, {
+          intervalMs: state.intervalMs || intervalToMs(timeframe),
+          lastUpdateMs: effectiveUpdate,
+          maxBars: SHARED_MAX_BARS,
+          reset,
+        });
+      } catch (error) {
+        console.warn("SharedCandles merge failed", error);
+      }
+    }
+
+    async function restoreChartFromShared(symbol, interval) {
+      if (!SharedCandles) return false;
+      const timeframe = interval || "1m";
+      let restored = false;
+
+      const normalise = (bars) =>
+        (bars || [])
+          .map((bar) => ensureChartBar(bar))
+          .filter((bar) => bar !== null);
+
+      const applyBars = (bars, meta) => {
+        if (!bars.length) return false;
+        if (meta && Number.isFinite(meta.intervalMs)) {
+          state.intervalMs = Number(meta.intervalMs);
+        }
+        if (meta && Number.isFinite(meta.lastUpdateMs)) {
+          state.lastUpdateMs = Number(meta.lastUpdateMs);
+        } else if (meta && Number.isFinite(meta.updatedAt)) {
+          state.lastUpdateMs = Number(meta.updatedAt);
+        }
+        mergeChartBars(bars, { reset: true, persist: false });
+        return true;
+      };
+
+      try {
+        if (typeof SharedCandles.get === "function") {
+          const local = SharedCandles.get(symbol, timeframe);
+          if (local && Array.isArray(local.candles) && local.candles.length) {
+            const bars = normalise(local.candles);
+            if (applyBars(bars, local)) {
+              restored = true;
+            }
+          }
+        }
+      } catch (error) {
+        console.warn("SharedCandles local restore failed", error);
+      }
+
+      if (restored) {
+        return true;
+      }
+
+      if (typeof SharedCandles.fetchRemote !== "function") {
+        return false;
+      }
+
+      try {
+        const remote = await SharedCandles.fetchRemote(symbol, timeframe);
+        if (remote && Array.isArray(remote.candles) && remote.candles.length) {
+          const bars = normalise(remote.candles);
+          if (applyBars(bars, remote)) {
+            restored = true;
+          }
+        }
+      } catch (error) {
+        console.warn("SharedCandles remote restore failed", error);
+      }
+
+      return restored;
+    }
+
+    function mergeChartBars(bars, { reset = false, persist = true } = {}) {
       const incoming = (bars || []).map((bar) => ensureChartBar(bar)).filter((bar) => bar !== null);
       if (reset) {
         const changed =
@@ -3282,6 +3190,18 @@ def render_inspection_page(
         state.candles = incoming;
         if (state.series) {
           state.series.setData(state.candles);
+        }
+        if (state.candles.length > SHARED_MAX_BARS) {
+          state.candles = state.candles.slice(state.candles.length - SHARED_MAX_BARS);
+          if (state.series) {
+            state.series.setData(state.candles);
+          }
+        }
+        const lastBar = state.candles[state.candles.length - 1] || null;
+        const inferredUpdate = Number(lastBar?.ts_ms_utc ?? lastBar?.time * 1000 ?? Date.now());
+        state.lastUpdateMs = Number.isFinite(inferredUpdate) ? inferredUpdate : Date.now();
+        if (persist) {
+          persistChartCandles({ bars: state.candles, reset: true, lastUpdateMs: state.lastUpdateMs });
         }
         return changed;
       }
@@ -3317,6 +3237,18 @@ def render_inspection_page(
 
       if (changed) {
         state.candles.sort((a, b) => Number(a.time) - Number(b.time));
+        if (state.candles.length > SHARED_MAX_BARS) {
+          state.candles = state.candles.slice(state.candles.length - SHARED_MAX_BARS);
+          if (state.series) {
+            state.series.setData(state.candles);
+          }
+        }
+        const lastBar = state.candles[state.candles.length - 1] || null;
+        const inferredUpdate = Number(lastBar?.ts_ms_utc ?? lastBar?.time * 1000 ?? Date.now());
+        state.lastUpdateMs = Number.isFinite(inferredUpdate) ? inferredUpdate : Date.now();
+        if (persist) {
+          persistChartCandles({ bars: incoming, reset: false, lastUpdateMs: state.lastUpdateMs });
+        }
         if (state.series) {
           state.series.setData(state.candles);
         }
@@ -3396,22 +3328,29 @@ def render_inspection_page(
     }
 
     function updateChartDataFromFrame(options = {}) {
+      const { resetRequestedKeys = false, persist = false } = options;
       const frameCandles = state.payload?.DATA?.frames?.[state.frame]?.candles || [];
       const bars = toChartBars(frameCandles);
-      mergeChartBars(bars, { reset: true });
+      mergeChartBars(bars, { reset: true, persist });
       state.intervalMs = intervalToMs(state.frame || "1m");
-      ensureGapWatcher({ resetRequestedKeys: options.resetRequestedKeys });
+      ensureGapWatcher({ resetRequestedKeys });
     }
 
     function ensureChart() {
       if (!chartContainer) return;
       const ensureLibrary = () => {
         if (window.LightweightCharts) {
+          LightweightCharts = window.LightweightCharts;
           initialiseChart();
         }
       };
 
       function initialiseChart() {
+        LightweightCharts = window.LightweightCharts || LightweightCharts;
+        if (!LightweightCharts) {
+          updateStatus("Библиотека графика недоступна", "error");
+          return;
+        }
         if (state.chart) return;
         const baseHeight = Math.max(
           320,
@@ -3453,11 +3392,6 @@ def render_inspection_page(
           borderVisible: true,
         });
 
-        updateChartDataFromFrame({ resetRequestedKeys: true });
-        if (state.candles.length && state.chart) {
-          state.chart.timeScale().fitContent();
-        }
-
         const resize = () => {
           if (!state.chart) return;
           const nextHeight = Math.max(
@@ -3497,6 +3431,7 @@ def render_inspection_page(
       }
 
       if (window.LightweightCharts) {
+        LightweightCharts = window.LightweightCharts;
         initialiseChart();
         return;
       }
@@ -3507,22 +3442,80 @@ def render_inspection_page(
         loader.src = "https://unpkg.com/lightweight-charts@4.0.0/dist/lightweight-charts.standalone.production.js";
         loader.id = "lw-chart-loader";
         loader.async = false;
-        loader.onload = ensureLibrary;
+        loader.onload = () => {
+          LightweightCharts = window.LightweightCharts || LightweightCharts;
+          ensureLibrary();
+        };
         loader.onerror = () => updateStatus("Не удалось загрузить библиотеку графика", "error");
         document.head.appendChild(loader);
       }
     }
 
-    function renderChart() {
-      if (!chartContainer) return;
-      ensureChart();
-      if (!state.series) return;
-      updateChartDataFromFrame();
-      if (state.candles.length && state.chart) {
-        state.chart.timeScale().fitContent();
+    function ensureFrameData({ resetRequestedKeys = false, fitContent = false } = {}) {
+      const frames = state.payload?.DATA?.frames || {};
+      const timeframe = state.frame || "1m";
+      state.intervalMs = intervalToMs(timeframe);
+      const symbol = activeSymbol();
+      const hasFrameData = frameHasCandles(frames, timeframe);
+
+      if (hasFrameData) {
+        updateChartDataFromFrame({ resetRequestedKeys, persist: false });
+        if (fitContent && state.chart && state.candles.length) {
+          state.chart.timeScale().fitContent();
+        }
+        return Promise.resolve(true);
       }
-      updateSelectionLabel();
-      updateTimeframeToggle();
+
+      if (!symbol) {
+        ensureGapWatcher({ resetRequestedKeys });
+        return Promise.resolve(false);
+      }
+
+      return restoreChartFromShared(symbol, timeframe)
+        .then((restored) => {
+          if (restored) {
+            ensureGapWatcher({ resetRequestedKeys });
+          } else if (hasFrameData) {
+            updateChartDataFromFrame({ resetRequestedKeys, persist: false });
+          } else {
+            ensureGapWatcher({ resetRequestedKeys });
+          }
+          if (fitContent && state.chart && state.candles.length) {
+            state.chart.timeScale().fitContent();
+          }
+          return restored;
+        })
+        .catch((error) => {
+          console.warn("SharedCandles restore failed", error);
+          if (hasFrameData) {
+            updateChartDataFromFrame({ resetRequestedKeys, persist: false });
+            if (fitContent && state.chart && state.candles.length) {
+              state.chart.timeScale().fitContent();
+            }
+          } else {
+            ensureGapWatcher({ resetRequestedKeys });
+          }
+          return false;
+        });
+    }
+
+    function renderChart(options = {}) {
+      if (!chartContainer) return;
+      LightweightCharts = window.LightweightCharts || LightweightCharts;
+      if (!LightweightCharts) {
+        updateStatus("Библиотека графика недоступна", "error");
+        return;
+      }
+      ensureChart();
+      const fitContent = options.fitContent !== false;
+      ensureFrameData({ resetRequestedKeys: options.resetRequestedKeys, fitContent })
+        .then(() => {
+          updateSelectionLabel();
+          updateTimeframeToggle();
+        })
+        .catch((error) => {
+          console.warn("Failed to render chart", error);
+        });
     }
 
     async function refreshSnapshots() {
@@ -3560,8 +3553,7 @@ def render_inspection_page(
         populateFrames(payload);
         renderJson(payload);
         renderMeta(payload);
-        renderChart();
-        updateSelectionLabel();
+        renderChart({ resetRequestedKeys: true, fitContent: true });
         updateStatus("Снэпшот загружен", "success");
       } catch (error) {
         console.error(error);
@@ -3583,7 +3575,7 @@ def render_inspection_page(
         const tf = button.dataset.tf;
         if (!tf) return;
         state.frame = tf;
-        renderChart();
+        renderChart({ resetRequestedKeys: true });
         updateTimeframeToggle();
       });
     }
@@ -3776,815 +3768,12 @@ def render_inspection_page(
       });
     }
 
-    function initPreviewPanel() {
-      const previewRoot = document.querySelector("[data-preview-root]");
-      if (!previewRoot) return;
-
-      const form = document.getElementById("preview-chart-controls");
-      const symbolField = document.getElementById("preview-symbol");
-      const intervalField = document.getElementById("preview-interval");
-      const chartEl = document.getElementById("preview-chart");
-      const lastTimeEl = document.getElementById("preview-last-time");
-      const lastPriceEl = document.getElementById("preview-last-price");
-      const lastRangeEl = document.getElementById("preview-last-range");
-      const statusEl = document.getElementById("preview-status");
-      const selectionLabelEl = document.getElementById("preview-selection-label");
-      const clearSelectionBtn = document.getElementById("preview-clear-selection");
-      const createSessionBtn = document.getElementById("preview-create-session");
-      const versionEl = document.getElementById("preview-app-version");
-      const openInspectionBtn = document.getElementById("preview-open-inspection");
-
-      if (openInspectionBtn) {
-        openInspectionBtn.addEventListener("click", (event) => {
-          event.preventDefault();
-          window.open("/inspection", "_blank", "noopener,noreferrer");
-        });
-      }
-
-      const previewState = {
-        chart: null,
-        series: null,
-        symbol: normaliseSymbol(symbolField ? symbolField.value : initial.symbol) || defaultSymbol,
-        interval: (intervalField && intervalField.value) || "1m",
-        selection: null,
-        candles: [],
-        minuteCandles: [],
-        refreshTimer: null,
-        lastFetchedAtMs: null,
-        lastUpdateMs: null,
-        isFetching: false,
-        intervalMs: intervalToMs((intervalField && intervalField.value) || "1m"),
-        gapWatcher: null,
-      };
-
-      function normaliseMinuteBar(bar) {
-        if (!bar) return null;
-        const open = Number(bar.open ?? bar.o ?? 0);
-        const high = Number(bar.high ?? bar.h ?? open);
-        const low = Number(bar.low ?? bar.l ?? open);
-        const close = Number(bar.close ?? bar.c ?? open);
-        const volume = Number(bar.volume ?? bar.v ?? 0);
-        const ts = Number(bar.ts_ms_utc ?? bar.t ?? bar.time ?? 0);
-        if (
-          !Number.isFinite(ts) ||
-          !Number.isFinite(open) ||
-          !Number.isFinite(high) ||
-          !Number.isFinite(low) ||
-          !Number.isFinite(close)
-        ) {
-          return null;
-        }
-        const openMs = Math.floor(ts);
-        const lastUpdate = openMs + MINUTE_INTERVAL_MS;
-        return {
-          time: Math.floor(openMs / 1000),
-          open,
-          high,
-          low,
-          close,
-          ts_ms_utc: openMs,
-          last_update_ms: lastUpdate,
-          volume: Number.isFinite(volume) ? volume : 0,
-        };
-      }
-
-      function mergeMinuteBars(bars, { reset = false } = {}) {
-        if (reset) previewState.minuteCandles = [];
-        if (!Array.isArray(bars) || !bars.length) return false;
-        const index = new Map();
-        previewState.minuteCandles.forEach((bar, idx) => {
-          const key = Number(bar?.ts_ms_utc ?? (bar?.time ?? 0) * 1000);
-          if (Number.isFinite(key)) {
-            index.set(key, idx);
-          }
-        });
-        let changed = false;
-        bars.forEach((entry) => {
-          const normalised = normaliseMinuteBar(entry);
-          if (!normalised) return;
-          const key = Number(normalised.ts_ms_utc);
-          if (!Number.isFinite(key)) return;
-          if (index.has(key)) {
-            previewState.minuteCandles[index.get(key)] = normalised;
-          } else {
-            index.set(key, previewState.minuteCandles.length);
-            previewState.minuteCandles.push(normalised);
-          }
-          changed = true;
-        });
-        if (!changed) return false;
-        previewState.minuteCandles.sort((a, b) => Number(a.ts_ms_utc) - Number(b.ts_ms_utc));
-        if (previewState.minuteCandles.length > PREVIEW_MINUTE_MAX_BARS) {
-          previewState.minuteCandles = previewState.minuteCandles.slice(
-            previewState.minuteCandles.length - PREVIEW_MINUTE_MAX_BARS,
-          );
-        }
-        return true;
-      }
-
-      function aggregateMinuteBuckets(minuteBars, intervalMs) {
-        if (!Array.isArray(minuteBars) || !minuteBars.length) return [];
-        const safeInterval = Math.max(1, Number(intervalMs) || MINUTE_INTERVAL_MS);
-        const buckets = new Map();
-        minuteBars.forEach((bar) => {
-          if (!bar) return;
-          const openMs = Number(bar.ts_ms_utc ?? bar.t ?? bar.time ?? 0);
-          if (!Number.isFinite(openMs)) return;
-          const bucketStart = Math.floor(openMs / safeInterval) * safeInterval;
-          const high = Number(bar.high ?? bar.h ?? bar.open ?? bar.o ?? 0);
-          const low = Number(bar.low ?? bar.l ?? bar.open ?? bar.o ?? 0);
-          const close = Number(bar.close ?? bar.c ?? bar.open ?? bar.o ?? 0);
-          const open = Number(bar.open ?? bar.o ?? close);
-          const volume = Number(bar.volume ?? bar.v ?? 0);
-          if (!Number.isFinite(bucketStart)) return;
-          let bucket = buckets.get(bucketStart);
-          if (!bucket) {
-            bucket = {
-              start: bucketStart,
-              open,
-              high,
-              low,
-              close,
-              volume: Number.isFinite(volume) ? volume : 0,
-              firstTs: openMs,
-              lastUpdate: openMs + MINUTE_INTERVAL_MS,
-            };
-            buckets.set(bucketStart, bucket);
-          } else {
-            if (openMs < bucket.firstTs) {
-              bucket.firstTs = openMs;
-              bucket.open = open;
-            }
-            bucket.high = Math.max(bucket.high, high);
-            bucket.low = Math.min(bucket.low, low);
-            bucket.close = close;
-            if (Number.isFinite(volume)) {
-              bucket.volume += volume;
-            }
-            bucket.lastUpdate = Math.max(bucket.lastUpdate, openMs + MINUTE_INTERVAL_MS);
-          }
-        });
-        return Array.from(buckets.values())
-          .map((bucket) => ({
-            start: bucket.start,
-            open: bucket.open,
-            high: bucket.high,
-            low: bucket.low,
-            close: bucket.close,
-            volume: bucket.volume,
-            lastUpdate: bucket.lastUpdate,
-          }))
-          .sort((a, b) => a.start - b.start);
-      }
-
-      function applyMinuteAggregation({ persist = true } = {}) {
-        if (!previewState.minuteCandles.length) return false;
-        const intervalMs = previewState.intervalMs || intervalToMs(previewState.interval);
-        const buckets = aggregateMinuteBuckets(previewState.minuteCandles, intervalMs);
-        if (!buckets.length) return false;
-        let changed = false;
-        const previousUpdate = Number(previewState.lastUpdateMs) || 0;
-        let maxUpdate = previousUpdate;
-        buckets.forEach((bucket) => {
-          const startMs = Number(bucket.start);
-          if (!Number.isFinite(startMs)) return;
-          const idx = previewState.candles.findIndex((bar) => {
-            const barTs = Number(bar?.ts_ms_utc ?? (bar?.time ?? 0) * 1000);
-            return Number.isFinite(barTs) && Math.floor(barTs) === startMs;
-          });
-          const baseBar = idx >= 0 ? previewState.candles[idx] : null;
-          const normalised = {
-            time: Math.floor(startMs / 1000),
-            open: Number.isFinite(baseBar?.open) ? Number(baseBar.open) : Number(bucket.open),
-            high: Math.max(
-              Number.isFinite(baseBar?.high) ? Number(baseBar.high) : Number(bucket.high),
-              Number(bucket.high),
-            ),
-            low: Math.min(
-              Number.isFinite(baseBar?.low) ? Number(baseBar.low) : Number(bucket.low),
-              Number(bucket.low),
-            ),
-            close: Number(bucket.close),
-            ts_ms_utc: startMs,
-            last_update_ms: Number(bucket.lastUpdate),
-          };
-          if (baseBar) {
-            const updated = {
-              ...baseBar,
-              open: normalised.open,
-              high: normalised.high,
-              low: normalised.low,
-              close: normalised.close,
-              ts_ms_utc: normalised.ts_ms_utc,
-              last_update_ms: normalised.last_update_ms,
-            };
-            const baseVolume = Number(baseBar.volume ?? baseBar.v ?? 0);
-            const bucketVolume = Number(bucket.volume ?? 0);
-            if (Number.isFinite(baseVolume) || Number.isFinite(bucketVolume)) {
-              updated.volume = (Number.isFinite(baseVolume) ? baseVolume : 0) +
-                (Number.isFinite(bucketVolume) ? bucketVolume : 0);
-            }
-            const diff =
-              Number(baseBar.open) !== updated.open ||
-              Number(baseBar.high) !== updated.high ||
-              Number(baseBar.low) !== updated.low ||
-              Number(baseBar.close) !== updated.close ||
-              Number(baseBar.last_update_ms) !== updated.last_update_ms;
-            if (diff) {
-              previewState.candles[idx] = updated;
-              changed = true;
-            } else {
-              previewState.candles[idx] = updated;
-            }
-          } else {
-            previewState.candles.push({
-              time: normalised.time,
-              open: normalised.open,
-              high: normalised.high,
-              low: normalised.low,
-              close: normalised.close,
-              ts_ms_utc: normalised.ts_ms_utc,
-              last_update_ms: normalised.last_update_ms,
-            });
-            changed = true;
-          }
-          if (Number.isFinite(normalised.last_update_ms)) {
-            maxUpdate = Math.max(maxUpdate, Number(normalised.last_update_ms));
-          }
-        });
-        if (changed) {
-          previewState.candles.sort((a, b) => Number(a.time) - Number(b.time));
-        }
-        if (Number.isFinite(maxUpdate) && maxUpdate > 0) {
-          previewState.lastUpdateMs = maxUpdate;
-        }
-        if ((changed || previewState.lastUpdateMs !== previousUpdate) && persist) {
-          persistPreviewCandles({ bars: previewState.candles, lastUpdateMs: previewState.lastUpdateMs });
-        }
-        return changed;
-      }
-
-      async function fetchMinuteWindow({ force = false } = {}) {
-        if (!previewState.symbol) return [];
-        const nowMs = Date.now();
-        const intervalMs = previewState.intervalMs || intervalToMs(previewState.interval);
-        let startMs = null;
-        if (force || !previewState.minuteCandles.length) {
-          const lookback = Math.max(intervalMs, PREVIEW_MINUTE_LOOKBACK_MS);
-          startMs = Math.max(0, nowMs - lookback);
-        } else {
-          const last = previewState.minuteCandles[previewState.minuteCandles.length - 1];
-          const lastTs = Number(last?.ts_ms_utc ?? last?.t ?? 0);
-          if (Number.isFinite(lastTs)) {
-            startMs = Math.max(0, lastTs - MINUTE_INTERVAL_MS);
-          }
-        }
-        return fetchCandles(previewState.symbol, MINUTE_INTERVAL_KEY, startMs, nowMs);
-      }
-
-      function findBarAtOrBefore(targetMs) {
-        if (!Number.isFinite(targetMs)) return null;
-        for (let idx = previewState.candles.length - 1; idx >= 0; idx -= 1) {
-          const bar = previewState.candles[idx];
-          if (!bar) continue;
-          const barTs = Number(bar.ts_ms_utc ?? (bar.time ?? 0) * 1000);
-          if (!Number.isFinite(barTs)) continue;
-          if (barTs <= targetMs) {
-            return bar;
-          }
-        }
-        return null;
-      }
-
-      function normaliseSelectionRange(rawStart, rawEnd) {
-        let start = Number(rawStart);
-        let end = Number(rawEnd);
-        if (!Number.isFinite(start) || !Number.isFinite(end)) {
-          return null;
-        }
-        if (end < start) {
-          const tmp = start;
-          start = end;
-          end = tmp;
-        }
-        start = Math.floor(start);
-        end = Math.floor(end);
-        const intervalMs = previewState.intervalMs || intervalToMs(previewState.interval);
-        const lastBar = findBarAtOrBefore(end);
-        if (lastBar) {
-          const barUpdate = Number.isFinite(lastBar.last_update_ms)
-            ? Number(lastBar.last_update_ms)
-            : Number(previewState.lastUpdateMs);
-          const displayEnd = computeCandleDisplayTime(lastBar, intervalMs, barUpdate);
-          if (Number.isFinite(displayEnd)) {
-            end = Math.max(start, Number(displayEnd));
-          }
-        }
-        return { start, end };
-      }
-
-      function setPreviewStatus(message, tone = "info") {
-        if (!statusEl) return;
-        statusEl.textContent = message || "";
-        statusEl.dataset.tone = tone;
-        statusEl.hidden = !message;
-      }
-
-      function mergePreviewBars(
-        bars,
-        { reset = false, maxBars = PREVIEW_SHARED_MAX_BARS, lastUpdateMs = null } = {},
-      ) {
-        if (reset) previewState.candles = [];
-        if (!Array.isArray(bars) || !bars.length) return false;
-        const index = new Map();
-        previewState.candles.forEach((bar, idx) => {
-          index.set(Number(bar.time), idx);
-        });
-        let changed = false;
-        bars.forEach((candidate) => {
-          const bar = ensurePreviewBar(candidate);
-          if (!bar) return;
-          const time = Number(bar.time);
-          if (!Number.isFinite(time)) return;
-          if (index.has(time)) {
-            previewState.candles[index.get(time)] = bar;
-          } else {
-            index.set(time, previewState.candles.length);
-            previewState.candles.push(bar);
-          }
-          changed = true;
-        });
-        if (!changed) return false;
-
-        previewState.candles.sort((a, b) => Number(a.time) - Number(b.time));
-        const limit = Math.max(1, Number(maxBars) || PREVIEW_SHARED_MAX_BARS);
-        if (previewState.candles.length > limit) {
-          previewState.candles = previewState.candles.slice(previewState.candles.length - limit);
-        }
-        const effectiveUpdate = Number.isFinite(lastUpdateMs) ? Number(lastUpdateMs) : Date.now();
-        previewState.lastUpdateMs = effectiveUpdate;
-        persistPreviewCandles({ bars, reset, lastUpdateMs: effectiveUpdate });
-        return changed;
-      }
-
-      function persistPreviewCandles({ bars = null, reset = false, lastUpdateMs = null } = {}) {
-        if (!SharedCandles || typeof SharedCandles.merge !== "function") return;
-        const payload = Array.isArray(bars) && bars.length ? bars : previewState.candles;
-        if (!payload.length) return;
-        const effectiveUpdate = Number.isFinite(lastUpdateMs)
-          ? Number(lastUpdateMs)
-          : Number.isFinite(previewState.lastUpdateMs)
-          ? Number(previewState.lastUpdateMs)
-          : Date.now();
-        try {
-          SharedCandles.merge(previewState.symbol, previewState.interval, payload, {
-            intervalMs: previewState.intervalMs,
-            lastUpdateMs: effectiveUpdate,
-            maxBars: PREVIEW_SHARED_MAX_BARS,
-            reset,
-          });
-        } catch (error) {
-          console.warn("preview shared store failed", error);
-        }
-      }
-
-      function restorePreviewFromShared(symbol, interval) {
-        if (!SharedCandles || typeof SharedCandles.get !== "function") {
-          return false;
-        }
-        try {
-          const stored = SharedCandles.get(symbol, interval);
-          if (!stored || !Array.isArray(stored.candles) || !stored.candles.length) {
-            return false;
-          }
-          const bars = stored.candles.map((bar) => ensurePreviewBar(bar)).filter((bar) => bar !== null);
-          if (!bars.length) {
-            return false;
-          }
-          const storedInterval = Number(stored.intervalMs);
-          if (Number.isFinite(storedInterval)) {
-            previewState.intervalMs = storedInterval;
-          }
-          const lastUpdate = Number(stored.lastUpdateMs) || Number(stored.updatedAt) || Date.now();
-          const changed = mergePreviewBars(bars, { reset: true, lastUpdateMs: lastUpdate });
-          if (changed) {
-            applyPreviewCandles({ fitContent: true });
-            return true;
-          }
-          return false;
-        } catch (error) {
-          console.warn("preview shared restore failed", error);
-          return false;
-        }
-      }
-
-      function catch_gap() {
-        if (previewState.gapWatcher && typeof previewState.gapWatcher.notifyData === "function") {
-          previewState.gapWatcher.notifyData();
-        }
-      }
-
-      async function fill_gap(gap) {
-        if (!gap) return false;
-        if (!previewState.symbol || !previewState.interval) return false;
-        try {
-          const intervalMs = previewState.intervalMs || intervalToMs(previewState.interval);
-          const startBound = Number(gap.startMs);
-          const endBound = Number(gap.endMs);
-          if (!Number.isFinite(startBound) || !Number.isFinite(endBound)) {
-            return false;
-          }
-          const rangeWidth = Math.max(intervalMs, endBound - startBound);
-          const approxBars = Math.ceil(rangeWidth / intervalMs) + 2;
-          const buffer = intervalMs;
-          const bars = await fetchRange(
-            previewState.symbol,
-            previewState.interval,
-            Math.max(0, startBound - buffer),
-            endBound + buffer,
-            Math.min(1000, Math.max(approxBars, 50)),
-          );
-          const changed = mergePreviewBars(bars, { lastUpdateMs: Date.now() });
-          if (changed) {
-            applyPreviewCandles({ fitContent: false });
-            catch_gap();
-          }
-          return true;
-        } catch (error) {
-          console.error("preview gap fill failed", error);
-          setPreviewStatus("Failed to fetch missing candles", "error");
-          return false;
-        }
-      }
-
-      function updatePreviewSelectionLabel() {
-        const start = previewState.selection && previewState.selection.start;
-        const end = previewState.selection && previewState.selection.end;
-        const label = selectionLabel(start, end);
-        if (selectionLabelEl) selectionLabelEl.textContent = label;
-      }
-
-      function updatePreviewInfo(bar) {
-        const intervalMs = previewState.intervalMs || intervalToMs(previewState.interval);
-        let lastUpdateMs = Number.isFinite(bar?.last_update_ms)
-          ? Number(bar.last_update_ms)
-          : Number.isFinite(previewState.lastUpdateMs)
-          ? Number(previewState.lastUpdateMs)
-          : Date.now();
-        const selectionEnd = Number(previewState.selection && previewState.selection.end);
-        if (Number.isFinite(selectionEnd)) {
-          lastUpdateMs = Math.min(lastUpdateMs, Number(selectionEnd));
-        }
-        if (!bar) {
-          if (lastTimeEl) lastTimeEl.textContent = "-";
-          if (lastPriceEl) lastPriceEl.textContent = "-";
-          if (lastRangeEl) lastRangeEl.textContent = "-";
-          return;
-        }
-        const displayTs = computeCandleDisplayTime(bar, intervalMs, lastUpdateMs);
-        if (lastTimeEl) lastTimeEl.textContent = formatTs(displayTs);
-        const close = Number(bar.close ?? bar.c ?? 0);
-        if (lastPriceEl) lastPriceEl.textContent = Number.isFinite(close) ? close.toFixed(2) : "-";
-        const high = Number(bar.high ?? bar.h ?? close);
-        const low = Number(bar.low ?? bar.l ?? close);
-        const base = close || 1;
-        const rangeValue = Math.max(0, high - low);
-        const percent = base ? (rangeValue / base) * 100 : 0;
-        if (lastRangeEl) lastRangeEl.textContent = `${rangeValue.toFixed(2)} (${percent.toFixed(2)}%)`;
-      }
-
-      function stopPreviewRefresh() {
-        if (previewState.refreshTimer) {
-          clearTimeout(previewState.refreshTimer);
-          previewState.refreshTimer = null;
-        }
-      }
-
-      function schedulePreviewRefresh() {
-        stopPreviewRefresh();
-        previewState.refreshTimer = setTimeout(async () => {
-          previewState.refreshTimer = null;
-          await refreshPreviewCandles({ silent: true });
-          schedulePreviewRefresh();
-        }, PREVIEW_REFRESH_INTERVAL_MS);
-      }
-
-      async function loadPreviewCandles({ reset = false, fitContent = false, limit = 1000 } = {}) {
-        if (!previewState.symbol || !previewState.interval) return false;
-        const intervalMs = intervalToMs(previewState.interval);
-        previewState.intervalMs = intervalMs;
-        if (reset) {
-          previewState.minuteCandles = [];
-        }
-        const history = await fetchHistory(previewState.symbol, previewState.interval, limit);
-        const historyChanged = mergePreviewBars(history, {
-          reset,
-          lastUpdateMs: Number.isFinite(previewState.lastUpdateMs) ? previewState.lastUpdateMs : Date.now(),
-        });
-        if (historyChanged || reset || !previewState.candles.length) {
-          applyPreviewCandles({ fitContent });
-          catch_gap();
-        }
-
-        try {
-          const minuteBars = await fetchMinuteWindow({ force: true });
-          const previousUpdate = Number(previewState.lastUpdateMs) || 0;
-          const minuteChanged = mergeMinuteBars(minuteBars, { reset });
-          const aggregatedChanged = minuteChanged ? applyMinuteAggregation({ persist: true }) : false;
-          if (aggregatedChanged) {
-            applyPreviewCandles({ fitContent: false });
-            catch_gap();
-          } else if (minuteChanged || Number(previewState.lastUpdateMs || 0) !== previousUpdate) {
-            const targetBar =
-              findBarAtOrBefore(Number(previewState.selection?.end)) ||
-              previewState.candles[previewState.candles.length - 1] ||
-              null;
-            updatePreviewInfo(targetBar);
-          }
-          if (previewState.selection && previewState.selection.start && previewState.selection.end) {
-            const adjustedRange = normaliseSelectionRange(
-              previewState.selection.start,
-              previewState.selection.end,
-            );
-            if (adjustedRange) {
-              previewState.selection = adjustedRange;
-              updatePreviewSelectionLabel();
-            }
-          }
-        } catch (error) {
-          console.warn("preview minute fetch failed", error);
-        }
-
-        return historyChanged;
-      }
-
-      function applyPreviewCandles({ fitContent = false } = {}) {
-        if (previewState.series) {
-          previewState.series.setData(previewState.candles);
-        }
-        if (fitContent && previewState.chart && previewState.candles.length) {
-          previewState.chart.timeScale().fitContent();
-        }
-        let lastBar = previewState.candles[previewState.candles.length - 1] || null;
-        const selectionEnd = previewState.selection && previewState.selection.end;
-        if (Number.isFinite(selectionEnd)) {
-          const endMs = Number(selectionEnd);
-          for (let idx = previewState.candles.length - 1; idx >= 0; idx -= 1) {
-            const candidate = previewState.candles[idx];
-            if (!candidate) continue;
-            const candidateTs = Number.isFinite(candidate.ts_ms_utc)
-              ? Number(candidate.ts_ms_utc)
-              : Number(candidate.time) * 1000;
-            if (!Number.isFinite(candidateTs)) continue;
-            if (candidateTs <= endMs) {
-              lastBar = candidate;
-              break;
-            }
-          }
-        }
-        updatePreviewInfo(lastBar);
-      }
-
-      async function refreshPreviewCandles({ silent = false } = {}) {
-        if (previewState.isFetching) return;
-        if (!previewState.symbol || !previewState.interval) return;
-        previewState.isFetching = true;
-        try {
-          const minuteBars = await fetchMinuteWindow({ force: false });
-          const previousUpdate = Number(previewState.lastUpdateMs) || 0;
-          const minuteChanged = mergeMinuteBars(minuteBars, { reset: false });
-          const aggregatedChanged = minuteChanged ? applyMinuteAggregation({ persist: true }) : false;
-          if (aggregatedChanged) {
-            applyPreviewCandles({ fitContent: false });
-            catch_gap();
-          } else if (minuteChanged || Number(previewState.lastUpdateMs || 0) !== previousUpdate) {
-            const targetBar =
-              findBarAtOrBefore(Number(previewState.selection?.end)) ||
-              previewState.candles[previewState.candles.length - 1] ||
-              null;
-            updatePreviewInfo(targetBar);
-          }
-          if (previewState.selection && previewState.selection.start && previewState.selection.end) {
-            const adjustedRange = normaliseSelectionRange(
-              previewState.selection.start,
-              previewState.selection.end,
-            );
-            if (adjustedRange) {
-              previewState.selection = adjustedRange;
-              updatePreviewSelectionLabel();
-            }
-          }
-          if (!silent) {
-            setPreviewStatus("", "info");
-          }
-        } catch (error) {
-          console.error("Failed to refresh preview candles", error);
-          if (!silent) {
-            setPreviewStatus("Failed to load Binance history", "error");
-          }
-        } finally {
-          previewState.isFetching = false;
-        }
-      }
-
-      function ensurePreviewChart() {
-        if (previewState.chart || !chartEl || !LightweightCharts) return;
-        previewState.chart = LightweightCharts.createChart(chartEl, {
-          autoSize: true,
-          layout: { background: { color: "#0f172a" }, textColor: "#e2e8f0" },
-          rightPriceScale: { borderColor: "rgba(148, 163, 184, 0.4)" },
-          timeScale: { borderColor: "rgba(148, 163, 184, 0.4)", timeVisible: true, secondsVisible: true },
-          crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
-          grid: {
-            vertLines: { color: "rgba(15, 23, 42, 0.6)" },
-            horzLines: { color: "rgba(15, 23, 42, 0.6)" },
-          },
-        });
-        previewState.series = previewState.chart.addCandlestickSeries({
-          upColor: "#22c55e",
-          downColor: "#ef4444",
-          wickUpColor: "#f8fafc",
-          wickDownColor: "#f8fafc",
-          borderUpColor: "#22c55e",
-          borderDownColor: "#ef4444",
-          borderVisible: true,
-        });
-
-        if (ChartGapWatcher && typeof ChartGapWatcher.attach === "function") {
-          previewState.gapWatcher = ChartGapWatcher.attach({
-            chart: previewState.chart,
-            interval: previewState.interval,
-            intervalMs: previewState.intervalMs,
-            getCandles: () => previewState.candles,
-            requestGap: fill_gap,
-          });
-        }
-
-        const resize = () => {
-          if (!previewState.chart) return;
-          const height = Math.max(
-            320,
-            chartEl.clientHeight ||
-              chartEl.offsetHeight ||
-              (chartEl.parentElement && chartEl.parentElement.clientHeight) ||
-              320,
-          );
-          previewState.chart.applyOptions({ height });
-        };
-        resize();
-        if (window.ResizeObserver) {
-          const observer = new ResizeObserver(resize);
-          observer.observe(chartEl);
-        } else {
-          window.addEventListener("resize", resize);
-        }
-
-        previewState.chart.subscribeClick((param) => {
-          if (!param || typeof param.time === "undefined") return;
-          const ts = Math.floor(Number(param.time) * 1000);
-          if (!Number.isFinite(ts)) return;
-          if (!previewState.selection || !previewState.selection.start || previewState.selection.end) {
-            previewState.selection = { start: ts, end: null };
-          } else {
-            const range = normaliseSelectionRange(previewState.selection.start, ts);
-            if (range) {
-              previewState.selection = range;
-            } else {
-              previewState.selection = { start: ts, end: ts };
-            }
-          }
-          updatePreviewSelectionLabel();
-          const targetBar =
-            previewState.selection && previewState.selection.end
-              ? findBarAtOrBefore(Number(previewState.selection.end)) ||
-                previewState.candles[previewState.candles.length - 1] ||
-                null
-              : previewState.candles[previewState.candles.length - 1] || null;
-          updatePreviewInfo(targetBar);
-        });
-      }
-
-      async function loadPreview(symbolRaw, intervalRaw) {
-        const resolvedSymbol =
-          normaliseSymbol(symbolRaw) || normaliseSymbol(initial.symbol) || defaultSymbol;
-        const resolvedInterval = intervalRaw || "1m";
-        previewState.symbol = resolvedSymbol;
-        previewState.interval = resolvedInterval;
-        previewState.intervalMs = intervalToMs(resolvedInterval);
-        previewState.minuteCandles = [];
-        previewState.lastUpdateMs = null;
-        previewState.lastFetchedAtMs = null;
-        previewState.selection = null;
-        stopPreviewRefresh();
-        if (symbolField) symbolField.value = resolvedSymbol;
-        if (intervalField) intervalField.value = resolvedInterval;
-        updatePreviewSelectionLabel();
-        ensurePreviewChart();
-        if (previewState.gapWatcher && typeof previewState.gapWatcher.updateContext === "function") {
-          previewState.gapWatcher.updateContext({
-            symbol: previewState.symbol,
-            interval: previewState.interval,
-            intervalMs: previewState.intervalMs,
-            getCandles: () => previewState.candles,
-            requestGap: fill_gap,
-            resetRequestedKeys: true,
-          });
-        }
-
-        const restoredFromShared = restorePreviewFromShared(resolvedSymbol, resolvedInterval);
-        if (restoredFromShared && previewState.gapWatcher && typeof previewState.gapWatcher.notifyData === "function") {
-          previewState.gapWatcher.notifyData();
-        }
-
-        setPreviewStatus("Loading Binance history...", "info");
-        try {
-          await loadPreviewCandles({ reset: true, fitContent: !restoredFromShared, limit: 1000 });
-          setPreviewStatus("", "info");
-          schedulePreviewRefresh();
-        } catch (error) {
-          console.error(error);
-          setPreviewStatus("Failed to load Binance history", "error");
-          stopPreviewRefresh();
-        }
-      }
-
-      if (clearSelectionBtn) {
-        clearSelectionBtn.addEventListener("click", () => {
-          previewState.selection = null;
-          updatePreviewSelectionLabel();
-          setPreviewStatus("", "info");
-          const lastBar = previewState.candles[previewState.candles.length - 1] || null;
-          updatePreviewInfo(lastBar);
-        });
-      }
-
-      if (form) {
-        form.addEventListener("submit", (event) => {
-          event.preventDefault();
-          loadPreview(
-            symbolField ? symbolField.value : previewState.symbol,
-            intervalField ? intervalField.value : previewState.interval,
-          );
-        });
-      }
-
-      window.addEventListener("beforeunload", () => {
-        stopPreviewRefresh();
-      });
-
-      if (createSessionBtn) {
-        createSessionBtn.addEventListener("click", async () => {
-          if (!previewState.selection || !previewState.selection.start || !previewState.selection.end) {
-            setPreviewStatus("Select a range on the chart first", "warning");
-            return;
-          }
-          createSessionBtn.disabled = true;
-          setPreviewStatus("Building test environment...", "info");
-          try {
-            const { snapshotId } = await createSnapshotFromSelection({
-              symbolValue: symbolField ? symbolField.value : previewState.symbol,
-              selection: previewState.selection,
-              frames: DEFAULT_TEST_TIMEFRAMES,
-              source: "preview-chart",
-            });
-            state.snapshotId = snapshotId;
-            await refreshSnapshots();
-            if (snapshotSelect) snapshotSelect.value = snapshotId;
-            await loadSnapshot(snapshotId);
-            setPreviewStatus("Test environment created", "success");
-          } catch (error) {
-            console.error(error);
-            const detail = error && typeof error.message === "string" ? error.message : "";
-            setPreviewStatus(`Failed to create test environment${detail ? `: ${detail}` : ""}`, "error");
-          } finally {
-            createSessionBtn.disabled = false;
-          }
-        });
-      }
-
-      if (versionEl) {
-        fetch("/version")
-          .then((resp) => (resp.ok ? resp.json() : null))
-          .then((data) => {
-            if (data && typeof data.version === "string" && versionEl) {
-              versionEl.textContent = data.version;
-            }
-          })
-          .catch(() => {});
-      }
-
-      ensurePreviewChart();
-      loadPreview(previewState.symbol, previewState.interval);
-    }
-
-    initPreviewPanel();
 
     renderJson(state.payload);
     populateFrames(state.payload);
     populateSnapshots(initial.snapshots || []);
     renderMeta(state.payload);
     renderChart();
-    updateSelectionLabel();
     await refreshSnapshots();
     if (state.snapshotId && snapshotSelect) {
       snapshotSelect.value = state.snapshotId;
@@ -4608,7 +3797,7 @@ def render_inspection_page(
           <p>Сбор свежих свечей, выбор диапазона и проверка расчётов без сохранения данных на сервере.</p>
         </header>
         <main>
-          <section class=\"panel\">
+          <section class=\"panel panel--collection\">
             <h2>Сбор данных</h2>
             <p class=\"panel-lead\">Собирайте актуальную информацию без сохранения снэпшотов на сервере.</p>
             <div class=\"collection-actions\">
@@ -4644,7 +3833,7 @@ def render_inspection_page(
           </section>
 
 
-          <section class=\"panel\">
+          <section class=\"panel panel--view\">
             <h2>Просмотр данных</h2>
             <div class="chart-toolbar">
               <div class="chart-toolbar__symbol">
@@ -4694,80 +3883,6 @@ def render_inspection_page(
               </div>
             </div>
           </section>
-        <div id=\"preset-modal\" class=\"modal\" hidden>
-          <div id=\"preset-modal-backdrop\" class=\"modal__backdrop\"></div>
-          <div class=\"modal__dialog\" role=\"dialog\" aria-modal=\"true\" aria-labelledby=\"preset-modal-title\">
-            <header class=\"modal__header\">
-              <h3 id=\"preset-modal-title\">Настроить пресет TPO</h3>
-              <button class=\"modal__close\" type=\"button\" data-close-preset>&times;</button>
-            </header>
-            <div class=\"modal__body\">
-              <div id=\"preset-list-view\" hidden>
-                <div class=\"preset-list\" id=\"preset-list\"></div>
-                <button id=\"preset-create-button\" class=\"btn-primary\" type=\"button\">Создать пресет</button>
-              </div>
-              <form id=\"preset-form\" hidden>
-                <input type=\"hidden\" id=\"preset-mode-input\" value=\"create\" />
-                <div class=\"preset-form-grid\" id=\"preset-form-section\">
-                  <label>
-                    <span>Символ</span>
-                    <input id=\"preset-symbol\" type=\"text\" required autocomplete=\"off\" />
-                  </label>
-                  <label>
-                    <span>Таймфрейм</span>
-                    <select id=\"preset-tf\">
-                      <option value=\"1m\">1m</option>
-                    </select>
-                  </label>
-                  <label>
-                    <span>Количество сессий</span>
-                    <input id=\"preset-last-n\" type=\"number\" min=\"1\" max=\"5\" step=\"1\" />
-                  </label>
-                  <label>
-                    <span>Value area %</span>
-                    <input id=\"preset-value-area\" type=\"number\" min=\"0.1\" max=\"0.95\" step=\"0.01\" />
-                  </label>
-                  <label>
-                    <span>Режим биннинга</span>
-                    <select id=\"preset-binning-mode\">
-                      <option value=\"adaptive\">Adaptive (ATR)</option>
-                      <option value=\"tick\">Tick size</option>
-                    </select>
-                  </label>
-                  <label data-preset-tick>
-                    <span>Tick size</span>
-                    <input id=\"preset-tick-size\" type=\"number\" step=\"0.0001\" min=\"0\" />
-                  </label>
-                  <label data-preset-adaptive>
-                    <span>ATR multiplier</span>
-                    <input id=\"preset-atr-multiplier\" type=\"number\" step=\"0.05\" min=\"0.1\" max=\"2\" />
-                  </label>
-                  <label data-preset-adaptive>
-                    <span>Целевые бины</span>
-                    <input id=\"preset-target-bins\" type=\"number\" step=\"5\" min=\"40\" max=\"200\" />
-                  </label>
-                  <label>
-                    <span>Отсечение хвоста</span>
-                    <input id=\"preset-clip-tail\" type=\"number\" step=\"0.001\" min=\"0\" max=\"0.05\" />
-                  </label>
-                  <label>
-                    <span>Сглаживание</span>
-                    <select id=\"preset-smooth-window\">
-                      <option value=\"1\">Без сглаживания</option>
-                      <option value=\"2\">Окно 2</option>
-                      <option value=\"3\">Окно 3</option>
-                    </select>
-                  </label>
-                </div>
-                <div class=\"preset-form-actions\">
-                  <button id=\"preset-submit\" class=\"btn-primary\" type=\"submit\">Сохранить</button>
-                  <button class=\"btn-secondary\" type=\"button\" data-close-preset>Отмена</button>
-                </div>
-              </form>
-            </div>
-          </div>
-        </div>
-
         <div id="preset-modal" class="modal" hidden>
           <div id="preset-modal-backdrop" class="modal__backdrop"></div>
           <div class="modal__dialog" role="dialog" aria-modal="true" aria-labelledby="preset-modal-title">
@@ -4852,3 +3967,88 @@ def render_inspection_page(
     </html>
     """
     return page_html
+
+
+
+def validate_enhanced_snapshot(snapshot: Mapping[str, Any]) -> tuple[bool, List[str]]:
+    """Run strict validation over inspection snapshot payloads."""
+
+    errors: List[str] = []
+    candles = snapshot.get("candles")
+    if isinstance(candles, Mapping):
+        candles = candles.get("candles")
+    if not isinstance(candles, Sequence):
+        candles = []
+    candles = list(candles)[:1000]
+
+    last_ts: int | None = None
+    for index, row in enumerate(candles):
+        candle = _parse_minute_row(row) if isinstance(row, Mapping) else _parse_minute_row(row)
+        if candle is None:
+            errors.append(f"Invalid candle at index {index}")
+            continue
+        ts = int(candle["t"])
+        if last_ts is not None and ts <= last_ts:
+            errors.append("Candles must be strictly sorted by time")
+            break
+        if last_ts is not None and ts - last_ts > MINUTE_INTERVAL_MS * 3:
+            logging.getLogger(__name__).debug("Gap detected between %s and %s", last_ts, ts)
+        if candle["h"] < max(candle["o"], candle["c"]):
+            candle["h"] = max(candle["o"], candle["c"])
+        if candle["l"] > min(candle["o"], candle["c"]):
+            candle["l"] = min(candle["o"], candle["c"])
+        if candle["v"] <= 0:
+            candle["v"] = 1e-9
+        last_ts = ts
+
+    orderflow = snapshot.get("orderflow") if isinstance(snapshot.get("orderflow"), Mapping) else {}
+    footprint = orderflow.get("footprint") if isinstance(orderflow, Mapping) else None
+    if isinstance(footprint, Sequence):
+        for item in footprint:
+            if not isinstance(item, Mapping):
+                errors.append("Footprint rows must be objects")
+                continue
+            bid = _coerce_float(item.get("bid")) or 0.0
+            ask = _coerce_float(item.get("ask")) or 0.0
+            delta = _coerce_float(item.get("delta")) or 0.0
+            if abs((ask - bid) - delta) > 1e-3:
+                errors.append("Footprint delta mismatch")
+                break
+
+    cvd = orderflow.get("cvd") if isinstance(orderflow, Mapping) else None
+    if isinstance(cvd, Sequence):
+        for row in cvd:
+            if not isinstance(row, Mapping):
+                errors.append("CVD rows must be objects")
+                break
+            buy = _coerce_float(row.get("cvd_buy")) or 0.0
+            sell = _coerce_float(row.get("cvd_sell")) or 0.0
+            net = _coerce_float(row.get("cvd_net")) or 0.0
+            if abs((buy - sell) - net) > 1e-3:
+                errors.append("CVD net mismatch")
+                break
+
+    derivatives = snapshot.get("derivatives")
+    if isinstance(derivatives, Sequence):
+        for item in derivatives:
+            if not isinstance(item, Mapping):
+                errors.append("Derivative rows must be objects")
+                break
+            oi = _coerce_float(item.get("oi"))
+            funding = _coerce_float(item.get("funding"))
+            if oi is None or oi <= 0:
+                errors.append("Open interest must be positive")
+            if funding is None:
+                errors.append("Funding rate missing")
+
+    book = snapshot.get("book")
+    if isinstance(book, Mapping):
+        if not isinstance(book.get("top_levels"), Sequence):
+            errors.append("Orderbook top_levels missing")
+
+    valid = not errors
+    if valid:
+        logging.getLogger(__name__).info("Snapshot validation succeeded")
+    else:
+        logging.getLogger(__name__).warning("Snapshot validation failed: %s", errors)
+    return valid, errors

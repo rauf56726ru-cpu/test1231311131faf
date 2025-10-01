@@ -2,3 +2,5 @@ fastapi
 uvicorn[standard]
 httpx
 pytest
+python-binance
+pydantic-settings

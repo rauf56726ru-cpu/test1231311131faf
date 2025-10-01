@@ -20,7 +20,17 @@
   const lastPriceEl = document.getElementById("last-price");
   const rangeEl = document.getElementById("last-range");
   const versionEl = document.getElementById("app-version");
-  const inspectionButton = document.getElementById("show-inspection");
+  const inspectionBtn = document.getElementById("inspection-btn") || document.getElementById("show-inspection");
+  const analyzeBtn = document.getElementById("analyze-btn");
+  const exportBtn = document.getElementById("export-zones");
+  const toastContainer = document.getElementById("toast-container");
+  const modalEl = document.getElementById("modal-confirm");
+  const modalConfirmBtn = modalEl ? modalEl.querySelector("[data-action='confirm']") : null;
+  const modalCancelBtn = modalEl ? modalEl.querySelector("[data-action='cancel']") : null;
+  const progressBar = document.getElementById("inspection-progress");
+  const dashboardEl = document.getElementById("dashboard");
+  const presetBadge = document.getElementById("preset-badge");
+  const symbolButtons = Array.from(document.querySelectorAll("[data-symbol-option]"));
 
   if (!chartContainer || !form || !symbolInput || !intervalInput) {
     console.error("Chart container or controls are missing in the DOM");
@@ -36,9 +46,24 @@
     priceLine: null,
     ws: null,
     reconnectTimer: null,
+    reconnectAttempts: 0,
     gapWatcher: null,
     lastUpdateMs: null,
+    pocSeries: null,
+    vahSeries: null,
+    valSeries: null,
+    inspectProgressTimer: null,
+    lastSnapshotId: null,
   };
+
+  function setActiveSymbolButton(symbol) {
+    if (!symbolButtons.length) return;
+    symbolButtons.forEach((button) => {
+      const isActive = button.dataset.symbolOption === symbol;
+      button.classList.toggle("is-active", isActive);
+      button.setAttribute("aria-pressed", isActive ? "true" : "false");
+    });
+  }
 
   function intervalToMs(value) {
     const numeric = Number(value);
@@ -67,74 +92,6 @@
     return map[value] || 60_000;
   }
 
-  function buildInspectionSnapshot() {
-    const createdAt = Date.now();
-    const id = `snap-${createdAt}-${Math.random().toString(36).slice(2, 8)}`;
-    const candles = state.candles.map((bar) => {
-      const timeMs = Number(bar.ts_ms_utc || bar.t || bar.time * 1000 || 0);
-      const open = Number(bar.open ?? bar.o ?? 0);
-      const high = Number(bar.high ?? bar.h ?? open);
-      const low = Number(bar.low ?? bar.l ?? open);
-      const close = Number(bar.close ?? bar.c ?? open);
-      const volume = Number(bar.volume ?? bar.v ?? 0);
-      return {
-        t: Number.isFinite(timeMs) ? timeMs : 0,
-        o: Number.isFinite(open) ? open : close,
-        h: Number.isFinite(high) ? high : close,
-        l: Number.isFinite(low) ? low : close,
-        c: Number.isFinite(close) ? close : open,
-        v: Number.isFinite(volume) ? volume : 0,
-      };
-    });
-    return {
-      id,
-      symbol: state.symbol,
-      tf: state.interval,
-      candles,
-      meta: {
-        source: "chart-ui",
-        generated_at: new Date(createdAt).toISOString(),
-        candle_count: candles.length,
-      },
-    };
-  }
-
-  async function sendInspectionSnapshot(snapshot) {
-    const response = await fetch("/inspection/snapshot", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(snapshot),
-    });
-    if (!response.ok) {
-      const errorText = await response.text().catch(() => "");
-      throw new Error(`Failed to register snapshot: ${response.status} ${errorText}`);
-    }
-    const data = await response.json().catch(() => ({}));
-    return typeof data.snapshot_id === "string" ? data.snapshot_id : snapshot.id;
-  }
-
-  if (inspectionButton) {
-    inspectionButton.addEventListener("click", async (event) => {
-      event.preventDefault();
-      const previewWindow = window.open("about:blank", "_blank", "noopener,noreferrer");
-      if (!previewWindow) {
-        notifyStatus("Браузер заблокировал окно инспекции", "warning");
-        return;
-      }
-      try {
-        const snapshot = buildInspectionSnapshot();
-        const snapshotId = await sendInspectionSnapshot(snapshot);
-        const url = new URL("/inspection", window.location.origin);
-        url.searchParams.set("snapshot", snapshotId);
-        previewWindow.location.href = url.toString();
-      } catch (error) {
-        console.error("Failed to open inspection", error);
-        previewWindow.close();
-        notifyStatus("Не удалось подготовить данные инспекции", "error");
-      }
-    });
-  }
-
   function formatNumber(value, digits = 2) {
     if (!Number.isFinite(value)) return "—";
     return Number(value).toFixed(digits);
@@ -144,9 +101,21 @@
     const date = new Date(Number(tsMs));
     if (Number.isNaN(date.getTime())) return "—";
     const pad = (num) => String(num).padStart(2, "0");
-    return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(
-      date.getUTCMinutes()
-    )}:${pad(date.getUTCSeconds())}`;
+    const datePart = `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}`;
+    const timePart = `${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`;
+    return `${datePart} ${timePart}`;
+  }
+
+  function showToast(message, variant = "info", timeout = 4000) {
+    if (!toastContainer) return;
+    const toast = document.createElement("div");
+    toast.className = `toast toast--${variant}`;
+    toast.textContent = message;
+    toastContainer.appendChild(toast);
+    setTimeout(() => {
+      toast.classList.add("is-hidden");
+      setTimeout(() => toast.remove(), 250);
+    }, timeout);
   }
 
   function notifyStatus(message, variant = "info") {
@@ -160,32 +129,37 @@
     if (!versionEl) return;
     try {
       const response = await fetch("/version");
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = await response.json();
-      const version = data && typeof data.version === "string" ? data.version : null;
-      versionEl.textContent = version || "—";
+      versionEl.textContent = typeof data.version === "string" ? data.version : "—";
     } catch (error) {
       console.warn("Failed to fetch version", error);
       versionEl.textContent = "—";
     }
   }
 
+  async function fetchPreset(symbol) {
+    if (!presetBadge) return;
+    try {
+      const response = await fetch(`/presets/${encodeURIComponent(symbol)}`);
+      if (!response.ok) throw new Error("Preset request failed");
+      const data = await response.json();
+      const preset = data && data.preset ? data.preset : null;
+      presetBadge.textContent = preset ? `Preset: ${preset.symbol || symbol}` : `Preset: ${symbol}`;
+    } catch (error) {
+      console.warn("Failed to load preset", error);
+      presetBadge.textContent = `Preset: ${symbol}`;
+    }
+  }
+
   function normaliseBar(bar) {
     if (!bar) return null;
-    const open = Number(bar.open);
-    const high = Number(bar.high);
-    const low = Number(bar.low);
-    const close = Number(bar.close);
-    const time = Number(bar.time);
-    if (
-      !Number.isFinite(time) ||
-      !Number.isFinite(open) ||
-      !Number.isFinite(high) ||
-      !Number.isFinite(low) ||
-      !Number.isFinite(close)
-    ) {
+    const open = Number(bar.open ?? bar.o);
+    const high = Number(bar.high ?? bar.h);
+    const low = Number(bar.low ?? bar.l);
+    const close = Number(bar.close ?? bar.c);
+    const time = Number(bar.time ?? bar.t ?? 0);
+    if (!Number.isFinite(time) || !Number.isFinite(open) || !Number.isFinite(high) || !Number.isFinite(low) || !Number.isFinite(close)) {
       return null;
     }
     return {
@@ -276,20 +250,10 @@
         if (remote && Array.isArray(remote.candles) && remote.candles.length) {
           const lastUpdate = Number(remote.lastUpdateMs) || Number(remote.updatedAt) || Date.now();
           const shouldReset = !restored;
-          mergeCandles(remote.candles, { reset: shouldReset, lastUpdateMs: lastUpdate });
-          if (SharedCandles && typeof SharedCandles.merge === "function") {
-            try {
-              SharedCandles.merge(symbol, interval, remote.candles, {
-                intervalMs: Number(remote.intervalMs) || intervalToMs(interval),
-                lastUpdateMs: lastUpdate,
-                maxBars: 2000,
-                reset: shouldReset,
-                syncRemote: false,
-              });
-            } catch (error) {
-              console.warn("SharedCandles local cache sync failed", error);
-            }
-          }
+          mergeCandles(remote.candles.map((bar) => normaliseBar(bar)).filter(Boolean), {
+            reset: shouldReset,
+            lastUpdateMs: lastUpdate,
+          });
           restored = true;
           applied = true;
         }
@@ -317,6 +281,49 @@
     if (rangeEl) {
       const range = bar.high - bar.low;
       rangeEl.textContent = `${formatNumber(range, 2)} (${formatNumber((range / bar.low) * 100, 2)}%)`;
+    }
+  }
+
+  function ensureOverlaySeries() {
+    if (!state.chart || !state.candleSeries) return;
+    if (!state.pocSeries) {
+      state.pocSeries = state.chart.addLineSeries({ color: "#22c55e", lineWidth: 2, title: "POC" });
+    }
+    if (!state.vahSeries) {
+      state.vahSeries = state.chart.addLineSeries({ color: "#ef4444", lineWidth: 2, title: "VAH" });
+    }
+    if (!state.valSeries) {
+      state.valSeries = state.chart.addLineSeries({ color: "#ef4444", lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dotted, title: "VAL" });
+    }
+  }
+
+  function updateOverlayLevels(levels) {
+    ensureOverlaySeries();
+    if (!levels || !Array.isArray(state.candles) || !state.candles.length) {
+      if (state.pocSeries) state.pocSeries.setData([]);
+      if (state.vahSeries) state.vahSeries.setData([]);
+      if (state.valSeries) state.valSeries.setData([]);
+      return;
+    }
+    const lastTime = state.candles[state.candles.length - 1].time;
+    const linePoints = [
+      { time: lastTime - 10, value: levels.POC },
+      { time: lastTime, value: levels.POC },
+    ];
+    if (state.pocSeries && Number.isFinite(levels.POC)) {
+      state.pocSeries.setData(linePoints);
+    }
+    if (state.vahSeries && Number.isFinite(levels.VAH)) {
+      state.vahSeries.setData([
+        { time: lastTime - 10, value: levels.VAH },
+        { time: lastTime, value: levels.VAH },
+      ]);
+    }
+    if (state.valSeries && Number.isFinite(levels.VAL)) {
+      state.valSeries.setData([
+        { time: lastTime - 10, value: levels.VAL },
+        { time: lastTime, value: levels.VAL },
+      ]);
     }
   }
 
@@ -384,10 +391,11 @@
 
   function scheduleReconnect() {
     if (state.reconnectTimer) return;
+    const delay = Math.min(30_000, 1_000 * Math.pow(2, state.reconnectAttempts));
     state.reconnectTimer = setTimeout(() => {
       state.reconnectTimer = null;
       connectWs();
-    }, 3000);
+    }, delay);
   }
 
   function handleWsMessage(event) {
@@ -431,6 +439,7 @@
     const ws = new WebSocket(url);
     state.ws = ws;
     ws.onopen = () => {
+      state.reconnectAttempts = 0;
       notifyStatus("Подключено к потоку Binance", "info");
     };
     ws.onmessage = handleWsMessage;
@@ -441,6 +450,7 @@
     };
     ws.onclose = () => {
       if (state.ws === ws) {
+        state.reconnectAttempts += 1;
         notifyStatus("Соединение закрыто, переподключаемся...", "warning");
         scheduleReconnect();
       }
@@ -561,6 +571,9 @@
     const normalizedInterval = interval.trim();
     state.symbol = normalizedSymbol;
     state.interval = normalizedInterval;
+    symbolInput.value = normalizedSymbol;
+    setActiveSymbolButton(normalizedSymbol);
+    fetchPreset(normalizedSymbol);
     initChart();
     const restored = await restoreFromSharedStore(normalizedSymbol, normalizedInterval);
     if (restored && state.gapWatcher && typeof state.gapWatcher.notifyData === "function") {
@@ -590,6 +603,240 @@
     }
   }
 
+  function renderDashboard(payload) {
+    if (!dashboardEl) return;
+    if (!payload) {
+      dashboardEl.innerHTML = "<p class=\"empty\">Нет данных анализа</p>";
+      return;
+    }
+    const sections = [];
+    if (payload.ohlcv_multi) {
+      const frames = Object.entries(payload.ohlcv_multi)
+        .map(([tf, frame]) => `<li><strong>${tf}</strong>: ${(frame.candles || []).length} свечей</li>`) // summary
+        .join("");
+      sections.push(`<section><h3>OHLCV</h3><ul>${frames}</ul></section>`);
+    }
+    if (payload.orderflow && payload.orderflow.footprint) {
+      const recent = payload.orderflow.footprint.slice(-3);
+      const rows = recent
+        .map((row) => `<tr><td>${row.t}</td><td>${formatNumber(row.price)}</td><td>${formatNumber(row.delta)}</td><td>${formatNumber(row.imbalance)}</td></tr>`)
+        .join("");
+      sections.push(`<section><h3>Footprint</h3><table><thead><tr><th>Время</th><th>Цена</th><th>Δ</th><th>Imb.</th></tr></thead><tbody>${rows}</tbody></table></section>`);
+    }
+    if (payload.derivatives) {
+      const last = payload.derivatives[payload.derivatives.length - 1];
+      if (last) {
+        sections.push(
+          `<section><h3>Derivatives</h3><p>OI: ${formatNumber(last.oi, 0)} | Funding: ${formatNumber(last.funding * 100, 4)}% | Basis: ${formatNumber(last.basis_bps, 2)} bps</p></section>`
+        );
+      }
+    }
+    if (payload.liquidity_map) {
+      sections.push(
+        `<section><h3>Liquidity Map</h3><p>PDH: ${formatNumber(payload.liquidity_map.PDH)} | PDL: ${formatNumber(payload.liquidity_map.PDL)}</p></section>`
+      );
+    }
+    if (payload.news_events) {
+      const items = payload.news_events
+        .slice(-3)
+        .map((event) => `<li><time>${event.time_utc}</time> — <span>${event.title}</span> (${event.impact})</li>`)
+        .join("");
+      sections.push(`<section><h3>Новости</h3><ul>${items}</ul></section>`);
+    }
+    dashboardEl.innerHTML = sections.join("");
+  }
+
+  function buildInspectionSnapshot() {
+    const createdAt = Date.now();
+    const id = `snap-${createdAt}-${Math.random().toString(36).slice(2, 8)}`;
+    const candles = state.candles.map((bar) => {
+      const timeMs = Number(bar.ts_ms_utc || bar.t || bar.time * 1000 || 0);
+      const open = Number(bar.open ?? bar.o ?? 0);
+      const high = Number(bar.high ?? bar.h ?? open);
+      const low = Number(bar.low ?? bar.l ?? open);
+      const close = Number(bar.close ?? bar.c ?? open);
+      const volume = Number(bar.volume ?? bar.v ?? 0);
+      return {
+        t: Number.isFinite(timeMs) ? timeMs : 0,
+        o: Number.isFinite(open) ? open : close,
+        h: Number.isFinite(high) ? high : close,
+        l: Number.isFinite(low) ? low : close,
+        c: Number.isFinite(close) ? close : open,
+        v: Math.max(0, Number.isFinite(volume) ? volume : 0),
+      };
+    });
+    return {
+      id,
+      symbol: state.symbol,
+      tf: state.interval,
+      candles,
+      lookback_days: 7,
+      meta: {
+        source: "chart-ui",
+        generated_at: new Date(createdAt).toISOString(),
+        candle_count: candles.length,
+      },
+    };
+  }
+
+  function toggleInspectionProgress(active) {
+    if (!progressBar) return;
+    if (active) {
+      progressBar.value = 0;
+      progressBar.classList.remove("hidden");
+      let current = 0;
+      clearInterval(state.inspectProgressTimer);
+      state.inspectProgressTimer = setInterval(() => {
+        current = Math.min(95, current + Math.random() * 7);
+        progressBar.value = current;
+      }, 250);
+    } else {
+      clearInterval(state.inspectProgressTimer);
+      state.inspectProgressTimer = null;
+      progressBar.value = 100;
+      setTimeout(() => progressBar.classList.add("hidden"), 300);
+    }
+  }
+
+  async function submitInspectionSnapshot() {
+    const snapshot = buildInspectionSnapshot();
+    toggleInspectionProgress(true);
+    if (inspectionBtn) inspectionBtn.disabled = true;
+    try {
+      const response = await fetch("/inspection/snapshot", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(snapshot),
+      });
+      if (!response.ok) {
+        const errorPayload = await response.json().catch(() => ({}));
+        throw new Error(errorPayload?.error || JSON.stringify(errorPayload));
+      }
+      const data = await response.json();
+      const snapshotId = typeof data.snapshot_id === "string" ? data.snapshot_id : snapshot.id;
+      state.lastSnapshotId = snapshotId;
+      showToast("Snapshot создан", "success");
+      await refreshDashboard(snapshotId);
+    } catch (error) {
+      console.error("Inspection snapshot failed", error);
+      showToast(`Ошибка инспекции: ${error.message || error}`, "error", 6000);
+    } finally {
+      toggleInspectionProgress(false);
+      if (inspectionBtn) inspectionBtn.disabled = false;
+    }
+  }
+
+  async function refreshDashboard(snapshotId) {
+    try {
+      const url = new URL("/inspection", window.location.origin);
+      url.searchParams.set("snapshot", snapshotId);
+      const response = await fetch(url.toString(), { headers: { accept: "application/json" } });
+      if (!response.ok) throw new Error("Inspection payload unavailable");
+      const payload = await response.json();
+      const data = payload?.DATA || {};
+      const snapshotData = {
+        ohlcv_multi: data.ohlcv ?? null,
+        orderflow: data.orderflow ?? null,
+        derivatives: data.derivatives ?? null,
+        liquidity_map: data.liquidity_map ?? null,
+        news_events: data.news_events ?? null,
+      };
+      renderDashboard(snapshotData);
+      const tpo = data?.tpo?.sessions || [];
+      const pocEntry = data?.tpo?.daily?.[0];
+      if (pocEntry) {
+        updateOverlayLevels({ POC: pocEntry.POC, VAH: pocEntry.VAH, VAL: pocEntry.VAL });
+      }
+    } catch (error) {
+      console.warn("Failed to refresh dashboard", error);
+      renderDashboard(null);
+    }
+  }
+
+  async function analyzeSnapshot(type) {
+    if (!state.lastSnapshotId) {
+      showToast("Сначала создайте snapshot", "warning");
+      return;
+    }
+    try {
+      const response = await fetch("/inspection/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ snapshot_id: state.lastSnapshotId, analysis_type: type }),
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}));
+        throw new Error(payload?.error || "Analyze failed");
+      }
+      const data = await response.json();
+      if (type === "tpo" && data?.tpo?.daily?.length) {
+        const last = data.tpo.daily[data.tpo.daily.length - 1];
+        updateOverlayLevels({ POC: last.POC, VAH: last.VAH, VAL: last.VAL });
+      }
+      renderDashboard({
+        ohlcv_multi: null,
+        orderflow: null,
+        derivatives: null,
+        liquidity_map: type === "liquidity" ? data?.liquidity_map : null,
+        news_events: null,
+      });
+      showToast("Анализ завершен", "success");
+    } catch (error) {
+      console.error("Analyze request failed", error);
+      showToast(`Ошибка анализа: ${error.message || error}`, "error", 6000);
+    }
+  }
+
+  async function exportZones() {
+    if (!state.lastSnapshotId) {
+      showToast("Нет данных для экспорта", "warning");
+      return;
+    }
+    try {
+      const url = new URL("/profile", window.location.origin);
+      url.searchParams.set("snapshot", state.lastSnapshotId);
+      url.searchParams.set("tf", state.interval);
+      const response = await fetch(url.toString());
+      if (!response.ok) throw new Error("Profile export failed");
+      const data = await response.json();
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+      const downloadUrl = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = downloadUrl;
+      link.download = `${state.symbol}_${state.interval}_profile.json`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(downloadUrl);
+      showToast("Профиль экспортирован", "success");
+    } catch (error) {
+      console.error("Export failed", error);
+      showToast(`Экспорт не удался: ${error.message || error}`, "error", 6000);
+    }
+  }
+
+  function openModal() {
+    if (!modalEl) return Promise.resolve(false);
+    modalEl.classList.remove("hidden");
+    return new Promise((resolve) => {
+      const cleanup = () => {
+        modalEl.classList.add("hidden");
+        modalConfirmBtn?.removeEventListener("click", onConfirm);
+        modalCancelBtn?.removeEventListener("click", onCancel);
+      };
+      const onConfirm = () => {
+        cleanup();
+        resolve(true);
+      };
+      const onCancel = () => {
+        cleanup();
+        resolve(false);
+      };
+      modalConfirmBtn?.addEventListener("click", onConfirm, { once: true });
+      modalCancelBtn?.addEventListener("click", onCancel, { once: true });
+    });
+  }
+
   form.addEventListener("submit", (event) => {
     event.preventDefault();
     const symbol = symbolInput.value || "BTCUSDT";
@@ -597,12 +844,52 @@
     loadSymbol(symbol, interval);
   });
 
+  if (symbolButtons.length) {
+    symbolButtons.forEach((button) => {
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        const nextSymbol = (button.dataset.symbolOption || "").toUpperCase();
+        if (!nextSymbol) return;
+        if (state.symbol === nextSymbol) {
+          symbolInput.value = nextSymbol;
+          return;
+        }
+        loadSymbol(nextSymbol, state.interval);
+      });
+    });
+  }
+
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible" && !state.ws) {
       connectWs();
     }
   });
 
+  if (inspectionBtn) {
+    inspectionBtn.addEventListener("click", async (event) => {
+      event.preventDefault();
+      const confirmed = await openModal();
+      if (!confirmed) return;
+      submitInspectionSnapshot();
+    });
+  }
+
+  if (analyzeBtn) {
+    analyzeBtn.addEventListener("click", (event) => {
+      event.preventDefault();
+      analyzeSnapshot("tpo");
+    });
+  }
+
+  if (exportBtn) {
+    exportBtn.addEventListener("click", (event) => {
+      event.preventDefault();
+      exportZones();
+    });
+  }
+
   fetchVersion();
+  fetchPreset(state.symbol);
+  setActiveSymbolButton(state.symbol);
   loadSymbol(state.symbol, state.interval);
 })();

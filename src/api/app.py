@@ -3,15 +3,17 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, Mapping, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from math import ceil
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+
+from pydantic import BaseModel, Field, validator
 
 from ..services import (
     DataQualityError,
@@ -37,10 +39,277 @@ from ..services import (
     update_preset,
 )
 from ..services.zones import Config as ZonesConfig, detect_zones
+
+from ..services.book import fetch_orderbook
+from ..services.derivatives import fetch_derivatives
+from ..services.inspection import validate_enhanced_snapshot
+from ..services.liquidity import generate_liquidity_map
+from ..services.news import fetch_news
+from ..services.ohlcv import build_multi_tf_ohlcv, fetch_ohlcv as fetch_ohlcv_enhanced
+from ..services.orderflow import calculate_cvd, fetch_footprint
+from ..services.tpo import calculate_session_tpo, calculate_tpo
 from ..version import APP_VERSION
 from ..meta import Meta
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+
+class CandleIn(BaseModel):
+    """Incoming candle schema for inspection snapshots."""
+
+    t: int = Field(..., ge=0)
+    o: float
+    h: float
+    l: float
+    c: float
+    v: float
+
+    @validator("v")
+    def _validate_volume(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("Volume must be positive")
+        return value
+
+
+class OrderflowFootprintIn(BaseModel):
+    """Representation of a footprint row."""
+
+    t: str
+    price: float
+    bid: float
+    ask: float
+    delta: Optional[float] = None
+    imbalance: Optional[float] = None
+    absorption: Optional[bool] = None
+
+    @validator("delta", always=True)
+    def _validate_delta(cls, value: Optional[float], values: Dict[str, Any]) -> float:
+        bid = values.get("bid", 0.0)
+        ask = values.get("ask", 0.0)
+        delta_value = value if value is not None else ask - bid
+        if abs(delta_value - (ask - bid)) > 1e-3:
+            raise ValueError("delta must equal ask - bid")
+        return delta_value
+
+
+class OrderflowSectionIn(BaseModel):
+    """Incoming orderflow payload."""
+
+    footprint: Optional[List[OrderflowFootprintIn]] = None
+    cvd: Optional[List[Dict[str, float]]] = None
+
+
+class SnapshotIn(BaseModel):
+    """Snapshot request body."""
+
+    symbol: str
+    tf: str
+    candles: List[CandleIn] = Field(default_factory=list)
+    frames: Optional[Dict[str, Any]] = None
+    ohlcv: Optional[Dict[str, Any]] = None
+    orderflow: Optional[OrderflowSectionIn] = None
+    liquidity_map: Optional[Dict[str, Any]] = None
+    derivatives: Optional[List[Dict[str, Any]]] = None
+    book: Optional[Dict[str, Any]] = None
+    news_events: Optional[List[Dict[str, Any]]] = None
+    meta: Optional[Dict[str, Any]] = None
+    lookback_days: int = Field(7, ge=1, le=30)
+
+    @validator("symbol")
+    def _validate_symbol(cls, value: str) -> str:
+        if not value or not value.strip():
+            raise ValueError("symbol is required")
+        return value.upper().strip()
+
+    @validator("tf")
+    def _validate_tf(cls, value: str) -> str:
+        if not value or not value.strip():
+            raise ValueError("tf is required")
+        return value.strip().lower()
+
+    @validator("candles")
+    def _limit_candles(cls, value: List[CandleIn]) -> List[CandleIn]:
+        if len(value) > 5000:
+            raise ValueError("candles limit exceeded (max 5000)")
+        return value
+
+
+
+
+def _to_iso(ms: int) -> str:
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _build_fallback_multi(symbol: str, candles: Sequence[CandleIn]) -> Dict[str, Dict[str, object]]:
+    frames: Dict[str, Dict[str, object]] = {}
+    base_rows: List[Dict[str, object]] = []
+    for candle in candles:
+        base_rows.append({
+            "t": _to_iso(candle.t),
+            "o": candle.o,
+            "h": candle.h,
+            "l": candle.l,
+            "c": candle.c,
+            "v": candle.v,
+        })
+    frames["1m"] = {"symbol": symbol, "tf": "1m", "candles": base_rows}
+
+    def _aggregate(window_minutes: int) -> List[Dict[str, object]]:
+        grouped: Dict[int, Dict[str, object]] = {}
+        step_ms = window_minutes * 60_000
+        for row in candles:
+            bucket = (row.t // step_ms) * step_ms
+            bucket_row = grouped.get(bucket)
+            if bucket_row is None:
+                grouped[bucket] = {
+                    "t": _to_iso(bucket),
+                    "o": row.o,
+                    "h": row.h,
+                    "l": row.l,
+                    "c": row.c,
+                    "v": row.v,
+                }
+            else:
+                bucket_row["h"] = max(bucket_row["h"], row.h)
+                bucket_row["l"] = min(bucket_row["l"], row.l)
+                bucket_row["c"] = row.c
+                bucket_row["v"] = bucket_row["v"] + row.v
+        return [grouped[key] for key in sorted(grouped)]
+
+    for tf, minutes in (("3m", 3), ("5m", 5), ("15m", 15), ("4h", 240), ("1d", 1440)):
+        frames[tf] = {"symbol": symbol, "tf": tf, "candles": _aggregate(minutes)}
+
+    return frames
+
+
+def _fallback_footprint(candles: Sequence[CandleIn]) -> List[Dict[str, object]]:
+    footprint: List[Dict[str, object]] = []
+    for candle in candles[-120:]:
+        bid = candle.v * 0.45
+        ask = candle.v * 0.55
+        delta = ask - bid
+        footprint.append({
+            "t": _to_iso(candle.t),
+            "price": candle.c,
+            "bid": bid,
+            "ask": ask,
+            "delta": delta,
+            "imbalance": ask / bid if bid else 0.0,
+            "absorption": abs(delta) > 100,
+        })
+    return footprint
+
+
+def _fallback_cvd(footprint: Sequence[Mapping[str, object]]) -> List[Dict[str, object]]:
+    cumulative_buy = 0.0
+    cumulative_sell = 0.0
+    series: List[Dict[str, object]] = []
+    for row in footprint:
+        delta = float(row.get("delta", 0.0))
+        if delta >= 0:
+            cumulative_buy += delta
+        else:
+            cumulative_sell += abs(delta)
+        series.append({
+            "t": row.get("t"),
+            "cvd_buy": cumulative_buy,
+            "cvd_sell": cumulative_sell,
+            "cvd_net": cumulative_buy - cumulative_sell,
+        })
+    return series
+
+
+def _fallback_derivatives(symbol: str, candles: Sequence[CandleIn]) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for candle in candles[-24:]:
+        rows.append({
+            "t": _to_iso(candle.t),
+            "oi": max(candle.c * candle.v * 5, 1e5),
+            "funding": 0.0001 * ((candle.c - candle.o) / candle.o if candle.o else 0.0),
+            "liq_long": max(candle.h - candle.c, 0.0),
+            "liq_short": max(candle.c - candle.l, 0.0),
+            "basis_bps": ((candle.c - candle.o) / candle.o * 10_000) if candle.o else 0.0,
+        })
+    return rows
+
+
+def _fallback_book(symbol: str, candle: CandleIn) -> Dict[str, object]:
+    price = candle.c
+    levels = []
+    for idx in range(5):
+        levels.append({"side": "bid", "p": price - idx * 0.5, "sz": candle.v * (1 - idx * 0.1)})
+        levels.append({"side": "ask", "p": price + idx * 0.5, "sz": candle.v * (1 - idx * 0.1)})
+    total_bid = sum(level["sz"] for level in levels if level["side"] == "bid")
+    total_ask = sum(level["sz"] for level in levels if level["side"] == "ask")
+    imbalance = total_bid / total_ask if total_ask else 0.0
+    return {
+        "symbol": symbol,
+        "captured_at": _to_iso(candle.t),
+        "window_minutes": 0,
+        "top_levels": levels,
+        "imbalance": imbalance,
+        "spoofing_flags": [],
+    }
+
+
+def _fallback_news(symbol: str) -> List[Dict[str, object]]:
+    now = datetime.now(timezone.utc)
+    return [
+        {
+            "symbol": symbol,
+            "time_utc": _to_iso(int(now.timestamp() * 1000)),
+            "title": "System snapshot",
+            "impact": "low",
+            "tag": "mock",
+        }
+    ]
+
+
+def _coerce_candle_entry(row: Mapping[str, Any]) -> CandleIn:
+    t_value = row.get("t") or row.get("time") or row.get("openTime") or row.get("open_time") or 0
+    try:
+        t_int = int(float(t_value))
+    except (TypeError, ValueError):
+        t_int = 0
+
+    def _num(primary: str, fallback: str) -> float:
+        value = row.get(primary)
+        if value is None:
+            value = row.get(fallback)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    return CandleIn(
+        t=t_int,
+        o=_num("o", "open"),
+        h=_num("h", "high"),
+        l=_num("l", "low"),
+        c=_num("c", "close"),
+        v=max(_num("v", "volume"), 1e-9),
+    )
+
+class AnalysisRequest(BaseModel):
+    """Request body for progressive inspection analysis."""
+
+    snapshot_id: str
+    analysis_type: str
+
+    @validator("snapshot_id")
+    def _validate_snapshot_id(cls, value: str) -> str:
+        if not value or not value.strip():
+            raise ValueError("snapshot_id is required")
+        return value
+
+    @validator("analysis_type")
+    def _validate_analysis_type(cls, value: str) -> str:
+        allowed = {"tpo", "zones", "liquidity"}
+        if value not in allowed:
+            raise ValueError(f"analysis_type must be one of {sorted(allowed)}")
+        return value
+
 PUBLIC_DIR = PROJECT_ROOT / "public"
 TEMPLATES_DIR = PROJECT_ROOT / "templates"
 
@@ -56,6 +325,13 @@ app.add_middleware(
 if PUBLIC_DIR.is_dir():
     app.mount("/public", StaticFiles(directory=PUBLIC_DIR), name="public")
 
+
+@app.on_event("startup")
+async def _startup() -> None:
+    if not hasattr(app.state, "ohlcv_cache"):
+        app.state.ohlcv_cache = {}
+    if not hasattr(app.state, "snapshots"):
+        app.state.snapshots = {}
 
 def _prepare_summary_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Reduce payload weight while keeping hourly context and fresh minute data."""
@@ -117,12 +393,226 @@ def _prepare_summary_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @app.post("/inspection/snapshot")
-async def register_inspection_snapshot(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
+async def register_inspection_snapshot(payload: SnapshotIn) -> Dict[str, str]:
+    symbol = payload.symbol
+    lookback_days = payload.lookback_days
+    cache = getattr(app.state, "ohlcv_cache", {})
+
+    source_candles: List[CandleIn] = list(payload.candles)
+    if payload.frames:
+        for frame in payload.frames.values():
+            if isinstance(frame, Mapping):
+                frame_candles = frame.get("candles")
+                if isinstance(frame_candles, Sequence):
+                    for row in frame_candles:
+                        if isinstance(row, Mapping):
+                            try:
+                                coerced = _coerce_candle_entry(row)
+                            except Exception:
+                                continue
+                            source_candles.append(coerced)
+    if not source_candles:
+        raise HTTPException(status_code=400, detail="No candles provided")
+
     try:
-        snapshot_id = register_snapshot(payload)
+        ohlcv_multi = await build_multi_tf_ohlcv(symbol, lookback_days, cache=cache)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Falling back to local OHLCV for %s: %s", symbol, exc)
+        ohlcv_multi = _build_fallback_multi(symbol, source_candles)
+
+    base_candles = []
+    one_minute = ohlcv_multi.get("1m") if isinstance(ohlcv_multi, Mapping) else None
+    if isinstance(one_minute, Mapping):
+        base_candles = one_minute.get("candles") or []
+
+    orderflow_payload = payload.orderflow.dict() if payload.orderflow else {}
+
+    try:
+        footprint = await fetch_footprint(symbol, 4)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Footprint fallback engaged: %s", exc)
+        footprint = _fallback_footprint(source_candles)
+
+    try:
+        cvd_series = await calculate_cvd(symbol, 24)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("CVD fallback engaged: %s", exc)
+        cvd_series = _fallback_cvd(footprint)
+
+    try:
+        liquidity_map = await generate_liquidity_map(base_candles, 5)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Liquidity map fallback engaged: %s", exc)
+        liquidity_map = {
+            "PDH": None,
+            "PDL": None,
+            "EQH": [],
+            "EQL": [],
+            "session_highs_lows": [],
+            "resting_liquidity": [],
+        }
+
+    try:
+        derivatives_rows = await fetch_derivatives(symbol, 24, cache=cache)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Derivatives fallback engaged: %s", exc)
+        derivatives_rows = _fallback_derivatives(symbol, source_candles)
+
+    try:
+        book_state = await fetch_orderbook(symbol, 60)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Orderbook fallback engaged: %s", exc)
+        last_candle = source_candles[-1] if source_candles else CandleIn(t=0, o=0, h=0, l=0, c=0, v=1)
+        book_state = _fallback_book(symbol, last_candle)
+
+    try:
+        news_items = await fetch_news(symbol, 72)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("News fallback engaged: %s", exc)
+        news_items = _fallback_news(symbol)
+
+    orderflow_payload["footprint"] = footprint
+    orderflow_payload["cvd"] = cvd_series
+
+    snapshot = payload.dict(exclude_none=True)
+    if not snapshot.get("candles") and source_candles:
+        snapshot["candles"] = [c.dict() for c in source_candles]
+    sanitised_candles: List[Dict[str, object]] = []
+    for index, entry in enumerate(snapshot.get("candles", [])):
+        if isinstance(entry, Mapping):
+            normalised = dict(entry)
+            ts_value = normalised.get("t")
+            try:
+                ts_int = int(ts_value) if ts_value is not None else None
+            except (TypeError, ValueError):
+                ts_int = None
+            if ts_int is None or ts_int <= 0:
+                ts_int = index * 60_000 + 1
+            normalised["t"] = ts_int
+            normalised["time"] = ts_int
+            if "open" not in normalised and "o" in normalised:
+                normalised["open"] = normalised.get("o")
+            if "high" not in normalised and "h" in normalised:
+                normalised["high"] = normalised.get("h")
+            if "low" not in normalised and "l" in normalised:
+                normalised["low"] = normalised.get("l")
+            if "close" not in normalised and "c" in normalised:
+                normalised["close"] = normalised.get("c")
+            if "volume" not in normalised and "v" in normalised:
+                normalised["volume"] = normalised.get("v")
+            sanitised_candles.append(normalised)
+    if sanitised_candles:
+        snapshot["candles"] = sanitised_candles
+    snapshot["ohlcv"] = ohlcv_multi
+    snapshot["orderflow"] = orderflow_payload
+    snapshot["liquidity_map"] = liquidity_map
+    snapshot["derivatives"] = derivatives_rows
+    snapshot["book"] = book_state
+    snapshot["news_events"] = news_items
+
+    valid, errors = validate_enhanced_snapshot(snapshot)
+    if not valid:
+        raise HTTPException(status_code=422, detail={"errors": errors})
+
+    try:
+        snapshot_id = register_snapshot(snapshot)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    getattr(app.state, "snapshots", {})[snapshot_id] = snapshot
     return {"snapshot_id": snapshot_id}
+
+
+@app.get("/ohlcv")
+async def ohlcv_endpoint(
+    symbol: str = Query(..., description="Trading symbol, e.g. SOLUSDT"),
+    tf: str = Query("1m", description="Timeframe"),
+    lookback_days: int = Query(7, ge=1, le=30, description="Number of days to look back"),
+) -> JSONResponse:
+    cache = getattr(app.state, "ohlcv_cache", {})
+    try:
+        data = await fetch_ohlcv_enhanced(symbol, tf, lookback_days, cache=cache)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch OHLCV: {exc}") from exc
+    return JSONResponse(data)
+
+
+@app.get("/orderflow/footprint")
+async def orderflow_footprint_endpoint(
+    symbol: str = Query(...),
+    hours: int = Query(4, ge=1, le=24),
+) -> JSONResponse:
+    try:
+        data = await fetch_footprint(symbol, hours)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to load footprint: {exc}") from exc
+    return JSONResponse({"symbol": symbol.upper(), "hours": hours, "footprint": data})
+
+
+@app.get("/orderflow/cvd")
+async def orderflow_cvd_endpoint(
+    symbol: str = Query(...),
+    hours: int = Query(24, ge=1, le=72),
+) -> JSONResponse:
+    try:
+        data = await calculate_cvd(symbol, hours)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to load CVD: {exc}") from exc
+    return JSONResponse({"symbol": symbol.upper(), "hours": hours, "cvd": data})
+
+
+@app.get("/liquidity_map")
+async def liquidity_map_endpoint(
+    symbol: str = Query(...),
+    days: int = Query(5, ge=1, le=14),
+) -> JSONResponse:
+    cache = getattr(app.state, "ohlcv_cache", {})
+    ohlcv_data = await fetch_ohlcv_enhanced(symbol, "1m", max(1, days), cache=cache)
+    candles = ohlcv_data.get("candles") if isinstance(ohlcv_data, Mapping) else []
+    try:
+        liquidity_map = await generate_liquidity_map(candles or [], days)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to build liquidity map: {exc}") from exc
+    return JSONResponse({"symbol": symbol.upper(), "days": days, "liquidity_map": liquidity_map})
+
+
+@app.get("/derivatives")
+async def derivatives_endpoint(
+    symbol: str = Query(...),
+    hours: int = Query(24, ge=1, le=168),
+) -> JSONResponse:
+    cache = getattr(app.state, "ohlcv_cache", {})
+    try:
+        rows = await fetch_derivatives(symbol, hours, cache=cache)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch derivatives: {exc}") from exc
+    return JSONResponse({"symbol": symbol.upper(), "hours": hours, "derivatives": rows})
+
+
+@app.get("/book")
+async def book_endpoint(
+    symbol: str = Query(...),
+    minutes: int = Query(60, ge=1, le=240),
+) -> JSONResponse:
+    try:
+        data = await fetch_orderbook(symbol, minutes)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch orderbook: {exc}") from exc
+    return JSONResponse(data)
+
+
+@app.get("/news_events")
+async def news_events_endpoint(
+    symbol: str = Query(...),
+    hours: int = Query(72, ge=1, le=168),
+) -> JSONResponse:
+    try:
+        events = await fetch_news(symbol, hours)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch news: {exc}") from exc
+    return JSONResponse({"symbol": symbol.upper(), "hours": hours, "events": events})
 
 
 @app.get("/shared-candles")
@@ -239,6 +729,13 @@ async def inspection(
 
     payload = build_inspection_payload(target_snapshot)
 
+    enriched = getattr(app.state, "snapshots", {}).get(target_snapshot.get("id")) if isinstance(target_snapshot, Mapping) else None
+    if isinstance(enriched, Mapping):
+        data_section = payload.setdefault("DATA", {})
+        for key in ("ohlcv", "orderflow", "liquidity_map", "derivatives", "book", "news_events"):
+            if key in enriched and key not in data_section:
+                data_section[key] = enriched[key]
+
     accept_header = request.headers.get("accept", "").lower()
     if "application/json" in accept_header:
         return JSONResponse(payload)
@@ -251,6 +748,47 @@ async def inspection(
         snapshots=snapshots,
     )
     return HTMLResponse(content=html)
+
+
+@app.post("/inspection/analyze")
+async def inspection_analyze(request: AnalysisRequest) -> JSONResponse:
+    snapshot_id = request.snapshot_id
+    stored_snapshots = getattr(app.state, "snapshots", {})
+    snapshot = stored_snapshots.get(snapshot_id) if isinstance(stored_snapshots, Mapping) else None
+    if snapshot is None:
+        snapshot = get_snapshot(snapshot_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+
+    candles_payload = snapshot.get("candles")
+    if not candles_payload:
+        frames = snapshot.get("frames") if isinstance(snapshot.get("frames"), Mapping) else {}
+        tf = snapshot.get("tf", "1m")
+        if isinstance(frames, Mapping):
+            frame = frames.get(tf) or frames.get(tf.upper())
+            if isinstance(frame, Mapping):
+                candles_payload = frame.get("candles")
+
+    candles_payload = candles_payload or snapshot.get("ohlcv", {}).get("1m", {}).get("candles") if isinstance(snapshot.get("ohlcv"), Mapping) else []
+    candles_list = list(candles_payload) if isinstance(candles_payload, Sequence) else []
+    symbol = str(snapshot.get("symbol") or DEFAULT_SYMBOL).upper()
+    timeframe = str(snapshot.get("tf") or "1m")
+
+    if request.analysis_type == "tpo":
+        tpo_daily = calculate_tpo(candles_list) if candles_list else {"days": []}
+        session_data = [calculate_session_tpo(candles_list, session) for session in ("asia", "london", "ny")] if candles_list else []
+        return JSONResponse({"snapshot_id": snapshot_id, "tpo": {"daily": tpo_daily.get("days", []), "sessions": session_data}})
+
+    if request.analysis_type == "zones":
+        zone_frames = {timeframe: candles_list}
+        zones = detect_zones(frames=zone_frames, config=ZonesConfig()) if candles_list else {"zones": {}}
+        return JSONResponse({"snapshot_id": snapshot_id, "zones": zones})
+
+    if request.analysis_type == "liquidity":
+        liquidity_map = await generate_liquidity_map(candles_list, 5) if candles_list else {}
+        return JSONResponse({"snapshot_id": snapshot_id, "liquidity_map": liquidity_map})
+
+    raise HTTPException(status_code=400, detail="Unsupported analysis type")
 
 
 @app.get("/inspection/snapshots")
@@ -748,6 +1286,26 @@ async def zones_endpoint(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return JSONResponse(result)
+
+
+@app.get("/test-snapshot")
+async def test_snapshot() -> JSONResponse:
+    now = datetime.now(timezone.utc)
+    candles = []
+    base_price = 100.0
+    for index in range(10):
+        ts = int((now - timedelta(minutes=9 - index)).timestamp() * 1000)
+        open_price = base_price + index * 0.1
+        high = open_price + 0.5
+        low = open_price - 0.5
+        close = open_price + 0.2
+        candles.append({"t": ts, "o": open_price, "h": high, "l": low, "c": close, "v": 100 + index})
+    payload = {
+        "symbol": DEFAULT_SYMBOL,
+        "tf": "1m",
+        "candles": candles,
+    }
+    return JSONResponse(payload)
 
 
 @app.get("/health")
