@@ -4624,6 +4624,77 @@ def render_inspection_page(
           <p>Сбор свежих свечей, выбор диапазона и проверка расчётов без сохранения данных на сервере.</p>
         </header>
         <main>
+          <section class=\"panel index-preview\" data-preview-root>
+            <div class=\"page-header\">
+              <div class=\"header-top\">
+                <h2>Онлайн-просмотр Binance</h2>
+                <div class=\"header-controls\">
+                  <div class=\"app-meta\" aria-live=\"polite\">
+                    <span class=\"app-meta__label\">Версия:</span>
+                    <span id=\"preview-app-version\" class=\"app-meta__value\">—</span>
+                  </div>
+                  <button id=\"preview-open-inspection\" class=\"secondary\" type=\"button\">Открыть /inspection</button>
+                </div>
+              </div>
+              <p>
+                Отслеживайте потоковые свечи Binance и формируйте тестовые снэпшоты, не покидая панель инспекции.
+              </p>
+            </div>
+            <div class=\"page-main\">
+              <section class=\"controls-card\">
+                <form id=\"preview-chart-controls\" class=\"controls-form\">
+                  <label class=\"form-field\">
+                    <span>Тикер</span>
+                    <input id=\"preview-symbol\" type=\"text\" value=\"{symbol_value}\" required autocomplete=\"off\" />
+                  </label>
+                  <label class=\"form-field\">
+                    <span>Интервал</span>
+                    <select id=\"preview-interval\">
+                      <option value=\"1m\" selected>1m</option>
+                      <option value=\"3m\">3m</option>
+                      <option value=\"5m\">5m</option>
+                      <option value=\"15m\">15m</option>
+                      <option value=\"30m\">30m</option>
+                      <option value=\"1h\">1h</option>
+                      <option value=\"4h\">4h</option>
+                      <option value=\"1d\">1d</option>
+                    </select>
+                  </label>
+                  <button type=\"submit\" class=\"primary\">Загрузить график</button>
+                </form>
+              </section>
+              <section class=\"chart-card\">
+                <div class=\"chart-wrapper\">
+                  <div id=\"preview-chart\" class=\"chart-area\" aria-label=\"График предварительного просмотра\"></div>
+                </div>
+                <aside class=\"chart-info\">
+                  <div>
+                    <span class=\"info-label\">Последняя свеча:</span>
+                    <span id=\"preview-last-time\" class=\"info-value\">—</span>
+                  </div>
+                  <div>
+                    <span class=\"info-label\">Цена закрытия:</span>
+                    <span id=\"preview-last-price\" class=\"info-value\">—</span>
+                  </div>
+                  <div>
+                    <span class=\"info-label\">Диапазон свечи:</span>
+                    <span id=\"preview-last-range\" class=\"info-value\">—</span>
+                  </div>
+                </aside>
+                <div id=\"preview-status\" class=\"status-banner\" hidden data-tone=\"info\"></div>
+              </section>
+            </div>
+            <div class=\"preview-selection\">
+              <span class=\"badge\">Выделение</span>
+              <div class=\"preview-selection__controls\">
+                <span id=\"preview-selection-label\">—</span>
+                <button id=\"preview-clear-selection\" class=\"secondary\" type=\"button\">Сбросить</button>
+              </div>
+            </div>
+            <div class=\"preview-actions\">
+              <button id=\"preview-create-session\" class=\"primary\" type=\"button\">Создать тестовый снэпшот</button>
+            </div>
+          </section>
           <section class=\"panel\">
             <h2>Сбор данных</h2>
             <p class=\"panel-lead\">Собирайте актуальную информацию без сохранения снэпшотов на сервере.</p>
