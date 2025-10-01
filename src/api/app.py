@@ -905,6 +905,7 @@ async def inspection_check_all(
     if mode_value == "topup":
         last_collection = get_last_collection_time()
         window_hours = 4
+        window_start_override_ms: int | None = None
         if last_collection is not None:
             delta = collection_reference - last_collection
             delta_seconds = max(delta.total_seconds(), 0)
@@ -915,11 +916,18 @@ async def inspection_check_all(
                 window_hours = 4
             else:
                 window_hours = max(1, int(ceil(delta_hours)))
+            last_collection_utc = last_collection.astimezone(timezone.utc)
+            last_collection_ms = int(last_collection_utc.timestamp() * 1000)
+            aligned_ms = (last_collection_ms // 60_000) * 60_000
+            next_minute_ms = aligned_ms + 60_000
+            window_start_override_ms = max(0, next_minute_ms)
         try:
             payload = build_check_all_datas(
                 target_snapshot,
                 now_utc=now_override,
                 window_hours=window_hours,
+                window_start_override_ms=window_start_override_ms,
+                strict_window=True,
             )
         except DataQualityError as exc:
             raise HTTPException(
