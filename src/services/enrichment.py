@@ -9,7 +9,8 @@ from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional,
 
 import httpx
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
-MAX_DELTA_BARS = 50; MAX_FOOTPRINT_ROWS = 10
+MAX_DELTA_BARS = 50
+MAX_FOOTPRINT_ROWS = 10
 
 
 def _parse_ts(value: Any) -> Optional[int]:
@@ -48,7 +49,7 @@ def _map_minutes(rows: Iterable[Mapping[str, Any]]) -> Dict[int, Dict[str, float
         candle = _normalise_row(row)
         if candle is not None:
             minutes[candle["t"]] = candle
-    return minutes
+    return dict(sorted(minutes.items()))
 
 
 async def _fetch_recent(symbol: str, interval: str, limit: int) -> List[Dict[str, float]]:
@@ -114,12 +115,16 @@ def _supply_demand(candles: Sequence[Mapping[str, float]]) -> Dict[str, List[Dic
 
 
 def _delta_series(candles: Iterable[Mapping[str, float]]) -> List[Dict[str, Any]]:
+    ordered = sorted((row for row in candles if isinstance(row, Mapping)), key=lambda row: row.get("t", 0))
     rows: List[Dict[str, Any]] = []
-    for candle in list(candles)[-MAX_DELTA_BARS:]:
+    for candle in ordered[-MAX_DELTA_BARS:]:
         spread = max(float(candle.get("h", 0.0)) - float(candle.get("l", 0.0)), 1e-9)
         change = float(candle.get("c", 0.0)) - float(candle.get("o", 0.0))
-        volume = float(candle.get("v", 0.0))
-        rows.append({"t": int(candle.get("t", 0)), "delta": volume * (change / spread)})
+        volume = max(float(candle.get("v", 0.0)), 0.0)
+        delta = volume * (change / spread) if volume else 0.0
+        max_delta = max(volume, 1e-9)
+        delta = max(-max_delta, min(max_delta, delta))
+        rows.append({"t": int(candle.get("t", 0)), "delta": delta})
     return rows
 
 
@@ -157,6 +162,43 @@ def _footprint_summary(footprint: Sequence[Mapping[str, Any]], minute_map: Mappi
             "absorption": bool(total_vol and imbalance > 0.55 * total_vol and abs(price_move) < 0.25 * price_span),
         })
     return summaries
+
+
+def _synthetic_footprint(minute_rows: Mapping[int, Mapping[str, float]]) -> List[Dict[str, Any]]:
+    ordered_minutes = [minute_rows[key] for key in sorted(minute_rows.keys())]
+    if not ordered_minutes:
+        return []
+    recent = ordered_minutes[-MAX_FOOTPRINT_ROWS:]
+    ranges = [max(float(row.get("h", 0.0)) - float(row.get("l", 0.0)), 1e-9) for row in recent]
+    avg_range = statistics.fmean(ranges) if ranges else 0.0
+    footprint_rows: List[Dict[str, Any]] = []
+    for candle in recent:
+        ts = int(candle.get("t", 0))
+        spread = max(float(candle.get("h", 0.0)) - float(candle.get("l", 0.0)), 1e-9)
+        volume = max(float(candle.get("v", 0.0)), 0.0)
+        change = float(candle.get("c", 0.0)) - float(candle.get("o", 0.0))
+        delta = volume * (change / spread) if volume else 0.0
+        max_delta = max(volume, 1e-9)
+        delta = max(-max_delta, min(max_delta, delta))
+        buy_volume = (volume + delta) / 2 if volume else 0.0
+        sell_volume = max(volume - buy_volume, 0.0)
+        buy_share = (buy_volume / volume * 100.0) if volume else 0.0
+        sell_share = 100.0 - buy_share if volume else 0.0
+        price_span = spread
+        absorption = bool(
+            volume
+            and abs(delta) > 0.55 * volume
+            and (abs(change) < 0.25 * (avg_range or price_span))
+        )
+        footprint_rows.append(
+            {
+                "t": ts,
+                "buy_imbalance": round(buy_share, 3),
+                "sell_imbalance": round(sell_share, 3),
+                "absorption": absorption,
+            }
+        )
+    return footprint_rows
 
 
 def _block_candidates(candles: Sequence[Mapping[str, float]], tf: str, *, min_ratio: float) -> List[Dict[str, Any]]:
@@ -297,17 +339,36 @@ async def enrich_inspection_snapshot(
     minute_map = _map_minutes(minute_rows or [])
 
     # Pull compact higher-timeframe history directly from Binance.
-    one_day, four_hour, one_hour = await asyncio.gather(
+    fetches = await asyncio.gather(
         _fetch_recent(symbol, "1d", 3),
         _fetch_recent(symbol, "4h", 6),
-        _fetch_recent(symbol, "1h", 72),
+        _fetch_recent(symbol, "1h", 24),
+        return_exceptions=True,
     )
+
+    status = "ok"
+    missing_fields: List[str] = []
+    one_day: List[Dict[str, float]] = []
+    four_hour: List[Dict[str, float]] = []
+    one_hour: List[Dict[str, float]] = []
+
+    for interval, result in zip(("1d", "4h", "1h"), fetches):
+        if isinstance(result, Exception):
+            missing_fields.append(f"ohlcv:{interval}")
+            status = "insufficient_data"
+            continue
+        if interval == "1d":
+            one_day = result
+        elif interval == "4h":
+            four_hour = result
+        else:
+            one_hour = result
 
     # Build OHLCV blocks augmented with basic supply/demand heuristics.
     ohlcv_additions = {
         "1d": {"symbol": symbol, "tf": "1d", "candles": one_day, **_supply_demand(one_day)},
         "4h": {"symbol": symbol, "tf": "4h", "candles": four_hour, **_supply_demand(four_hour)},
-        "1h": {"symbol": symbol, "tf": "1h", "candles": one_hour[-24:], **_supply_demand(one_hour)},
+        "1h": {"symbol": symbol, "tf": "1h", "candles": one_hour, **_supply_demand(one_hour)},
     }
 
     # Derive simplified order-flow metrics from available 1m candles and footprint rows.
@@ -316,12 +377,24 @@ async def enrich_inspection_snapshot(
     orderflow_snapshot = snapshot.get("orderflow") if isinstance(snapshot.get("orderflow"), Mapping) else {}
     if isinstance(orderflow_snapshot, Mapping):
         footprint_raw = [row for row in orderflow_snapshot.get("footprint", []) if isinstance(row, Mapping)]
+    footprint_summary = _footprint_summary(footprint_raw, minute_map)
+    if not footprint_summary:
+        footprint_summary = _synthetic_footprint(minute_map)
     orderflow_block = {
         "delta": delta_rows,
         "cvd": _cvd(delta_rows),
-        "footprint": _footprint_summary(footprint_raw, minute_map),
+        "footprint": footprint_summary,
         "raw": footprint_raw,
     }
+    if not delta_rows:
+        status = "insufficient_data"
+        missing_fields.append("orderflow:delta")
+    if not orderflow_block["cvd"]:
+        status = "insufficient_data"
+        missing_fields.append("orderflow:cvd")
+    if not orderflow_block["footprint"]:
+        status = "insufficient_data"
+        missing_fields.append("orderflow:footprint")
 
     enriched_zones = {
         "mb": _block_candidates(one_hour, "1h", min_ratio=0.6) + _block_candidates(four_hour, "4h", min_ratio=0.6),
@@ -340,8 +413,8 @@ async def enrich_inspection_snapshot(
     profile_levels = _profile_summary(tpo_entries)
 
     enrichment = {
-        "status": "ok",
-        "missing_fields": [],
+        "status": status,
+        "missing_fields": sorted(set(missing_fields)),
         "ohlcv": ohlcv_additions,
         "orderflow": orderflow_block,
         "zones": enriched_zones,
