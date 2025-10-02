@@ -175,7 +175,7 @@ async def test_last_price_updates_when_minute_candles_change(
         {
             "t": int((base + timedelta(minutes=2)).timestamp() * 1000),
             "o": 108.0,
-            "h": 118.0,
+            "h": 123.0,
             "l": 105.0,
             "c": 123.0,
             "v": 4.0,

@@ -14,68 +14,72 @@ from typing import (
     Iterable,
     List,
     Mapping,
+    MutableMapping,
     Sequence,
     Tuple,
 )
 
+from .timeutils import ensure_ms_epoch, safe_datetime_from_ms
+
 
 LOGGER = logging.getLogger(__name__)
 
-_MIN_TS_MS = 1
-_FUTURE_DRIFT = timedelta(days=1)
+
+InvalidTimestampHandler = Callable[[int | None, str], None]
 
 
-InvalidTimestampHandler = Callable[[int, str], None]
+@dataclass(slots=True)
+class SessionSplitResult:
+    """Container for session grouping results."""
+
+    buckets: Dict[Tuple[date, str], List[Mapping[str, Any]]]
+    sessions_empty: bool = False
 
 
-def _max_allowed_ts_ms(now: datetime | None = None) -> int:
-    """Return the inclusive upper bound for candle timestamps in milliseconds."""
-
-    base = now or datetime.now(timezone.utc)
-    return int((base + _FUTURE_DRIFT).timestamp() * 1000)
-
-
-def _report_invalid_timestamp(ts: int, *, stage: str, handler: InvalidTimestampHandler | None) -> None:
-    """Emit a warning and notify the optional handler about an invalid candle."""
-
-    LOGGER.warning("Invalid candle timestamp: %s", ts, extra={"stage": stage})
-    if handler is not None:
-        handler(ts, stage)
-
-
-def _validate_timestamp_range(
-    ts: int,
+def _notify_invalid_timestamp(
+    value: Any,
     *,
-    max_ts: int,
+    stage: str,
+    handler: InvalidTimestampHandler | None,
+) -> None:
+    LOGGER.warning("Invalid candle timestamp: %s", value, extra={"stage": stage})
+    if handler is not None:
+        numeric: int | None
+        try:
+            numeric = int(value) if value is not None else None
+        except (TypeError, ValueError):
+            numeric = None
+        handler(numeric, stage)
+
+
+def _extract_timestamp_ms(
+    candle: Mapping[str, Any],
+    *,
     stage: str,
     handler: InvalidTimestampHandler | None,
 ) -> int | None:
-    """Return the timestamp if it falls within the accepted range."""
+    for key in ("t", "time", "openTime"):
+        if key not in candle:
+            continue
+        ms = ensure_ms_epoch(candle.get(key))
+        if ms is None:
+            _notify_invalid_timestamp(candle.get(key), stage=stage, handler=handler)
+            return None
+        return ms
+    return None
 
-    if ts < _MIN_TS_MS or ts > max_ts:
-        _report_invalid_timestamp(ts, stage=stage, handler=handler)
-        return None
-    return ts
 
-
-def _safe_datetime_from_timestamp(
-    ts: int,
+def _datetime_from_ms(
+    ms: int,
     *,
     tz: timezone,
-    max_ts: int,
     stage: str,
     handler: InvalidTimestampHandler | None,
 ) -> datetime | None:
-    """Convert a millisecond timestamp to ``datetime`` guarding against errors."""
-
-    valid_ts = _validate_timestamp_range(ts, max_ts=max_ts, stage=stage, handler=handler)
-    if valid_ts is None:
-        return None
-    try:
-        return datetime.fromtimestamp(valid_ts / 1000.0, tz=tz)
-    except (OSError, ValueError):
-        _report_invalid_timestamp(valid_ts, stage=stage, handler=handler)
-        return None
+    dt = safe_datetime_from_ms(ms, tz)
+    if dt is None:
+        _notify_invalid_timestamp(ms, stage=stage, handler=handler)
+    return dt
 
 
 _PROFILE_CACHE: Dict[Tuple[Any, ...], "VolumeProfile"] = {}
@@ -107,15 +111,7 @@ def _in_session(moment: dtime, start: dtime, end: dtime) -> bool:
 
 
 def _extract_timestamp(candle: Mapping[str, Any]) -> int | None:
-    for key in ("t", "time", "openTime"):
-        raw = candle.get(key)
-        if raw is None:
-            continue
-        try:
-            return int(raw)
-        except (TypeError, ValueError):
-            continue
-    return None
+    return _extract_timestamp_ms(candle, stage="profile_legacy", handler=None)
 
 
 def _session_extrema(
@@ -141,26 +137,31 @@ def split_by_sessions(
     tz: timezone = timezone.utc,
     *,
     invalid_ts_handler: InvalidTimestampHandler | None = None,
-) -> Dict[Tuple[date, str], List[Mapping[str, Any]]]:
+) -> SessionSplitResult:
     """Group candles by (date, session) buckets similar to VWAP sessions."""
 
     buckets: Dict[Tuple[date, str], List[Mapping[str, Any]]] = {}
     session_list = list(sessions)
-    if not candles or not session_list:
-        return buckets
+    if not session_list:
+        return SessionSplitResult(buckets, sessions_empty=bool(candles))
 
-    max_ts = _max_allowed_ts_ms()
+    input_count = 0
+    accepted = 0
 
     for candle in candles:
         if not isinstance(candle, Mapping):
             continue
-        ts = _extract_timestamp(candle)
+        input_count += 1
+        ts = _extract_timestamp_ms(
+            candle,
+            stage="split_by_sessions",
+            handler=invalid_ts_handler,
+        )
         if ts is None:
             continue
-        dt = _safe_datetime_from_timestamp(
+        dt = _datetime_from_ms(
             ts,
             tz=tz,
-            max_ts=max_ts,
             stage="split_by_sessions",
             handler=invalid_ts_handler,
         )
@@ -176,7 +177,10 @@ def split_by_sessions(
             bucket_key = (session_date, name)
             bucket = buckets.setdefault(bucket_key, [])
             bucket.append(dict(candle))
-    return buckets
+            accepted += 1
+
+    sessions_empty = input_count > 0 and accepted == 0
+    return SessionSplitResult(buckets, sessions_empty=sessions_empty)
 
 
 def _compute_true_ranges(candles: Sequence[Mapping[str, Any]]) -> List[float]:
@@ -430,32 +434,32 @@ def compute_session_profiles(
     """Return volume profile summaries grouped by calendar day."""
 
     session_list = list(sessions)
-    session_map = (
-        split_by_sessions(
+    if session_list:
+        split_result = split_by_sessions(
             candles_1m,
             session_list,
             invalid_ts_handler=invalid_ts_handler,
         )
-        if session_list
-        else {}
-    )
+        session_map: Dict[Tuple[date, str], List[Mapping[str, Any]]] = split_result.buckets
+    else:
+        split_result = SessionSplitResult({}, sessions_empty=bool(candles_1m))
+        session_map = {}
 
     daily_buckets: DefaultDict[date, List[Mapping[str, Any]]] = defaultdict(list)
-    if candles_1m:
-        max_ts = _max_allowed_ts_ms()
-    else:
-        max_ts = _MIN_TS_MS
 
     for candle in candles_1m:
         if not isinstance(candle, Mapping):
             continue
-        ts = _extract_timestamp(candle)
+        ts = _extract_timestamp_ms(
+            candle,
+            stage="compute_session_profiles",
+            handler=invalid_ts_handler,
+        )
         if ts is None:
             continue
-        dt = _safe_datetime_from_timestamp(
+        dt = _datetime_from_ms(
             ts,
             tz=timezone.utc,
-            max_ts=max_ts,
             stage="compute_session_profiles",
             handler=invalid_ts_handler,
         )
@@ -648,11 +652,17 @@ def build_profile_package(
     cache_token: Any | None = None,
     tf_key: str = "1m",
     invalid_ts_handler: InvalidTimestampHandler | None = None,
+    meta_out: MutableMapping[str, Any] | None = None,
 ) -> Tuple[List[Dict[str, object]], List[Dict[str, float]], List[Dict[str, Any]]]:
     """Compute TPO summaries, flattened profile, and derived zones."""
 
+    if meta_out is not None and "sessions_empty" not in meta_out:
+        meta_out["sessions_empty"] = False
+
     session_list = list(sessions)
     if not candles or not session_list:
+        if meta_out is not None and candles:
+            meta_out["sessions_empty"] = True
         return [], [], []
 
     token = cache_token
@@ -675,11 +685,14 @@ def build_profile_package(
     if not tpo_entries:
         return tpo_entries, flattened, zones
 
-    session_map = split_by_sessions(
+    split_session_result = split_by_sessions(
         candles,
         session_list,
         invalid_ts_handler=invalid_ts_handler,
     )
+    if meta_out is not None and split_session_result.sessions_empty:
+        meta_out["sessions_empty"] = True
+    session_map = split_session_result.buckets
     latest = tpo_entries[-1] if tpo_entries else None
     latest_date = latest.get("date") if isinstance(latest, Mapping) else None
     latest_session = latest.get("session") if isinstance(latest, Mapping) else None

@@ -34,8 +34,10 @@ from .liquidity import (
 )
 from .presets import resolve_profile_config
 from .profile import build_profile_package
+from .ohlc_sanitizer import SanitizedCandles, sanitize_candles
 from .smc import SMCConfig, detect_smc_blocks
 from .zones import Config as ZonesConfig, detect_zones
+from .timeutils import safe_datetime_from_ms
 UTC = timezone.utc
 LOGGER = logging.getLogger(__name__)
 MS_IN_HOUR = 3_600_000
@@ -290,7 +292,9 @@ def _isoformat_utc(timestamp_ms: int) -> str:
     """Return a stable Z-suffixed ISO string for a millisecond timestamp."""
 
     clamped_ms = max(0, int(timestamp_ms))
-    dt = datetime.fromtimestamp(clamped_ms / 1000.0, tz=UTC)
+    dt = safe_datetime_from_ms(clamped_ms, UTC)
+    if dt is None:
+        return "1970-01-01T00:00:00Z"
     return dt.isoformat().replace("+00:00", "Z")
 
 
@@ -633,6 +637,32 @@ def _build_insufficient_payload(
         "missing_fields": sorted(missing_fields),
     }
     return round_floats(payload)
+
+
+def build_inspection_error_payload(
+    snapshot: Mapping[str, Any],
+    *,
+    now_utc: datetime | None = None,
+    missing_fields: Sequence[str] | None = None,
+    reason: str = "invalid_timestamps",
+) -> Dict[str, Any]:
+    """Return a deterministic insufficient-data payload for unexpected errors."""
+
+    context = _prepare_snapshot_context(snapshot, now_utc)
+    payload = _build_insufficient_payload(
+        symbol=context.symbol,
+        now=context.now,
+        stream_price=context.stream_price,
+        stream_ts=context.stream_ts,
+    )
+    if missing_fields:
+        existing = set(payload.get("missing_fields", []))
+        payload["missing_fields"] = sorted(existing.union(set(missing_fields)))
+    meta = payload.get("meta")
+    if isinstance(meta, dict):
+        meta["insufficient_reason"] = reason
+        meta["sanitized"] = True
+    return payload
 
 
 def _resolve_last_price(
@@ -1975,8 +2005,8 @@ def _build_volume_profile_stats(
     tick_size: float | None,
     value_area_pct: float = VALUE_AREA_PCT,
 ) -> Dict[str, Any]:
-    window_start_iso = datetime.fromtimestamp(start_ms / 1000.0, tz=UTC).isoformat()
-    window_end_iso = datetime.fromtimestamp(end_ms / 1000.0, tz=UTC).isoformat()
+    window_start_iso = _isoformat_utc(start_ms)
+    window_end_iso = _isoformat_utc(end_ms)
 
     if end_ms < start_ms:
         return {
@@ -2167,7 +2197,9 @@ def _build_prev_day_block(
 
 
 def _start_of_day_ms(timestamp_ms: int) -> int:
-    dt = datetime.fromtimestamp(timestamp_ms / 1000.0, tz=UTC)
+    dt = safe_datetime_from_ms(timestamp_ms, UTC)
+    if dt is None:
+        return 0
     start_dt = datetime(dt.year, dt.month, dt.day, tzinfo=UTC)
     return int(start_dt.timestamp() * 1000)
 
@@ -2178,7 +2210,9 @@ def _session_window(
     end_time: dtime,
 ) -> tuple[int, int, int]:
     anchor_aligned = _align_to_interval(anchor_ms, MINUTE_INTERVAL_MS)
-    anchor_dt = datetime.fromtimestamp(anchor_aligned / 1000.0, tz=UTC)
+    anchor_dt = safe_datetime_from_ms(anchor_aligned, UTC)
+    if anchor_dt is None:
+        anchor_dt = datetime(1970, 1, 1, tzinfo=UTC)
     day_start = datetime(anchor_dt.year, anchor_dt.month, anchor_dt.day, tzinfo=UTC)
     session_start_dt = datetime.combine(day_start.date(), start_time, tzinfo=UTC)
     session_end_dt = datetime.combine(day_start.date(), end_time, tzinfo=UTC)
@@ -2505,18 +2539,42 @@ async def build_check_all_datas(
     status = "ok"
 
     notes: List[str] = []
-    invalid_candles_count = 0
-    invalid_candle_stages: Counter[str] = Counter()
+    invalid_ts_total = 0
+    invalid_ohlc_total = 0
+    invalid_candle_stages: Dict[str, Dict[str, int]] = {}
+    sanitized_applied = False
+    sessions_empty_flag = False
+
+    def _record_invalid(stage: str, *, invalid_ts: int = 0, invalid_ohlc: int = 0) -> None:
+        nonlocal invalid_ts_total, invalid_ohlc_total
+        if invalid_ts == 0 and invalid_ohlc == 0:
+            return
+        entry = invalid_candle_stages.setdefault(stage, {"invalid_ts": 0, "invalid_ohlc": 0})
+        if invalid_ts:
+            entry["invalid_ts"] += int(invalid_ts)
+            invalid_ts_total += int(invalid_ts)
+        if invalid_ohlc:
+            entry["invalid_ohlc"] += int(invalid_ohlc)
+            invalid_ohlc_total += int(invalid_ohlc)
+
+    def _apply_sanitizer(stage: str, candles: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+        nonlocal sanitized_applied
+        sanitized_applied = True
+        result = sanitize_candles(candles, stage=stage)
+        _record_invalid(stage, invalid_ts=result.invalid_ts, invalid_ohlc=result.invalid_ohlc)
+        return result.candles
 
     def _register_invalid_candle(_ts: int, stage: str) -> None:
-        nonlocal invalid_candles_count
-        invalid_candles_count += 1
-        invalid_candle_stages[stage] += 1
+        _record_invalid(stage, invalid_ts=1)
 
     budget = _TimeBudget(_BUILD_TIMEOUT_SECONDS)
 
     context = _prepare_snapshot_context(snapshot, now_utc)
     frames = context.frames
+
+    for tf_key, candles in list(frames.items()):
+        stage_name = f"seed.{tf_key}"
+        frames[tf_key] = _apply_sanitizer(stage_name, candles)
     raw_meta = context.raw_meta
     symbol = context.symbol
     now_dt = context.now
@@ -2562,6 +2620,7 @@ async def build_check_all_datas(
         window_end_ms=window_end_guess,
         window_hours=base_window_hours,
     )
+    frames["1m"] = _apply_sanitizer("rest.1m", frames.get("1m", []))
 
     minute_seed = frames.get("1m", [])
     if minute_seed:
@@ -2589,6 +2648,7 @@ async def build_check_all_datas(
             window_end_ms=window_end_guess,
             window_hours=base_window_hours,
         )
+        frames[primary_key] = _apply_sanitizer(f"rest.{primary_key}", frames.get(primary_key, []))
 
     primary_candles = frames.get(primary_key, [])
     if not primary_candles:
@@ -2602,6 +2662,7 @@ async def build_check_all_datas(
     frames["1m"] = minute_candles
 
     profile_config = resolve_profile_config(symbol, raw_meta)
+    profile_meta: Dict[str, Any] = {}
     sessions = list(VWAP_TPO_SESSIONS)
     profile_tpo: List[Dict[str, Any]] = []
     profile_flat: List[Dict[str, float]] = []
@@ -2664,8 +2725,10 @@ async def build_check_all_datas(
             cache_token=cache_token,
             tf_key=target_tf_key,
             invalid_ts_handler=_register_invalid_candle,
+            meta_out=profile_meta,
         )
         profile_level_map = _build_profile_level_map(profile_tpo)
+        sessions_empty_flag = bool(profile_meta.get("sessions_empty"))
 
     snapshot_selection = snapshot.get("selection") if isinstance(snapshot.get("selection"), Mapping) else None
     selection_start = selection_start_ms or _safe_int(snapshot_selection.get("start")) if snapshot_selection else None
@@ -2756,6 +2819,9 @@ async def build_check_all_datas(
                 window_end_ms,
                 time_gaps,
                 budget=budget,
+            )
+            downloaded_minutes = _apply_sanitizer(
+                "rest.1m.download", downloaded_minutes
             )
         except BinanceDownloadError as exc:
             detail = {
@@ -3022,7 +3088,7 @@ async def build_check_all_datas(
     liquidity_config = raw_meta.get("liquidity") if isinstance(raw_meta, Mapping) else None
 
     reference_ts = window_end_ms + MINUTE_INTERVAL_MS
-    reference_dt = datetime.fromtimestamp(reference_ts / 1000.0, tz=UTC)
+    reference_iso = _isoformat_utc(reference_ts)
     detailed_start_ts = window_start_ms
 
     movement_anchor_ts = detailed_start_ts
@@ -3030,6 +3096,10 @@ async def build_check_all_datas(
     movement_end_ts = max(selection_start, movement_anchor_ts)
     if movement_end_ts > window_end_ms:
         movement_end_ts = window_end_ms
+
+    detailed_start_iso = _isoformat_utc(detailed_start_ts)
+    movement_start_iso = _isoformat_utc(movement_start_ts)
+    movement_end_iso = _isoformat_utc(movement_end_ts)
 
     latest_minute_candle = minute_window_index.get(window_end_ms)
     latest_primary_candle = None
@@ -3048,12 +3118,6 @@ async def build_check_all_datas(
         latest_candle_ts = base_candles[-1]["t"]
     if latest_candle_ts is None:
         latest_candle_ts = window_end_ms
-    latest_candle_dt = datetime.fromtimestamp(latest_candle_ts / 1000.0, tz=UTC)
-
-    detailed_start_dt = datetime.fromtimestamp(detailed_start_ts / 1000.0, tz=UTC)
-    movement_start_dt = datetime.fromtimestamp(movement_start_ts / 1000.0, tz=UTC)
-    movement_end_dt = datetime.fromtimestamp(movement_end_ts / 1000.0, tz=UTC)
-
     detailed_frames: Dict[str, Any] = {}
     for tf_key, candles in frames.items():
         filtered = _filter_candles(candles, start_ms=detailed_start_ts, end_ms=reference_ts)
@@ -3078,8 +3142,8 @@ async def build_check_all_datas(
     detailed_section = {
         "hours": hours_window,
         "range": {
-            "start_utc": detailed_start_dt.isoformat(),
-            "end_utc": reference_dt.isoformat(),
+            "start_utc": detailed_start_iso,
+            "end_utc": reference_iso,
         },
         "frames": detailed_frames,
         "indicators": {
@@ -3108,8 +3172,8 @@ async def build_check_all_datas(
         delta_series = _build_delta_series(filtered)
         movement_frames[tf_key] = {
             "summary": _summarise(filtered),
-            "first_candle_utc": datetime.fromtimestamp(filtered[0]["t"] / 1000.0, tz=UTC).isoformat(),
-            "last_candle_utc": datetime.fromtimestamp(filtered[-1]["t"] / 1000.0, tz=UTC).isoformat(),
+            "first_candle_utc": _isoformat_utc(filtered[0]["t"]),
+            "last_candle_utc": _isoformat_utc(filtered[-1]["t"]),
         }
         delta_summaries[tf_key] = _summarise_delta_series(delta_series)
         vwap_summaries[tf_key] = {
@@ -3139,8 +3203,8 @@ async def build_check_all_datas(
     movement_section = {
         "days": movement_days,
         "range": {
-            "start_utc": movement_start_dt.isoformat(),
-            "end_utc": movement_end_dt.isoformat(),
+            "start_utc": movement_start_iso,
+            "end_utc": movement_end_iso,
         },
         "frames": movement_frames,
         "indicators": {
@@ -3980,23 +4044,40 @@ async def build_check_all_datas(
     if last_price_diag.get("mismatch"):
         meta_block["stream_vs_ohlcv_mismatch"] = True
 
-    meta_block["invalid_candles_count"] = invalid_candles_count
-    meta_block["invalid_candle_stages"] = dict(
-        sorted(invalid_candle_stages.items())
-    ) if invalid_candle_stages else {}
+    invalid_total = invalid_ts_total + invalid_ohlc_total
+    meta_block["invalid_candles_count"] = invalid_total
+    meta_block["invalid_ts_count"] = invalid_ts_total
+    meta_block["invalid_ohlc_count"] = invalid_ohlc_total
+    meta_block["sanitized"] = sanitized_applied
+    meta_block["sessions_empty"] = sessions_empty_flag
 
-    if invalid_candles_count:
-        stage_summary = ", ".join(
-            f"{stage}:{count}" for stage, count in sorted(invalid_candle_stages.items())
-        )
-        if stage_summary:
+    stage_breakdown: Dict[str, Dict[str, int]] = {}
+    for stage, counts in sorted(invalid_candle_stages.items()):
+        filtered_counts = {key: value for key, value in counts.items() if value}
+        if filtered_counts:
+            stage_breakdown[stage] = filtered_counts
+    meta_block["invalid_candle_stages"] = stage_breakdown
+
+    if invalid_ts_total:
+        if stage_breakdown:
+            ts_stages = {stage: counts.get("invalid_ts", 0) for stage, counts in stage_breakdown.items()}
+            ts_summary = ", ".join(
+                f"{stage}:{count}" for stage, count in ts_stages.items() if count
+            )
+        else:
+            ts_summary = ""
+        if ts_summary:
             notes.append(
-                f"Filtered {invalid_candles_count} candles with invalid timestamps ({stage_summary})"
+                f"Filtered {invalid_ts_total} candles with invalid timestamps ({ts_summary})"
             )
         else:
             notes.append(
-                f"Filtered {invalid_candles_count} candles with invalid timestamps"
+                f"Filtered {invalid_ts_total} candles with invalid timestamps"
             )
+    if invalid_ohlc_total:
+        notes.append(
+            f"Filtered {invalid_ohlc_total} candles with invalid OHLC ranges"
+        )
 
     final_payload = {
         "status": status,

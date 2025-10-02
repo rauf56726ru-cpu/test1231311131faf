@@ -184,7 +184,14 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
     assert meta["last_price_source"] in {"stream", "ohlcv"}
     assert "stale" in meta
     assert meta["invalid_candles_count"] >= 0
+    assert meta["invalid_ts_count"] >= 0
+    assert meta["invalid_ohlc_count"] >= 0
+    assert meta["invalid_candles_count"] == meta["invalid_ts_count"] + meta["invalid_ohlc_count"]
     assert isinstance(meta["invalid_candle_stages"], dict)
+    assert meta.get("sanitized") is True
+    assert isinstance(meta.get("sessions_empty"), bool)
+    for stage_counts in meta["invalid_candle_stages"].values():
+        assert isinstance(stage_counts, dict)
 
     data_block = body["data"]
 
@@ -283,7 +290,8 @@ async def test_check_all_reports_invalid_timestamps() -> None:
     assert result is not None
     assert result["status"] == "ok"
     meta = result["meta"]
-    assert meta["invalid_candles_count"] >= 1
+    assert meta["invalid_ts_count"] >= 1
+    assert meta["invalid_candles_count"] >= meta["invalid_ts_count"]
     assert meta["invalid_candle_stages"]
     assert result["notes"], "expected notes for invalid timestamps"
     assert any("invalid timestamps" in note for note in result["notes"])
@@ -467,3 +475,41 @@ async def test_async_builder_timeout_returns_insufficient(monkeypatch):
     assert result is not None
     assert result["status"] == "insufficient_data"
     assert result["meta"]["insufficient_reason"] == "stale_or_unseeded_buffers"
+
+def test_build_inspection_error_payload_sets_reason() -> None:
+    now = datetime(2024, 1, 1, tzinfo=UTC)
+    snapshot = {
+        "symbol": "BTCUSDT",
+        "tf": "1m",
+        "frames": {"1m": {"tf": "1m", "candles": []}},
+    }
+    payload = check_all_datas.build_inspection_error_payload(
+        snapshot,
+        now_utc=now,
+        missing_fields=["ohlcv.1m"],
+        reason="invalid_timestamps",
+    )
+    assert payload["status"] == "insufficient_data"
+    assert "ohlcv.1m" in payload["missing_fields"]
+    meta = payload["meta"]
+    assert meta["insufficient_reason"] == "invalid_timestamps"
+    assert meta.get("sanitized") is True
+
+def test_check_all_returns_insufficient_on_internal_error(client: TestClient, monkeypatch) -> None:
+    base = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
+    payload = _build_snapshot_payload(base, count=60)
+
+    create_response = client.post("/inspection/snapshot", json=payload)
+    assert create_response.status_code == 200
+    snapshot_id = create_response.json()["snapshot_id"]
+
+    async def boom(*args, **kwargs):  # pragma: no cover - monkeypatch helper
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("src.api.app.build_check_all_datas_async", boom)
+
+    response = client.get("/inspection/check-all", params={"snapshot": snapshot_id})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "insufficient_data"
+    assert body["meta"].get("insufficient_reason") == "invalid_timestamps"

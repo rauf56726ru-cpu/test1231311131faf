@@ -40,6 +40,7 @@ from ..services import (
     apply_enrichment_to_payload,
     enrich_inspection_snapshot,
     build_check_all_datas_async,
+    build_inspection_error_payload,
 )
 from ..services.zones import Config as ZonesConfig, detect_zones
 
@@ -928,6 +929,18 @@ async def inspection_check_all(
                 status_code=400,
                 detail={"message": str(exc), "data_quality": exc.detail},
             ) from exc
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            LOGGER.exception(
+                "inspection_check_all:summary_failed",
+                extra={**branch_log, "error": str(exc)},
+            )
+            fallback = build_inspection_error_payload(
+                target_snapshot,
+                now_utc=now_override,
+                missing_fields=["ohlcv.1m"],
+                reason="invalid_timestamps",
+            )
+            return JSONResponse(fallback)
         if payload is None:
             LOGGER.info("inspection_check_all:finished", extra={**branch_log, "status": None})
             return Response(status_code=204)
@@ -980,6 +993,18 @@ async def inspection_check_all(
                 status_code=400,
                 detail={"message": str(exc), "data_quality": exc.detail},
             ) from exc
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            LOGGER.exception(
+                "inspection_check_all:summary_failed",
+                extra={**branch_log, "error": str(exc)},
+            )
+            fallback = build_inspection_error_payload(
+                target_snapshot,
+                now_utc=now_override,
+                missing_fields=["ohlcv.1m"],
+                reason="invalid_timestamps",
+            )
+            return JSONResponse(fallback)
         if payload is None:
             LOGGER.info("inspection_check_all:finished", extra={**branch_log, "status": None})
             return Response(status_code=204)
@@ -1010,6 +1035,18 @@ async def inspection_check_all(
             status_code=400,
             detail={"message": str(exc), "data_quality": exc.detail},
         ) from exc
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        LOGGER.exception(
+            "inspection_check_all:selection_failed",
+            extra={**branch_log, "error": str(exc)},
+        )
+        fallback = build_inspection_error_payload(
+            target_snapshot,
+            now_utc=now_override,
+            missing_fields=["ohlcv.1m"],
+            reason="invalid_timestamps",
+        )
+        return JSONResponse(fallback)
     if payload is None:
         LOGGER.info("inspection_check_all:finished", extra={**branch_log, "status": None})
         return Response(status_code=204)
