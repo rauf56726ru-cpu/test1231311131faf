@@ -3036,15 +3036,16 @@ def render_inspection_page(
         checkAllHours.value = String(state.hours);
       }
       const presetReady = !state.presetRequired;
+      const liveCapable = Boolean(activeSymbol());
       if (collectSelectionButton) {
         collectSelectionButton.disabled =
           !state.snapshotId || !hasSelection || !hoursValid || !presetReady;
       }
       if (summaryButton) {
-        summaryButton.disabled = !state.snapshotId || !presetReady;
+        summaryButton.disabled = !liveCapable || !presetReady;
       }
       if (topupButton) {
-        topupButton.disabled = !state.snapshotId || !presetReady;
+        topupButton.disabled = !liveCapable || !presetReady;
       }
     }
 
@@ -3178,20 +3179,178 @@ def render_inspection_page(
       }
     }
 
-    async function requestSummaryData() {
-      if (!state.snapshotId) {
-        updateStatus("Выберите снэпшот для сбора контекста", "warning");
-        return;
+    function resolveLiveMetaSnapshot() {
+      if (priceStore && typeof priceStore.getMeta === "function") {
+        try {
+          const meta = priceStore.getMeta();
+          if (meta && typeof meta === "object") {
+            return { ...meta };
+          }
+        } catch (error) {
+          console.warn("Не удалось получить метаданные лайв-стрима", error);
+        }
       }
+      if (state.liveMeta && typeof state.liveMeta === "object") {
+        return { ...state.liveMeta };
+      }
+      return null;
+    }
 
+    function resolveLiveRangeEndMs(meta) {
+      const candidates = [];
+      if (meta && Number.isFinite(meta.last_ts_ms)) {
+        candidates.push(Number(meta.last_ts_ms));
+      }
+      if (priceStore && typeof priceStore.getLastCandle === "function") {
+        try {
+          const last = priceStore.getLastCandle();
+          if (last) {
+            const preview = ensurePreviewBar(last);
+            if (preview) {
+              const ts = Number.isFinite(preview.ts_ms_utc)
+                ? Math.floor(preview.ts_ms_utc)
+                : Math.floor(preview.time * 1000);
+              if (Number.isFinite(ts)) {
+                candidates.push(ts);
+              }
+            }
+          }
+        } catch (error) {
+          console.warn("Не удалось прочитать последнюю свечу лайв-потока", error);
+        }
+      }
+      const minuteLive = state.liveFrames?.["1m"]?.candles;
+      if (Array.isArray(minuteLive) && minuteLive.length) {
+        const preview = ensurePreviewBar(minuteLive[minuteLive.length - 1]);
+        if (preview) {
+          const ts = Number.isFinite(preview.ts_ms_utc)
+            ? Math.floor(preview.ts_ms_utc)
+            : Math.floor(preview.time * 1000);
+          if (Number.isFinite(ts)) {
+            candidates.push(ts);
+          }
+        }
+      }
+      const finite = candidates.filter((value) => Number.isFinite(value));
+      if (!finite.length) {
+        return Date.now();
+      }
+      return Math.max(...finite);
+    }
+
+    function normaliseSnapshotCandles(candles) {
+      const result = [];
+      const seen = new Set();
+      for (const candle of Array.isArray(candles) ? candles : []) {
+        const preview = ensurePreviewBar(candle);
+        if (!preview) continue;
+        const ts = Number.isFinite(preview.ts_ms_utc)
+          ? Math.floor(preview.ts_ms_utc)
+          : Math.floor(preview.time * 1000);
+        if (!Number.isFinite(ts) || seen.has(ts)) continue;
+        seen.add(ts);
+        const volumeSource = Number(
+          candle?.v ??
+            candle?.volume ??
+            candle?.vol ??
+            candle?.qty ??
+            Number.NaN,
+        );
+        const volume = Number.isFinite(volumeSource) ? Math.max(volumeSource, 1e-9) : 1e-9;
+        result.push({
+          t: ts,
+          o: Number(preview.open),
+          h: Number(preview.high),
+          l: Number(preview.low),
+          c: Number(preview.close),
+          v: volume,
+        });
+      }
+      result.sort((a, b) => a.t - b.t);
+      return result.slice(-5000);
+    }
+
+    async function captureLiveSnapshot(options = {}) {
+      const lookbackDaysRaw = Number(options?.lookbackDays);
+      const lookbackDays = Number.isFinite(lookbackDaysRaw)
+        ? Math.max(1, Math.floor(lookbackDaysRaw))
+        : 3;
+      const mode = typeof options?.mode === "string" ? options.mode : "summary";
+      const symbol = activeSymbol();
+      if (!symbol) {
+        throw new Error("live-snapshot-symbol-missing");
+      }
+      const liveMeta = resolveLiveMetaSnapshot();
+      const endMs = resolveLiveRangeEndMs(liveMeta);
+      const lookbackMs = lookbackDays * 24 * 60 * 60 * 1000;
+      const startMs = Math.max(0, Math.floor(endMs - lookbackMs));
+      const rawCandles = await fetchCandles(symbol, "1m", startMs, endMs, { limit: 1500 });
+      const candles = normaliseSnapshotCandles(rawCandles);
+      if (!candles.length) {
+        throw new Error("live-snapshot-empty");
+      }
+      const frames = { "1m": { tf: "1m", candles } };
+      const metaBlock = {
+        source: {
+          kind: "live-store",
+          mode,
+          lookback_days: lookbackDays,
+          captured_at: new Date().toISOString(),
+        },
+        requested: {
+          frames: Object.keys(frames),
+          lookback_days: lookbackDays,
+        },
+      };
+      if (liveMeta) {
+        const livePayload = {
+          last_price: Number.isFinite(liveMeta.last_price) ? Number(liveMeta.last_price) : null,
+          last_tf: liveMeta.last_tf || "1m",
+          last_ts_ms: Number.isFinite(liveMeta.last_ts_ms) ? Number(liveMeta.last_ts_ms) : null,
+          age_sec: Number.isFinite(liveMeta.age_sec) ? Number(liveMeta.age_sec) : null,
+          stale: Boolean(liveMeta.stale),
+          mismatch: Boolean(liveMeta.mismatch),
+        };
+        metaBlock.live = livePayload;
+        metaBlock.stream = livePayload;
+        metaBlock.live_price = livePayload;
+      }
+      const payload = {
+        symbol,
+        tf: "1m",
+        candles,
+        frames,
+        meta: metaBlock,
+        lookback_days: lookbackDays,
+      };
+      const result = await postSnapshot(payload);
+      if (!result || !result.snapshot_id) {
+        throw new Error("live-snapshot-registration-failed");
+      }
+      return { snapshotId: result.snapshot_id, payload };
+    }
+
+    async function requestSummaryData() {
       if (summaryButton) {
         summaryButton.disabled = true;
       }
 
+      let createdSnapshotId = null;
+
       try {
-        updateStatus("Собираем данные за последние 3 дня...", "info");
+        updateStatus("Собираем лайв-данные за последние 3 дня...", "info");
+        const { snapshotId } = await captureLiveSnapshot({ lookbackDays: 3, mode: "summary" });
+        createdSnapshotId = snapshotId;
+        state.snapshotId = snapshotId;
+        updateCheckAllState();
+        if (summaryButton) {
+          summaryButton.disabled = true;
+        }
+        if (snapshotSelect) {
+          snapshotSelect.value = snapshotId;
+        }
         const url = new URL("/inspection/check-all", window.location.origin);
-        url.searchParams.set("snapshot", state.snapshotId);
+        url.searchParams.set("snapshot", snapshotId);
         url.searchParams.set("mode", "summary");
         url.searchParams.set("summary_days", "3");
         const response = await fetch(url.toString(), {
@@ -3217,24 +3376,39 @@ def render_inspection_page(
         setJson(checkAllPre, null);
         updateStatus("Ошибка при сборе 3-дневного контекста", "error");
       } finally {
+        if (summaryButton) {
+          summaryButton.disabled = false;
+        }
+        if (createdSnapshotId) {
+          refreshSnapshots({ quiet: true }).catch((err) => {
+            console.warn("Не удалось обновить список снэпшотов", err);
+          });
+        }
         updateCheckAllState();
       }
     }
 
     async function requestTopupData() {
-      if (!state.snapshotId) {
-        updateStatus("Выберите снэпшот для досбора", "warning");
-        return;
-      }
-
       if (topupButton) {
         topupButton.disabled = true;
       }
 
+      let createdSnapshotId = null;
+
       try {
-        updateStatus("Дособираем свежие данные...", "info");
+        updateStatus("Дособираем свежие лайв-данные...", "info");
+        const { snapshotId } = await captureLiveSnapshot({ lookbackDays: 1, mode: "topup" });
+        createdSnapshotId = snapshotId;
+        state.snapshotId = snapshotId;
+        updateCheckAllState();
+        if (topupButton) {
+          topupButton.disabled = true;
+        }
+        if (snapshotSelect) {
+          snapshotSelect.value = snapshotId;
+        }
         const url = new URL("/inspection/check-all", window.location.origin);
-        url.searchParams.set("snapshot", state.snapshotId);
+        url.searchParams.set("snapshot", snapshotId);
         url.searchParams.set("mode", "topup");
         const response = await fetch(url.toString(), {
           headers: { Accept: "application/json" },
@@ -3259,6 +3433,14 @@ def render_inspection_page(
         setJson(checkAllPre, null);
         updateStatus("Ошибка при досборе данных", "error");
       } finally {
+        if (topupButton) {
+          topupButton.disabled = false;
+        }
+        if (createdSnapshotId) {
+          refreshSnapshots({ quiet: true }).catch((err) => {
+            console.warn("Не удалось обновить список снэпшотов", err);
+          });
+        }
         updateCheckAllState();
       }
     }
@@ -3744,14 +3926,17 @@ def render_inspection_page(
         });
     }
 
-    async function refreshSnapshots() {
+    async function refreshSnapshots(options = {}) {
+      const quiet = Boolean(options?.quiet);
       try {
         const list = await fetchSnapshots();
         initial.snapshots = list;
         populateSnapshots(list);
       } catch (error) {
         console.error(error);
-        updateStatus("Не удалось загрузить список снэпшотов", "error");
+        if (!quiet) {
+          updateStatus("Не удалось загрузить список снэпшотов", "error");
+        }
       }
     }
 
