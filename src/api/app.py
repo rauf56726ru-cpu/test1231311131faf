@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from math import ceil
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request, Response
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -898,7 +899,8 @@ async def inspection_check_all(
         days = summary_days if summary_days and summary_days > 0 else 3
         window_hours = max(1, days * 24)
         try:
-            payload = build_check_all_datas(
+            payload = await run_in_threadpool(
+                build_check_all_datas,
                 target_snapshot,
                 now_utc=now_override,
                 window_hours=window_hours,
@@ -934,7 +936,8 @@ async def inspection_check_all(
             next_minute_ms = aligned_ms + 60_000
             window_start_override_ms = max(0, next_minute_ms)
         try:
-            payload = build_check_all_datas(
+            payload = await run_in_threadpool(
+                build_check_all_datas,
                 target_snapshot,
                 now_utc=now_override,
                 window_hours=window_hours,
@@ -952,7 +955,8 @@ async def inspection_check_all(
         return JSONResponse(payload)
 
     try:
-        payload = build_check_all_datas(
+        payload = await run_in_threadpool(
+            build_check_all_datas,
             target_snapshot,
             now_utc=now_override,
             selection_start_ms=selection_start,
