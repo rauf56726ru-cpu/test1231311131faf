@@ -80,6 +80,8 @@ VWAP_TPO_SESSIONS: Tuple[Tuple[str, dtime, dtime], ...] = (
 _RETRYABLE_STATUS = {418, 429, 500, 502, 503, 504}
 _MAX_RETRIES = 5
 
+_BUILD_TIMEOUT_SECONDS = 12.0
+
 _EXPECTED_OHLCV_TFS: Tuple[str, ...] = ("1m", "3m", "5m", "15m", "1h", "4h", "1d")
 _EXPECTED_ORDERFLOW_TFS: Tuple[str, ...] = ("15m", "1h")
 _EXPECTED_ORDERFLOW_METRICS: Tuple[str, ...] = ("footprint", "delta", "cvd")
@@ -113,6 +115,37 @@ class BinanceDownloadError(RuntimeError):
     def __init__(self, downloaded: int, message: str):
         super().__init__(message)
         self.downloaded = int(downloaded)
+
+
+class _TimeBudgetExceeded(RuntimeError):
+    """Raised when the snapshot build exceeds the allocated time budget."""
+
+    def __init__(self, stage: str):
+        self.stage = stage
+        super().__init__(f"Time budget exceeded while {stage}")
+
+
+class _TimeBudget:
+    """Helper for enforcing a soft timeout while building the snapshot."""
+
+    __slots__ = ("deadline",)
+
+    def __init__(self, seconds: float | None):
+        if seconds is None or seconds <= 0:
+            self.deadline = None
+        else:
+            self.deadline = time.monotonic() + seconds
+
+    def remaining(self) -> float | None:
+        if self.deadline is None:
+            return None
+        return self.deadline - time.monotonic()
+
+    def raise_if_exceeded(self, stage: str) -> None:
+        if self.deadline is None:
+            return
+        if time.monotonic() >= self.deadline:
+            raise _TimeBudgetExceeded(stage)
 
 
 def _isoformat_utc(timestamp_ms: int) -> str:
@@ -643,6 +676,7 @@ def _request_binance_minutes(
     end_ms: int,
     *,
     limit: int,
+    budget: _TimeBudget | None = None,
 ) -> List[Sequence[object]]:
     params = {
         "symbol": symbol.upper(),
@@ -654,6 +688,8 @@ def _request_binance_minutes(
 
     delay = 0.5
     for attempt in range(_MAX_RETRIES):
+        if budget is not None:
+            budget.raise_if_exceeded("request_binance_minutes")
         try:
             response = client.get(BINANCE_FAPI_REST, params=params)
             response.raise_for_status()
@@ -664,13 +700,27 @@ def _request_binance_minutes(
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
             if status in _RETRYABLE_STATUS and attempt < _MAX_RETRIES - 1:
-                time.sleep(delay)
+                if budget is not None:
+                    budget.raise_if_exceeded("request_binance_minutes_backoff")
+                    remaining = budget.remaining()
+                    if remaining is not None and remaining <= 0:
+                        raise
+                    time.sleep(min(delay, max(0.0, remaining)))
+                else:
+                    time.sleep(delay)
                 delay *= 2
                 continue
             raise
         except httpx.RequestError:
             if attempt < _MAX_RETRIES - 1:
-                time.sleep(delay)
+                if budget is not None:
+                    budget.raise_if_exceeded("request_binance_minutes_retry")
+                    remaining = budget.remaining()
+                    if remaining is not None and remaining <= 0:
+                        raise
+                    time.sleep(min(delay, max(0.0, remaining)))
+                else:
+                    time.sleep(delay)
                 delay *= 2
                 continue
             raise
@@ -682,6 +732,8 @@ def _download_missing_minutes(
     start_ms: int,
     end_ms: int,
     gaps: Sequence[Mapping[str, int]],
+    *,
+    budget: _TimeBudget | None = None,
 ) -> List[Dict[str, Any]]:
     if not gaps:
         return []
@@ -690,12 +742,16 @@ def _download_missing_minutes(
     downloaded = 0
 
     try:
-        with httpx.Client(timeout=15.0) as client:
+        with httpx.Client(timeout=httpx.Timeout(6.0, connect=3.0)) as client:
             for gap in gaps:
+                if budget is not None:
+                    budget.raise_if_exceeded("download_missing_minutes_gap")
                 gap_start = int(gap["from"])
                 gap_end = int(gap["to"])
                 cursor = gap_start
                 while cursor <= gap_end:
+                    if budget is not None:
+                        budget.raise_if_exceeded("download_missing_minutes_cursor")
                     chunk_end = min(
                         gap_end,
                         cursor + (1000 - 1) * MINUTE_INTERVAL_MS,
@@ -707,6 +763,7 @@ def _download_missing_minutes(
                         cursor,
                         request_end,
                         limit=1000,
+                        budget=budget,
                     )
                     if not raw_rows:
                         break
@@ -732,6 +789,34 @@ def _download_missing_minutes(
         raise BinanceDownloadError(downloaded, str(exc)) from exc
 
     return fetched
+
+
+def _call_download_missing_minutes(
+    symbol: str,
+    start_ms: int,
+    end_ms: int,
+    gaps: Sequence[Mapping[str, int]],
+    *,
+    budget: _TimeBudget | None,
+) -> List[Dict[str, Any]]:
+    """Invoke `_download_missing_minutes` while tolerating legacy stubs without budget."""
+
+    if budget is None:
+        return _download_missing_minutes(symbol, start_ms, end_ms, gaps)
+
+    try:
+        return _download_missing_minutes(
+            symbol,
+            start_ms,
+            end_ms,
+            gaps,
+            budget=budget,
+        )
+    except TypeError as exc:
+        message = str(exc)
+        if "unexpected keyword argument" not in message or "budget" not in message:
+            raise
+        return _download_missing_minutes(symbol, start_ms, end_ms, gaps)
 
 
 def _aggregate_from_minutes(
@@ -2273,6 +2358,8 @@ def build_check_all_datas(
 
     status = "ok"
 
+    budget = _TimeBudget(_BUILD_TIMEOUT_SECONDS)
+
     frames = _normalise_frames(snapshot)
     raw_meta = snapshot.get("meta") if isinstance(snapshot.get("meta"), Mapping) else None
     symbol = str(snapshot.get("symbol") or snapshot.get("pair") or "UNKNOWN").upper()
@@ -2328,6 +2415,20 @@ def build_check_all_datas(
         stream_ts=stream_ts,
     )
 
+    try:
+        budget.raise_if_exceeded("seed_1m_backfill")
+    except _TimeBudgetExceeded as exc:
+        LOGGER.warning(
+            "Time budget exceeded before seeding minute frame",
+            extra={"stage": exc.stage, "symbol": symbol},
+        )
+        return _build_insufficient_payload(
+            symbol=symbol,
+            now=now_dt,
+            stream_price=stream_price,
+            stream_ts=stream_ts,
+        )
+
     _backfill_timeframe_with_rest(
         frames,
         symbol=symbol,
@@ -2352,6 +2453,19 @@ def build_check_all_datas(
         )
 
     if not frames.get(primary_key):
+        try:
+            budget.raise_if_exceeded("seed_primary_backfill")
+        except _TimeBudgetExceeded as exc:
+            LOGGER.warning(
+                "Time budget exceeded before seeding primary frame",
+                extra={"stage": exc.stage, "symbol": symbol, "primary_key": primary_key},
+            )
+            return _build_insufficient_payload(
+                symbol=symbol,
+                now=now_dt,
+                stream_price=stream_price,
+                stream_ts=stream_ts,
+            )
         _backfill_timeframe_with_rest(
             frames,
             symbol=symbol,
@@ -2536,11 +2650,13 @@ def build_check_all_datas(
     fetched_unique = 0
     if time_gaps:
         try:
-            downloaded_minutes = _download_missing_minutes(
+            budget.raise_if_exceeded("download_missing_minutes_start")
+            downloaded_minutes = _call_download_missing_minutes(
                 symbol,
                 window_start_ms,
                 window_end_ms,
                 time_gaps,
+                budget=budget,
             )
         except BinanceDownloadError as exc:
             detail = {
@@ -2555,6 +2671,23 @@ def build_check_all_datas(
                 "downloaded": exc.downloaded,
             }
             raise DataQualityError(detail) from exc
+        except _TimeBudgetExceeded as exc:
+            LOGGER.warning(
+                "Time budget exceeded while downloading missing 1m candles",
+                extra={
+                    "stage": exc.stage,
+                    "symbol": symbol,
+                    "window_start_ms": window_start_ms,
+                    "window_end_ms": window_end_ms,
+                    "time_gaps": time_gaps,
+                },
+            )
+            return _build_insufficient_payload(
+                symbol=symbol,
+                now=now_dt,
+                stream_price=stream_price,
+                stream_ts=stream_ts,
+            )
         for candle in downloaded_minutes:
             ts = candle["t"]
             if ts < window_start_ms or ts > window_end_ms:
@@ -2582,6 +2715,20 @@ def build_check_all_datas(
 
     frames["1m"] = [minute_index_all[ts] for ts in sorted(minute_index_all)]
     minute_candles = frames["1m"]
+
+    try:
+        budget.raise_if_exceeded("zones_preparation")
+    except _TimeBudgetExceeded as exc:
+        LOGGER.warning(
+            "Time budget exceeded before zones preparation",
+            extra={"stage": exc.stage, "symbol": symbol},
+        )
+        return _build_insufficient_payload(
+            symbol=symbol,
+            now=now_dt,
+            stream_price=stream_price,
+            stream_ts=stream_ts,
+        )
 
     zones_window_hours = max(1, hours_window)
     if not strict_window:
@@ -2623,11 +2770,13 @@ def build_check_all_datas(
     zone_history_gaps = _summarise_missing_times(zone_expected_minutes, minute_index_all)
     if zone_history_gaps:
         try:
-            zone_downloaded_minutes = _download_missing_minutes(
+            budget.raise_if_exceeded("zones_history_backfill_start")
+            zone_downloaded_minutes = _call_download_missing_minutes(
                 symbol,
                 zones_history_start_ms,
                 window_end_ms,
                 zone_history_gaps,
+                budget=budget,
             )
         except BinanceDownloadError as exc:
             detail = {
@@ -2639,6 +2788,23 @@ def build_check_all_datas(
                 "time_gaps": zone_history_gaps,
             }
             raise DataQualityError(detail) from exc
+        except _TimeBudgetExceeded as exc:
+            LOGGER.warning(
+                "Time budget exceeded while seeding zone history",
+                extra={
+                    "stage": exc.stage,
+                    "symbol": symbol,
+                    "zones_history_start_ms": zones_history_start_ms,
+                    "window_end_ms": window_end_ms,
+                    "time_gaps": zone_history_gaps,
+                },
+            )
+            return _build_insufficient_payload(
+                symbol=symbol,
+                now=now_dt,
+                stream_price=stream_price,
+                stream_ts=stream_ts,
+            )
         for candle in zone_downloaded_minutes:
             ts = candle["t"]
             if ts < zones_history_start_ms or ts > window_end_ms:
