@@ -158,7 +158,8 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
     assert response.status_code == 200
     body = response.json()
 
-    assert set(body.keys()) == {"meta", "data", "availability", "missing_fields"}
+    assert set(body.keys()) == {"status", "meta", "data", "availability", "missing_fields"}
+    assert body["status"] == "ok"
 
     meta = body["meta"]
     assert meta["symbol"] == payload["symbol"]

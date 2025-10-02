@@ -6,7 +6,7 @@ import math
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, time as dtime
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple, Set
+from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple, Set
 
 import httpx
 
@@ -51,6 +51,7 @@ try:
         TIMEFRAME_TO_MS,
         aggregate_1m_to_1h,
         build_multi_timeframe_ohlcv,
+        fetch_ohlcv_sync,
         resample_ohlcv,
     )
 except ImportError:  # pragma: no cover - circular import guard
@@ -65,6 +66,9 @@ except ImportError:  # pragma: no cover - circular import guard
     def build_multi_timeframe_ohlcv(*args, **kwargs):  # type: ignore[override]
         raise ImportError("build_multi_timeframe_ohlcv is unavailable")
 
+    def fetch_ohlcv_sync(*args, **kwargs):  # type: ignore[override]
+        raise ImportError("fetch_ohlcv_sync is unavailable")
+
 MINUTE_INTERVAL_MS = TIMEFRAME_TO_MS.get("1m", MS_IN_HOUR // 60)
 
 VWAP_TPO_SESSIONS: Tuple[Tuple[str, dtime, dtime], ...] = (
@@ -75,6 +79,25 @@ VWAP_TPO_SESSIONS: Tuple[Tuple[str, dtime, dtime], ...] = (
 
 _RETRYABLE_STATUS = {418, 429, 500, 502, 503, 504}
 _MAX_RETRIES = 5
+
+_EXPECTED_OHLCV_TFS: Tuple[str, ...] = ("1m", "3m", "5m", "15m", "1h", "4h", "1d")
+_EXPECTED_ORDERFLOW_TFS: Tuple[str, ...] = ("15m", "1h")
+_EXPECTED_ORDERFLOW_METRICS: Tuple[str, ...] = ("footprint", "delta", "cvd")
+_EXPECTED_ZONE_KEYS: Tuple[str, ...] = (
+    "fvg",
+    "fvl",
+    "ob",
+    "mb",
+    "bb",
+    "rb",
+    "pb",
+    "sr",
+    "profile_levels",
+)
+
+_COLD_BACKFILL_MIN_REQUIRED: Dict[str, int] = {
+    tf: 1 for tf in _EXPECTED_OHLCV_TFS
+}
 
 class DataQualityError(RuntimeError):
     """Raised when the inspected snapshot fails deterministic data checks."""
@@ -200,6 +223,238 @@ def _deduplicate_sorted(
 
     ordered_times = sorted(seen)
     return [seen[ts] for ts in ordered_times]
+
+
+def _normalise_external_candles(
+    payload: Sequence[Mapping[str, Any]] | Mapping[str, Any] | None,
+) -> List[Dict[str, Any]]:
+    """Normalise external candle payloads into the internal shape."""
+
+    if payload is None:
+        return []
+
+    if isinstance(payload, Mapping):
+        raw_candles = payload.get("candles")
+        if not isinstance(raw_candles, Sequence):
+            return []
+        source: Sequence[Mapping[str, Any]] = raw_candles  # type: ignore[assignment]
+    elif isinstance(payload, Sequence):
+        source = [item for item in payload if isinstance(item, Mapping)]  # type: ignore[list-item]
+    else:
+        return []
+
+    normalised: List[Dict[str, Any]] = []
+    for item in source:
+        ts = _safe_int(item.get("t"))
+        if ts is None:
+            continue
+        normalised.append(
+            {
+                "t": ts,
+                "o": _coerce_float(item.get("o")),
+                "h": _coerce_float(item.get("h")),
+                "l": _coerce_float(item.get("l")),
+                "c": _coerce_float(item.get("c")),
+                "v": _coerce_float(item.get("v")),
+            }
+        )
+
+    normalised.sort(key=lambda candle: candle["t"])
+    return normalised
+
+
+def _merge_candle_collections(
+    existing: Sequence[Mapping[str, Any]],
+    incoming: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Merge two candle collections preferring values from the existing set."""
+
+    combined: List[Mapping[str, Any]] = []
+    if incoming:
+        combined.extend(incoming)
+    if existing:
+        combined.extend(existing)
+    return _deduplicate_sorted(combined)
+
+
+def _resolve_window_end_ms(
+    frames: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    now_ms: int,
+    selection_end_ms: int | None,
+    stream_ts: int | None,
+) -> int:
+    """Resolve a best-effort window end timestamp based on available hints."""
+
+    candidates: List[int] = [now_ms]
+    if selection_end_ms is not None:
+        candidates.append(selection_end_ms)
+    if stream_ts is not None:
+        candidates.append(stream_ts)
+
+    for candles in frames.values():
+        if not candles:
+            continue
+        last_ts = _safe_int(candles[-1].get("t"))
+        if last_ts is not None:
+            candidates.append(last_ts)
+
+    return max(candidates) if candidates else now_ms
+
+
+def _backfill_timeframe_with_rest(
+    frames: MutableMapping[str, List[MutableMapping[str, Any]]],
+    *,
+    symbol: str,
+    timeframe: str,
+    window_end_ms: int,
+    window_hours: int,
+    fetcher: Callable[..., Mapping[str, Any]] | None = None,
+    minimum_required: int | None = None,
+) -> bool:
+    """Ensure the requested timeframe has at least the required candles."""
+
+    interval_ms = TIMEFRAME_TO_MS.get(timeframe)
+    if interval_ms is None:
+        return False
+
+    if minimum_required is None:
+        minimum_required = _COLD_BACKFILL_MIN_REQUIRED.get(timeframe, 1)
+    minimum_required = max(1, int(minimum_required))
+
+    existing = frames.get(timeframe, [])
+    window_start_ms = max(0, window_end_ms - max(1, window_hours) * MS_IN_HOUR)
+
+    available = 0
+    for candle in existing:
+        ts = _safe_int(candle.get("t"))
+        if ts is None:
+            continue
+        if window_start_ms <= ts <= window_end_ms:
+            available += 1
+            if available >= minimum_required:
+                return False
+
+    fetch_callable = fetcher or fetch_ohlcv_sync
+    try:
+        fetched_payload = fetch_callable(symbol, timeframe, hours=max(1, window_hours))
+    except Exception as exc:  # pragma: no cover - defensive logging
+        LOGGER.warning(
+            "Cold backfill request failed",
+            exc_info=exc,
+            extra={
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "window_hours": window_hours,
+            },
+        )
+        return False
+
+    fetched_candles = _normalise_external_candles(fetched_payload)
+    if not fetched_candles:
+        return False
+
+    merged = _merge_candle_collections(existing, fetched_candles)
+    frames[timeframe] = [dict(candle) for candle in merged]
+    return True
+
+
+def _build_insufficient_payload(
+    *,
+    symbol: str,
+    now: datetime,
+    stream_price: float | None,
+    stream_ts: int | None,
+) -> Dict[str, Any]:
+    """Return a deterministic payload when cold backfill could not seed data."""
+
+    frames_stub: Dict[str, Sequence[Mapping[str, Any]]] = {
+        tf: [] for tf in _EXPECTED_OHLCV_TFS
+    }
+    (
+        last_price,
+        last_iso,
+        last_tf,
+        age_sec,
+        _,
+        price_source,
+        _diagnostics,
+    ) = _resolve_last_price(
+        frames_stub,
+        now=now,
+        stream_price=stream_price,
+        stream_ts=stream_ts,
+        tick_size=None,
+    )
+
+    meta_block: Dict[str, Any] = {
+        "symbol": symbol,
+        "tz": "Europe/Berlin",
+        "last_price": last_price,
+        "last_ts_utc": last_iso,
+        "last_tf": last_tf,
+        "last_price_source": price_source,
+        "insufficient_reason": "stale_or_unseeded_buffers",
+        "stale": True,
+    }
+    if age_sec is not None:
+        meta_block["snapshot_age_sec"] = age_sec
+
+    data_payload = {
+        "symbol": symbol,
+        "ohlcv": {tf: {"candles": []} for tf in _EXPECTED_OHLCV_TFS},
+        "orderflow": {tf: {"per_bar": []} for tf in _EXPECTED_ORDERFLOW_TFS},
+        "vwap_tpo": {
+            "daily": {},
+            "sessions": {session: {} for session in ("asia", "london", "ny")},
+        },
+        "tpo": {"composite_day": {}},
+        "prev_day": {},
+        "zones": {key: [] for key in _EXPECTED_ZONE_KEYS},
+        "liquidity": {"eqh": [], "eql": []},
+        "risk_prefs": {"rr_min": 2.5, "risk_per_trade_pct": 1.0},
+        "context": {"globalBias": "neutral", "narrative": "", "openOppositeZones": False},
+    }
+
+    availability_payload = {
+        "ohlcv": {tf: {"candles": 0, "has_data": False} for tf in _EXPECTED_OHLCV_TFS},
+        "vwap_sessions": {
+            session: {
+                "present": False,
+                "metrics": {
+                    metric: False
+                    for metric in ("poc", "vah", "val", "ib_high", "ib_low")
+                },
+            }
+            for session in ("asia", "london", "ny")
+        },
+        "zones": {key: {"count": 0} for key in _EXPECTED_ZONE_KEYS},
+        "orderflow": {
+            "timeframes": {
+                tf: {"bars": 0, "has_data": False} for tf in _EXPECTED_ORDERFLOW_TFS
+            },
+            "metrics": {metric: False for metric in _EXPECTED_ORDERFLOW_METRICS},
+        },
+    }
+
+    missing_fields: Set[str] = set()
+    missing_fields.update(f"ohlcv.{tf}" for tf in _EXPECTED_OHLCV_TFS)
+    for session in ("asia", "london", "ny"):
+        missing_fields.add(f"vwap_tpo.sessions.{session}")
+        for metric in ("poc", "vah", "val", "ib_high", "ib_low"):
+            missing_fields.add(f"vwap_tpo.sessions.{session}.{metric}")
+    missing_fields.update(f"zones.{key}" for key in _EXPECTED_ZONE_KEYS)
+    missing_fields.update(f"orderflow.{tf}" for tf in _EXPECTED_ORDERFLOW_TFS)
+    missing_fields.update(f"orderflow.{metric}" for metric in _EXPECTED_ORDERFLOW_METRICS)
+
+    payload = {
+        "status": "insufficient_data",
+        "meta": meta_block,
+        "data": data_payload,
+        "availability": availability_payload,
+        "missing_fields": sorted(missing_fields),
+    }
+    return round_floats(payload)
 
 
 def _resolve_last_price(
@@ -2016,27 +2271,17 @@ def build_check_all_datas(
 ) -> Dict[str, Any] | None:
     """Create an enriched payload for the snapshot health endpoint."""
 
+    status = "ok"
+
     frames = _normalise_frames(snapshot)
-    if not frames:
-        return None
-
-    primary_key = _primary_frame_key(snapshot, frames)
-    if not primary_key:
-        return None
-
-    primary_candles = frames.get(primary_key, [])
-    if not primary_candles:
-        return None
-
-    # Drop unused granularities to keep the payload focused on the requested set.
-    frames.pop("3m", None)
-    frames.pop("5m", None)
-
-    minute_candles = _deduplicate_sorted(frames.get("1m", []))
-    frames["1m"] = minute_candles
-
-    symbol = str(snapshot.get("symbol") or snapshot.get("pair") or "UNKNOWN").upper()
     raw_meta = snapshot.get("meta") if isinstance(snapshot.get("meta"), Mapping) else None
+    symbol = str(snapshot.get("symbol") or snapshot.get("pair") or "UNKNOWN").upper()
+
+    if now_utc is None:
+        now_dt = datetime.now(UTC)
+    else:
+        now_dt = now_utc.astimezone(UTC)
+    now_ms = int(now_dt.timestamp() * 1000)
 
     stream_price: float | None = None
     stream_ts: int | None = None
@@ -2060,6 +2305,76 @@ def build_check_all_datas(
         stream_price = price
         stream_ts = ts
         break
+
+    if selection_end_ms is None:
+        selection_payload = snapshot.get("selection")
+        if isinstance(selection_payload, Mapping):
+            selection_end_candidate = _safe_int(selection_payload.get("end"))
+            if selection_end_candidate is not None:
+                selection_end_ms = selection_end_candidate
+
+    if not frames:
+        frames = {}
+
+    base_window_hours = window_hours if window_hours is not None else hours
+    if base_window_hours is None or base_window_hours <= 0:
+        base_window_hours = 4
+    base_window_hours = int(base_window_hours)
+
+    window_end_guess = _resolve_window_end_ms(
+        frames,
+        now_ms=now_ms,
+        selection_end_ms=selection_end_ms,
+        stream_ts=stream_ts,
+    )
+
+    _backfill_timeframe_with_rest(
+        frames,
+        symbol=symbol,
+        timeframe="1m",
+        window_end_ms=window_end_guess,
+        window_hours=base_window_hours,
+    )
+
+    minute_seed = frames.get("1m", [])
+    if minute_seed:
+        frames["1m"] = _deduplicate_sorted(minute_seed)
+
+    primary_key = _primary_frame_key(snapshot, frames)
+    if not primary_key and "1m" in frames:
+        primary_key = "1m"
+    if not primary_key:
+        return _build_insufficient_payload(
+            symbol=symbol,
+            now=now_dt,
+            stream_price=stream_price,
+            stream_ts=stream_ts,
+        )
+
+    if not frames.get(primary_key):
+        _backfill_timeframe_with_rest(
+            frames,
+            symbol=symbol,
+            timeframe=primary_key,
+            window_end_ms=window_end_guess,
+            window_hours=base_window_hours,
+        )
+
+    primary_candles = frames.get(primary_key, [])
+    if not primary_candles:
+        return _build_insufficient_payload(
+            symbol=symbol,
+            now=now_dt,
+            stream_price=stream_price,
+            stream_ts=stream_ts,
+        )
+
+    # Drop unused granularities to keep the payload focused on the requested set.
+    frames.pop("3m", None)
+    frames.pop("5m", None)
+
+    minute_candles = _deduplicate_sorted(frames.get("1m", []))
+    frames["1m"] = minute_candles
 
     profile_config = resolve_profile_config(symbol, raw_meta)
     sessions = list(VWAP_TPO_SESSIONS)
@@ -2161,7 +2476,12 @@ def build_check_all_datas(
         window_end_ms = primary_candles[-1]["t"] + max(primary_interval - MINUTE_INTERVAL_MS, 0)
 
     if window_end_ms is None:
-        return None
+        return _build_insufficient_payload(
+            symbol=symbol,
+            now=now_dt,
+            stream_price=stream_price,
+            stream_ts=stream_ts,
+        )
 
     window_end_ms = max(0, _align_to_interval(window_end_ms, MINUTE_INTERVAL_MS))
 
@@ -3408,6 +3728,7 @@ def build_check_all_datas(
         meta_block["stream_vs_ohlcv_mismatch"] = True
 
     final_payload = {
+        "status": status,
         "meta": meta_block,
         "data": data_payload,
         "availability": availability,
