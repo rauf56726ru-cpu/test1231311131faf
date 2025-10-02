@@ -1858,6 +1858,8 @@ def build_check_all_datas(
     selection_end_ms: int | None = None,
     hours: int | None = None,
     window_hours: int | None = None,
+    window_start_override_ms: int | None = None,
+    strict_window: bool = False,
 ) -> Dict[str, Any] | None:
     """Create an enriched payload for the snapshot health endpoint."""
 
@@ -1957,15 +1959,6 @@ def build_check_all_datas(
     if selection_start > selection_end:
         selection_start, selection_end = selection_end, selection_start
 
-    if window_hours is not None:
-        try:
-            hours_candidate = int(window_hours)
-        except (TypeError, ValueError):
-            hours_candidate = 0
-        hours_window = max(1, hours_candidate)
-    else:
-        hours_window = hours if hours in VALID_HOUR_WINDOWS else min(VALID_HOUR_WINDOWS)
-
     if now_utc is not None:
         if now_utc.tzinfo is None:
             now_dt = now_utc.replace(tzinfo=UTC)
@@ -1990,10 +1983,42 @@ def build_check_all_datas(
 
     window_end_ms = max(0, _align_to_interval(window_end_ms, MINUTE_INTERVAL_MS))
 
-    raw_window_start = window_end_ms - hours_window * MS_IN_HOUR
-    window_start_ms = max(0, _align_to_interval(raw_window_start, MINUTE_INTERVAL_MS))
-    if target_interval_ms > MINUTE_INTERVAL_MS:
-        window_start_ms = max(0, _align_to_interval(window_start_ms, target_interval_ms))
+    if window_hours is not None:
+        try:
+            hours_candidate = int(window_hours)
+        except (TypeError, ValueError):
+            hours_candidate = 0
+        hours_window = max(1, hours_candidate)
+    else:
+        hours_window = hours if hours in VALID_HOUR_WINDOWS else min(VALID_HOUR_WINDOWS)
+
+    override_start_ms: int | None = None
+    if window_start_override_ms is not None:
+        try:
+            override_start_ms = int(window_start_override_ms)
+        except (TypeError, ValueError):
+            override_start_ms = None
+        if override_start_ms is not None:
+            override_start_ms = max(0, override_start_ms)
+
+    if override_start_ms is not None:
+        window_start_ms = max(0, _align_to_interval(override_start_ms, MINUTE_INTERVAL_MS))
+        if window_start_ms >= window_end_ms:
+            window_start_ms = max(0, window_end_ms - MINUTE_INTERVAL_MS)
+        if target_interval_ms > MINUTE_INTERVAL_MS and not strict_window:
+            aligned_target = _align_to_interval(window_start_ms, target_interval_ms)
+            if aligned_target < window_start_ms:
+                aligned_target += target_interval_ms
+            if aligned_target >= window_end_ms:
+                aligned_target = max(0, window_end_ms - target_interval_ms)
+            window_start_ms = max(0, aligned_target)
+        span_ms = max(MINUTE_INTERVAL_MS, window_end_ms - window_start_ms + MINUTE_INTERVAL_MS)
+        hours_window = max(1, int(math.ceil(span_ms / MS_IN_HOUR)))
+    else:
+        raw_window_start = window_end_ms - hours_window * MS_IN_HOUR
+        window_start_ms = max(0, _align_to_interval(raw_window_start, MINUTE_INTERVAL_MS))
+        if target_interval_ms > MINUTE_INTERVAL_MS:
+            window_start_ms = max(0, _align_to_interval(window_start_ms, target_interval_ms))
 
     minute_index_all = {candle["t"]: candle for candle in minute_candles}
     minute_window_index = {
@@ -2056,26 +2081,38 @@ def build_check_all_datas(
     frames["1m"] = [minute_index_all[ts] for ts in sorted(minute_index_all)]
     minute_candles = frames["1m"]
 
-    zones_window_hours = max(48, hours_window)
+    zones_window_hours = max(1, hours_window)
+    if not strict_window:
+        zones_window_hours = max(48, zones_window_hours)
     fifteen_min_ms = TIMEFRAME_TO_MS.get("15m") or 15 * MINUTE_INTERVAL_MS
-    zone_window_ms = zones_window_hours * MS_IN_HOUR
-    raw_zone_start = max(0, window_end_ms - zone_window_ms)
-    if fifteen_min_ms:
-        raw_zone_start = max(0, _align_to_interval(raw_zone_start, fifteen_min_ms))
-    zones_window_start_ms = raw_zone_start
+    if strict_window:
+        zones_window_start_ms = max(0, _align_to_interval(window_start_ms, MINUTE_INTERVAL_MS))
+    else:
+        zone_window_ms = zones_window_hours * MS_IN_HOUR
+        raw_zone_start = max(0, window_end_ms - zone_window_ms)
+        if fifteen_min_ms:
+            raw_zone_start = max(0, _align_to_interval(raw_zone_start, fifteen_min_ms))
+        zones_window_start_ms = raw_zone_start
     warmup_bars_base = zone_cfg.atr_period + 10
     min_bars_per_tf = {"15m": 200, "1h": 60, "4h": 24}
+    required_bars_per_tf: Dict[str, int] = {}
     history_candidate = zones_window_start_ms
     for tf_key, baseline in min_bars_per_tf.items():
         required = max(baseline, warmup_bars_base)
+        required_bars_per_tf[tf_key] = required
+        if strict_window:
+            continue
         interval_ms_tf = TIMEFRAME_TO_MS.get(tf_key)
         if not interval_ms_tf:
             continue
         candidate = zones_window_start_ms - required * interval_ms_tf
         if candidate < history_candidate:
             history_candidate = candidate
-    history_candidate = min(history_candidate, zones_window_start_ms - MS_IN_DAY)
-    zones_history_start_ms = max(0, history_candidate)
+    if strict_window:
+        zones_history_start_ms = zones_window_start_ms
+    else:
+        history_candidate = min(history_candidate, zones_window_start_ms - MS_IN_DAY)
+        zones_history_start_ms = max(0, history_candidate)
     zones_history_start_ms = max(0, _align_to_interval(zones_history_start_ms, MINUTE_INTERVAL_MS))
 
     zone_expected_minutes = _build_expected_times(
@@ -2162,6 +2199,15 @@ def build_check_all_datas(
         total = len(zone_frames_full.get(tf, []))
         window_count = len(zone_frames_window.get(tf, []))
         warmup_bars_per_tf[tf] = max(0, total - window_count)
+    zone_availability: Dict[str, Dict[str, int | bool]] = {}
+    if strict_window:
+        for tf_key, required in required_bars_per_tf.items():
+            available = len(zone_frames_window.get(tf_key, []))
+            zone_availability[tf_key] = {
+                "required": int(required),
+                "available": int(available),
+                "ok": bool(available >= required),
+            }
     zones_diag = {
         "tf_lengths": zone_tf_lengths,
         "atr_period": zone_cfg.atr_period,
@@ -2169,6 +2215,8 @@ def build_check_all_datas(
         "window_hours": zones_window_hours,
         "tick_size": zone_cfg.tick_size,
     }
+    if zone_availability:
+        zones_diag["availability"] = zone_availability
     zone_cfg.zones_window_start_ms = zones_window_start_ms
     zone_cfg.window_end_ms_prev_closed = window_end_ms
     zone_cfg.allow_base_fallback = True
@@ -2523,6 +2571,16 @@ def build_check_all_datas(
                 if rb_fallback_map:
                     zones_diag["base_fallback_used"] = rb_fallback_map
                 zones_diag["detection"] = detection_diag
+    zone_type_timeframes = {
+        "fvg": ("15m", "1h", "4h"),
+        "ob": ("15m", "1h", "4h"),
+        "mb": ("1h", "4h"),
+        "bb": ("1h", "4h"),
+        "rb": ("15m", "1h", "4h"),
+        "pb": ("15m", "1h", "4h"),
+        "sr": ("1h", "4h"),
+    }
+
     if isinstance(zones_container, MutableMapping):
         timestamp_filters = {
             "fvg": "created_utc",
@@ -2574,6 +2632,13 @@ def build_check_all_datas(
                     "window_hours": zones_window_hours,
                 },
             )
+
+    if strict_window and zone_availability and isinstance(zones_container, MutableMapping):
+        for zone_key, tf_candidates in zone_type_timeframes.items():
+            if not tf_candidates or zone_key not in zones_container:
+                continue
+            if any(not zone_availability.get(tf, {}).get("ok", False) for tf in tf_candidates):
+                zones_container[zone_key] = []
 
     liquidity_payload = build_liquidity_snapshot(
         liquidity_frames,
@@ -2952,6 +3017,35 @@ def build_check_all_datas(
                 zones_public[key] = [
                     dict(item) for item in raw_zone if isinstance(item, Mapping)
                 ]
+
+    if strict_window and zone_availability:
+        for zone_key, tf_candidates in zone_type_timeframes.items():
+            if zones_public.get(zone_key):
+                continue
+            if not tf_candidates:
+                continue
+            insufficient: List[str] = []
+            tracked = 0
+            for tf_name in tf_candidates:
+                tracked += 1
+                info = zone_availability.get(tf_name)
+                required = required_bars_per_tf.get(tf_name, 0)
+                available = len(zone_frames_window.get(tf_name, []))
+                ok = available >= required if required else False
+                if info is not None:
+                    required = int(info.get("required", required))
+                    available = int(info.get("available", available))
+                    ok = bool(info.get("ok", available >= required if required else False))
+                if not required:
+                    continue
+                if not ok:
+                    insufficient.append(f"{tf_name}: {available}/{required}")
+            if tracked and insufficient and len(insufficient) == tracked:
+                message = (
+                    f"В выбранный период данных для {zone_key.upper()} нет "
+                    f"(доступно {', '.join(insufficient)})."
+                )
+                zones_public[zone_key] = [{"message": message, "period": "topup"}]
 
     liquidity_public = {
         "eqh": list(liquidity_equal_levels.get("eqh", [])),

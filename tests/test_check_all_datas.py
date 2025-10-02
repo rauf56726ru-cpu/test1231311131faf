@@ -9,6 +9,7 @@ from src.api.app import app
 import src.services.check_all_datas as check_all_datas
 import src.services.inspection as inspection
 from src.services import presets
+from src.services.collection_state import reset_state, set_last_collection_time
 
 UTC = timezone.utc
 
@@ -226,6 +227,36 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
 
     assert body["risk_prefs"] == {"rr_min": pytest.approx(2.5), "risk_per_trade_pct": pytest.approx(1.0)}
     assert body["context"] == {"globalBias": "neutral", "narrative": "", "openOppositeZones": False}
+
+
+def test_topup_limits_window_to_last_collection(client: TestClient) -> None:
+    reset_state()
+    base = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
+    payload = _build_snapshot_payload(base, count=60 * 6)
+
+    create_response = client.post("/inspection/snapshot", json=payload)
+    assert create_response.status_code == 200
+    snapshot_id = create_response.json()["snapshot_id"]
+
+    last_collection_dt = base + timedelta(hours=5, minutes=55)
+    set_last_collection_time(last_collection_dt)
+
+    try:
+        response = client.get(
+            "/inspection/check-all",
+            params={"snapshot": snapshot_id, "mode": "topup"},
+        )
+        assert response.status_code == 200
+        body = response.json()
+
+        for zone_key in ("fvg", "ob", "mb", "bb", "rb", "pb", "sr"):
+            zone_entries = body["zones"].get(zone_key, [])
+            assert zone_entries, f"expected informational entry for {zone_key}"
+            message_entry = zone_entries[0]
+            assert "message" in message_entry
+            assert "выбранный период" in message_entry["message"].lower()
+    finally:
+        reset_state()
 
 
 def test_multi_timeframe_ohlcv_alignment(client: TestClient) -> None:

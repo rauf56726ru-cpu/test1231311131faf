@@ -31,6 +31,7 @@ from .presets import (
 )
 from .liquidity import build_liquidity_snapshot
 from .zones import Config as ZonesConfig, detect_zones
+from .enrichment import apply_enrichment_to_payload, enrich_inspection_snapshot
 from .collection_state import get_last_collection_time, set_last_collection_time
 from .shared_candles_store import (
     clear_shared_candles,
@@ -92,4 +93,6 @@ __all__ = [
     "get_shared_candles",
     "merge_shared_candles",
     "clear_shared_candles",
+    "enrich_inspection_snapshot",
+    "apply_enrichment_to_payload",
 ]

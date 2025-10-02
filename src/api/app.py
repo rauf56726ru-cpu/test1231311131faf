@@ -37,6 +37,8 @@ from ..services import (
     save_preset,
     set_last_collection_time,
     update_preset,
+    apply_enrichment_to_payload,
+    enrich_inspection_snapshot,
 )
 from ..services.zones import Config as ZonesConfig, detect_zones
 
@@ -510,6 +512,15 @@ async def register_inspection_snapshot(payload: SnapshotIn) -> Dict[str, str]:
     snapshot["book"] = book_state
     snapshot["news_events"] = news_items
 
+    enrichment: Dict[str, Any] | None = None
+    try:
+        enrichment = await enrich_inspection_snapshot(snapshot, cache=cache)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Snapshot enrichment failed: %s", exc)
+        enrichment = {"status": "insufficient_data", "missing_fields": [str(exc)]}
+    if enrichment:
+        snapshot["enrichment"] = enrichment
+
     valid, errors = validate_enhanced_snapshot(snapshot)
     if not valid:
         raise HTTPException(status_code=422, detail={"errors": errors})
@@ -729,12 +740,28 @@ async def inspection(
 
     payload = build_inspection_payload(target_snapshot)
 
-    enriched = getattr(app.state, "snapshots", {}).get(target_snapshot.get("id")) if isinstance(target_snapshot, Mapping) else None
-    if isinstance(enriched, Mapping):
+    stored_snapshots = getattr(app.state, "snapshots", {})
+    enriched_snapshot = stored_snapshots.get(target_snapshot.get("id")) if isinstance(stored_snapshots, Mapping) else None
+    if isinstance(enriched_snapshot, Mapping):
+        enrichment_payload = enriched_snapshot.get("enrichment") if isinstance(enriched_snapshot.get("enrichment"), Mapping) else None
+        if enrichment_payload is None:
+            try:
+                cache = getattr(app.state, "ohlcv_cache", {})
+                combined_snapshot = dict(enriched_snapshot)
+                data_section = payload.get("DATA") if isinstance(payload.get("DATA"), Mapping) else None
+                if data_section is not None:
+                    combined_snapshot["DATA"] = data_section
+                enrichment_payload = await enrich_inspection_snapshot(combined_snapshot, cache=cache)
+                enriched_snapshot["enrichment"] = enrichment_payload
+            except Exception as exc:
+                logging.getLogger(__name__).warning("Inspection enrichment failed: %s", exc)
+                enrichment_payload = None
         data_section = payload.setdefault("DATA", {})
         for key in ("ohlcv", "orderflow", "liquidity_map", "derivatives", "book", "news_events"):
-            if key in enriched and key not in data_section:
-                data_section[key] = enriched[key]
+            if key in enriched_snapshot and key not in data_section:
+                data_section[key] = enriched_snapshot[key]
+        if enrichment_payload:
+            apply_enrichment_to_payload(payload, enrichment_payload)
 
     accept_header = request.headers.get("accept", "").lower()
     if "application/json" in accept_header:
@@ -878,6 +905,7 @@ async def inspection_check_all(
     if mode_value == "topup":
         last_collection = get_last_collection_time()
         window_hours = 4
+        window_start_override_ms: int | None = None
         if last_collection is not None:
             delta = collection_reference - last_collection
             delta_seconds = max(delta.total_seconds(), 0)
@@ -888,11 +916,18 @@ async def inspection_check_all(
                 window_hours = 4
             else:
                 window_hours = max(1, int(ceil(delta_hours)))
+            last_collection_utc = last_collection.astimezone(timezone.utc)
+            last_collection_ms = int(last_collection_utc.timestamp() * 1000)
+            aligned_ms = (last_collection_ms // 60_000) * 60_000
+            next_minute_ms = aligned_ms + 60_000
+            window_start_override_ms = max(0, next_minute_ms)
         try:
             payload = build_check_all_datas(
                 target_snapshot,
                 now_utc=now_override,
                 window_hours=window_hours,
+                window_start_override_ms=window_start_override_ms,
+                strict_window=True,
             )
         except DataQualityError as exc:
             raise HTTPException(
