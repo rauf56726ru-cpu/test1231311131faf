@@ -5,6 +5,7 @@
   const BinanceCandles = window.BinanceCandles;
   const ChartGapWatcher = window.ChartGapWatcher;
   const SharedCandles = window.SharedCandles;
+  const MarketDataStore = window.MarketDataStore || null;
 
   if (!LightweightCharts || !BinanceCandles) {
     console.error("Chart dependencies are missing");
@@ -44,9 +45,6 @@
     chart: null,
     candleSeries: null,
     priceLine: null,
-    ws: null,
-    reconnectTimer: null,
-    reconnectAttempts: 0,
     gapWatcher: null,
     lastUpdateMs: null,
     pocSeries: null,
@@ -55,6 +53,15 @@
     inspectProgressTimer: null,
     lastSnapshotId: null,
   };
+
+  const marketStore =
+    MarketDataStore &&
+    new MarketDataStore({
+      symbol: state.symbol,
+      interval: state.interval,
+      pollIntervalMs: 1500,
+      historyLimit: 1500,
+    });
 
   function setActiveSymbolButton(symbol) {
     if (!symbolButtons.length) return;
@@ -128,7 +135,7 @@
   async function fetchVersion() {
     if (!versionEl) return;
     try {
-      const response = await fetch("/version");
+      const response = await fetch("/version", { cache: "no-store" });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = await response.json();
       versionEl.textContent = typeof data.version === "string" ? data.version : "—";
@@ -141,7 +148,7 @@
   async function fetchPreset(symbol) {
     if (!presetBadge) return;
     try {
-      const response = await fetch(`/presets/${encodeURIComponent(symbol)}`);
+      const response = await fetch(`/presets/${encodeURIComponent(symbol)}`, { cache: "no-store" });
       if (!response.ok) throw new Error("Preset request failed");
       const data = await response.json();
       const preset = data && data.preset ? data.preset : null;
@@ -268,6 +275,79 @@
     return restored;
   }
 
+
+  function refreshGapWatcherContext() {
+    if (!state.gapWatcher || typeof state.gapWatcher.updateContext !== "function") return;
+    state.gapWatcher.updateContext({
+      symbol: state.symbol,
+      interval: state.interval,
+      intervalMs: intervalToMs(state.interval),
+      getCandles: () => state.candles,
+      requestGap: handleGapRequest,
+      resetRequestedKeys: false,
+    });
+    if (typeof state.gapWatcher.notifyData === "function") {
+      state.gapWatcher.notifyData();
+    }
+  }
+
+  function handleStoreEvent(event) {
+    if (!event) return;
+    const eventSymbol = (event.symbol || "").toUpperCase();
+    if (eventSymbol && eventSymbol !== state.symbol) return;
+    if (event.interval && event.interval !== state.interval) return;
+
+    if (event.type === "status") {
+      if (event.status === "connected") {
+        notifyStatus("Подключено к потоку Binance", "info");
+      } else if (event.status === "closed") {
+        notifyStatus("Соединение закрыто, активирован пуллинг", "warning");
+      } else if (event.status === "error") {
+        notifyStatus("Ошибка потока, переподключение...", "warning");
+      }
+      return;
+    }
+
+    if (event.type === "error") {
+      notifyStatus("Ошибка загрузки данных Binance", "error");
+      return;
+    }
+
+    const now = Date.now();
+
+    if (event.type === "snapshot") {
+      const bars = Array.isArray(event.candles) ? event.candles : [];
+      const changed = mergeCandles(bars, { reset: true, lastUpdateMs: now });
+      if (changed) {
+        applyCandles();
+        focusOnLastCandle({ preserveSpan: false });
+        refreshGapWatcherContext();
+      }
+      notifyStatus("История загружена", "success");
+    } else if (event.type === "update") {
+      const payload = event.candle ? [event.candle] : [];
+      const changed = mergeCandles(payload, { reset: false, lastUpdateMs: now });
+      if (changed) {
+        applyCandles(event.candle);
+        refreshGapWatcherContext();
+      }
+    } else if (event.type === "poll") {
+      const bars = Array.isArray(event.candles) ? event.candles : [];
+      if (mergeCandles(bars, { reset: false, lastUpdateMs: now })) {
+        applyCandles();
+      }
+    }
+
+    if (event.meta && event.meta.last_price != null) {
+      updateInfo(event.candle || marketStore?.getLastCandle() || null);
+    }
+  }
+
+  if (marketStore) {
+    marketStore.subscribe(handleStoreEvent);
+    marketStore.start();
+  }
+
   function updateInfo(lastBar) {
     const bar = lastBar || state.candles[state.candles.length - 1];
     if (!bar) {
@@ -374,89 +454,6 @@
     timeScale.scrollToRealTime();
   }
 
-  function detachWs() {
-    if (state.ws) {
-      state.ws.onopen = null;
-      state.ws.onmessage = null;
-      state.ws.onclose = null;
-      state.ws.onerror = null;
-      state.ws.close(1000);
-    }
-    state.ws = null;
-    if (state.reconnectTimer) {
-      clearTimeout(state.reconnectTimer);
-      state.reconnectTimer = null;
-    }
-  }
-
-  function scheduleReconnect() {
-    if (state.reconnectTimer) return;
-    const delay = Math.min(30_000, 1_000 * Math.pow(2, state.reconnectAttempts));
-    state.reconnectTimer = setTimeout(() => {
-      state.reconnectTimer = null;
-      connectWs();
-    }, delay);
-  }
-
-  function handleWsMessage(event) {
-    if (!state.candleSeries) return;
-    try {
-      const payload = JSON.parse(event.data);
-      const bar = BinanceCandles.barFromWs(payload);
-      const normalised = normaliseBar(bar);
-      if (!normalised) return;
-      const last = state.candles[state.candles.length - 1];
-      const nowMs = Date.now();
-      if (last && Number(last.time) === Number(normalised.time)) {
-        state.candles[state.candles.length - 1] = normalised;
-        state.candleSeries.update(normalised);
-        state.lastUpdateMs = nowMs;
-        persistSharedCandles({ bars: [normalised], lastUpdateMs: nowMs });
-      } else if (!last || Number(normalised.time) > Number(last.time)) {
-        state.candles.push(normalised);
-        state.candleSeries.update(normalised);
-        state.lastUpdateMs = nowMs;
-        persistSharedCandles({ bars: [normalised], lastUpdateMs: nowMs });
-      } else {
-        mergeCandles([normalised], { lastUpdateMs: nowMs });
-        state.candleSeries.setData(state.candles);
-      }
-      updatePriceLine(normalised);
-      updateInfo(normalised);
-      if (state.gapWatcher && typeof state.gapWatcher.notifyData === "function") {
-        state.gapWatcher.notifyData();
-      }
-    } catch (error) {
-      console.error("Failed to parse ws message", error);
-    }
-  }
-
-  function connectWs() {
-    detachWs();
-    const symbol = state.symbol.toLowerCase();
-    const interval = state.interval;
-    const url = `wss://fstream.binance.com/ws/${symbol}@kline_${interval}`;
-    const ws = new WebSocket(url);
-    state.ws = ws;
-    ws.onopen = () => {
-      state.reconnectAttempts = 0;
-      notifyStatus("Подключено к потоку Binance", "info");
-    };
-    ws.onmessage = handleWsMessage;
-    ws.onerror = (event) => {
-      console.error("WebSocket error", event);
-      notifyStatus("Ошибка WebSocket, переподключение...", "warning");
-      ws.close();
-    };
-    ws.onclose = () => {
-      if (state.ws === ws) {
-        state.reconnectAttempts += 1;
-        notifyStatus("Соединение закрыто, переподключаемся...", "warning");
-        scheduleReconnect();
-      }
-    };
-  }
-
   async function fetchHistory(symbol, interval, limit = 500) {
     const rows = await BinanceCandles.fetchHistory(symbol, interval, limit);
     return rows.map((bar) => normaliseBar(bar)).filter(Boolean);
@@ -473,7 +470,7 @@
       url.searchParams.set("endTime", Math.floor(endMs));
     }
     url.searchParams.set("limit", String(Math.max(1, Math.min(limit, 1500))));
-    const resp = await fetch(url.toString());
+    const resp = await fetch(url.toString(), { cache: "no-store" });
     if (!resp.ok) {
       throw new Error(`Failed to fetch gap candles: ${resp.status}`);
     }
@@ -565,7 +562,6 @@
   }
 
   async function loadSymbol(symbol, interval) {
-    detachWs();
     notifyStatus("Загружаем историю...", "info");
     const normalizedSymbol = symbol.trim().toUpperCase();
     const normalizedInterval = interval.trim();
@@ -576,30 +572,16 @@
     fetchPreset(normalizedSymbol);
     initChart();
     const restored = await restoreFromSharedStore(normalizedSymbol, normalizedInterval);
-    if (restored && state.gapWatcher && typeof state.gapWatcher.notifyData === "function") {
-      state.gapWatcher.notifyData();
-    }
-    try {
-      const history = await fetchHistory(normalizedSymbol, normalizedInterval, 1000);
-      mergeCandles(history, { reset: true, lastUpdateMs: Date.now() });
+    if (restored) {
       applyCandles();
       focusOnLastCandle({ preserveSpan: false });
-      if (state.gapWatcher && typeof state.gapWatcher.updateContext === "function") {
-        state.gapWatcher.updateContext({
-          symbol: state.symbol,
-          interval: state.interval,
-          intervalMs: intervalToMs(state.interval),
-          getCandles: () => state.candles,
-          requestGap: handleGapRequest,
-          resetRequestedKeys: true,
-        });
-        state.gapWatcher.notifyData();
-      }
-      notifyStatus("История загружена", "success");
-      connectWs();
-    } catch (error) {
-      console.error("Failed to load history", error);
-      notifyStatus("Не удалось загрузить данные Binance", "error");
+      refreshGapWatcherContext();
+    }
+    if (marketStore) {
+      marketStore.setSymbol(normalizedSymbol, normalizedInterval);
+      marketStore.restart();
+    } else {
+      notifyStatus("Лайв-хранилище недоступно", "error");
     }
   }
 
@@ -706,6 +688,7 @@
       const response = await fetch("/inspection/snapshot", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        cache: "no-store",
         body: JSON.stringify(snapshot),
       });
       if (!response.ok) {
@@ -730,7 +713,10 @@
     try {
       const url = new URL("/inspection", window.location.origin);
       url.searchParams.set("snapshot", snapshotId);
-      const response = await fetch(url.toString(), { headers: { accept: "application/json" } });
+      const response = await fetch(url.toString(), {
+        headers: { accept: "application/json" },
+        cache: "no-store",
+      });
       if (!response.ok) throw new Error("Inspection payload unavailable");
       const payload = await response.json();
       const data = payload?.DATA || {};
@@ -762,6 +748,7 @@
       const response = await fetch("/inspection/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        cache: "no-store",
         body: JSON.stringify({ snapshot_id: state.lastSnapshotId, analysis_type: type }),
       });
       if (!response.ok) {
@@ -796,7 +783,7 @@
       const url = new URL("/profile", window.location.origin);
       url.searchParams.set("snapshot", state.lastSnapshotId);
       url.searchParams.set("tf", state.interval);
-      const response = await fetch(url.toString());
+      const response = await fetch(url.toString(), { cache: "no-store" });
       if (!response.ok) throw new Error("Profile export failed");
       const data = await response.json();
       const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
@@ -860,8 +847,8 @@
   }
 
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible" && !state.ws) {
-      connectWs();
+    if (document.visibilityState === "visible" && marketStore) {
+      marketStore.restart();
     }
   });
 

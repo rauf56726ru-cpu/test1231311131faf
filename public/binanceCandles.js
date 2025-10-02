@@ -127,7 +127,7 @@
       `&interval=${encodeURIComponent(interval)}` +
       `&limit=${encodeURIComponent(cappedLimit)}`;
 
-    const resp = await fetch(url);
+    const resp = await fetch(url, { cache: "no-store" });
     if (!resp.ok) {
       throw new Error(`klines ${resp.status}`);
     }
