@@ -165,7 +165,14 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
     assert response.status_code == 200
     body = response.json()
 
-    assert set(body.keys()) == {"status", "meta", "data", "availability", "missing_fields"}
+    assert set(body.keys()) == {
+        "status",
+        "meta",
+        "data",
+        "availability",
+        "missing_fields",
+        "notes",
+    }
     assert body["status"] == "ok"
 
     meta = body["meta"]
@@ -176,6 +183,8 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
     assert "last_tf" in meta
     assert meta["last_price_source"] in {"stream", "ohlcv"}
     assert "stale" in meta
+    assert meta["invalid_candles_count"] >= 0
+    assert isinstance(meta["invalid_candle_stages"], dict)
 
     data_block = body["data"]
 
@@ -188,6 +197,9 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
     assert set(orderflow.keys()) == {"15m", "1h"}
     for block in orderflow.values():
         assert isinstance(block["per_bar"], list)
+
+    assert isinstance(body["notes"], list)
+    assert not body["notes"]
 
     vwap_tpo = data_block["vwap_tpo"]
     assert vwap_tpo["daily"]["open_utc"].startswith("2024-01-02T00:00:00")
@@ -244,6 +256,37 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
     availability = body["availability"]
     assert set(availability.keys()) == {"ohlcv", "vwap_sessions", "zones", "orderflow"}
     assert isinstance(body["missing_fields"], list)
+
+
+@pytest.mark.anyio("asyncio")
+async def test_check_all_reports_invalid_timestamps() -> None:
+    base = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
+    payload = _build_snapshot_payload(base, count=120)
+    candles = payload["candles"]
+    bad_index = len(candles) // 2
+    candles[bad_index]["t"] = -1
+
+    snapshot = {
+        "id": "invalid-ts",  # stable identifier for caching paths
+        "symbol": payload["symbol"],
+        "tf": "1m",
+        "frames": {"1m": {"tf": "1m", "candles": candles}},
+        "selection": {"start": candles[0]["t"], "end": candles[-1]["t"]},
+    }
+
+    result = await check_all_datas.build_check_all_datas(
+        snapshot,
+        now_utc=base + timedelta(hours=4),
+        hours=4,
+    )
+
+    assert result is not None
+    assert result["status"] == "ok"
+    meta = result["meta"]
+    assert meta["invalid_candles_count"] >= 1
+    assert meta["invalid_candle_stages"]
+    assert result["notes"], "expected notes for invalid timestamps"
+    assert any("invalid timestamps" in note for note in result["notes"])
 
 
 def test_topup_limits_window_to_last_collection(client: TestClient) -> None:

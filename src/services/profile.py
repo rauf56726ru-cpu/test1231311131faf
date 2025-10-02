@@ -4,8 +4,78 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, time as dtime, timedelta, timezone
+import logging
 import math
-from typing import Any, DefaultDict, Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import (
+    Any,
+    Callable,
+    DefaultDict,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Sequence,
+    Tuple,
+)
+
+
+LOGGER = logging.getLogger(__name__)
+
+_MIN_TS_MS = 1
+_FUTURE_DRIFT = timedelta(days=1)
+
+
+InvalidTimestampHandler = Callable[[int, str], None]
+
+
+def _max_allowed_ts_ms(now: datetime | None = None) -> int:
+    """Return the inclusive upper bound for candle timestamps in milliseconds."""
+
+    base = now or datetime.now(timezone.utc)
+    return int((base + _FUTURE_DRIFT).timestamp() * 1000)
+
+
+def _report_invalid_timestamp(ts: int, *, stage: str, handler: InvalidTimestampHandler | None) -> None:
+    """Emit a warning and notify the optional handler about an invalid candle."""
+
+    LOGGER.warning("Invalid candle timestamp: %s", ts, extra={"stage": stage})
+    if handler is not None:
+        handler(ts, stage)
+
+
+def _validate_timestamp_range(
+    ts: int,
+    *,
+    max_ts: int,
+    stage: str,
+    handler: InvalidTimestampHandler | None,
+) -> int | None:
+    """Return the timestamp if it falls within the accepted range."""
+
+    if ts < _MIN_TS_MS or ts > max_ts:
+        _report_invalid_timestamp(ts, stage=stage, handler=handler)
+        return None
+    return ts
+
+
+def _safe_datetime_from_timestamp(
+    ts: int,
+    *,
+    tz: timezone,
+    max_ts: int,
+    stage: str,
+    handler: InvalidTimestampHandler | None,
+) -> datetime | None:
+    """Convert a millisecond timestamp to ``datetime`` guarding against errors."""
+
+    valid_ts = _validate_timestamp_range(ts, max_ts=max_ts, stage=stage, handler=handler)
+    if valid_ts is None:
+        return None
+    try:
+        return datetime.fromtimestamp(valid_ts / 1000.0, tz=tz)
+    except (OSError, ValueError):
+        _report_invalid_timestamp(valid_ts, stage=stage, handler=handler)
+        return None
 
 
 _PROFILE_CACHE: Dict[Tuple[Any, ...], "VolumeProfile"] = {}
@@ -69,6 +139,8 @@ def split_by_sessions(
     candles: Sequence[Mapping[str, Any]],
     sessions: Iterable[Tuple[str, dtime, dtime]],
     tz: timezone = timezone.utc,
+    *,
+    invalid_ts_handler: InvalidTimestampHandler | None = None,
 ) -> Dict[Tuple[date, str], List[Mapping[str, Any]]]:
     """Group candles by (date, session) buckets similar to VWAP sessions."""
 
@@ -77,13 +149,23 @@ def split_by_sessions(
     if not candles or not session_list:
         return buckets
 
+    max_ts = _max_allowed_ts_ms()
+
     for candle in candles:
         if not isinstance(candle, Mapping):
             continue
         ts = _extract_timestamp(candle)
         if ts is None:
             continue
-        dt = datetime.fromtimestamp(ts / 1000.0, tz=tz)
+        dt = _safe_datetime_from_timestamp(
+            ts,
+            tz=tz,
+            max_ts=max_ts,
+            stage="split_by_sessions",
+            handler=invalid_ts_handler,
+        )
+        if dt is None:
+            continue
         moment = dt.time()
         for name, start, end in session_list:
             if not _in_session(moment, start, end):
@@ -343,33 +425,42 @@ def compute_session_profiles(
     atr_multiplier: float = 0.5,
     target_bins: int = 80,
     cache_token: Any | None = None,
+    invalid_ts_handler: InvalidTimestampHandler | None = None,
 ) -> List[Dict[str, object]]:
     """Return volume profile summaries grouped by calendar day."""
 
     session_list = list(sessions)
     session_map = (
-        split_by_sessions(candles_1m, session_list) if session_list else {}
+        split_by_sessions(
+            candles_1m,
+            session_list,
+            invalid_ts_handler=invalid_ts_handler,
+        )
+        if session_list
+        else {}
     )
 
     daily_buckets: DefaultDict[date, List[Mapping[str, Any]]] = defaultdict(list)
+    if candles_1m:
+        max_ts = _max_allowed_ts_ms()
+    else:
+        max_ts = _MIN_TS_MS
+
     for candle in candles_1m:
         if not isinstance(candle, Mapping):
             continue
         ts = _extract_timestamp(candle)
         if ts is None:
             continue
-        dt = datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc)
-        daily_buckets[dt.date()].append(dict(candle))
-
-
-    daily_buckets: DefaultDict[date, List[Mapping[str, Any]]] = defaultdict(list)
-    for candle in candles_1m:
-        if not isinstance(candle, Mapping):
+        dt = _safe_datetime_from_timestamp(
+            ts,
+            tz=timezone.utc,
+            max_ts=max_ts,
+            stage="compute_session_profiles",
+            handler=invalid_ts_handler,
+        )
+        if dt is None:
             continue
-        ts = _extract_timestamp(candle)
-        if ts is None:
-            continue
-        dt = datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc)
         daily_buckets[dt.date()].append(dict(candle))
 
     if not daily_buckets:
@@ -556,6 +647,7 @@ def build_profile_package(
     smooth_window: int = 1,
     cache_token: Any | None = None,
     tf_key: str = "1m",
+    invalid_ts_handler: InvalidTimestampHandler | None = None,
 ) -> Tuple[List[Dict[str, object]], List[Dict[str, float]], List[Dict[str, Any]]]:
     """Compute TPO summaries, flattened profile, and derived zones."""
 
@@ -574,6 +666,7 @@ def build_profile_package(
         atr_multiplier=atr_multiplier,
         target_bins=target_bins,
         cache_token=token,
+        invalid_ts_handler=invalid_ts_handler,
     )
 
     flattened: List[Dict[str, float]] = []
@@ -582,7 +675,11 @@ def build_profile_package(
     if not tpo_entries:
         return tpo_entries, flattened, zones
 
-    session_map = split_by_sessions(candles, session_list)
+    session_map = split_by_sessions(
+        candles,
+        session_list,
+        invalid_ts_handler=invalid_ts_handler,
+    )
     latest = tpo_entries[-1] if tpo_entries else None
     latest_date = latest.get("date") if isinstance(latest, Mapping) else None
     latest_session = latest.get("session") if isinstance(latest, Mapping) else None

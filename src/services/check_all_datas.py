@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 import logging
 import math
 import time
@@ -2503,6 +2504,15 @@ async def build_check_all_datas(
 
     status = "ok"
 
+    notes: List[str] = []
+    invalid_candles_count = 0
+    invalid_candle_stages: Counter[str] = Counter()
+
+    def _register_invalid_candle(_ts: int, stage: str) -> None:
+        nonlocal invalid_candles_count
+        invalid_candles_count += 1
+        invalid_candle_stages[stage] += 1
+
     budget = _TimeBudget(_BUILD_TIMEOUT_SECONDS)
 
     context = _prepare_snapshot_context(snapshot, now_utc)
@@ -2653,6 +2663,7 @@ async def build_check_all_datas(
             smooth_window=int(profile_config.get("smooth_window", 1)),
             cache_token=cache_token,
             tf_key=target_tf_key,
+            invalid_ts_handler=_register_invalid_candle,
         )
         profile_level_map = _build_profile_level_map(profile_tpo)
 
@@ -3969,12 +3980,31 @@ async def build_check_all_datas(
     if last_price_diag.get("mismatch"):
         meta_block["stream_vs_ohlcv_mismatch"] = True
 
+    meta_block["invalid_candles_count"] = invalid_candles_count
+    meta_block["invalid_candle_stages"] = dict(
+        sorted(invalid_candle_stages.items())
+    ) if invalid_candle_stages else {}
+
+    if invalid_candles_count:
+        stage_summary = ", ".join(
+            f"{stage}:{count}" for stage, count in sorted(invalid_candle_stages.items())
+        )
+        if stage_summary:
+            notes.append(
+                f"Filtered {invalid_candles_count} candles with invalid timestamps ({stage_summary})"
+            )
+        else:
+            notes.append(
+                f"Filtered {invalid_candles_count} candles with invalid timestamps"
+            )
+
     final_payload = {
         "status": status,
         "meta": meta_block,
         "data": data_payload,
         "availability": availability,
         "missing_fields": missing_fields_list,
+        "notes": notes,
     }
 
     return round_floats(final_payload)
