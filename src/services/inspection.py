@@ -2494,9 +2494,11 @@ def render_inspection_page(
 
     const PREFERRED_CHART_FRAMES = ["1m", "3m", "15m", "30m", "1h", "4h", "1d", "1w"];
 
+    let state = null;
+
     function frameHasCandles(frames, tf) {
       if (!tf) return false;
-      const liveEntry = state.liveFrames?.[tf];
+      const liveEntry = state?.liveFrames?.[tf];
       if (liveEntry && Array.isArray(liveEntry.candles) && liveEntry.candles.length) {
         return true;
       }
@@ -2527,7 +2529,7 @@ def render_inspection_page(
     const initialFrameMap = initial.payload?.DATA?.frames || {};
     const defaultFrame = selectPreferredFrame(initialFrameMap, initial.timeframe);
 
-    const state = {
+    state = {
       payload: initial.payload || null,
       snapshotId: initial.snapshotId || null,
       selection: initial.payload?.DATA?.selection || null,
