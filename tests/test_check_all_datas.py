@@ -166,6 +166,8 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
     assert "last_price" in meta
     assert "last_ts_utc" in meta
     assert "last_tf" in meta
+    assert meta["last_price_source"] in {"stream", "ohlcv"}
+    assert "stale" in meta
 
     data_block = body["data"]
 

@@ -11,7 +11,7 @@ UTC = timezone.utc
 @pytest.fixture()
 def stub_check_all_dependencies(monkeypatch):
     def fake_profile_config(symbol: str, meta: Dict[str, Any] | None) -> Dict[str, Any]:
-        return {}
+        return {"tick_size": 0.5}
 
     def fake_profile_package(*args, **kwargs):
         return ([], [], [])
@@ -57,6 +57,7 @@ def stub_check_all_dependencies(monkeypatch):
     monkeypatch.setattr(check_all_datas, "build_profile_package", fake_profile_package)
     monkeypatch.setattr(check_all_datas, "detect_zones", fake_detect_zones)
     monkeypatch.setattr(check_all_datas, "build_liquidity_snapshot", fake_liquidity)
+    monkeypatch.setattr(check_all_datas, "resolve_liquidity_tick_size", lambda *args, **kwargs: (0.5, "stub"))
     monkeypatch.setattr(check_all_datas, "build_multi_timeframe_ohlcv", fake_multi_tf)
     monkeypatch.setattr(check_all_datas, "aggregate_1m_to_1h", fake_aggregate)
     monkeypatch.setattr(check_all_datas, "detect_smc_blocks", fake_smc)
@@ -101,6 +102,8 @@ def test_last_price_prefers_minute_candle_over_analysis(stub_check_all_dependenc
     assert meta["last_price"] == pytest.approx(116.0)
     assert meta["last_tf"] == "1m"
     assert meta.get("insufficient_reason") is None
+    assert meta["last_price_source"] == "ohlcv"
+    assert meta["stale"] is False
 
 
 def test_snapshot_staleness_marks_meta(stub_check_all_dependencies) -> None:
@@ -127,6 +130,7 @@ def test_snapshot_staleness_marks_meta(stub_check_all_dependencies) -> None:
     assert meta["snapshot_age_sec"] >= 600
     reason = meta.get("insufficient_reason")
     assert isinstance(reason, str) and reason.startswith("stale_snapshot_")
+    assert meta["stale"] is True
 
 
 def test_last_price_updates_when_minute_candles_change(stub_check_all_dependencies) -> None:
@@ -171,3 +175,59 @@ def test_last_price_updates_when_minute_candles_change(stub_check_all_dependenci
     refreshed = check_all_datas.build_check_all_datas(snapshot, now_utc=base + timedelta(minutes=3))
     assert refreshed["meta"]["last_price"] == pytest.approx(123.0)
     assert refreshed["meta"]["last_tf"] == "1m"
+    assert refreshed["meta"]["last_price_source"] == "ohlcv"
+
+
+def test_stream_price_overrides_candle(stub_check_all_dependencies) -> None:
+    base = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
+    candles = [
+        {
+            "t": int((base + timedelta(minutes=0)).timestamp() * 1000),
+            "o": 100.0,
+            "h": 110.0,
+            "l": 95.0,
+            "c": 105.0,
+            "v": 3.0,
+        },
+    ]
+    snapshot = _snapshot_with_candles(candles, entry_price=101.0)
+    stream_ts = int((base + timedelta(minutes=1, seconds=2)).timestamp() * 1000)
+    snapshot["stream"] = {"price": 107.5, "ts": stream_ts}
+
+    result = check_all_datas.build_check_all_datas(snapshot, now_utc=base + timedelta(minutes=1, seconds=3))
+
+    meta = result["meta"]
+    assert meta["last_price"] == pytest.approx(107.5)
+    assert meta["last_tf"] == "stream"
+    assert meta["last_price_source"] == "stream"
+    assert meta.get("stale") is False
+    assert meta.get("insufficient_reason") is None
+
+
+def test_stream_vs_ohlcv_mismatch_flag(stub_check_all_dependencies) -> None:
+    base = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
+    candle_ts = int(base.timestamp() * 1000)
+    candles = [
+        {
+            "t": candle_ts,
+            "o": 100.0,
+            "h": 110.0,
+            "l": 95.0,
+            "c": 100.0,
+            "v": 3.0,
+        }
+    ]
+    snapshot = _snapshot_with_candles(candles, entry_price=100.0)
+    stream_ts = candle_ts + 60_000 + 4_000
+    snapshot["stream"] = {"price": 101.5, "ts": stream_ts}
+
+    result = check_all_datas.build_check_all_datas(
+        snapshot,
+        now_utc=base + timedelta(minutes=1, seconds=10),
+    )
+
+    meta = result["meta"]
+    assert meta["last_price_source"] == "stream"
+    assert meta["last_price"] == pytest.approx(101.5)
+    assert meta.get("stream_vs_ohlcv_mismatch") is True
+    assert meta.get("insufficient_reason") is None

@@ -206,14 +206,29 @@ def _resolve_last_price(
     frames: Mapping[str, Sequence[Mapping[str, Any]]],
     *,
     now: datetime,
-) -> Tuple[float | None, str | None, str | None, int | None, str | None]:
-    """Return last price metadata using the most granular available timeframe."""
+    stream_price: float | None = None,
+    stream_ts: int | None = None,
+    tick_size: float | None = None,
+) -> Tuple[
+    float | None,
+    str | None,
+    str | None,
+    int | None,
+    str | None,
+    str,
+    Dict[str, Any],
+]:
+    """Return last price metadata using the most granular available timeframe.
+
+    The function prefers a live stream tick when present, falling back to the
+    most granular OHLCV close otherwise. It also emits diagnostics when the
+    stream price diverges from OHLCV beyond one tick while being delayed.
+    """
 
     priority = ("1m", "3m", "5m", "15m", "1h", "4h", "1d")
-    selected_tf: str | None = None
-    last_price: float | None = None
-    last_iso: str | None = None
-    last_ts: int | None = None
+    candle_tf: str | None = None
+    candle_price: float | None = None
+    candle_ts: int | None = None
 
     for tf in priority:
         candles = frames.get(tf)
@@ -227,11 +242,27 @@ def _resolve_last_price(
         price = _safe_float(last_candle.get("c"))
         if ts is None or price is None:
             continue
-        selected_tf = tf
-        last_price = price
-        last_ts = ts
-        last_iso = _isoformat_utc(ts)
+        candle_tf = tf
+        candle_price = price
+        candle_ts = ts
         break
+
+    diagnostics: Dict[str, Any] = {}
+    price_source = "ohlcv"
+
+    last_price: float | None = candle_price
+    last_ts: int | None = candle_ts
+    last_tf: str | None = candle_tf
+
+    if stream_price is not None and stream_ts is not None:
+        price_source = "stream"
+        last_price = stream_price
+        last_ts = stream_ts
+        last_tf = "stream"
+        diagnostics["stream_ts"] = stream_ts
+        diagnostics["stream_price"] = stream_price
+
+    last_iso: str | None = _isoformat_utc(last_ts) if last_ts is not None else None
 
     insufficient_reason: str | None = None
     snapshot_age_sec: int | None = None
@@ -242,9 +273,58 @@ def _resolve_last_price(
         if snapshot_age_sec > 5 * 60:
             insufficient_reason = f"stale_snapshot_{snapshot_age_sec}"
     else:
-        insufficient_reason = "missing_ohlcv_last_price"
+        insufficient_reason = "missing_live_last_price"
 
-    return last_price, last_iso, selected_tf, snapshot_age_sec, insufficient_reason
+    if candle_price is None or candle_ts is None:
+        diagnostics["ohlcv_missing"] = True
+    else:
+        diagnostics["ohlcv_price"] = candle_price
+        diagnostics["ohlcv_ts"] = candle_ts
+        diagnostics["ohlcv_tf"] = candle_tf
+
+    if price_source == "stream" and candle_price is not None and candle_ts is not None:
+        tick = float(tick_size) if tick_size else None
+        if tick is not None and tick > 0:
+            diff = abs(stream_price - candle_price)
+            interval_ms = TIMEFRAME_TO_MS.get(candle_tf or "1m", 60_000)
+            candle_close_ms = candle_ts + interval_ms
+            lag_ms = abs(stream_ts - candle_close_ms)
+            diagnostics["stream_vs_candle_diff"] = diff
+            diagnostics["stream_vs_candle_lag_ms"] = lag_ms
+            if diff > tick and lag_ms > 2000:
+                diagnostics["mismatch"] = True
+                LOGGER.warning(
+                    "Stream vs OHLCV mismatch detected",
+                    extra={
+                        "stream_price": stream_price,
+                        "ohlcv_price": candle_price,
+                        "tick_size": tick,
+                        "lag_ms": lag_ms,
+                        "diff": diff,
+                        "ohlcv_tf": candle_tf,
+                    },
+                )
+
+    LOGGER.info(
+        "Resolved last price for inspection snapshot",
+        extra={
+            "source": price_source,
+            "tf": last_tf,
+            "ts": last_ts,
+            "age_sec": snapshot_age_sec,
+            "insufficient_reason": insufficient_reason,
+        },
+    )
+
+    return (
+        last_price,
+        last_iso,
+        last_tf,
+        snapshot_age_sec,
+        insufficient_reason,
+        price_source,
+        diagnostics,
+    )
 
 
 def _build_expected_times(start_ms: int, end_ms: int, interval_ms: int) -> List[int]:
@@ -428,6 +508,33 @@ def _aggregate_from_minutes(
         "c": bucket[-1]["c"],
         "v": sum(item["v"] for item in bucket),
     }
+
+
+def _normalise_stream_point(candidate: Mapping[str, Any] | None) -> Tuple[float | None, int | None]:
+    if not isinstance(candidate, Mapping):
+        return None, None
+
+    price: float | None = None
+    for key in ("price", "last_price", "p", "value", "close"):
+        price = _safe_float(candidate.get(key))
+        if price is not None:
+            break
+
+    ts_raw: int | None = None
+    for key in ("ts", "timestamp", "time", "t", "ts_ms", "event_time"):
+        value = candidate.get(key)
+        if value is None:
+            continue
+        ts_raw = _safe_int(value)
+        if ts_raw is not None:
+            if ts_raw < 10_000_000_000:
+                ts_raw *= 1000
+            break
+
+    if price is None or ts_raw is None:
+        return None, None
+
+    return price, ts_raw
 
 
 def _coerce_float(value: Any) -> float:
@@ -1930,6 +2037,30 @@ def build_check_all_datas(
 
     symbol = str(snapshot.get("symbol") or snapshot.get("pair") or "UNKNOWN").upper()
     raw_meta = snapshot.get("meta") if isinstance(snapshot.get("meta"), Mapping) else None
+
+    stream_price: float | None = None
+    stream_ts: int | None = None
+    stream_candidates: List[Mapping[str, Any]] = []
+
+    for key in ("stream", "live", "live_price", "live_tick"):
+        candidate = snapshot.get(key)
+        if isinstance(candidate, Mapping):
+            stream_candidates.append(candidate)
+
+    if isinstance(raw_meta, Mapping):
+        for key in ("stream", "live", "live_price", "ticker"):
+            candidate = raw_meta.get(key)
+            if isinstance(candidate, Mapping):
+                stream_candidates.append(candidate)
+
+    for candidate in stream_candidates:
+        price, ts = _normalise_stream_point(candidate)
+        if price is None or ts is None:
+            continue
+        stream_price = price
+        stream_ts = ts
+        break
+
     profile_config = resolve_profile_config(symbol, raw_meta)
     sessions = list(VWAP_TPO_SESSIONS)
     profile_tpo: List[Dict[str, Any]] = []
@@ -2131,46 +2262,6 @@ def build_check_all_datas(
 
     frames["1m"] = [minute_index_all[ts] for ts in sorted(minute_index_all)]
     minute_candles = frames["1m"]
-
-    last_price_value, last_iso_ts, last_tf, snapshot_age_sec, insufficient_reason = _resolve_last_price(
-        frames,
-        now=now_dt,
-    )
-
-    if last_tf is not None and last_iso_ts is not None and last_price_value is not None:
-        LOGGER.info(
-            "Resolved last price from OHLCV",
-            extra={
-                "snapshot_tf": last_tf,
-                "snapshot_ts": last_iso_ts,
-                "snapshot_price": last_price_value,
-            },
-        )
-
-    if snapshot_age_sec is not None:
-        LOGGER.info("Snapshot age evaluated", extra={"snapshot_age_sec": snapshot_age_sec})
-
-    analysis_entry_price = None
-    analysis_block = snapshot.get("analysis") if isinstance(snapshot.get("analysis"), Mapping) else None
-    if isinstance(analysis_block, Mapping):
-        trade_block = analysis_block.get("trade")
-        if isinstance(trade_block, Mapping):
-            analysis_entry_price = _safe_float(trade_block.get("entry_price"))
-
-    if (
-        analysis_entry_price is not None
-        and last_price_value is not None
-        and not math.isclose(analysis_entry_price, last_price_value, rel_tol=1e-9, abs_tol=1e-6)
-    ):
-        LOGGER.warning(
-            "Analysis entry price differs from resolved last price",
-            extra={
-                "analysis_entry_price": analysis_entry_price,
-                "last_price": last_price_value,
-                "last_tf": last_tf,
-                "last_ts_utc": last_iso_ts,
-            },
-        )
 
     zones_window_hours = max(1, hours_window)
     if not strict_window:
@@ -2557,9 +2648,50 @@ def build_check_all_datas(
         },
     )
 
+    (
+        last_price_value,
+        last_iso_ts,
+        last_tf,
+        snapshot_age_sec,
+        insufficient_reason,
+        last_price_source,
+        last_price_diag,
+    ) = _resolve_last_price(
+        frames,
+        now=now_dt,
+        stream_price=stream_price,
+        stream_ts=stream_ts,
+        tick_size=tick_size_numeric,
+    )
+
+    if snapshot_age_sec is not None:
+        LOGGER.info("Snapshot age evaluated", extra={"snapshot_age_sec": snapshot_age_sec})
+
     if tick_size_numeric and isinstance(tick_size_numeric, (int, float)):
         zone_cfg.tick_size = float(tick_size_numeric)
     zones_diag["tick_size"] = zone_cfg.tick_size
+
+    analysis_entry_price = None
+    analysis_block = snapshot.get("analysis") if isinstance(snapshot.get("analysis"), Mapping) else None
+    if isinstance(analysis_block, Mapping):
+        trade_block = analysis_block.get("trade")
+        if isinstance(trade_block, Mapping):
+            analysis_entry_price = _safe_float(trade_block.get("entry_price"))
+
+    if (
+        analysis_entry_price is not None
+        and last_price_value is not None
+        and not math.isclose(analysis_entry_price, last_price_value, rel_tol=1e-9, abs_tol=1e-6)
+    ):
+        LOGGER.warning(
+            "Analysis entry price differs from resolved last price",
+            extra={
+                "analysis_entry_price": analysis_entry_price,
+                "last_price": last_price_value,
+                "last_tf": last_tf,
+                "last_ts_utc": last_iso_ts,
+            },
+        )
 
     if zone_frames_full:
         try:
@@ -3263,11 +3395,17 @@ def build_check_all_datas(
         "last_price": last_price_value,
         "last_ts_utc": last_iso_ts,
         "last_tf": last_tf,
+        "last_price_source": last_price_source,
     }
     if snapshot_age_sec is not None:
         meta_block["snapshot_age_sec"] = snapshot_age_sec
     if insufficient_reason:
         meta_block["insufficient_reason"] = insufficient_reason
+    meta_block["stale"] = bool(
+        isinstance(insufficient_reason, str) and insufficient_reason.startswith("stale_snapshot")
+    )
+    if last_price_diag.get("mismatch"):
+        meta_block["stream_vs_ohlcv_mismatch"] = True
 
     final_payload = {
         "meta": meta_block,
