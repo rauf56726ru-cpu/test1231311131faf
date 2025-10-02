@@ -158,32 +158,30 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
     assert response.status_code == 200
     body = response.json()
 
-    expected_order = [
-        "symbol",
-        "ohlcv",
-        "orderflow",
-        "vwap_tpo",
-        "tpo",
-        "prev_day",
-        "zones",
-        "liquidity",
-        "risk_prefs",
-        "context",
-    ]
-    assert list(body.keys()) == expected_order
-    assert body["symbol"] == payload["symbol"]
+    assert set(body.keys()) == {"meta", "data", "availability", "missing_fields"}
 
-    ohlcv = body["ohlcv"]
+    meta = body["meta"]
+    assert meta["symbol"] == payload["symbol"]
+    assert meta["tz"] == "Europe/Berlin"
+    assert "last_price" in meta
+    assert "last_ts_utc" in meta
+    assert "last_tf" in meta
+    assert meta["last_price_source"] in {"stream", "ohlcv"}
+    assert "stale" in meta
+
+    data_block = body["data"]
+
+    ohlcv = data_block["ohlcv"]
     assert set(ohlcv.keys()) == {"1m", "3m", "5m", "15m", "1h", "4h", "1d"}
     for series in ohlcv.values():
         assert isinstance(series["candles"], list)
 
-    orderflow = body["orderflow"]
+    orderflow = data_block["orderflow"]
     assert set(orderflow.keys()) == {"15m", "1h"}
     for block in orderflow.values():
         assert isinstance(block["per_bar"], list)
 
-    vwap_tpo = body["vwap_tpo"]
+    vwap_tpo = data_block["vwap_tpo"]
     assert vwap_tpo["daily"]["open_utc"].startswith("2024-01-02T00:00:00")
     assert set(vwap_tpo["sessions"].keys()) == {"asia", "london", "ny"}
     for session_payload in vwap_tpo["sessions"].values():
@@ -202,10 +200,10 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
             "low",
         }
 
-    composite_day = body["tpo"]["composite_day"]
+    composite_day = data_block["tpo"]["composite_day"]
     assert set(composite_day.keys()) == {"poc", "vah", "val"}
 
-    prev_day = body["prev_day"]
+    prev_day = data_block["prev_day"]
     assert set(prev_day.keys()) == {"pdh", "pdl", "close", "poc", "vah", "val"}
     prev_minutes = payload["candles"][: 60 * 24]
     expected_high = max(candle["h"] for candle in prev_minutes)
@@ -215,18 +213,29 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
     assert prev_day["pdl"] == pytest.approx(expected_low)
     assert prev_day["close"] == pytest.approx(expected_close)
 
-    zones = body["zones"]
-    assert set(zones.keys()) == {"fvg", "ob", "mb", "bb", "rb", "pb", "sr", "profile_levels"}
+    zones = data_block["zones"]
+    assert set(zones.keys()) == {"fvg", "fvl", "ob", "mb", "bb", "rb", "pb", "sr", "profile_levels"}
     for zone_series in zones.values():
         assert isinstance(zone_series, list)
 
-    liquidity = body["liquidity"]
+    liquidity = data_block["liquidity"]
     assert set(liquidity.keys()) == {"eqh", "eql"}
     for levels in liquidity.values():
         assert isinstance(levels, list)
 
-    assert body["risk_prefs"] == {"rr_min": pytest.approx(2.5), "risk_per_trade_pct": pytest.approx(1.0)}
-    assert body["context"] == {"globalBias": "neutral", "narrative": "", "openOppositeZones": False}
+    assert data_block["risk_prefs"] == {
+        "rr_min": pytest.approx(2.5),
+        "risk_per_trade_pct": pytest.approx(1.0),
+    }
+    assert data_block["context"] == {
+        "globalBias": "neutral",
+        "narrative": "",
+        "openOppositeZones": False,
+    }
+
+    availability = body["availability"]
+    assert set(availability.keys()) == {"ohlcv", "vwap_sessions", "zones", "orderflow"}
+    assert isinstance(body["missing_fields"], list)
 
 
 def test_topup_limits_window_to_last_collection(client: TestClient) -> None:
@@ -248,9 +257,10 @@ def test_topup_limits_window_to_last_collection(client: TestClient) -> None:
         )
         assert response.status_code == 200
         body = response.json()
+        zones_block = body["data"]["zones"]
 
         for zone_key in ("fvg", "ob", "mb", "bb", "rb", "pb", "sr"):
-            zone_entries = body["zones"].get(zone_key, [])
+            zone_entries = zones_block.get(zone_key, [])
             assert zone_entries, f"expected informational entry for {zone_key}"
             message_entry = zone_entries[0]
             assert "message" in message_entry
@@ -271,7 +281,7 @@ def test_multi_timeframe_ohlcv_alignment(client: TestClient) -> None:
     assert response.status_code == 200
     body = response.json()
 
-    ohlcv_block = body["ohlcv"]
+    ohlcv_block = body["data"]["ohlcv"]
     assert ohlcv_block["1m"]["candles"]
 
     minute_map = {candle["t"]: candle for candle in ohlcv_block["1m"]["candles"]}
@@ -330,7 +340,7 @@ def test_orderflow_block_matches_spec(client: TestClient) -> None:
     assert response.status_code == 200
     body = response.json()
 
-    orderflow_block = body["orderflow"]
+    orderflow_block = body["data"]["orderflow"]
     assert set(orderflow_block.keys()) == {"15m", "1h"}
 
     fifteen_series = orderflow_block["15m"]["per_bar"]
@@ -369,7 +379,7 @@ def test_vwap_tpo_sessions_include_aliases(client: TestClient) -> None:
     assert response.status_code == 200
     body = response.json()
 
-    sessions = body["vwap_tpo"]["sessions"]
+    sessions = body["data"]["vwap_tpo"]["sessions"]
     ny_session = sessions["ny"]
     assert ny_session["open_utc"].endswith("13:30:00Z")
     assert ny_session["close_utc"].endswith("16:30:00Z")
@@ -378,7 +388,7 @@ def test_vwap_tpo_sessions_include_aliases(client: TestClient) -> None:
     assert "ib_high" in ny_session
     assert "ib_low" in ny_session
 
-    composite_day = body["tpo"]["composite_day"]
+    composite_day = body["data"]["tpo"]["composite_day"]
     assert composite_day["poc"] is not None
     assert composite_day["vah"] is not None
     assert composite_day["val"] is not None

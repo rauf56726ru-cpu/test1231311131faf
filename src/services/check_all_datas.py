@@ -6,7 +6,7 @@ import math
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, time as dtime
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple, Set
 
 import httpx
 
@@ -23,6 +23,7 @@ from .profile import build_profile_package
 from .smc import SMCConfig, detect_smc_blocks
 from .zones import Config as ZonesConfig, detect_zones
 UTC = timezone.utc
+LOGGER = logging.getLogger(__name__)
 MS_IN_HOUR = 3_600_000
 MS_IN_DAY = 86_400_000
 VALID_HOUR_WINDOWS = {1, 2, 3, 4}
@@ -199,6 +200,131 @@ def _deduplicate_sorted(
 
     ordered_times = sorted(seen)
     return [seen[ts] for ts in ordered_times]
+
+
+def _resolve_last_price(
+    frames: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    now: datetime,
+    stream_price: float | None = None,
+    stream_ts: int | None = None,
+    tick_size: float | None = None,
+) -> Tuple[
+    float | None,
+    str | None,
+    str | None,
+    int | None,
+    str | None,
+    str,
+    Dict[str, Any],
+]:
+    """Return last price metadata using the most granular available timeframe.
+
+    The function prefers a live stream tick when present, falling back to the
+    most granular OHLCV close otherwise. It also emits diagnostics when the
+    stream price diverges from OHLCV beyond one tick while being delayed.
+    """
+
+    priority = ("1m", "3m", "5m", "15m", "1h", "4h", "1d")
+    candle_tf: str | None = None
+    candle_price: float | None = None
+    candle_ts: int | None = None
+
+    for tf in priority:
+        candles = frames.get(tf)
+        if not candles:
+            continue
+        deduped = _deduplicate_sorted(candles)
+        if not deduped:
+            continue
+        last_candle = deduped[-1]
+        ts = _safe_int(last_candle.get("t"))
+        price = _safe_float(last_candle.get("c"))
+        if ts is None or price is None:
+            continue
+        candle_tf = tf
+        candle_price = price
+        candle_ts = ts
+        break
+
+    diagnostics: Dict[str, Any] = {}
+    price_source = "ohlcv"
+
+    last_price: float | None = candle_price
+    last_ts: int | None = candle_ts
+    last_tf: str | None = candle_tf
+
+    if stream_price is not None and stream_ts is not None:
+        price_source = "stream"
+        last_price = stream_price
+        last_ts = stream_ts
+        last_tf = "stream"
+        diagnostics["stream_ts"] = stream_ts
+        diagnostics["stream_price"] = stream_price
+
+    last_iso: str | None = _isoformat_utc(last_ts) if last_ts is not None else None
+
+    insufficient_reason: str | None = None
+    snapshot_age_sec: int | None = None
+
+    if last_ts is not None:
+        now_ms = int(now.timestamp() * 1000)
+        snapshot_age_sec = max(0, (now_ms - last_ts) // 1000)
+        if snapshot_age_sec > 5 * 60:
+            insufficient_reason = f"stale_snapshot_{snapshot_age_sec}"
+    else:
+        insufficient_reason = "missing_live_last_price"
+
+    if candle_price is None or candle_ts is None:
+        diagnostics["ohlcv_missing"] = True
+    else:
+        diagnostics["ohlcv_price"] = candle_price
+        diagnostics["ohlcv_ts"] = candle_ts
+        diagnostics["ohlcv_tf"] = candle_tf
+
+    if price_source == "stream" and candle_price is not None and candle_ts is not None:
+        tick = float(tick_size) if tick_size else None
+        if tick is not None and tick > 0:
+            diff = abs(stream_price - candle_price)
+            interval_ms = TIMEFRAME_TO_MS.get(candle_tf or "1m", 60_000)
+            candle_close_ms = candle_ts + interval_ms
+            lag_ms = abs(stream_ts - candle_close_ms)
+            diagnostics["stream_vs_candle_diff"] = diff
+            diagnostics["stream_vs_candle_lag_ms"] = lag_ms
+            if diff > tick and lag_ms > 2000:
+                diagnostics["mismatch"] = True
+                LOGGER.warning(
+                    "Stream vs OHLCV mismatch detected",
+                    extra={
+                        "stream_price": stream_price,
+                        "ohlcv_price": candle_price,
+                        "tick_size": tick,
+                        "lag_ms": lag_ms,
+                        "diff": diff,
+                        "ohlcv_tf": candle_tf,
+                    },
+                )
+
+    LOGGER.info(
+        "Resolved last price for inspection snapshot",
+        extra={
+            "source": price_source,
+            "tf": last_tf,
+            "ts": last_ts,
+            "age_sec": snapshot_age_sec,
+            "insufficient_reason": insufficient_reason,
+        },
+    )
+
+    return (
+        last_price,
+        last_iso,
+        last_tf,
+        snapshot_age_sec,
+        insufficient_reason,
+        price_source,
+        diagnostics,
+    )
 
 
 def _build_expected_times(start_ms: int, end_ms: int, interval_ms: int) -> List[int]:
@@ -382,6 +508,33 @@ def _aggregate_from_minutes(
         "c": bucket[-1]["c"],
         "v": sum(item["v"] for item in bucket),
     }
+
+
+def _normalise_stream_point(candidate: Mapping[str, Any] | None) -> Tuple[float | None, int | None]:
+    if not isinstance(candidate, Mapping):
+        return None, None
+
+    price: float | None = None
+    for key in ("price", "last_price", "p", "value", "close"):
+        price = _safe_float(candidate.get(key))
+        if price is not None:
+            break
+
+    ts_raw: int | None = None
+    for key in ("ts", "timestamp", "time", "t", "ts_ms", "event_time"):
+        value = candidate.get(key)
+        if value is None:
+            continue
+        ts_raw = _safe_int(value)
+        if ts_raw is not None:
+            if ts_raw < 10_000_000_000:
+                ts_raw *= 1000
+            break
+
+    if price is None or ts_raw is None:
+        return None, None
+
+    return price, ts_raw
 
 
 def _coerce_float(value: Any) -> float:
@@ -1884,6 +2037,30 @@ def build_check_all_datas(
 
     symbol = str(snapshot.get("symbol") or snapshot.get("pair") or "UNKNOWN").upper()
     raw_meta = snapshot.get("meta") if isinstance(snapshot.get("meta"), Mapping) else None
+
+    stream_price: float | None = None
+    stream_ts: int | None = None
+    stream_candidates: List[Mapping[str, Any]] = []
+
+    for key in ("stream", "live", "live_price", "live_tick"):
+        candidate = snapshot.get(key)
+        if isinstance(candidate, Mapping):
+            stream_candidates.append(candidate)
+
+    if isinstance(raw_meta, Mapping):
+        for key in ("stream", "live", "live_price", "ticker"):
+            candidate = raw_meta.get(key)
+            if isinstance(candidate, Mapping):
+                stream_candidates.append(candidate)
+
+    for candidate in stream_candidates:
+        price, ts = _normalise_stream_point(candidate)
+        if price is None or ts is None:
+            continue
+        stream_price = price
+        stream_ts = ts
+        break
+
     profile_config = resolve_profile_config(symbol, raw_meta)
     sessions = list(VWAP_TPO_SESSIONS)
     profile_tpo: List[Dict[str, Any]] = []
@@ -1894,6 +2071,7 @@ def build_check_all_datas(
         "symbol": symbol,
         "zones": {
             "fvg": [],
+            "fvl": [],
             "ob": [],
             "mb": [],
             "bb": [],
@@ -1964,6 +2142,10 @@ def build_check_all_datas(
             now_dt = now_utc.replace(tzinfo=UTC)
         else:
             now_dt = now_utc.astimezone(UTC)
+    else:
+        now_dt = datetime.now(UTC)
+
+    if now_utc is not None:
         now_ms = int(now_dt.timestamp() * 1000)
         window_end_ms = _align_to_interval(now_ms, MINUTE_INTERVAL_MS) - MINUTE_INTERVAL_MS
     else:
@@ -2466,9 +2648,50 @@ def build_check_all_datas(
         },
     )
 
+    (
+        last_price_value,
+        last_iso_ts,
+        last_tf,
+        snapshot_age_sec,
+        insufficient_reason,
+        last_price_source,
+        last_price_diag,
+    ) = _resolve_last_price(
+        frames,
+        now=now_dt,
+        stream_price=stream_price,
+        stream_ts=stream_ts,
+        tick_size=tick_size_numeric,
+    )
+
+    if snapshot_age_sec is not None:
+        LOGGER.info("Snapshot age evaluated", extra={"snapshot_age_sec": snapshot_age_sec})
+
     if tick_size_numeric and isinstance(tick_size_numeric, (int, float)):
         zone_cfg.tick_size = float(tick_size_numeric)
     zones_diag["tick_size"] = zone_cfg.tick_size
+
+    analysis_entry_price = None
+    analysis_block = snapshot.get("analysis") if isinstance(snapshot.get("analysis"), Mapping) else None
+    if isinstance(analysis_block, Mapping):
+        trade_block = analysis_block.get("trade")
+        if isinstance(trade_block, Mapping):
+            analysis_entry_price = _safe_float(trade_block.get("entry_price"))
+
+    if (
+        analysis_entry_price is not None
+        and last_price_value is not None
+        and not math.isclose(analysis_entry_price, last_price_value, rel_tol=1e-9, abs_tol=1e-6)
+    ):
+        LOGGER.warning(
+            "Analysis entry price differs from resolved last price",
+            extra={
+                "analysis_entry_price": analysis_entry_price,
+                "last_price": last_price_value,
+                "last_tf": last_tf,
+                "last_ts_utc": last_iso_ts,
+            },
+        )
 
     if zone_frames_full:
         try:
@@ -2490,6 +2713,7 @@ def build_check_all_datas(
             detected_zones = {
                 "zones": {
                     "fvg": [],
+                    "fvl": [],
                     "ob": [],
                     "mb": [],
                     "bb": [],
@@ -2573,6 +2797,7 @@ def build_check_all_datas(
                 zones_diag["detection"] = detection_diag
     zone_type_timeframes = {
         "fvg": ("15m", "1h", "4h"),
+        "fvl": ("15m", "1h", "4h"),
         "ob": ("15m", "1h", "4h"),
         "mb": ("1h", "4h"),
         "bb": ("1h", "4h"),
@@ -2584,6 +2809,7 @@ def build_check_all_datas(
     if isinstance(zones_container, MutableMapping):
         timestamp_filters = {
             "fvg": "created_utc",
+            "fvl": "created_utc",
             "ob": "origin_utc",
             "mb": "origin_utc",
             "bb": "origin_utc",
@@ -3008,7 +3234,7 @@ def build_check_all_datas(
         orderflow_public[tf] = {"per_bar": per_bar}
 
     zones_container = detected_zones.get("zones") if isinstance(detected_zones, Mapping) else None
-    zone_keys = ("fvg", "ob", "mb", "bb", "rb", "pb", "sr", "profile_levels")
+    zone_keys = ("fvg", "fvl", "ob", "mb", "bb", "rb", "pb", "sr", "profile_levels")
     zones_public: Dict[str, List[Dict[str, Any]]] = {key: [] for key in zone_keys}
     if isinstance(zones_container, Mapping):
         for key in zone_keys:
@@ -3078,7 +3304,7 @@ def build_check_all_datas(
         "openOppositeZones": bool(raw_open_opposite) if isinstance(raw_open_opposite, bool) else False,
     }
 
-    response_payload = {
+    data_payload = {
         "symbol": symbol,
         "ohlcv": ohlcv_public,
         "orderflow": orderflow_public,
@@ -3091,4 +3317,101 @@ def build_check_all_datas(
         "context": context_public,
     }
 
-    return round_floats(response_payload)
+    availability: Dict[str, Any] = {
+        "ohlcv": {},
+        "vwap_sessions": {},
+        "zones": {},
+        "orderflow": {"timeframes": {}, "metrics": {}},
+    }
+    missing_fields: Set[str] = set()
+
+    for tf in ("1m", "3m", "5m", "15m", "1h", "4h", "1d"):
+        candles_payload = ohlcv_public.get(tf, {})
+        candles = candles_payload.get("candles") if isinstance(candles_payload, Mapping) else []
+        count = len(candles) if isinstance(candles, Sequence) else 0
+        availability["ohlcv"][tf] = {"candles": count, "has_data": count > 0}
+        if count == 0:
+            missing_fields.add(f"ohlcv.{tf}")
+
+    sessions_public = vwap_tpo_public.get("sessions", {}) if isinstance(vwap_tpo_public, Mapping) else {}
+    for session_name in ("asia", "london", "ny"):
+        raw_session = sessions_public.get(session_name) if isinstance(sessions_public, Mapping) else None
+        session_present = isinstance(raw_session, Mapping) and bool(raw_session)
+        metrics_presence: Dict[str, bool] = {}
+        if not session_present:
+            missing_fields.add(f"vwap_tpo.sessions.{session_name}")
+        for metric in ("poc", "vah", "val", "ib_high", "ib_low"):
+            metric_value = raw_session.get(metric) if isinstance(raw_session, Mapping) else None
+            has_metric = metric_value is not None
+            metrics_presence[metric] = has_metric
+            if not has_metric:
+                missing_fields.add(f"vwap_tpo.sessions.{session_name}.{metric}")
+        availability["vwap_sessions"][session_name] = {
+            "present": session_present,
+            "metrics": metrics_presence,
+        }
+
+    for zone_key, series in zones_public.items():
+        count = len(series) if isinstance(series, Sequence) else 0
+        availability["zones"][zone_key] = {"count": count}
+        if count == 0:
+            missing_fields.add(f"zones.{zone_key}")
+
+    orderflow_metrics = {"footprint": False, "delta": False, "cvd": False}
+    orderflow_source = snapshot.get("orderflow") if isinstance(snapshot.get("orderflow"), Mapping) else None
+    if isinstance(orderflow_source, Mapping):
+        footprint_payload = orderflow_source.get("footprint")
+        if isinstance(footprint_payload, Sequence) and footprint_payload:
+            orderflow_metrics["footprint"] = True
+
+    for tf, payload in orderflow_public.items():
+        per_bar = payload.get("per_bar") if isinstance(payload, Mapping) else []
+        series = per_bar if isinstance(per_bar, Sequence) else []
+        series_list = [entry for entry in series if isinstance(entry, Mapping)]
+        availability["orderflow"]["timeframes"][tf] = {
+            "bars": len(series_list),
+            "has_data": len(series_list) > 0,
+        }
+        if not series_list:
+            missing_fields.add(f"orderflow.{tf}")
+        if series_list:
+            if any(entry.get("delta") is not None for entry in series_list):
+                orderflow_metrics["delta"] = True
+            if any(entry.get("cvd") is not None for entry in series_list):
+                orderflow_metrics["cvd"] = True
+
+    for metric, present in orderflow_metrics.items():
+        if not present:
+            missing_fields.add(f"orderflow.{metric}")
+    availability["orderflow"]["metrics"] = orderflow_metrics
+
+    missing_fields_list = sorted(missing_fields)
+    if missing_fields_list:
+        LOGGER.info("Missing fields detected", extra={"missing_fields": missing_fields_list})
+
+    meta_block: Dict[str, Any] = {
+        "symbol": symbol,
+        "tz": "Europe/Berlin",
+        "last_price": last_price_value,
+        "last_ts_utc": last_iso_ts,
+        "last_tf": last_tf,
+        "last_price_source": last_price_source,
+    }
+    if snapshot_age_sec is not None:
+        meta_block["snapshot_age_sec"] = snapshot_age_sec
+    if insufficient_reason:
+        meta_block["insufficient_reason"] = insufficient_reason
+    meta_block["stale"] = bool(
+        isinstance(insufficient_reason, str) and insufficient_reason.startswith("stale_snapshot")
+    )
+    if last_price_diag.get("mismatch"):
+        meta_block["stream_vs_ohlcv_mismatch"] = True
+
+    final_payload = {
+        "meta": meta_block,
+        "data": data_payload,
+        "availability": availability,
+        "missing_fields": missing_fields_list,
+    }
+
+    return round_floats(final_payload)

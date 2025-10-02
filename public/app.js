@@ -5,6 +5,7 @@
   const BinanceCandles = window.BinanceCandles;
   const ChartGapWatcher = window.ChartGapWatcher;
   const SharedCandles = window.SharedCandles;
+  const MarketDataStore = window.MarketDataStore || null;
 
   if (!LightweightCharts || !BinanceCandles) {
     console.error("Chart dependencies are missing");
@@ -44,9 +45,6 @@
     chart: null,
     candleSeries: null,
     priceLine: null,
-    ws: null,
-    reconnectTimer: null,
-    reconnectAttempts: 0,
     gapWatcher: null,
     lastUpdateMs: null,
     pocSeries: null,
@@ -54,7 +52,26 @@
     valSeries: null,
     inspectProgressTimer: null,
     lastSnapshotId: null,
+    shared: {
+      pending: new Map(),
+      resetPending: false,
+      lastUpdateMs: null,
+      flushTimer: null,
+      inFlight: false,
+      dirty: false,
+      lastFlushMs: 0,
+      flushPromise: null,
+    },
   };
+
+  const marketStore =
+    MarketDataStore &&
+    new MarketDataStore({
+      symbol: state.symbol,
+      interval: state.interval,
+      pollIntervalMs: 1500,
+      historyLimit: 1500,
+    });
 
   function setActiveSymbolButton(symbol) {
     if (!symbolButtons.length) return;
@@ -128,7 +145,7 @@
   async function fetchVersion() {
     if (!versionEl) return;
     try {
-      const response = await fetch("/version");
+      const response = await fetch("/version", { cache: "no-store" });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = await response.json();
       versionEl.textContent = typeof data.version === "string" ? data.version : "—";
@@ -141,7 +158,7 @@
   async function fetchPreset(symbol) {
     if (!presetBadge) return;
     try {
-      const response = await fetch(`/presets/${encodeURIComponent(symbol)}`);
+      const response = await fetch(`/presets/${encodeURIComponent(symbol)}`, { cache: "no-store" });
       if (!response.ok) throw new Error("Preset request failed");
       const data = await response.json();
       const preset = data && data.preset ? data.preset : null;
@@ -172,25 +189,174 @@
     };
   }
 
-  function persistSharedCandles({ bars = null, reset = false, lastUpdateMs = null } = {}) {
-    if (!SharedCandles || typeof SharedCandles.merge !== "function") return;
-    const payload = Array.isArray(bars) && bars.length ? bars : state.candles;
-    if (!Array.isArray(payload) || !payload.length) return;
-    const intervalMs = intervalToMs(state.interval);
-    const effectiveUpdate = Number.isFinite(lastUpdateMs) ? Number(lastUpdateMs) : state.lastUpdateMs;
-    try {
-      SharedCandles.merge(state.symbol, state.interval, payload, {
-        intervalMs,
-        lastUpdateMs: effectiveUpdate,
-        maxBars: 2000,
-        reset,
-      });
-    } catch (error) {
-      console.warn("SharedCandles merge failed", error);
+  function toSharedBar(bar) {
+    if (!bar) return null;
+    const time = Number(bar.time ?? bar.t ?? 0);
+    const open = Number(bar.open ?? bar.o);
+    const high = Number(bar.high ?? bar.h);
+    const low = Number(bar.low ?? bar.l);
+    const close = Number(bar.close ?? bar.c);
+    if (
+      !Number.isFinite(time) ||
+      !Number.isFinite(open) ||
+      !Number.isFinite(high) ||
+      !Number.isFinite(low) ||
+      !Number.isFinite(close)
+    ) {
+      return null;
+    }
+    return { time, open, high, low, close };
+  }
+
+  function persistSharedCandles({ bars = null, reset = false, lastUpdateMs = null, immediate = false } = {}) {
+    const shared = state.shared;
+    if (reset) {
+      shared.pending = new Map();
+      shared.resetPending = true;
+    }
+    const entries = Array.isArray(bars) ? bars : [];
+    for (const bar of entries) {
+      const sharedBar = toSharedBar(bar);
+      if (!sharedBar) continue;
+      shared.pending.set(sharedBar.time, sharedBar);
+    }
+    if (Number.isFinite(lastUpdateMs)) {
+      shared.lastUpdateMs = Number(lastUpdateMs);
+    }
+    if (shared.pending.size || shared.resetPending) {
+      scheduleSharedFlush({ immediate: immediate || reset });
     }
   }
 
-  function mergeCandles(bars, { reset = false, lastUpdateMs = null } = {}) {
+  function scheduleSharedFlush({ immediate = false, waitMs = null, force = false } = {}) {
+    const shared = state.shared;
+    const now = Date.now();
+    const sinceLast = now - (shared.lastFlushMs || 0);
+    let delay;
+    if (Number.isFinite(waitMs)) {
+      delay = Math.max(0, waitMs);
+    } else {
+      const baseDelay = Math.max(0, 1000 - sinceLast);
+      delay = immediate ? baseDelay : Math.max(250, baseDelay);
+    }
+    if (delay === 0 && shared.flushTimer) {
+      clearTimeout(shared.flushTimer);
+      shared.flushTimer = null;
+    }
+    if (shared.flushTimer) {
+      return;
+    }
+    shared.flushTimer = setTimeout(() => {
+      shared.flushTimer = null;
+      flushSharedCandles({ force }).catch((error) => {
+        console.warn("SharedCandles flush failed", error);
+      });
+    }, delay);
+  }
+
+  function wait(ms) {
+    return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+  }
+
+  async function flushSharedCandles({ force = false } = {}) {
+    const shared = state.shared;
+    if (!shared.pending.size && !shared.resetPending) {
+      return;
+    }
+    if (shared.inFlight) {
+      shared.dirty = true;
+      return shared.flushPromise || Promise.resolve();
+    }
+
+    const execute = async () => {
+      const now = Date.now();
+      const sinceLast = now - (shared.lastFlushMs || 0);
+      if (!force && sinceLast < 1000) {
+        scheduleSharedFlush({ waitMs: 1000 - sinceLast });
+        return;
+      }
+      if (force && sinceLast < 1000) {
+        await wait(1000 - sinceLast);
+      }
+      if (shared.flushTimer) {
+        clearTimeout(shared.flushTimer);
+        shared.flushTimer = null;
+      }
+      const pendingEntries = Array.from(shared.pending.values());
+      const reset = shared.resetPending;
+      const lastUpdateMs = Number.isFinite(shared.lastUpdateMs) ? Number(shared.lastUpdateMs) : Date.now();
+      shared.pending = new Map();
+      shared.resetPending = false;
+      shared.inFlight = true;
+      shared.dirty = false;
+
+      const payload = pendingEntries
+        .map((bar) => ({ ...bar }))
+        .sort((a, b) => Number(a.time) - Number(b.time));
+
+      if (SharedCandles && typeof SharedCandles.merge === "function") {
+        try {
+          SharedCandles.merge(state.symbol, state.interval, payload, {
+            intervalMs: intervalToMs(state.interval),
+            lastUpdateMs,
+            maxBars: 2000,
+            reset,
+            syncRemote: false,
+          });
+        } catch (error) {
+          console.warn("SharedCandles local merge failed", error);
+        }
+      }
+
+      try {
+        const response = await fetch("/shared-candles", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          cache: "no-store",
+          body: JSON.stringify({
+            symbol: state.symbol,
+            interval: state.interval,
+            candles: payload,
+            reset,
+            intervalMs: intervalToMs(state.interval),
+            lastUpdateMs,
+            maxBars: 2000,
+          }),
+        });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        shared.lastFlushMs = Date.now();
+        shared.lastUpdateMs = lastUpdateMs;
+      } catch (error) {
+        console.warn("SharedCandles remote sync failed", error);
+        const buffer = shared.pending;
+        if (reset) {
+          buffer.clear();
+        }
+        for (const bar of payload) {
+          buffer.set(Number(bar.time), { ...bar });
+        }
+        shared.resetPending = reset || shared.resetPending;
+        shared.dirty = true;
+      } finally {
+        shared.inFlight = false;
+        if (!shared.dirty) {
+          shared.lastFlushMs = shared.lastFlushMs || Date.now();
+        }
+        if (shared.dirty || shared.pending.size) {
+          scheduleSharedFlush();
+        }
+      }
+    };
+
+    shared.flushPromise = execute().finally(() => {
+      shared.flushPromise = null;
+    });
+    return shared.flushPromise;
+  }
+
+  function mergeCandles(bars, { reset = false, lastUpdateMs = null, immediate = false } = {}) {
     if (reset) state.candles = [];
     if (!Array.isArray(bars) || !bars.length) return false;
     const index = new Map();
@@ -198,6 +364,7 @@
       index.set(Number(bar.time), idx);
     });
     let changed = false;
+    const delta = new Map();
     bars.forEach((bar) => {
       if (!bar) return;
       const time = Number(bar.time);
@@ -205,10 +372,12 @@
       if (index.has(time)) {
         state.candles[index.get(time)] = bar;
         changed = true;
+        delta.set(time, bar);
       } else {
         index.set(time, state.candles.length);
         state.candles.push(bar);
         changed = true;
+        delta.set(time, bar);
       }
     });
     if (changed) {
@@ -218,7 +387,8 @@
       }
       const effectiveUpdate = Number.isFinite(lastUpdateMs) ? Number(lastUpdateMs) : Date.now();
       state.lastUpdateMs = effectiveUpdate;
-      persistSharedCandles({ reset, lastUpdateMs: effectiveUpdate });
+      const changedBars = Array.from(delta.values());
+      persistSharedCandles({ bars: changedBars, reset, lastUpdateMs: effectiveUpdate, immediate });
     }
     return changed;
   }
@@ -234,7 +404,7 @@
           const bars = stored.candles.map((bar) => normaliseBar(bar)).filter(Boolean);
           if (bars.length) {
             const lastUpdate = Number(stored.lastUpdateMs) || Number(stored.updatedAt) || Date.now();
-            mergeCandles(bars, { reset: true, lastUpdateMs: lastUpdate });
+          mergeCandles(bars, { reset: true, lastUpdateMs: lastUpdate, immediate: true });
             restored = true;
             applied = true;
           }
@@ -253,6 +423,7 @@
           mergeCandles(remote.candles.map((bar) => normaliseBar(bar)).filter(Boolean), {
             reset: shouldReset,
             lastUpdateMs: lastUpdate,
+            immediate: shouldReset,
           });
           restored = true;
           applied = true;
@@ -266,6 +437,79 @@
       applyCandles();
     }
     return restored;
+  }
+
+
+  function refreshGapWatcherContext() {
+    if (!state.gapWatcher || typeof state.gapWatcher.updateContext !== "function") return;
+    state.gapWatcher.updateContext({
+      symbol: state.symbol,
+      interval: state.interval,
+      intervalMs: intervalToMs(state.interval),
+      getCandles: () => state.candles,
+      requestGap: handleGapRequest,
+      resetRequestedKeys: false,
+    });
+    if (typeof state.gapWatcher.notifyData === "function") {
+      state.gapWatcher.notifyData();
+    }
+  }
+
+  function handleStoreEvent(event) {
+    if (!event) return;
+    const eventSymbol = (event.symbol || "").toUpperCase();
+    if (eventSymbol && eventSymbol !== state.symbol) return;
+    if (event.interval && event.interval !== state.interval) return;
+
+    if (event.type === "status") {
+      if (event.status === "connected") {
+        notifyStatus("Подключено к потоку Binance", "info");
+      } else if (event.status === "closed") {
+        notifyStatus("Соединение закрыто, активирован пуллинг", "warning");
+      } else if (event.status === "error") {
+        notifyStatus("Ошибка потока, переподключение...", "warning");
+      }
+      return;
+    }
+
+    if (event.type === "error") {
+      notifyStatus("Ошибка загрузки данных Binance", "error");
+      return;
+    }
+
+    const now = Date.now();
+
+    if (event.type === "snapshot") {
+      const bars = Array.isArray(event.candles) ? event.candles : [];
+      const changed = mergeCandles(bars, { reset: true, lastUpdateMs: now, immediate: true });
+      if (changed) {
+        applyCandles();
+        focusOnLastCandle({ preserveSpan: false });
+        refreshGapWatcherContext();
+      }
+      notifyStatus("История загружена", "success");
+    } else if (event.type === "update") {
+      const payload = event.candle ? [event.candle] : [];
+      const changed = mergeCandles(payload, { reset: false, lastUpdateMs: now, immediate: Boolean(event.isFinal) });
+      if (changed) {
+        applyCandles(event.candle);
+        refreshGapWatcherContext();
+      }
+    } else if (event.type === "poll") {
+      const bars = Array.isArray(event.candles) ? event.candles : [];
+      if (mergeCandles(bars, { reset: false, lastUpdateMs: now, immediate: false })) {
+        applyCandles();
+      }
+    }
+
+    if (event.meta && event.meta.last_price != null) {
+      updateInfo(event.candle || marketStore?.getLastCandle() || null);
+    }
+  }
+
+  if (marketStore) {
+    marketStore.subscribe(handleStoreEvent);
+    marketStore.start();
   }
 
   function updateInfo(lastBar) {
@@ -374,89 +618,6 @@
     timeScale.scrollToRealTime();
   }
 
-  function detachWs() {
-    if (state.ws) {
-      state.ws.onopen = null;
-      state.ws.onmessage = null;
-      state.ws.onclose = null;
-      state.ws.onerror = null;
-      state.ws.close(1000);
-    }
-    state.ws = null;
-    if (state.reconnectTimer) {
-      clearTimeout(state.reconnectTimer);
-      state.reconnectTimer = null;
-    }
-  }
-
-  function scheduleReconnect() {
-    if (state.reconnectTimer) return;
-    const delay = Math.min(30_000, 1_000 * Math.pow(2, state.reconnectAttempts));
-    state.reconnectTimer = setTimeout(() => {
-      state.reconnectTimer = null;
-      connectWs();
-    }, delay);
-  }
-
-  function handleWsMessage(event) {
-    if (!state.candleSeries) return;
-    try {
-      const payload = JSON.parse(event.data);
-      const bar = BinanceCandles.barFromWs(payload);
-      const normalised = normaliseBar(bar);
-      if (!normalised) return;
-      const last = state.candles[state.candles.length - 1];
-      const nowMs = Date.now();
-      if (last && Number(last.time) === Number(normalised.time)) {
-        state.candles[state.candles.length - 1] = normalised;
-        state.candleSeries.update(normalised);
-        state.lastUpdateMs = nowMs;
-        persistSharedCandles({ bars: [normalised], lastUpdateMs: nowMs });
-      } else if (!last || Number(normalised.time) > Number(last.time)) {
-        state.candles.push(normalised);
-        state.candleSeries.update(normalised);
-        state.lastUpdateMs = nowMs;
-        persistSharedCandles({ bars: [normalised], lastUpdateMs: nowMs });
-      } else {
-        mergeCandles([normalised], { lastUpdateMs: nowMs });
-        state.candleSeries.setData(state.candles);
-      }
-      updatePriceLine(normalised);
-      updateInfo(normalised);
-      if (state.gapWatcher && typeof state.gapWatcher.notifyData === "function") {
-        state.gapWatcher.notifyData();
-      }
-    } catch (error) {
-      console.error("Failed to parse ws message", error);
-    }
-  }
-
-  function connectWs() {
-    detachWs();
-    const symbol = state.symbol.toLowerCase();
-    const interval = state.interval;
-    const url = `wss://fstream.binance.com/ws/${symbol}@kline_${interval}`;
-    const ws = new WebSocket(url);
-    state.ws = ws;
-    ws.onopen = () => {
-      state.reconnectAttempts = 0;
-      notifyStatus("Подключено к потоку Binance", "info");
-    };
-    ws.onmessage = handleWsMessage;
-    ws.onerror = (event) => {
-      console.error("WebSocket error", event);
-      notifyStatus("Ошибка WebSocket, переподключение...", "warning");
-      ws.close();
-    };
-    ws.onclose = () => {
-      if (state.ws === ws) {
-        state.reconnectAttempts += 1;
-        notifyStatus("Соединение закрыто, переподключаемся...", "warning");
-        scheduleReconnect();
-      }
-    };
-  }
-
   async function fetchHistory(symbol, interval, limit = 500) {
     const rows = await BinanceCandles.fetchHistory(symbol, interval, limit);
     return rows.map((bar) => normaliseBar(bar)).filter(Boolean);
@@ -473,7 +634,7 @@
       url.searchParams.set("endTime", Math.floor(endMs));
     }
     url.searchParams.set("limit", String(Math.max(1, Math.min(limit, 1500))));
-    const resp = await fetch(url.toString());
+    const resp = await fetch(url.toString(), { cache: "no-store" });
     if (!resp.ok) {
       throw new Error(`Failed to fetch gap candles: ${resp.status}`);
     }
@@ -493,7 +654,7 @@
         Number(gap.endMs) + intervalMs,
         Math.min(1000, Math.max(approxBars, 50))
       );
-      const changed = mergeCandles(bars, { lastUpdateMs: Date.now() });
+      const changed = mergeCandles(bars, { lastUpdateMs: Date.now(), immediate: true });
       if (changed) {
         applyCandles();
         if (state.gapWatcher && typeof state.gapWatcher.notifyData === "function") {
@@ -565,7 +726,6 @@
   }
 
   async function loadSymbol(symbol, interval) {
-    detachWs();
     notifyStatus("Загружаем историю...", "info");
     const normalizedSymbol = symbol.trim().toUpperCase();
     const normalizedInterval = interval.trim();
@@ -575,31 +735,28 @@
     setActiveSymbolButton(normalizedSymbol);
     fetchPreset(normalizedSymbol);
     initChart();
-    const restored = await restoreFromSharedStore(normalizedSymbol, normalizedInterval);
-    if (restored && state.gapWatcher && typeof state.gapWatcher.notifyData === "function") {
-      state.gapWatcher.notifyData();
+    if (state.shared.flushTimer) {
+      clearTimeout(state.shared.flushTimer);
+      state.shared.flushTimer = null;
     }
-    try {
-      const history = await fetchHistory(normalizedSymbol, normalizedInterval, 1000);
-      mergeCandles(history, { reset: true, lastUpdateMs: Date.now() });
+    state.shared.pending = new Map();
+    state.shared.resetPending = false;
+    state.shared.lastUpdateMs = null;
+    state.shared.inFlight = false;
+    state.shared.dirty = false;
+    state.shared.lastFlushMs = 0;
+    state.shared.flushPromise = null;
+    const restored = await restoreFromSharedStore(normalizedSymbol, normalizedInterval);
+    if (restored) {
       applyCandles();
       focusOnLastCandle({ preserveSpan: false });
-      if (state.gapWatcher && typeof state.gapWatcher.updateContext === "function") {
-        state.gapWatcher.updateContext({
-          symbol: state.symbol,
-          interval: state.interval,
-          intervalMs: intervalToMs(state.interval),
-          getCandles: () => state.candles,
-          requestGap: handleGapRequest,
-          resetRequestedKeys: true,
-        });
-        state.gapWatcher.notifyData();
-      }
-      notifyStatus("История загружена", "success");
-      connectWs();
-    } catch (error) {
-      console.error("Failed to load history", error);
-      notifyStatus("Не удалось загрузить данные Binance", "error");
+      refreshGapWatcherContext();
+    }
+    if (marketStore) {
+      marketStore.setSymbol(normalizedSymbol, normalizedInterval);
+      marketStore.restart();
+    } else {
+      notifyStatus("Лайв-хранилище недоступно", "error");
     }
   }
 
@@ -699,6 +856,7 @@
   }
 
   async function submitInspectionSnapshot() {
+    await flushSharedCandles({ force: true });
     const snapshot = buildInspectionSnapshot();
     toggleInspectionProgress(true);
     if (inspectionBtn) inspectionBtn.disabled = true;
@@ -706,6 +864,7 @@
       const response = await fetch("/inspection/snapshot", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        cache: "no-store",
         body: JSON.stringify(snapshot),
       });
       if (!response.ok) {
@@ -730,7 +889,10 @@
     try {
       const url = new URL("/inspection", window.location.origin);
       url.searchParams.set("snapshot", snapshotId);
-      const response = await fetch(url.toString(), { headers: { accept: "application/json" } });
+      const response = await fetch(url.toString(), {
+        headers: { accept: "application/json" },
+        cache: "no-store",
+      });
       if (!response.ok) throw new Error("Inspection payload unavailable");
       const payload = await response.json();
       const data = payload?.DATA || {};
@@ -762,6 +924,7 @@
       const response = await fetch("/inspection/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        cache: "no-store",
         body: JSON.stringify({ snapshot_id: state.lastSnapshotId, analysis_type: type }),
       });
       if (!response.ok) {
@@ -796,7 +959,7 @@
       const url = new URL("/profile", window.location.origin);
       url.searchParams.set("snapshot", state.lastSnapshotId);
       url.searchParams.set("tf", state.interval);
-      const response = await fetch(url.toString());
+      const response = await fetch(url.toString(), { cache: "no-store" });
       if (!response.ok) throw new Error("Profile export failed");
       const data = await response.json();
       const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
@@ -860,8 +1023,8 @@
   }
 
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible" && !state.ws) {
-      connectWs();
+    if (document.visibilityState === "visible" && marketStore) {
+      marketStore.restart();
     }
   });
 

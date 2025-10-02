@@ -50,8 +50,9 @@ from ..services.news import fetch_news
 from ..services.ohlcv import build_multi_tf_ohlcv, fetch_ohlcv as fetch_ohlcv_enhanced
 from ..services.orderflow import calculate_cvd, fetch_footprint
 from ..services.tpo import calculate_session_tpo, calculate_tpo
-from ..version import APP_VERSION
 from ..meta import Meta
+from ..static_version import STATIC_VERSION
+from ..version import APP_VERSION
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -326,6 +327,17 @@ app.add_middleware(
 
 if PUBLIC_DIR.is_dir():
     app.mount("/public", StaticFiles(directory=PUBLIC_DIR), name="public")
+
+
+@app.middleware("http")
+async def add_no_store_header(request: Request, call_next):
+    """Disable caching for dynamic API responses."""
+
+    response = await call_next(request)
+    path = request.url.path or ""
+    if not path.startswith("/public/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.on_event("startup")
@@ -1359,6 +1371,6 @@ async def index() -> HTMLResponse:
         html = TEMPLATES_DIR.joinpath("index.html").read_text(encoding="utf-8")
     except FileNotFoundError as exc:  # pragma: no cover - deployment guard
         raise HTTPException(status_code=500, detail="Index template is missing") from exc
-    return HTMLResponse(content=html)
+    return HTMLResponse(content=html.replace("__STATIC_VERSION__", STATIC_VERSION))
 
 

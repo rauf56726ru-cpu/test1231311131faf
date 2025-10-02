@@ -42,6 +42,7 @@ from .profile import build_profile_package
 from .presets import resolve_profile_config
 from .zones import Config as ZonesConfig, detect_zones
 from ..meta import Meta
+from ..static_version import STATIC_VERSION
 
 Snapshot = Dict[str, Any]
 
@@ -1465,6 +1466,7 @@ def render_inspection_page(
 ) -> str:
     """Render the inspection dashboard HTML."""
 
+    static_version = STATIC_VERSION
     payload_json = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
     snapshots_json = json.dumps(snapshots, ensure_ascii=False).replace("</", "<\\/")
 
@@ -1660,6 +1662,35 @@ def render_inspection_page(
       gap: 0.6rem;
       align-items: center;
       flex-wrap: wrap;
+    }
+    .live-meta {
+      margin-top: 1rem;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 0.75rem;
+      padding: 0.85rem 1rem;
+      border-radius: 14px;
+      border: 1px solid rgba(148, 163, 184, 0.22);
+      background: rgba(15, 23, 42, 0.68);
+      box-shadow: inset 0 1px 0 rgba(148, 163, 184, 0.08);
+    }
+    .live-meta__item span {
+      display: block;
+      font-size: 0.75rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    .live-meta__value {
+      font-size: 1.05rem;
+      font-weight: 600;
+      color: #f8fafc;
+    }
+    .live-meta__value[data-state="stale"] {
+      color: #f97316;
+    }
+    .live-meta__value[data-state="fresh"] {
+      color: #22c55e;
     }
     .chart-toolbar {
       display: flex;
@@ -2087,7 +2118,7 @@ def render_inspection_page(
   }
 
   async function fetchSnapshots() {
-    const response = await fetch("/inspection/snapshots");
+    const response = await fetch("/inspection/snapshots", { cache: "no-store" });
     if (!response.ok) throw new Error("Failed to fetch snapshots");
     return response.json();
   }
@@ -2170,7 +2201,7 @@ def render_inspection_page(
       url.searchParams.set("endTime", Math.floor(endMs));
     }
     url.searchParams.set("limit", String(Math.max(1, Math.min(limit, 1500))));
-    const response = await fetch(url.toString());
+    const response = await fetch(url.toString(), { cache: "no-store" });
     if (!response.ok) {
       throw new Error(`Failed to fetch range: ${response.status}`);
     }
@@ -2282,7 +2313,7 @@ def render_inspection_page(
       }
       url.searchParams.set("limit", String(batchLimit));
 
-      const resp = await fetch(url.toString());
+      const resp = await fetch(url.toString(), { cache: "no-store" });
       if (!resp.ok) {
         throw new Error(`klines ${resp.status}`);
       }
@@ -2353,6 +2384,7 @@ def render_inspection_page(
     const response = await fetch("/inspection/snapshot", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      cache: "no-store",
       body: JSON.stringify(payload),
     });
     if (!response.ok) {
@@ -2365,6 +2397,7 @@ def render_inspection_page(
   async function fetchPayload(id) {
     const response = await fetch(`/inspection?snapshot=${encodeURIComponent(id)}`, {
       headers: { Accept: "application/json" },
+      cache: "no-store",
     });
     if (!response.ok) {
       throw new Error("Failed to fetch payload");
@@ -2444,6 +2477,12 @@ def render_inspection_page(
     const presetSubmitButton = document.getElementById("preset-submit");
     const presetCancelButtons = Array.from(document.querySelectorAll("[data-close-preset]"));
     const presetCreateButton = document.getElementById("preset-create-button");
+    const livePriceEl = document.getElementById("live-last-price");
+    const liveTsEl = document.getElementById("live-last-ts");
+    const liveTfEl = document.getElementById("live-last-tf");
+    const liveAgeEl = document.getElementById("live-age-sec");
+    const liveStateEl = document.getElementById("live-stale-flag");
+    const mismatchBanner = document.getElementById("stream-mismatch");
 
     initCollapsibles();
 
@@ -2455,8 +2494,15 @@ def render_inspection_page(
 
     const PREFERRED_CHART_FRAMES = ["1m", "3m", "15m", "30m", "1h", "4h", "1d", "1w"];
 
+    let state = null;
+
     function frameHasCandles(frames, tf) {
-      if (!frames || !tf) return false;
+      if (!tf) return false;
+      const liveEntry = state?.liveFrames?.[tf];
+      if (liveEntry && Array.isArray(liveEntry.candles) && liveEntry.candles.length) {
+        return true;
+      }
+      if (!frames) return false;
       const entry = frames[tf];
       if (!entry || typeof entry !== "object") return false;
       const candles = Array.isArray(entry.candles) ? entry.candles : [];
@@ -2483,7 +2529,7 @@ def render_inspection_page(
     const initialFrameMap = initial.payload?.DATA?.frames || {};
     const defaultFrame = selectPreferredFrame(initialFrameMap, initial.timeframe);
 
-    const state = {
+    state = {
       payload: initial.payload || null,
       snapshotId: initial.snapshotId || null,
       selection: initial.payload?.DATA?.selection || null,
@@ -2506,6 +2552,9 @@ def render_inspection_page(
       presetModalMode: null,
       managingSymbol: null,
       presetModalOpen: false,
+      liveFrames: {},
+      liveMeta: null,
+      liveMismatch: false,
     };
 
     const AUTO_PRESET_SYMBOLS = new Set(["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
@@ -2523,6 +2572,151 @@ def render_inspection_page(
         normaliseSymbol(initial.symbol) ||
         defaultSymbol
       );
+    }
+
+    const MarketDataStore = window.MarketDataStore || null;
+    const chartStore =
+      MarketDataStore &&
+      new MarketDataStore({
+        symbol: activeSymbol(),
+        interval: state.frame || "1m",
+        pollIntervalMs: 1500,
+        historyLimit: 1500,
+      });
+    const priceStore =
+      MarketDataStore &&
+      new MarketDataStore({
+        symbol: activeSymbol(),
+        interval: "1m",
+        pollIntervalMs: 1500,
+        historyLimit: 1500,
+      });
+
+    function formatLivePrice(value) {
+      if (!Number.isFinite(value)) return "—";
+      const abs = Math.abs(value);
+      if (abs >= 100_000) return value.toFixed(1);
+      if (abs >= 10_000) return value.toFixed(2);
+      if (abs >= 1_000) return value.toFixed(2);
+      if (abs >= 100) return value.toFixed(2);
+      if (abs >= 10) return value.toFixed(3);
+      if (abs >= 1) return value.toFixed(4);
+      if (abs >= 0.1) return value.toFixed(5);
+      return value.toFixed(6);
+    }
+
+    function renderLiveMeta(meta) {
+      state.liveMeta = meta || null;
+      if (!meta) {
+        if (livePriceEl) livePriceEl.textContent = "—";
+        if (liveTsEl) liveTsEl.textContent = "—";
+        if (liveTfEl) liveTfEl.textContent = "—";
+        if (liveAgeEl) liveAgeEl.textContent = "—";
+        if (liveStateEl) {
+          liveStateEl.textContent = "—";
+          liveStateEl.dataset.state = "unknown";
+        }
+        if (mismatchBanner) mismatchBanner.hidden = true;
+        return;
+      }
+      if (livePriceEl) livePriceEl.textContent = formatLivePrice(meta.last_price);
+      if (liveTsEl) liveTsEl.textContent = meta.last_ts_ms ? formatTs(meta.last_ts_ms) : "—";
+      if (liveTfEl) liveTfEl.textContent = meta.last_tf || "—";
+      if (liveAgeEl) liveAgeEl.textContent = Number.isFinite(meta.age_sec) ? `${meta.age_sec}s` : "—";
+      if (liveStateEl) {
+        liveStateEl.textContent = meta.stale ? "Stale" : "Live";
+        liveStateEl.dataset.state = meta.stale ? "stale" : "fresh";
+      }
+      state.liveMismatch = Boolean(meta.mismatch);
+      if (mismatchBanner) {
+        mismatchBanner.hidden = !state.liveMismatch;
+        if (state.liveMismatch) {
+          mismatchBanner.dataset.tone = "warning";
+          mismatchBanner.textContent = "Stream vs OHLCV mismatch > 1 tick";
+        }
+      }
+    }
+
+    function syncLiveStores({ force = false } = {}) {
+      const symbol = activeSymbol();
+      const chartInterval = state.frame || "1m";
+      if (chartStore) {
+        chartStore.setSymbol(symbol, chartInterval);
+        if (force) chartStore.restart();
+      }
+      if (priceStore) {
+        priceStore.setSymbol(symbol, "1m");
+        if (force) priceStore.restart();
+      }
+    }
+
+    function handleChartStoreEvent(event) {
+      if (!event || !chartStore) return;
+      const eventSymbol = normaliseSymbol(event.symbol);
+      const currentSymbol = normaliseSymbol(activeSymbol());
+      if (eventSymbol && currentSymbol && eventSymbol !== currentSymbol) return;
+      const tf = event.interval || (state.frame || "1m");
+      const latest = chartStore.candles ? chartStore.candles.slice() : [];
+      if (!state.liveFrames) state.liveFrames = {};
+      if (latest.length) {
+        state.liveFrames[tf] = { tf, candles: latest };
+        state.availableFrames = { ...(state.availableFrames || {}), [tf]: { tf, candles: latest } };
+      }
+
+      if (event.type === "status") {
+        if (event.status === "connected") {
+          updateStatus("Лайв-данные подключены", "info");
+        } else if (event.status === "closed") {
+          updateStatus("Лайв-канал закрыт, используем пуллинг", "warning");
+        } else if (event.status === "error") {
+          updateStatus("Ошибка потока, переподключение...", "warning");
+        }
+        return;
+      }
+      if (event.type === "error") {
+        updateStatus("Ошибка получения лайв-данных", "error");
+        return;
+      }
+
+      if (tf === (state.frame || "1m")) {
+        if (event.type === "snapshot") {
+          mergeChartBars(latest, { reset: true, persist: true });
+          renderChart({ resetRequestedKeys: true, fitContent: true });
+        } else if (event.type === "update" && event.candle) {
+          mergeChartBars([event.candle], { reset: false, persist: true });
+        } else if (event.type === "poll") {
+          const pollBars = Array.isArray(event.candles) ? event.candles : [];
+          if (pollBars.length) {
+            mergeChartBars(pollBars, { reset: false, persist: false });
+          }
+        }
+      }
+
+      updateTimeframeToggle();
+    }
+
+    function handlePriceStoreEvent(event) {
+      if (!event || !priceStore) return;
+      const eventSymbol = normaliseSymbol(event.symbol);
+      const currentSymbol = normaliseSymbol(activeSymbol());
+      if (eventSymbol && currentSymbol && eventSymbol !== currentSymbol) return;
+      if (event.meta) {
+        renderLiveMeta(event.meta);
+      }
+    }
+
+    if (chartStore) {
+      chartStore.subscribe(handleChartStoreEvent);
+      chartStore.start();
+    }
+
+    if (priceStore) {
+      priceStore.subscribe(handlePriceStoreEvent);
+      priceStore.start();
+    }
+
+    if (chartStore || priceStore) {
+      syncLiveStores({ force: true });
     }
 
     function renderChartSymbol() {
@@ -2669,7 +2863,10 @@ def render_inspection_page(
     async function refreshPresetList() {
       if (!presetListContainer) return;
       try {
-        const response = await fetch("/presets", { headers: { Accept: "application/json" } });
+        const response = await fetch("/presets", {
+          headers: { Accept: "application/json" },
+          cache: "no-store",
+        });
         const data = await response.json();
         const list = Array.isArray(data?.presets) ? data.presets : [];
         state.presetList = list;
@@ -2731,7 +2928,10 @@ def render_inspection_page(
         deleteButton.addEventListener("click", async () => {
           if (!window.confirm(`Удалить пресет ${symbol}?`)) return;
           try {
-            const response = await fetch(`/presets/${symbol}`, { method: "DELETE" });
+            const response = await fetch(`/presets/${symbol}`, {
+              method: "DELETE",
+              cache: "no-store",
+            });
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
             if (normaliseSymbol(symbol) === normaliseSymbol(activeSymbol())) {
               state.profilePreset = null;
@@ -2764,6 +2964,7 @@ def render_inspection_page(
         const response = await fetch(url, {
           method,
           headers: { "Content-Type": "application/json", Accept: "application/json" },
+          cache: "no-store",
           body: JSON.stringify(payload),
         });
         if (!response.ok) {
@@ -2808,6 +3009,9 @@ def render_inspection_page(
       symbolInput.addEventListener("input", () => {
         renderChartSymbol();
       });
+      symbolInput.addEventListener("change", () => {
+        syncLiveStores({ force: true });
+      });
     }
 
     function updateStatus(message, tone = "info") {
@@ -2832,15 +3036,16 @@ def render_inspection_page(
         checkAllHours.value = String(state.hours);
       }
       const presetReady = !state.presetRequired;
+      const liveCapable = Boolean(activeSymbol());
       if (collectSelectionButton) {
         collectSelectionButton.disabled =
           !state.snapshotId || !hasSelection || !hoursValid || !presetReady;
       }
       if (summaryButton) {
-        summaryButton.disabled = !state.snapshotId || !presetReady;
+        summaryButton.disabled = !liveCapable || !presetReady;
       }
       if (topupButton) {
-        topupButton.disabled = !state.snapshotId || !presetReady;
+        topupButton.disabled = !liveCapable || !presetReady;
       }
     }
 
@@ -2865,8 +3070,15 @@ def render_inspection_page(
 
     function populateFrames(payload) {
       const frames = payload?.DATA?.frames || {};
-      state.availableFrames = frames;
-      const target = selectPreferredFrame(frames, state.frame);
+      const combined = { ...frames };
+      if (state.liveFrames) {
+        Object.entries(state.liveFrames).forEach(([tf, entry]) => {
+          if (!tf) return;
+          combined[tf] = { tf, candles: entry?.candles || [] };
+        });
+      }
+      state.availableFrames = combined;
+      const target = selectPreferredFrame(combined, state.frame);
       state.frame = target;
       updateTimeframeToggle();
     }
@@ -2942,6 +3154,7 @@ def render_inspection_page(
         url.searchParams.set("hours", String(state.hours));
         const response = await fetch(url.toString(), {
           headers: { Accept: "application/json" },
+          cache: "no-store",
         });
         if (response.status === 204) {
           state.checkAll = null;
@@ -2966,24 +3179,183 @@ def render_inspection_page(
       }
     }
 
-    async function requestSummaryData() {
-      if (!state.snapshotId) {
-        updateStatus("Выберите снэпшот для сбора контекста", "warning");
-        return;
+    function resolveLiveMetaSnapshot() {
+      if (priceStore && typeof priceStore.getMeta === "function") {
+        try {
+          const meta = priceStore.getMeta();
+          if (meta && typeof meta === "object") {
+            return { ...meta };
+          }
+        } catch (error) {
+          console.warn("Не удалось получить метаданные лайв-стрима", error);
+        }
       }
+      if (state.liveMeta && typeof state.liveMeta === "object") {
+        return { ...state.liveMeta };
+      }
+      return null;
+    }
 
+    function resolveLiveRangeEndMs(meta) {
+      const candidates = [];
+      if (meta && Number.isFinite(meta.last_ts_ms)) {
+        candidates.push(Number(meta.last_ts_ms));
+      }
+      if (priceStore && typeof priceStore.getLastCandle === "function") {
+        try {
+          const last = priceStore.getLastCandle();
+          if (last) {
+            const preview = ensurePreviewBar(last);
+            if (preview) {
+              const ts = Number.isFinite(preview.ts_ms_utc)
+                ? Math.floor(preview.ts_ms_utc)
+                : Math.floor(preview.time * 1000);
+              if (Number.isFinite(ts)) {
+                candidates.push(ts);
+              }
+            }
+          }
+        } catch (error) {
+          console.warn("Не удалось прочитать последнюю свечу лайв-потока", error);
+        }
+      }
+      const minuteLive = state.liveFrames?.["1m"]?.candles;
+      if (Array.isArray(minuteLive) && minuteLive.length) {
+        const preview = ensurePreviewBar(minuteLive[minuteLive.length - 1]);
+        if (preview) {
+          const ts = Number.isFinite(preview.ts_ms_utc)
+            ? Math.floor(preview.ts_ms_utc)
+            : Math.floor(preview.time * 1000);
+          if (Number.isFinite(ts)) {
+            candidates.push(ts);
+          }
+        }
+      }
+      const finite = candidates.filter((value) => Number.isFinite(value));
+      if (!finite.length) {
+        return Date.now();
+      }
+      return Math.max(...finite);
+    }
+
+    function normaliseSnapshotCandles(candles) {
+      const result = [];
+      const seen = new Set();
+      for (const candle of Array.isArray(candles) ? candles : []) {
+        const preview = ensurePreviewBar(candle);
+        if (!preview) continue;
+        const ts = Number.isFinite(preview.ts_ms_utc)
+          ? Math.floor(preview.ts_ms_utc)
+          : Math.floor(preview.time * 1000);
+        if (!Number.isFinite(ts) || seen.has(ts)) continue;
+        seen.add(ts);
+        const volumeSource = Number(
+          candle?.v ??
+            candle?.volume ??
+            candle?.vol ??
+            candle?.qty ??
+            Number.NaN,
+        );
+        const volume = Number.isFinite(volumeSource) ? Math.max(volumeSource, 1e-9) : 1e-9;
+        result.push({
+          t: ts,
+          o: Number(preview.open),
+          h: Number(preview.high),
+          l: Number(preview.low),
+          c: Number(preview.close),
+          v: volume,
+        });
+      }
+      result.sort((a, b) => a.t - b.t);
+      return result.slice(-5000);
+    }
+
+    async function captureLiveSnapshot(options = {}) {
+      const lookbackDaysRaw = Number(options?.lookbackDays);
+      const lookbackDays = Number.isFinite(lookbackDaysRaw)
+        ? Math.max(1, Math.floor(lookbackDaysRaw))
+        : 3;
+      const mode = typeof options?.mode === "string" ? options.mode : "summary";
+      const symbol = activeSymbol();
+      if (!symbol) {
+        throw new Error("live-snapshot-symbol-missing");
+      }
+      const liveMeta = resolveLiveMetaSnapshot();
+      const endMs = resolveLiveRangeEndMs(liveMeta);
+      const lookbackMs = lookbackDays * 24 * 60 * 60 * 1000;
+      const startMs = Math.max(0, Math.floor(endMs - lookbackMs));
+      const rawCandles = await fetchCandles(symbol, "1m", startMs, endMs, { limit: 1500 });
+      const candles = normaliseSnapshotCandles(rawCandles);
+      if (!candles.length) {
+        throw new Error("live-snapshot-empty");
+      }
+      const frames = { "1m": { tf: "1m", candles } };
+      const metaBlock = {
+        source: {
+          kind: "live-store",
+          mode,
+          lookback_days: lookbackDays,
+          captured_at: new Date().toISOString(),
+        },
+        requested: {
+          frames: Object.keys(frames),
+          lookback_days: lookbackDays,
+        },
+      };
+      if (liveMeta) {
+        const livePayload = {
+          last_price: Number.isFinite(liveMeta.last_price) ? Number(liveMeta.last_price) : null,
+          last_tf: liveMeta.last_tf || "1m",
+          last_ts_ms: Number.isFinite(liveMeta.last_ts_ms) ? Number(liveMeta.last_ts_ms) : null,
+          age_sec: Number.isFinite(liveMeta.age_sec) ? Number(liveMeta.age_sec) : null,
+          stale: Boolean(liveMeta.stale),
+          mismatch: Boolean(liveMeta.mismatch),
+        };
+        metaBlock.live = livePayload;
+        metaBlock.stream = livePayload;
+        metaBlock.live_price = livePayload;
+      }
+      const payload = {
+        symbol,
+        tf: "1m",
+        candles,
+        frames,
+        meta: metaBlock,
+        lookback_days: lookbackDays,
+      };
+      const result = await postSnapshot(payload);
+      if (!result || !result.snapshot_id) {
+        throw new Error("live-snapshot-registration-failed");
+      }
+      return { snapshotId: result.snapshot_id, payload };
+    }
+
+    async function requestSummaryData() {
       if (summaryButton) {
         summaryButton.disabled = true;
       }
 
+      let createdSnapshotId = null;
+
       try {
-        updateStatus("Собираем данные за последние 3 дня...", "info");
+        updateStatus("Собираем лайв-данные за последние 3 дня...", "info");
+        const { snapshotId } = await captureLiveSnapshot({ lookbackDays: 3, mode: "summary" });
+        createdSnapshotId = snapshotId;
+        state.snapshotId = snapshotId;
+        updateCheckAllState();
+        if (summaryButton) {
+          summaryButton.disabled = true;
+        }
+        if (snapshotSelect) {
+          snapshotSelect.value = snapshotId;
+        }
         const url = new URL("/inspection/check-all", window.location.origin);
-        url.searchParams.set("snapshot", state.snapshotId);
+        url.searchParams.set("snapshot", snapshotId);
         url.searchParams.set("mode", "summary");
         url.searchParams.set("summary_days", "3");
         const response = await fetch(url.toString(), {
           headers: { Accept: "application/json" },
+          cache: "no-store",
         });
         if (response.status === 204) {
           state.checkAll = null;
@@ -3004,27 +3376,43 @@ def render_inspection_page(
         setJson(checkAllPre, null);
         updateStatus("Ошибка при сборе 3-дневного контекста", "error");
       } finally {
+        if (summaryButton) {
+          summaryButton.disabled = false;
+        }
+        if (createdSnapshotId) {
+          refreshSnapshots({ quiet: true }).catch((err) => {
+            console.warn("Не удалось обновить список снэпшотов", err);
+          });
+        }
         updateCheckAllState();
       }
     }
 
     async function requestTopupData() {
-      if (!state.snapshotId) {
-        updateStatus("Выберите снэпшот для досбора", "warning");
-        return;
-      }
-
       if (topupButton) {
         topupButton.disabled = true;
       }
 
+      let createdSnapshotId = null;
+
       try {
-        updateStatus("Дособираем свежие данные...", "info");
+        updateStatus("Дособираем свежие лайв-данные...", "info");
+        const { snapshotId } = await captureLiveSnapshot({ lookbackDays: 1, mode: "topup" });
+        createdSnapshotId = snapshotId;
+        state.snapshotId = snapshotId;
+        updateCheckAllState();
+        if (topupButton) {
+          topupButton.disabled = true;
+        }
+        if (snapshotSelect) {
+          snapshotSelect.value = snapshotId;
+        }
         const url = new URL("/inspection/check-all", window.location.origin);
-        url.searchParams.set("snapshot", state.snapshotId);
+        url.searchParams.set("snapshot", snapshotId);
         url.searchParams.set("mode", "topup");
         const response = await fetch(url.toString(), {
           headers: { Accept: "application/json" },
+          cache: "no-store",
         });
         if (response.status === 204) {
           state.checkAll = null;
@@ -3045,6 +3433,14 @@ def render_inspection_page(
         setJson(checkAllPre, null);
         updateStatus("Ошибка при досборе данных", "error");
       } finally {
+        if (topupButton) {
+          topupButton.disabled = false;
+        }
+        if (createdSnapshotId) {
+          refreshSnapshots({ quiet: true }).catch((err) => {
+            console.warn("Не удалось обновить список снэпшотов", err);
+          });
+        }
         updateCheckAllState();
       }
     }
@@ -3329,7 +3725,10 @@ def render_inspection_page(
 
     function updateChartDataFromFrame(options = {}) {
       const { resetRequestedKeys = false, persist = false } = options;
-      const frameCandles = state.payload?.DATA?.frames?.[state.frame]?.candles || [];
+      let frameCandles = state.liveFrames?.[state.frame]?.candles;
+      if (!Array.isArray(frameCandles) || !frameCandles.length) {
+        frameCandles = state.payload?.DATA?.frames?.[state.frame]?.candles || [];
+      }
       const bars = toChartBars(frameCandles);
       mergeChartBars(bars, { reset: true, persist });
       state.intervalMs = intervalToMs(state.frame || "1m");
@@ -3456,6 +3855,15 @@ def render_inspection_page(
       const timeframe = state.frame || "1m";
       state.intervalMs = intervalToMs(timeframe);
       const symbol = activeSymbol();
+      const liveEntry = state.liveFrames?.[timeframe];
+      if (liveEntry && Array.isArray(liveEntry.candles) && liveEntry.candles.length) {
+        mergeChartBars(liveEntry.candles, { reset: true, persist: false });
+        ensureGapWatcher({ resetRequestedKeys });
+        if (fitContent && state.chart && state.candles.length) {
+          state.chart.timeScale().fitContent();
+        }
+        return Promise.resolve(true);
+      }
       const hasFrameData = frameHasCandles(frames, timeframe);
 
       if (hasFrameData) {
@@ -3518,14 +3926,17 @@ def render_inspection_page(
         });
     }
 
-    async function refreshSnapshots() {
+    async function refreshSnapshots(options = {}) {
+      const quiet = Boolean(options?.quiet);
       try {
         const list = await fetchSnapshots();
         initial.snapshots = list;
         populateSnapshots(list);
       } catch (error) {
         console.error(error);
-        updateStatus("Не удалось загрузить список снэпшотов", "error");
+        if (!quiet) {
+          updateStatus("Не удалось загрузить список снэпшотов", "error");
+        }
       }
     }
 
@@ -3551,6 +3962,7 @@ def render_inspection_page(
           renderChartSymbol();
         }
         populateFrames(payload);
+        syncLiveStores({ force: true });
         renderJson(payload);
         renderMeta(payload);
         renderChart({ resetRequestedKeys: true, fitContent: true });
@@ -3577,6 +3989,7 @@ def render_inspection_page(
         state.frame = tf;
         renderChart({ resetRequestedKeys: true });
         updateTimeframeToggle();
+        syncLiveStores({ force: true });
       });
     }
 
@@ -3829,6 +4242,29 @@ def render_inspection_page(
                 <button id=\"clear-selection\" class=\"secondary\" type=\"button\">Сбросить выделение</button>
               </div>
             </div>
+            <div class=\"live-meta\" id=\"live-meta\">
+              <div class=\"live-meta__item\">
+                <span>Последняя цена</span>
+                <strong id=\"live-last-price\" class=\"live-meta__value\">—</strong>
+              </div>
+              <div class=\"live-meta__item\">
+                <span>Обновлено (UTC)</span>
+                <strong id=\"live-last-ts\" class=\"live-meta__value\">—</strong>
+              </div>
+              <div class=\"live-meta__item\">
+                <span>Таймфрейм</span>
+                <strong id=\"live-last-tf\" class=\"live-meta__value\">—</strong>
+              </div>
+              <div class=\"live-meta__item\">
+                <span>Возраст</span>
+                <strong id=\"live-age-sec\" class=\"live-meta__value\">—</strong>
+              </div>
+              <div class=\"live-meta__item\">
+                <span>Статус</span>
+                <strong id=\"live-stale-flag\" class=\"live-meta__value\" data-state=\"unknown\">—</strong>
+              </div>
+            </div>
+            <div class=\"status-banner\" id=\"stream-mismatch\" hidden data-tone=\"warning\">Stream vs OHLCV mismatch &gt; 1 tick</div>
             <div id=\"snapshot-meta\"></div>
           </section>
 
@@ -3959,9 +4395,10 @@ def render_inspection_page(
         </main>
         <script>{script_block}</script>
         <script src=\"https://unpkg.com/lightweight-charts@4.0.0/dist/lightweight-charts.standalone.production.js\"></script>
-        <script src="/public/binanceCandles.js"></script>
-        <script src="/public/chart-gap-watcher.js"></script>
-        <script src="/public/shared-candles.js"></script>
+        <script src="/public/binanceCandles.js?v={static_version}"></script>
+        <script src="/public/chart-gap-watcher.js?v={static_version}"></script>
+        <script src="/public/shared-candles.js?v={static_version}"></script>
+        <script src="/public/market-data-store.js?v={static_version}"></script>
         <script>{ui_script}</script>
       </body>
     </html>
