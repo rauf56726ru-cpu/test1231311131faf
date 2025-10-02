@@ -32,6 +32,11 @@ def preset_storage(tmp_path, monkeypatch):
     presets._STORAGE_LOADED = False
 
 
+@pytest.fixture
+def anyio_backend():
+    yield "asyncio"
+
+
 @pytest.fixture(autouse=True)
 def snapshot_storage(tmp_path, monkeypatch):
     storage_dir = tmp_path / "snapshots"
@@ -45,7 +50,7 @@ def snapshot_storage(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def stub_binance_minutes(monkeypatch):
-    def filler(symbol: str, start_ms: int, end_ms: int, gaps):
+    async def filler(symbol: str, start_ms: int, end_ms: int, gaps):
         candles = []
         for gap in gaps:
             cursor = int(gap["from"])
@@ -64,7 +69,7 @@ def stub_binance_minutes(monkeypatch):
                 cursor += 60_000
         return candles
 
-    monkeypatch.setattr(check_all_datas, "_download_missing_minutes", filler)
+    monkeypatch.setattr(check_all_datas, "_download_missing_minutes_async", filler)
 
     def filler_htf(symbol: str, gaps, *, fetcher, target):
         inserted = 0
@@ -397,12 +402,13 @@ def test_vwap_tpo_sessions_include_aliases(client: TestClient) -> None:
     assert composite_day["val"] is not None
 
 
-def test_async_builder_timeout_returns_insufficient(monkeypatch):
+@pytest.mark.anyio("asyncio")
+async def test_async_builder_timeout_returns_insufficient(monkeypatch):
     base = datetime(2024, 5, 1, 0, 0, tzinfo=UTC)
     snapshot = _build_snapshot_payload(base, count=5)
 
-    def slow_builder(snapshot, **kwargs):
-        time.sleep(0.2)
+    async def slow_builder(snapshot, **kwargs):
+        await asyncio.sleep(0.2)
         return {
             "status": "ok",
             "meta": {"symbol": snapshot.get("symbol", "UNKNOWN")},
@@ -413,9 +419,7 @@ def test_async_builder_timeout_returns_insufficient(monkeypatch):
 
     monkeypatch.setattr(check_all_datas, "build_check_all_datas", slow_builder)
 
-    result = asyncio.run(
-        check_all_datas.build_check_all_datas_async(snapshot, timeout=0.05)
-    )
+    result = await check_all_datas.build_check_all_datas_async(snapshot, timeout=0.05)
 
     assert result is not None
     assert result["status"] == "insufficient_data"

@@ -7,8 +7,19 @@ import math
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, time as dtime
-from functools import partial
-from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple, Set
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    MutableMapping,
+    Sequence,
+    Tuple,
+    Set,
+)
 
 import httpx
 
@@ -53,6 +64,7 @@ try:
         TIMEFRAME_TO_MS,
         aggregate_1m_to_1h,
         build_multi_timeframe_ohlcv,
+        fetch_ohlcv,
         fetch_ohlcv_sync,
         resample_ohlcv,
     )
@@ -67,6 +79,9 @@ except ImportError:  # pragma: no cover - circular import guard
 
     def build_multi_timeframe_ohlcv(*args, **kwargs):  # type: ignore[override]
         raise ImportError("build_multi_timeframe_ohlcv is unavailable")
+
+    async def fetch_ohlcv(*args, **kwargs):  # type: ignore[override]
+        raise ImportError("fetch_ohlcv is unavailable")
 
     def fetch_ohlcv_sync(*args, **kwargs):  # type: ignore[override]
         raise ImportError("fetch_ohlcv_sync is unavailable")
@@ -243,13 +258,13 @@ async def build_check_all_datas_async(
     timeout: float | None = _ASYNC_BUILD_TIMEOUT_SECONDS,
     **kwargs: Any,
 ) -> Dict[str, Any] | None:
-    """Execute ``build_check_all_datas`` on a worker thread with a timeout."""
+    """Execute ``build_check_all_datas`` with a timeout that respects cancellation."""
 
     context = _prepare_snapshot_context(snapshot, kwargs.get("now_utc"))
     build_kwargs = dict(kwargs)
 
     async def _invoke() -> Dict[str, Any] | None:
-        return await asyncio.to_thread(partial(build_check_all_datas, snapshot, **build_kwargs))
+        return await build_check_all_datas(snapshot, **build_kwargs)
 
     try:
         if timeout is not None and timeout > 0:
@@ -457,14 +472,14 @@ def _resolve_window_end_ms(
     return max(candidates) if candidates else now_ms
 
 
-def _backfill_timeframe_with_rest(
+async def _backfill_timeframe_with_rest(
     frames: MutableMapping[str, List[MutableMapping[str, Any]]],
     *,
     symbol: str,
     timeframe: str,
     window_end_ms: int,
     window_hours: int,
-    fetcher: Callable[..., Mapping[str, Any]] | None = None,
+    fetcher: Callable[..., Awaitable[Mapping[str, Any]]] | Callable[..., Mapping[str, Any]] | None = None,
     minimum_required: int | None = None,
 ) -> bool:
     """Ensure the requested timeframe has at least the required candles."""
@@ -490,9 +505,16 @@ def _backfill_timeframe_with_rest(
             if available >= minimum_required:
                 return False
 
-    fetch_callable = fetcher or fetch_ohlcv_sync
+    fetch_callable = fetcher or fetch_ohlcv
     try:
-        fetched_payload = fetch_callable(symbol, timeframe, hours=max(1, window_hours))
+        if asyncio.iscoroutinefunction(fetch_callable):
+            fetched_payload = await fetch_callable(symbol, timeframe, hours=max(1, window_hours))  # type: ignore[arg-type]
+        else:
+            result = fetch_callable(symbol, timeframe, hours=max(1, window_hours))
+            if asyncio.iscoroutine(result):
+                fetched_payload = await result  # type: ignore[assignment]
+            else:
+                fetched_payload = result
     except Exception as exc:  # pragma: no cover - defensive logging
         LOGGER.warning(
             "Cold backfill request failed",
@@ -791,8 +813,8 @@ def _normalise_binance_row(row: Sequence[object]) -> Dict[str, Any] | None:
     }
 
 
-def _request_binance_minutes(
-    client: httpx.Client,
+async def _request_binance_minutes_async(
+    client: httpx.AsyncClient,
     symbol: str,
     start_ms: int,
     end_ms: int,
@@ -813,7 +835,7 @@ def _request_binance_minutes(
         if budget is not None:
             budget.raise_if_exceeded("request_binance_minutes")
         try:
-            response = client.get(BINANCE_FAPI_REST, params=params)
+            response = await client.get(BINANCE_FAPI_REST, params=params)
             response.raise_for_status()
             data = response.json()
             if isinstance(data, list):
@@ -827,9 +849,9 @@ def _request_binance_minutes(
                     remaining = budget.remaining()
                     if remaining is not None and remaining <= 0:
                         raise
-                    time.sleep(min(delay, max(0.0, remaining)))
+                    await asyncio.sleep(min(delay, max(0.0, remaining)))
                 else:
-                    time.sleep(delay)
+                    await asyncio.sleep(delay)
                 delay *= 2
                 continue
             raise
@@ -840,16 +862,16 @@ def _request_binance_minutes(
                     remaining = budget.remaining()
                     if remaining is not None and remaining <= 0:
                         raise
-                    time.sleep(min(delay, max(0.0, remaining)))
+                    await asyncio.sleep(min(delay, max(0.0, remaining)))
                 else:
-                    time.sleep(delay)
+                    await asyncio.sleep(delay)
                 delay *= 2
                 continue
             raise
     return []
 
 
-def _download_missing_minutes(
+async def _download_missing_minutes_async(
     symbol: str,
     start_ms: int,
     end_ms: int,
@@ -864,7 +886,8 @@ def _download_missing_minutes(
     downloaded = 0
 
     try:
-        with httpx.Client(timeout=httpx.Timeout(6.0, connect=3.0)) as client:
+        timeout = httpx.Timeout(6.0, connect=3.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
             for gap in gaps:
                 if budget is not None:
                     budget.raise_if_exceeded("download_missing_minutes_gap")
@@ -879,7 +902,7 @@ def _download_missing_minutes(
                         cursor + (1000 - 1) * MINUTE_INTERVAL_MS,
                     )
                     request_end = chunk_end + MINUTE_INTERVAL_MS
-                    raw_rows = _request_binance_minutes(
+                    raw_rows = await _request_binance_minutes_async(
                         client,
                         symbol,
                         cursor,
@@ -913,7 +936,7 @@ def _download_missing_minutes(
     return fetched
 
 
-def _call_download_missing_minutes(
+async def _call_download_missing_minutes_async(
     symbol: str,
     start_ms: int,
     end_ms: int,
@@ -924,10 +947,10 @@ def _call_download_missing_minutes(
     """Invoke `_download_missing_minutes` while tolerating legacy stubs without budget."""
 
     if budget is None:
-        return _download_missing_minutes(symbol, start_ms, end_ms, gaps)
+        return await _download_missing_minutes_async(symbol, start_ms, end_ms, gaps)
 
     try:
-        return _download_missing_minutes(
+        return await _download_missing_minutes_async(
             symbol,
             start_ms,
             end_ms,
@@ -938,7 +961,7 @@ def _call_download_missing_minutes(
         message = str(exc)
         if "unexpected keyword argument" not in message or "budget" not in message:
             raise
-        return _download_missing_minutes(symbol, start_ms, end_ms, gaps)
+        return await _download_missing_minutes_async(symbol, start_ms, end_ms, gaps)
 
 
 def _aggregate_from_minutes(
@@ -2465,7 +2488,7 @@ def _build_daily_vwap(
     }
 
 
-def build_check_all_datas(
+async def build_check_all_datas(
     snapshot: Mapping[str, Any],
     *,
     now_utc: datetime | None = None,
@@ -2522,7 +2545,7 @@ def build_check_all_datas(
         )
         return _insufficient_from_context(context, now_override=now_dt)
 
-    _backfill_timeframe_with_rest(
+    await _backfill_timeframe_with_rest(
         frames,
         symbol=symbol,
         timeframe="1m",
@@ -2549,7 +2572,7 @@ def build_check_all_datas(
                 extra={"stage": exc.stage, "symbol": symbol, "primary_key": primary_key},
             )
             return _insufficient_from_context(context, now_override=now_dt)
-        _backfill_timeframe_with_rest(
+        await _backfill_timeframe_with_rest(
             frames,
             symbol=symbol,
             timeframe=primary_key,
@@ -2616,7 +2639,8 @@ def build_check_all_datas(
             symbol,
             target_tf_key,
         )
-        (profile_tpo, profile_flat, profile_zones) = build_profile_package(
+        (profile_tpo, profile_flat, profile_zones) = await asyncio.to_thread(
+            build_profile_package,
             base_candles,
             sessions=sessions,
             last_n=int(profile_config.get("last_n", 3)),
@@ -2715,7 +2739,7 @@ def build_check_all_datas(
     if time_gaps:
         try:
             budget.raise_if_exceeded("download_missing_minutes_start")
-            downloaded_minutes = _call_download_missing_minutes(
+            downloaded_minutes = await _call_download_missing_minutes_async(
                 symbol,
                 window_start_ms,
                 window_end_ms,
@@ -2825,7 +2849,7 @@ def build_check_all_datas(
     if zone_history_gaps:
         try:
             budget.raise_if_exceeded("zones_history_backfill_start")
-            zone_downloaded_minutes = _call_download_missing_minutes(
+            zone_downloaded_minutes = await _call_download_missing_minutes_async(
                 symbol,
                 zones_history_start_ms,
                 window_end_ms,
@@ -3230,7 +3254,8 @@ def build_check_all_datas(
 
     if zone_frames_full:
         try:
-            detected_zones = detect_zones(
+            detected_zones = await asyncio.to_thread(
+                detect_zones,
                 frames=zone_frames_full,
                 profile_levels=profile_level_map,
                 liquidity_levels=liquidity_equal_levels,
@@ -3401,7 +3426,8 @@ def build_check_all_datas(
             if any(not zone_availability.get(tf, {}).get("ok", False) for tf in tf_candidates):
                 zones_container[zone_key] = []
 
-    liquidity_payload = build_liquidity_snapshot(
+    liquidity_payload = await asyncio.to_thread(
+        build_liquidity_snapshot,
         liquidity_frames,
         symbol=symbol,
         tick_size=tick_size_numeric,
@@ -3462,7 +3488,8 @@ def build_check_all_datas(
         liquidity_source = liquidity_payload
     elif isinstance(snapshot.get("liquidity"), Mapping):
         liquidity_source = snapshot.get("liquidity")  # type: ignore[assignment]
-    smc_blocks_list, smc_stats = detect_smc_blocks(
+    smc_blocks_list, smc_stats = await asyncio.to_thread(
+        detect_smc_blocks,
         hourly_htf,
         timeframe="1h",
         structure_flags=structure_events,

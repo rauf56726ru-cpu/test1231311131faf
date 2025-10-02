@@ -66,6 +66,11 @@ def stub_check_all_dependencies(monkeypatch):
     yield
 
 
+@pytest.fixture
+def anyio_backend():
+    yield "asyncio"
+
+
 def _snapshot_with_candles(candles: Sequence[Dict[str, Any]], entry_price: float) -> Dict[str, Any]:
     return {
         "symbol": "BTCUSDT",
@@ -76,7 +81,10 @@ def _snapshot_with_candles(candles: Sequence[Dict[str, Any]], entry_price: float
     }
 
 
-def test_last_price_prefers_minute_candle_over_analysis(stub_check_all_dependencies) -> None:
+@pytest.mark.anyio("asyncio")
+async def test_last_price_prefers_minute_candle_over_analysis(
+    stub_check_all_dependencies,
+) -> None:
     base = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
     candles = []
     for offset, close in enumerate((110.0, 116.0)):
@@ -95,7 +103,7 @@ def test_last_price_prefers_minute_candle_over_analysis(stub_check_all_dependenc
     snapshot = _snapshot_with_candles(candles, entry_price=101.0)
     now_dt = base + timedelta(minutes=2)
 
-    result = check_all_datas.build_check_all_datas(snapshot, now_utc=now_dt)
+    result = await check_all_datas.build_check_all_datas(snapshot, now_utc=now_dt)
 
     assert result is not None
     meta = result["meta"]
@@ -106,7 +114,8 @@ def test_last_price_prefers_minute_candle_over_analysis(stub_check_all_dependenc
     assert meta["stale"] is False
 
 
-def test_snapshot_staleness_marks_meta(stub_check_all_dependencies) -> None:
+@pytest.mark.anyio("asyncio")
+async def test_snapshot_staleness_marks_meta(stub_check_all_dependencies) -> None:
     base = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
     stale_time = base
     candles = [
@@ -122,7 +131,7 @@ def test_snapshot_staleness_marks_meta(stub_check_all_dependencies) -> None:
     snapshot = _snapshot_with_candles(candles, entry_price=99.0)
     now_dt = stale_time + timedelta(minutes=10)
 
-    result = check_all_datas.build_check_all_datas(snapshot, now_utc=now_dt)
+    result = await check_all_datas.build_check_all_datas(snapshot, now_utc=now_dt)
 
     assert result is not None
     meta = result["meta"]
@@ -133,7 +142,10 @@ def test_snapshot_staleness_marks_meta(stub_check_all_dependencies) -> None:
     assert meta["stale"] is True
 
 
-def test_last_price_updates_when_minute_candles_change(stub_check_all_dependencies) -> None:
+@pytest.mark.anyio("asyncio")
+async def test_last_price_updates_when_minute_candles_change(
+    stub_check_all_dependencies,
+) -> None:
     base = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
     first_candles = [
         {
@@ -156,7 +168,7 @@ def test_last_price_updates_when_minute_candles_change(stub_check_all_dependenci
     snapshot = _snapshot_with_candles(first_candles, entry_price=100.0)
     now_dt = base + timedelta(minutes=2)
 
-    initial = check_all_datas.build_check_all_datas(snapshot, now_utc=now_dt)
+    initial = await check_all_datas.build_check_all_datas(snapshot, now_utc=now_dt)
     assert initial["meta"]["last_price"] == pytest.approx(108.0)
 
     updated_candles = first_candles[:-1] + [
@@ -172,13 +184,16 @@ def test_last_price_updates_when_minute_candles_change(stub_check_all_dependenci
     snapshot["frames"]["1m"]["candles"] = updated_candles
     snapshot["selection"]["end"] = updated_candles[-1]["t"]
 
-    refreshed = check_all_datas.build_check_all_datas(snapshot, now_utc=base + timedelta(minutes=3))
+    refreshed = await check_all_datas.build_check_all_datas(
+        snapshot, now_utc=base + timedelta(minutes=3)
+    )
     assert refreshed["meta"]["last_price"] == pytest.approx(123.0)
     assert refreshed["meta"]["last_tf"] == "1m"
     assert refreshed["meta"]["last_price_source"] == "ohlcv"
 
 
-def test_stream_price_overrides_candle(stub_check_all_dependencies) -> None:
+@pytest.mark.anyio("asyncio")
+async def test_stream_price_overrides_candle(stub_check_all_dependencies) -> None:
     base = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
     candles = [
         {
@@ -194,7 +209,9 @@ def test_stream_price_overrides_candle(stub_check_all_dependencies) -> None:
     stream_ts = int((base + timedelta(minutes=1, seconds=2)).timestamp() * 1000)
     snapshot["stream"] = {"price": 107.5, "ts": stream_ts}
 
-    result = check_all_datas.build_check_all_datas(snapshot, now_utc=base + timedelta(minutes=1, seconds=3))
+    result = await check_all_datas.build_check_all_datas(
+        snapshot, now_utc=base + timedelta(minutes=1, seconds=3)
+    )
 
     meta = result["meta"]
     assert meta["last_price"] == pytest.approx(107.5)
@@ -204,7 +221,8 @@ def test_stream_price_overrides_candle(stub_check_all_dependencies) -> None:
     assert meta.get("insufficient_reason") is None
 
 
-def test_stream_vs_ohlcv_mismatch_flag(stub_check_all_dependencies) -> None:
+@pytest.mark.anyio("asyncio")
+async def test_stream_vs_ohlcv_mismatch_flag(stub_check_all_dependencies) -> None:
     base = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
     candle_ts = int(base.timestamp() * 1000)
     candles = [
@@ -221,7 +239,7 @@ def test_stream_vs_ohlcv_mismatch_flag(stub_check_all_dependencies) -> None:
     stream_ts = candle_ts + 60_000 + 4_000
     snapshot["stream"] = {"price": 101.5, "ts": stream_ts}
 
-    result = check_all_datas.build_check_all_datas(
+    result = await check_all_datas.build_check_all_datas(
         snapshot,
         now_utc=base + timedelta(minutes=1, seconds=10),
     )
