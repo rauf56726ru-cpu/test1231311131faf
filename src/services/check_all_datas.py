@@ -1,11 +1,13 @@
 """Snapshot builder for the inspection check-all endpoint."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, time as dtime
+from functools import partial
 from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple, Set
 
 import httpx
@@ -81,6 +83,7 @@ _RETRYABLE_STATUS = {418, 429, 500, 502, 503, 504}
 _MAX_RETRIES = 5
 
 _BUILD_TIMEOUT_SECONDS = 12.0
+_ASYNC_BUILD_TIMEOUT_SECONDS = 5.0
 
 _EXPECTED_OHLCV_TFS: Tuple[str, ...] = ("1m", "3m", "5m", "15m", "1h", "4h", "1d")
 _EXPECTED_ORDERFLOW_TFS: Tuple[str, ...] = ("15m", "1h")
@@ -100,6 +103,92 @@ _EXPECTED_ZONE_KEYS: Tuple[str, ...] = (
 _COLD_BACKFILL_MIN_REQUIRED: Dict[str, int] = {
     tf: 1 for tf in _EXPECTED_OHLCV_TFS
 }
+
+
+@dataclass(slots=True)
+class _SnapshotContext:
+    """Prepared context for building inspection snapshots."""
+
+    symbol: str
+    now: datetime
+    frames: Dict[str, List[MutableMapping[str, Any]]]
+    raw_meta: Mapping[str, Any] | None
+    stream_price: float | None
+    stream_ts: int | None
+    has_now_override: bool
+
+
+def _iter_stream_candidates(
+    snapshot: Mapping[str, Any], raw_meta: Mapping[str, Any] | None
+) -> Iterable[Mapping[str, Any]]:
+    """Yield candidate live-tick payloads from a snapshot and its metadata."""
+
+    for key in ("stream", "live", "live_price", "live_tick"):
+        candidate = snapshot.get(key)
+        if isinstance(candidate, Mapping):
+            yield candidate
+
+    if isinstance(raw_meta, Mapping):
+        for key in ("stream", "live", "live_price", "ticker"):
+            candidate = raw_meta.get(key)
+            if isinstance(candidate, Mapping):
+                yield candidate
+
+
+def _resolve_stream_from_context(
+    snapshot: Mapping[str, Any], raw_meta: Mapping[str, Any] | None
+) -> Tuple[float | None, int | None]:
+    """Extract the first valid stream price/timestamp pair from the snapshot."""
+
+    for candidate in _iter_stream_candidates(snapshot, raw_meta):
+        price, ts = _normalise_stream_point(candidate)
+        if price is not None and ts is not None:
+            return price, ts
+    return None, None
+
+
+def _prepare_snapshot_context(
+    snapshot: Mapping[str, Any], now_utc: datetime | None
+) -> _SnapshotContext:
+    """Assemble the deterministic build context for an inspection snapshot."""
+
+    frames = _normalise_frames(snapshot) or {}
+    raw_meta = snapshot.get("meta") if isinstance(snapshot.get("meta"), Mapping) else None
+    symbol = str(snapshot.get("symbol") or snapshot.get("pair") or "UNKNOWN").upper()
+
+    if now_utc is None:
+        now_dt = datetime.now(UTC)
+    else:
+        if now_utc.tzinfo is None:
+            now_dt = now_utc.replace(tzinfo=UTC)
+        else:
+            now_dt = now_utc.astimezone(UTC)
+
+    stream_price, stream_ts = _resolve_stream_from_context(snapshot, raw_meta)
+
+    return _SnapshotContext(
+        symbol=symbol,
+        now=now_dt,
+        frames=frames,
+        raw_meta=raw_meta,
+        stream_price=stream_price,
+        stream_ts=stream_ts,
+        has_now_override=now_utc is not None,
+    )
+
+
+def _insufficient_from_context(
+    context: _SnapshotContext, *, now_override: datetime | None = None
+) -> Dict[str, Any]:
+    """Materialise an insufficient-data payload for the provided context."""
+
+    now_dt = now_override or context.now
+    return _build_insufficient_payload(
+        symbol=context.symbol,
+        now=now_dt,
+        stream_price=context.stream_price,
+        stream_ts=context.stream_ts,
+    )
 
 class DataQualityError(RuntimeError):
     """Raised when the inspected snapshot fails deterministic data checks."""
@@ -146,6 +235,39 @@ class _TimeBudget:
             return
         if time.monotonic() >= self.deadline:
             raise _TimeBudgetExceeded(stage)
+
+
+async def build_check_all_datas_async(
+    snapshot: Mapping[str, Any],
+    *,
+    timeout: float | None = _ASYNC_BUILD_TIMEOUT_SECONDS,
+    **kwargs: Any,
+) -> Dict[str, Any] | None:
+    """Execute ``build_check_all_datas`` on a worker thread with a timeout."""
+
+    context = _prepare_snapshot_context(snapshot, kwargs.get("now_utc"))
+    build_kwargs = dict(kwargs)
+
+    async def _invoke() -> Dict[str, Any] | None:
+        return await asyncio.to_thread(partial(build_check_all_datas, snapshot, **build_kwargs))
+
+    try:
+        if timeout is not None and timeout > 0:
+            return await asyncio.wait_for(_invoke(), timeout)
+        return await _invoke()
+    except asyncio.TimeoutError:
+        LOGGER.warning(
+            "Check-all build timed out",
+            extra={
+                "symbol": context.symbol,
+                "timeout": timeout,
+                "has_now_override": context.has_now_override,
+                "hours": build_kwargs.get("hours"),
+                "window_hours": build_kwargs.get("window_hours"),
+                "strict_window": build_kwargs.get("strict_window"),
+            },
+        )
+        return _insufficient_from_context(context)
 
 
 def _isoformat_utc(timestamp_ms: int) -> str:
@@ -2360,38 +2482,14 @@ def build_check_all_datas(
 
     budget = _TimeBudget(_BUILD_TIMEOUT_SECONDS)
 
-    frames = _normalise_frames(snapshot)
-    raw_meta = snapshot.get("meta") if isinstance(snapshot.get("meta"), Mapping) else None
-    symbol = str(snapshot.get("symbol") or snapshot.get("pair") or "UNKNOWN").upper()
-
-    if now_utc is None:
-        now_dt = datetime.now(UTC)
-    else:
-        now_dt = now_utc.astimezone(UTC)
+    context = _prepare_snapshot_context(snapshot, now_utc)
+    frames = context.frames
+    raw_meta = context.raw_meta
+    symbol = context.symbol
+    now_dt = context.now
+    stream_price = context.stream_price
+    stream_ts = context.stream_ts
     now_ms = int(now_dt.timestamp() * 1000)
-
-    stream_price: float | None = None
-    stream_ts: int | None = None
-    stream_candidates: List[Mapping[str, Any]] = []
-
-    for key in ("stream", "live", "live_price", "live_tick"):
-        candidate = snapshot.get(key)
-        if isinstance(candidate, Mapping):
-            stream_candidates.append(candidate)
-
-    if isinstance(raw_meta, Mapping):
-        for key in ("stream", "live", "live_price", "ticker"):
-            candidate = raw_meta.get(key)
-            if isinstance(candidate, Mapping):
-                stream_candidates.append(candidate)
-
-    for candidate in stream_candidates:
-        price, ts = _normalise_stream_point(candidate)
-        if price is None or ts is None:
-            continue
-        stream_price = price
-        stream_ts = ts
-        break
 
     if selection_end_ms is None:
         selection_payload = snapshot.get("selection")
@@ -2422,12 +2520,7 @@ def build_check_all_datas(
             "Time budget exceeded before seeding minute frame",
             extra={"stage": exc.stage, "symbol": symbol},
         )
-        return _build_insufficient_payload(
-            symbol=symbol,
-            now=now_dt,
-            stream_price=stream_price,
-            stream_ts=stream_ts,
-        )
+        return _insufficient_from_context(context, now_override=now_dt)
 
     _backfill_timeframe_with_rest(
         frames,
@@ -2445,12 +2538,7 @@ def build_check_all_datas(
     if not primary_key and "1m" in frames:
         primary_key = "1m"
     if not primary_key:
-        return _build_insufficient_payload(
-            symbol=symbol,
-            now=now_dt,
-            stream_price=stream_price,
-            stream_ts=stream_ts,
-        )
+        return _insufficient_from_context(context, now_override=now_dt)
 
     if not frames.get(primary_key):
         try:
@@ -2460,12 +2548,7 @@ def build_check_all_datas(
                 "Time budget exceeded before seeding primary frame",
                 extra={"stage": exc.stage, "symbol": symbol, "primary_key": primary_key},
             )
-            return _build_insufficient_payload(
-                symbol=symbol,
-                now=now_dt,
-                stream_price=stream_price,
-                stream_ts=stream_ts,
-            )
+            return _insufficient_from_context(context, now_override=now_dt)
         _backfill_timeframe_with_rest(
             frames,
             symbol=symbol,
@@ -2476,12 +2559,7 @@ def build_check_all_datas(
 
     primary_candles = frames.get(primary_key, [])
     if not primary_candles:
-        return _build_insufficient_payload(
-            symbol=symbol,
-            now=now_dt,
-            stream_price=stream_price,
-            stream_ts=stream_ts,
-        )
+        return _insufficient_from_context(context, now_override=now_dt)
 
     # Drop unused granularities to keep the payload focused on the requested set.
     frames.pop("3m", None)
@@ -2566,16 +2644,7 @@ def build_check_all_datas(
     if selection_start > selection_end:
         selection_start, selection_end = selection_end, selection_start
 
-    if now_utc is not None:
-        if now_utc.tzinfo is None:
-            now_dt = now_utc.replace(tzinfo=UTC)
-        else:
-            now_dt = now_utc.astimezone(UTC)
-    else:
-        now_dt = datetime.now(UTC)
-
-    if now_utc is not None:
-        now_ms = int(now_dt.timestamp() * 1000)
+    if context.has_now_override:
         window_end_ms = _align_to_interval(now_ms, MINUTE_INTERVAL_MS) - MINUTE_INTERVAL_MS
     else:
         window_end_ms = minute_candles[-1]["t"] if minute_candles else None
@@ -2590,12 +2659,7 @@ def build_check_all_datas(
         window_end_ms = primary_candles[-1]["t"] + max(primary_interval - MINUTE_INTERVAL_MS, 0)
 
     if window_end_ms is None:
-        return _build_insufficient_payload(
-            symbol=symbol,
-            now=now_dt,
-            stream_price=stream_price,
-            stream_ts=stream_ts,
-        )
+        return _insufficient_from_context(context, now_override=now_dt)
 
     window_end_ms = max(0, _align_to_interval(window_end_ms, MINUTE_INTERVAL_MS))
 
@@ -2682,12 +2746,7 @@ def build_check_all_datas(
                     "time_gaps": time_gaps,
                 },
             )
-            return _build_insufficient_payload(
-                symbol=symbol,
-                now=now_dt,
-                stream_price=stream_price,
-                stream_ts=stream_ts,
-            )
+            return _insufficient_from_context(context, now_override=now_dt)
         for candle in downloaded_minutes:
             ts = candle["t"]
             if ts < window_start_ms or ts > window_end_ms:
@@ -2723,12 +2782,7 @@ def build_check_all_datas(
             "Time budget exceeded before zones preparation",
             extra={"stage": exc.stage, "symbol": symbol},
         )
-        return _build_insufficient_payload(
-            symbol=symbol,
-            now=now_dt,
-            stream_price=stream_price,
-            stream_ts=stream_ts,
-        )
+        return _insufficient_from_context(context, now_override=now_dt)
 
     zones_window_hours = max(1, hours_window)
     if not strict_window:
@@ -2799,12 +2853,7 @@ def build_check_all_datas(
                     "time_gaps": zone_history_gaps,
                 },
             )
-            return _build_insufficient_payload(
-                symbol=symbol,
-                now=now_dt,
-                stream_price=stream_price,
-                stream_ts=stream_ts,
-            )
+            return _insufficient_from_context(context, now_override=now_dt)
         for candle in zone_downloaded_minutes:
             ts = candle["t"]
             if ts < zones_history_start_ms or ts > window_end_ms:

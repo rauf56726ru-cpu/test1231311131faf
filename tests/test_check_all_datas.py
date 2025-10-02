@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import asyncio
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -393,3 +395,28 @@ def test_vwap_tpo_sessions_include_aliases(client: TestClient) -> None:
     assert composite_day["poc"] is not None
     assert composite_day["vah"] is not None
     assert composite_day["val"] is not None
+
+
+def test_async_builder_timeout_returns_insufficient(monkeypatch):
+    base = datetime(2024, 5, 1, 0, 0, tzinfo=UTC)
+    snapshot = _build_snapshot_payload(base, count=5)
+
+    def slow_builder(snapshot, **kwargs):
+        time.sleep(0.2)
+        return {
+            "status": "ok",
+            "meta": {"symbol": snapshot.get("symbol", "UNKNOWN")},
+            "data": {},
+            "availability": {},
+            "missing_fields": [],
+        }
+
+    monkeypatch.setattr(check_all_datas, "build_check_all_datas", slow_builder)
+
+    result = asyncio.run(
+        check_all_datas.build_check_all_datas_async(snapshot, timeout=0.05)
+    )
+
+    assert result is not None
+    assert result["status"] == "insufficient_data"
+    assert result["meta"]["insufficient_reason"] == "stale_or_unseeded_buffers"
