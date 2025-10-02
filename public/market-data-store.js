@@ -10,6 +10,9 @@
 
   const DEFAULT_HISTORY_LIMIT = 600;
   const DEFAULT_POLL_INTERVAL_MS = 2000;
+  const HEARTBEAT_THRESHOLD_MS = 2000;
+  const STREAM_SILENCE_THRESHOLD_MS = 5000;
+  const MISSED_HEARTBEAT_LIMIT = 3;
   const WS_HOST = "wss://fstream.binance.com";
 
   function clampLimit(limit) {
@@ -65,7 +68,13 @@
     return 0.00001;
   }
 
-  function computeMeta({ candles, interval, lastStreamPrice, lastStreamTs }) {
+  function computeMeta({
+    candles,
+    interval,
+    lastStreamPrice,
+    lastStreamTs,
+    lastPriceSource,
+  }) {
     const last = candles.length ? candles[candles.length - 1] : null;
     if (!last) {
       return {
@@ -76,6 +85,7 @@
         age_sec: null,
         stale: true,
         mismatch: false,
+        last_price_source: null,
       };
     }
     const now = Date.now();
@@ -96,6 +106,7 @@
       age_sec: ageSec,
       stale,
       mismatch,
+      last_price_source: lastPriceSource || (Number.isFinite(lastStreamPrice) ? "stream" : "ohlcv"),
     };
   }
 
@@ -110,12 +121,17 @@
       this.ws = null;
       this.wsTimer = null;
       this.pollTimer = null;
+      this.healthTimer = null;
       this.loadingHistory = false;
       this.connected = false;
       this.lastStreamPrice = null;
       this.lastStreamTs = null;
+      this.lastPriceSource = null;
       this._initialised = false;
       this._pendingHistory = null;
+      this._missedHeartbeats = 0;
+      this._pollingActive = false;
+      this._pollInFlight = false;
     }
 
     subscribe(handler) {
@@ -144,16 +160,15 @@
         this._emit({ type: "error", error });
       });
       this._ensureRealtime();
-      this._ensurePolling();
+      this._startHealthMonitor();
     }
 
     stop() {
       this._initialised = false;
       this._teardownWs();
-      if (this.pollTimer) {
-        clearInterval(this.pollTimer);
-        this.pollTimer = null;
-      }
+      this._stopHealthMonitor();
+      this._pollingActive = false;
+      this._stopPolling();
     }
 
     async _loadHistory(force = false) {
@@ -165,12 +180,14 @@
         .then((rows) => rows.map((bar) => normaliseBar(bar)).filter(Boolean))
         .then((bars) => {
           this.candles = bars;
+          this.lastPriceSource = bars.length ? "ohlcv" : null;
           this.loadingHistory = false;
           const meta = computeMeta({
             candles: this.candles,
             interval: this.interval,
             lastStreamPrice: this.lastStreamPrice,
             lastStreamTs: this.lastStreamTs,
+            lastPriceSource: this.lastPriceSource,
           });
           this._emit({ type: "snapshot", symbol: this.symbol, interval: this.interval, candles: this.candles.slice(), meta });
           return bars;
@@ -204,6 +221,7 @@
             this.connected = false;
             this._emit({ type: "status", status: "closed", symbol: this.symbol, interval: this.interval });
             this._scheduleReconnect();
+            this._setPollingActive(true);
           }
         };
         ws.onmessage = (event) => {
@@ -212,14 +230,27 @@
             const bar = BinanceCandles.barFromWs(payload);
             const normalised = normaliseBar(bar);
             if (!normalised) return;
+            const kline = payload?.k || {};
+            const closeTime = Number(kline.T);
+            const eventTime = Number(payload?.E);
+            if (Number.isFinite(closeTime)) {
+              normalised.ts_ms_utc = closeTime;
+            } else if (Number.isFinite(eventTime)) {
+              normalised.ts_ms_utc = eventTime;
+            }
             this.lastStreamPrice = normalised.close;
-            this.lastStreamTs = Date.now();
-            this._mergeBars([normalised]);
+            this.lastStreamTs = Number.isFinite(eventTime) ? Number(eventTime) : Date.now();
+            const isFinal = Boolean(kline.x);
+            this._mergeBars([normalised], { source: "stream", isFinal });
+            if (isFinal) {
+              this._emit({ type: "heartbeat", symbol: this.symbol, interval: this.interval });
+            }
             const meta = computeMeta({
               candles: this.candles,
               interval: this.interval,
               lastStreamPrice: this.lastStreamPrice,
               lastStreamTs: this.lastStreamTs,
+              lastPriceSource: this.lastPriceSource,
             });
             this._emit({
               type: "update",
@@ -227,8 +258,10 @@
               interval: this.interval,
               candle: normalised,
               candles: this.candles.slice(-10),
+              isFinal,
               meta,
             });
+            this._handleHeartbeat();
           } catch (error) {
             console.error("MarketDataStore message parse failed", error);
           }
@@ -267,52 +300,130 @@
       }
     }
 
-    _ensurePolling() {
-      if (this.pollTimer) {
-        clearInterval(this.pollTimer);
+    _startHealthMonitor() {
+      this._stopHealthMonitor();
+      this.healthTimer = setInterval(() => {
+        this._checkStreamHealth();
+      }, 1000);
+    }
+
+    _stopHealthMonitor() {
+      if (this.healthTimer) {
+        clearInterval(this.healthTimer);
+        this.healthTimer = null;
       }
-      this.pollTimer = setInterval(() => {
-        this._pollLatest().catch((error) => {
-          console.warn("MarketDataStore poll failed", error);
-        });
+    }
+
+    _handleHeartbeat() {
+      this._missedHeartbeats = 0;
+      this._setPollingActive(false);
+    }
+
+    _checkStreamHealth() {
+      const now = Date.now();
+      const delta = this.lastStreamTs ? now - this.lastStreamTs : Infinity;
+      const websocketActive = this.ws && this.ws.readyState === WebSocket.OPEN;
+      if (!websocketActive) {
+        this._setPollingActive(true);
+        return;
+      }
+      if (delta <= HEARTBEAT_THRESHOLD_MS) {
+        this._missedHeartbeats = 0;
+        this._setPollingActive(false);
+        return;
+      }
+      this._missedHeartbeats += 1;
+      const exceededSilence = delta > STREAM_SILENCE_THRESHOLD_MS;
+      if (exceededSilence || this._missedHeartbeats >= MISSED_HEARTBEAT_LIMIT) {
+        this._setPollingActive(true);
+      }
+    }
+
+    _setPollingActive(active) {
+      if (active) {
+        if (this._pollingActive) return;
+        this._pollingActive = true;
+        this._schedulePoll();
+      } else {
+        if (!this._pollingActive) return;
+        this._pollingActive = false;
+        this._stopPolling();
+      }
+    }
+
+    _schedulePoll() {
+      if (!this._pollingActive) return;
+      if (this.pollTimer) return;
+      this.pollTimer = setTimeout(() => {
+        this.pollTimer = null;
+        if (!this._pollingActive) return;
+        this._pollLatest()
+          .catch((error) => {
+            console.warn("MarketDataStore poll failed", error);
+          })
+          .finally(() => {
+            if (this._pollingActive) {
+              this._schedulePoll();
+            }
+          });
       }, this.pollIntervalMs);
     }
 
-    async _pollLatest() {
-      const last = this.candles.length ? this.candles[this.candles.length - 1] : null;
-      const startTime = last ? last.ts_ms_utc - 5 * 60 * 1000 : undefined;
-      const params = new URLSearchParams();
-      params.set("symbol", this.symbol);
-      params.set("interval", this.interval);
-      if (Number.isFinite(startTime)) {
-        params.set("startTime", String(Math.max(0, Math.floor(startTime))));
+    _stopPolling() {
+      if (this.pollTimer) {
+        clearTimeout(this.pollTimer);
+        this.pollTimer = null;
       }
-      params.set("limit", String(Math.min(150, Math.max(10, Math.floor(this.historyLimit / 4)))));
-      const url = `https://fapi.binance.com/fapi/v1/klines?${params.toString()}`;
-      const response = await fetch(url, { cache: "no-store" });
-      if (!response.ok) {
-        throw new Error(`poll klines ${response.status}`);
-      }
-      const rows = await response.json();
-      const bars = BinanceCandles.transformKlines(rows).map((bar) => normaliseBar(bar)).filter(Boolean);
-      if (!bars.length) return;
-      this._mergeBars(bars);
-      const meta = computeMeta({
-        candles: this.candles,
-        interval: this.interval,
-        lastStreamPrice: this.lastStreamPrice,
-        lastStreamTs: this.lastStreamTs,
-      });
-      this._emit({ type: "poll", symbol: this.symbol, interval: this.interval, candles: bars, meta });
+      this._pollInFlight = false;
     }
 
-    _mergeBars(bars) {
+    async _pollLatest() {
+      if (this._pollInFlight) {
+        return;
+      }
+      this._pollInFlight = true;
+      try {
+        const last = this.candles.length ? this.candles[this.candles.length - 1] : null;
+        const startTime = last ? last.ts_ms_utc - 5 * 60 * 1000 : undefined;
+        const params = new URLSearchParams();
+        params.set("symbol", this.symbol);
+        params.set("interval", this.interval);
+        if (Number.isFinite(startTime)) {
+          params.set("startTime", String(Math.max(0, Math.floor(startTime))));
+        }
+        params.set("limit", String(Math.min(150, Math.max(10, Math.floor(this.historyLimit / 4)))));
+        const url = `https://fapi.binance.com/fapi/v1/klines?${params.toString()}`;
+        const response = await fetch(url, { cache: "no-store" });
+        if (!response.ok) {
+          throw new Error(`poll klines ${response.status}`);
+        }
+        const rows = await response.json();
+        const bars = BinanceCandles.transformKlines(rows).map((bar) => normaliseBar(bar)).filter(Boolean);
+        if (!bars.length) {
+          return;
+        }
+        this._mergeBars(bars, { source: "ohlcv" });
+        const meta = computeMeta({
+          candles: this.candles,
+          interval: this.interval,
+          lastStreamPrice: this.lastStreamPrice,
+          lastStreamTs: this.lastStreamTs,
+          lastPriceSource: this.lastPriceSource,
+        });
+        this._emit({ type: "poll", symbol: this.symbol, interval: this.interval, candles: bars, meta });
+      } finally {
+        this._pollInFlight = false;
+      }
+    }
+
+    _mergeBars(bars, options = {}) {
       if (!Array.isArray(bars) || !bars.length) return;
       const index = new Map();
       this.candles.forEach((bar, idx) => {
         index.set(Number(bar.time), idx);
       });
       let changed = false;
+      const touchedTimes = new Set();
       for (const bar of bars) {
         if (!bar) continue;
         const key = Number(bar.time);
@@ -328,17 +439,23 @@
           ) {
             this.candles[targetIdx] = bar;
             changed = true;
+            touchedTimes.add(key);
           }
         } else {
           index.set(key, this.candles.length);
           this.candles.push(bar);
           changed = true;
+          touchedTimes.add(key);
         }
       }
       if (changed) {
         this.candles.sort((a, b) => Number(a.time) - Number(b.time));
         if (this.candles.length > this.historyLimit) {
           this.candles = this.candles.slice(this.candles.length - this.historyLimit);
+        }
+        const lastCandle = this.candles[this.candles.length - 1];
+        if (lastCandle && touchedTimes.has(Number(lastCandle.time))) {
+          this.lastPriceSource = options?.source || this.lastPriceSource || "ohlcv";
         }
       }
     }
@@ -356,12 +473,16 @@
       this.candles = [];
       this.lastStreamPrice = null;
       this.lastStreamTs = null;
+      this.lastPriceSource = null;
+      this._missedHeartbeats = 0;
+      this._pollingActive = false;
+      this._stopPolling();
       this._emit({ type: "status", status: "restarting", symbol: this.symbol, interval: this.interval });
       this._loadHistory(true).catch((error) => {
         console.error("MarketDataStore reload failed", error);
       });
       this._ensureRealtime();
-      this._ensurePolling();
+      this._startHealthMonitor();
     }
 
     restart() {
@@ -369,7 +490,9 @@
         console.error("MarketDataStore restart failed", error);
       });
       this._ensureRealtime();
-      this._ensurePolling();
+      this._pollingActive = false;
+      this._stopPolling();
+      this._startHealthMonitor();
     }
 
     getMeta() {
@@ -378,6 +501,7 @@
         interval: this.interval,
         lastStreamPrice: this.lastStreamPrice,
         lastStreamTs: this.lastStreamTs,
+        lastPriceSource: this.lastPriceSource,
       });
     }
 
