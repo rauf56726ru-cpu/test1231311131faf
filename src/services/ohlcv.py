@@ -10,6 +10,8 @@ from typing import Dict, Iterable, List, Mapping, MutableMapping
 
 import httpx
 
+from .tracing import TraceContext, log_event
+
 BINANCE_SPOT_KLINES = "https://api.binance.com/api/v3/klines"
 SUPPORTED_TIMEFRAMES: tuple[str, ...] = ("1m", "3m", "5m", "15m", "1h", "4h", "1d")
 TIMEFRAME_TO_MINUTES: Dict[str, int] = {
@@ -184,6 +186,7 @@ async def fetch_ohlcv(
     lookback_days: int,
     *,
     cache: MutableMapping[str, Dict[str, object]] | None = None,
+    trace: TraceContext | None = None,
 ) -> Dict[str, object]:
     """Fetch OHLCV candles for a Binance symbol and timeframe."""
 
@@ -197,6 +200,11 @@ async def fetch_ohlcv(
     cache_key = f"{symbol_clean}:{tf}:{lookback_days}"
     ttl = _CACHE_TTL_1M if tf == "1m" else _CACHE_TTL_DEFAULT
     now = time.monotonic()
+    now_dt = datetime.now(timezone.utc)
+    window_payload = {
+        "from_ms": int((now_dt - timedelta(days=lookback_days)).timestamp() * 1000),
+        "to_ms": int(now_dt.timestamp() * 1000),
+    }
     shared_cache: MutableMapping[str, Dict[str, object]]
     if cache is None:
         shared_cache = _CACHE
@@ -206,12 +214,37 @@ async def fetch_ohlcv(
     if isinstance(cached_payload, Mapping):
         expires_at = cached_payload.get("_expires")
         if isinstance(expires_at, (int, float)) and expires_at > now:
-            LOGGER.debug("Serving OHLCV for %s from cache", cache_key)
+            if trace:
+                log_event(
+                    level="INFO",
+                    event="cache.hit",
+                    cid=trace.cid,
+                    rid=trace.new_rid(),
+                    user_action=trace.user_action,
+                    symbol=symbol_clean,
+                    tf=tf,
+                    window=window_payload,
+                    metrics={"ttl_ms": max(0.0, (expires_at - now) * 1000.0)},
+                )
+            else:
+                LOGGER.debug("Serving OHLCV for %s from cache", cache_key)
             result = dict(cached_payload)
             result.pop("_expires", None)
             return result
         if isinstance(expires_at, (int, float)) and expires_at <= now:
             shared_cache.pop(cache_key, None)
+            if trace:
+                log_event(
+                    level="INFO",
+                    event="cache.miss",
+                    cid=trace.cid,
+                    rid=trace.new_rid(),
+                    user_action=trace.user_action,
+                    symbol=symbol_clean,
+                    tf=tf,
+                    window=window_payload,
+                    details="expired",
+                )
 
     lock = await _get_lock_for_key(cache_key)
     async with lock:
@@ -219,7 +252,20 @@ async def fetch_ohlcv(
         if isinstance(cached_payload, Mapping):
             expires_at = cached_payload.get("_expires")
             if isinstance(expires_at, (int, float)) and expires_at > time.monotonic():
-                LOGGER.debug("Serving OHLCV for %s from cache after lock", cache_key)
+                if trace:
+                    log_event(
+                        level="INFO",
+                        event="cache.hit",
+                        cid=trace.cid,
+                        rid=trace.new_rid(),
+                        user_action=trace.user_action,
+                        symbol=symbol_clean,
+                        tf=tf,
+                        window=window_payload,
+                        metrics={"ttl_ms": max(0.0, (expires_at - time.monotonic()) * 1000.0)},
+                    )
+                else:
+                    LOGGER.debug("Serving OHLCV for %s from cache after lock", cache_key)
                 result = dict(cached_payload)
                 result.pop("_expires", None)
                 return result
@@ -240,6 +286,18 @@ async def fetch_ohlcv(
         cache_entry = dict(payload)
         cache_entry["_expires"] = time.monotonic() + ttl
         shared_cache[cache_key] = cache_entry
+        if trace:
+            log_event(
+                level="INFO",
+                event="cache.miss",
+                cid=trace.cid,
+                rid=trace.new_rid(),
+                user_action=trace.user_action,
+                symbol=symbol_clean,
+                tf=tf,
+                window=window_payload,
+                metrics={"ttl_ms": ttl * 1000.0},
+            )
         return payload
 
 
@@ -249,6 +307,7 @@ async def build_multi_tf_ohlcv(
     *,
     timeframes: Iterable[str] | None = None,
     cache: MutableMapping[str, Dict[str, object]] | None = None,
+    trace: TraceContext | None = None,
 ) -> Dict[str, object]:
     """Collect OHLCV series for multiple timeframes with shared caching."""
 
@@ -257,7 +316,7 @@ async def build_multi_tf_ohlcv(
     base_cache: MutableMapping[str, Dict[str, object]] | None = cache
     for tf in requested:
         try:
-            frames[tf] = await fetch_ohlcv(symbol, tf, lookback_days, cache=base_cache)
+            frames[tf] = await fetch_ohlcv(symbol, tf, lookback_days, cache=base_cache, trace=trace)
         except Exception as exc:  # pragma: no cover - defensive logging
             LOGGER.exception("Failed to build OHLCV for %s %s: %s", symbol, tf, exc)
             raise

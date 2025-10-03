@@ -55,6 +55,7 @@ from ..services.news import fetch_news
 from ..services.ohlcv import build_multi_tf_ohlcv, fetch_ohlcv as fetch_ohlcv_enhanced
 from ..services.orderflow import calculate_cvd, fetch_footprint
 from ..services.tpo import calculate_session_tpo, calculate_tpo
+from ..services.tracing import TraceContext, log_event, new_cid, new_rid
 from ..meta import Meta
 from ..static_version import STATIC_VERSION
 from ..version import APP_VERSION
@@ -901,6 +902,14 @@ async def inspection_check_all(
         target_snapshot = get_snapshot(snapshots[0]["id"])  # type: ignore[index]
 
     if target_snapshot is None:
+        log_event(
+            level="WARN",
+            event="pipeline.cancelled",
+            cid=cid,
+            rid=trace.new_rid(),
+            user_action=user_action,
+            details="snapshot_missing",
+        )
         return Response(status_code=204)
 
     now_override = None
@@ -919,6 +928,26 @@ async def inspection_check_all(
     if mode_value not in {"selection", "summary", "topup", "session_detailed"}:
         mode_value = "selection"
 
+    user_action_lookup = {
+        "summary": "Collect3DaysCompact",
+        "session_detailed": "CollectLastSessionDetailed",
+        "selection": "CollectNHoursDetailed",
+        "topup": "CollectTopUp",
+    }
+    user_action = user_action_lookup.get(mode_value, "CollectSelection")
+    cid = new_cid()
+    trace = TraceContext(cid=cid, user_action=user_action)
+    log_event(
+        level="INFO",
+        event="ui.click_received",
+        cid=cid,
+        rid=trace.new_rid(),
+        user_action=user_action,
+        details="inspection_check_all",
+        metrics={"hours": float(hours or 0)},
+        extra={"mode": mode_value, "debounced": False},
+    )
+
     collection_reference = now_override or datetime.now(timezone.utc)
     has_now_override = now_override is not None
     log_extra: Dict[str, Any] = {
@@ -929,6 +958,13 @@ async def inspection_check_all(
         "hours": hours,
         "has_now_override": has_now_override,
     }
+    snapshot_symbol = target_snapshot.get("symbol") if isinstance(target_snapshot, Mapping) else None
+    if not snapshot_symbol:
+        meta_block = target_snapshot.get("meta") if isinstance(target_snapshot, Mapping) else None
+        if isinstance(meta_block, Mapping):
+            snapshot_symbol = meta_block.get("symbol")
+    if snapshot_symbol:
+        log_extra["symbol"] = snapshot_symbol
     LOGGER.info("inspection_check_all:start", extra=log_extra)
 
     if mode_value == "summary":
@@ -941,10 +977,42 @@ async def inspection_check_all(
             meta_block = target_snapshot.get("meta") if isinstance(target_snapshot, Mapping) else None
             if isinstance(meta_block, Mapping):
                 symbol = meta_block.get("symbol")
+        if isinstance(symbol, str) and symbol:
+            window_end = (now_override or datetime.now(timezone.utc)).astimezone(timezone.utc)
+            window_start = window_end - timedelta(hours=window_hours)
+            log_event(
+                level="INFO",
+                event="pipeline.start",
+                cid=cid,
+                rid=trace.new_rid(),
+                user_action=user_action,
+                symbol=symbol,
+                window={"from_utc": window_start.isoformat().replace("+00:00", "Z"), "to_utc": window_end.isoformat().replace("+00:00", "Z")},
+                details="Collect3DaysCompact",
+            )
+            log_event(
+                level="INFO",
+                event="pipeline.contract_ok",
+                cid=cid,
+                rid=trace.new_rid(),
+                user_action=user_action,
+                symbol=symbol,
+                details="schema:compact.v1",
+                metrics={"hours": float(window_hours)},
+            )
+        else:
+            log_event(
+                level="ERROR",
+                event="error.validation",
+                cid=cid,
+                rid=trace.new_rid(),
+                user_action=user_action,
+                details="symbol_missing",
+            )
         collection_summary_payload: Dict[str, Any] | None = None
         if isinstance(symbol, str) and symbol:
             try:
-                summary_result = await collect_recent_summary(symbol, days=days)
+                summary_result = await collect_recent_summary(symbol, days=days, trace=trace)
                 collection_summary_payload = summary_result.as_dict()
                 branch_log["summary_collection"] = {
                     "requests": summary_result.requests,
@@ -952,6 +1020,15 @@ async def inspection_check_all(
                     "dropped_candles": summary_result.dropped_candles,
                 }
             except Exception as exc:  # pragma: no cover - defensive logging
+                log_event(
+                    level="WARN",
+                    event="error.fetch",
+                    cid=cid,
+                    rid=trace.new_rid(),
+                    user_action=user_action,
+                    symbol=symbol,
+                    details=f"summary_collection:{exc.__class__.__name__}",
+                )
                 LOGGER.warning(
                     "inspection_check_all:summary_collection_failed",
                     extra={**branch_log, "error": str(exc)},
@@ -962,8 +1039,19 @@ async def inspection_check_all(
                 now_utc=now_override,
                 window_hours=window_hours,
                 timeout=CHECK_ALL_BUILD_TIMEOUT,
+                trace=trace,
             )
         except DataQualityError as exc:
+            log_event(
+                level="ERROR",
+                event="error.validation",
+                cid=cid,
+                rid=trace.new_rid(),
+                user_action=user_action,
+                symbol=symbol,
+                details=str(exc),
+                extra={"fields": exc.detail},
+            )
             LOGGER.warning(
                 "inspection_check_all:data_quality_error",
                 extra={**branch_log, "error": str(exc)},
@@ -973,6 +1061,15 @@ async def inspection_check_all(
                 detail={"message": str(exc), "data_quality": exc.detail},
             ) from exc
         except Exception as exc:  # pragma: no cover - defensive fallback
+            log_event(
+                level="ERROR",
+                event="error.unhandled",
+                cid=cid,
+                rid=trace.new_rid(),
+                user_action=user_action,
+                symbol=symbol,
+                details=str(exc),
+            )
             LOGGER.exception(
                 "inspection_check_all:summary_failed",
                 extra={**branch_log, "error": str(exc)},
@@ -985,6 +1082,16 @@ async def inspection_check_all(
             )
             return JSONResponse(fallback)
         if payload is None:
+            log_event(
+                level="INFO",
+                event="pipeline.done",
+                cid=cid,
+                rid=trace.new_rid(),
+                user_action=user_action,
+                symbol=symbol,
+                details="no_content",
+                metrics={"fetch_ms": 0.0, "db_ms": 0.0, "compute_ms": 0.0, "serialize_ms": 0.0, "requests": 0},
+            )
             LOGGER.info("inspection_check_all:finished", extra={**branch_log, "status": None})
             return Response(status_code=204)
         payload = _prepare_summary_payload(dict(payload))
@@ -1007,16 +1114,101 @@ async def inspection_check_all(
             if isinstance(meta_block, Mapping):
                 symbol = meta_block.get("symbol")
         if not symbol:
+            log_event(
+                level="ERROR",
+                event="error.validation",
+                cid=cid,
+                rid=trace.new_rid(),
+                user_action=user_action,
+                details="symbol_missing",
+            )
             raise HTTPException(status_code=400, detail="Snapshot symbol missing")
+        log_event(
+            level="INFO",
+            event="pipeline.start",
+            cid=cid,
+            rid=trace.new_rid(),
+            user_action=user_action,
+            symbol=symbol,
+            details="CollectLastSessionDetailed",
+        )
+        log_event(
+            level="INFO",
+            event="pipeline.contract_ok",
+            cid=cid,
+            rid=trace.new_rid(),
+            user_action=user_action,
+            symbol=symbol,
+            details="schema:session_detailed.v1",
+        )
         try:
             session_result: SessionCollectionResult = await collect_last_session_detailed(symbol, now_override)
         except Exception as exc:  # pragma: no cover - defensive logging
+            log_event(
+                level="ERROR",
+                event="error.unhandled",
+                cid=cid,
+                rid=trace.new_rid(),
+                user_action=user_action,
+                symbol=symbol,
+                details=str(exc),
+            )
             LOGGER.exception(
                 "inspection_check_all:session_detailed_failed",
                 extra={**log_extra, "error": str(exc)},
             )
             raise HTTPException(status_code=500, detail="Session collection failed") from exc
         payload = session_result.as_dict()
+        session_block = payload.get("session") if isinstance(payload, Mapping) else {}
+        window_info = None
+        if isinstance(session_block, Mapping):
+            open_utc = session_block.get("open_utc")
+            close_utc = session_block.get("close_utc")
+            if open_utc and close_utc:
+                window_info = {"from_utc": str(open_utc), "to_utc": str(close_utc)}
+        data_block = payload.get("data") if isinstance(payload, Mapping) else {}
+        orderflow_block = {}
+        if isinstance(data_block, Mapping):
+            orderflow_candidate = data_block.get("orderflow")
+            if isinstance(orderflow_candidate, Mapping):
+                orderflow_block = orderflow_candidate
+        per_bar_entries = orderflow_block.get("per_bar") if isinstance(orderflow_block, Mapping) else None
+        delta_cvd_compact = orderflow_block.get("delta_cvd_compact") if isinstance(orderflow_block, Mapping) else None
+        orderflow_metrics = orderflow_block.get("metrics") if isinstance(orderflow_block, Mapping) else {}
+        delta_present = 0
+        cvd_present = 0
+        if isinstance(orderflow_metrics, Mapping):
+            delta_present = 1 if orderflow_metrics.get("delta") else 0
+            cvd_present = 1 if orderflow_metrics.get("cvd") else 0
+        per_bar_count = len(per_bar_entries) if isinstance(per_bar_entries, Sequence) else 0
+        delta_compact_count = len(delta_cvd_compact) if isinstance(delta_cvd_compact, Sequence) else 0
+        log_event(
+            level="INFO",
+            event="pipeline.done",
+            cid=cid,
+            rid=trace.new_rid(),
+            user_action=user_action,
+            symbol=symbol,
+            window=window_info,
+            metrics={
+                "coverage_pct": getattr(session_result, "coverage_pct", 0.0),
+                "delta_present": delta_present,
+                "cvd_present": cvd_present,
+                "per_bar_count": per_bar_count,
+                "delta_cvd_bins": delta_compact_count,
+            },
+            details=payload.get("status") if isinstance(payload, Mapping) else None,
+        )
+        log_event(
+            level="INFO",
+            event="output.publish",
+            cid=cid,
+            rid=trace.new_rid(),
+            user_action=user_action,
+            symbol=symbol,
+            details="session_detailed",
+            metrics={"status_ok": 1 if payload.get("status") == "ok" else 0},
+        )
         LOGGER.info(
             "inspection_check_all:finished",
             extra={**log_extra, "mode": mode_value, "status": payload.get("status")},
@@ -1045,6 +1237,47 @@ async def inspection_check_all(
         branch_log = dict(log_extra)
         branch_log["window_hours"] = window_hours
         branch_log["window_start_override_ms"] = window_start_override_ms
+        symbol = branch_log.get("symbol")
+        if isinstance(symbol, str) and symbol:
+            window_end = collection_reference.astimezone(timezone.utc)
+            if window_start_override_ms is not None:
+                window_start_dt = datetime.fromtimestamp(
+                    max(0, window_start_override_ms) / 1000.0, tz=timezone.utc
+                )
+            else:
+                window_start_dt = window_end - timedelta(hours=window_hours)
+            log_event(
+                level="INFO",
+                event="pipeline.start",
+                cid=cid,
+                rid=trace.new_rid(),
+                user_action=user_action,
+                symbol=symbol,
+                window={
+                    "from_utc": window_start_dt.isoformat().replace("+00:00", "Z"),
+                    "to_utc": window_end.isoformat().replace("+00:00", "Z"),
+                },
+                details="CollectTopUp",
+            )
+            log_event(
+                level="INFO",
+                event="pipeline.contract_ok",
+                cid=cid,
+                rid=trace.new_rid(),
+                user_action=user_action,
+                symbol=symbol,
+                details="schema:session_detailed.v1",
+                metrics={"hours": float(window_hours)},
+            )
+        else:
+            log_event(
+                level="ERROR",
+                event="error.validation",
+                cid=cid,
+                rid=trace.new_rid(),
+                user_action=user_action,
+                details="symbol_missing",
+            )
         try:
             payload = await build_check_all_datas_async(
                 target_snapshot,
@@ -1053,6 +1286,7 @@ async def inspection_check_all(
                 window_start_override_ms=window_start_override_ms,
                 strict_window=True,
                 timeout=CHECK_ALL_BUILD_TIMEOUT,
+                trace=trace,
             )
         except DataQualityError as exc:
             LOGGER.warning(
@@ -1076,6 +1310,22 @@ async def inspection_check_all(
             )
             return JSONResponse(fallback)
         if payload is None:
+            log_event(
+                level="INFO",
+                event="pipeline.done",
+                cid=cid,
+                rid=trace.new_rid(),
+                user_action=user_action,
+                symbol=symbol if isinstance(symbol, str) else None,
+                details="no_content",
+                metrics={
+                    "fetch_ms": 0.0,
+                    "db_ms": 0.0,
+                    "compute_ms": 0.0,
+                    "serialize_ms": 0.0,
+                    "requests": 0,
+                },
+            )
             LOGGER.info("inspection_check_all:finished", extra={**branch_log, "status": None})
             return Response(status_code=204)
         status_value = payload.get("status") if isinstance(payload, Mapping) else None
@@ -1087,6 +1337,31 @@ async def inspection_check_all(
         return JSONResponse(payload)
 
     branch_log = dict(log_extra)
+    if selection_start is not None and selection_end is not None:
+        window_start_dt = datetime.fromtimestamp(selection_start / 1000, tz=timezone.utc)
+        window_end_dt = datetime.fromtimestamp(selection_end / 1000, tz=timezone.utc)
+        log_event(
+            level="INFO",
+            event="pipeline.start",
+            cid=cid,
+            rid=trace.new_rid(),
+            user_action=user_action,
+            symbol=branch_log.get("symbol"),
+            window={
+                "from_utc": window_start_dt.isoformat().replace("+00:00", "Z"),
+                "to_utc": window_end_dt.isoformat().replace("+00:00", "Z"),
+            },
+            details="CollectNHoursDetailed",
+        )
+        log_event(
+            level="INFO",
+            event="pipeline.contract_ok",
+            cid=cid,
+            rid=trace.new_rid(),
+            user_action=user_action,
+            symbol=branch_log.get("symbol"),
+            details="schema:session_detailed.v1",
+        )
     try:
         payload = await build_check_all_datas_async(
             target_snapshot,
@@ -1095,8 +1370,18 @@ async def inspection_check_all(
             selection_end_ms=selection_end,
             hours=hours,
             timeout=CHECK_ALL_BUILD_TIMEOUT,
+            trace=trace,
         )
     except DataQualityError as exc:
+        log_event(
+            level="ERROR",
+            event="error.validation",
+            cid=cid,
+            rid=trace.new_rid(),
+            user_action=user_action,
+            details=str(exc),
+            extra={"fields": exc.detail},
+        )
         LOGGER.warning(
             "inspection_check_all:data_quality_error",
             extra={**branch_log, "error": str(exc)},
@@ -1106,6 +1391,14 @@ async def inspection_check_all(
             detail={"message": str(exc), "data_quality": exc.detail},
         ) from exc
     except Exception as exc:  # pragma: no cover - defensive fallback
+        log_event(
+            level="ERROR",
+            event="error.unhandled",
+            cid=cid,
+            rid=trace.new_rid(),
+            user_action=user_action,
+            details=str(exc),
+        )
         LOGGER.exception(
             "inspection_check_all:selection_failed",
             extra={**branch_log, "error": str(exc)},
@@ -1118,6 +1411,15 @@ async def inspection_check_all(
         )
         return JSONResponse(fallback)
     if payload is None:
+        log_event(
+            level="INFO",
+            event="pipeline.done",
+            cid=cid,
+            rid=trace.new_rid(),
+            user_action=user_action,
+            details="no_content",
+            metrics={"fetch_ms": 0.0, "db_ms": 0.0, "compute_ms": 0.0, "serialize_ms": 0.0, "requests": 0},
+        )
         LOGGER.info("inspection_check_all:finished", extra={**branch_log, "status": None})
         return Response(status_code=204)
 

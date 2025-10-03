@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time as dtime, timedelta, timezone
 import logging
 import math
+import time
 from typing import (
     Any,
     Callable,
@@ -20,6 +21,7 @@ from typing import (
 )
 
 from .timeutils import ensure_ms_epoch, safe_datetime_from_ms
+from .tracing import TraceContext, log_event, new_rid
 
 
 LOGGER = logging.getLogger(__name__)
@@ -430,9 +432,12 @@ def compute_session_profiles(
     target_bins: int = 80,
     cache_token: Any | None = None,
     invalid_ts_handler: InvalidTimestampHandler | None = None,
+    trace: TraceContext | None = None,
+    symbol: str | None = None,
 ) -> List[Dict[str, object]]:
     """Return volume profile summaries grouped by calendar day."""
 
+    compute_start = time.perf_counter()
     session_list = list(sessions)
     if session_list:
         split_result = split_by_sessions(
@@ -468,6 +473,17 @@ def compute_session_profiles(
         daily_buckets[dt.date()].append(dict(candle))
 
     if not daily_buckets:
+        if trace:
+            log_event(
+                level="INFO",
+                event="compute.vwap_tpo",
+                cid=trace.cid,
+                rid=new_rid(),
+                user_action=trace.user_action,
+                symbol=symbol,
+                details="empty",
+                metrics={"ms": (time.perf_counter() - compute_start) * 1000.0, "days": 0, "sessions": 0},
+            )
         return []
 
     ordered_dates = sorted(daily_buckets.keys())
@@ -579,6 +595,26 @@ def compute_session_profiles(
         summaries.append(day_payload)
         summaries.extend(session_payloads)
 
+    compute_ms = (time.perf_counter() - compute_start) * 1000.0
+    if trace:
+        poc_count = sum(1 for entry in summaries if entry.get("POC") is not None)
+        sessions_count = sum(
+            1 for entry in summaries if entry.get("session") not in (None, "daily")
+        )
+        log_event(
+            level="INFO",
+            event="compute.vwap_tpo",
+            cid=trace.cid,
+            rid=new_rid(),
+            user_action=trace.user_action,
+            symbol=symbol,
+            metrics={
+                "ms": compute_ms,
+                "days": sum(1 for entry in summaries if entry.get("session") == "daily"),
+                "sessions": sessions_count,
+                "poc": poc_count,
+            },
+        )
     return summaries
 
 
@@ -653,6 +689,8 @@ def build_profile_package(
     tf_key: str = "1m",
     invalid_ts_handler: InvalidTimestampHandler | None = None,
     meta_out: MutableMapping[str, Any] | None = None,
+    trace: TraceContext | None = None,
+    symbol: str | None = None,
 ) -> Tuple[List[Dict[str, object]], List[Dict[str, float]], List[Dict[str, Any]]]:
     """Compute TPO summaries, flattened profile, and derived zones."""
 
@@ -677,6 +715,8 @@ def build_profile_package(
         target_bins=target_bins,
         cache_token=token,
         invalid_ts_handler=invalid_ts_handler,
+        trace=trace,
+        symbol=symbol,
     )
 
     flattened: List[Dict[str, float]] = []

@@ -16,6 +16,7 @@ from .ohlc_sanitizer import sanitize_candles
 from .ohlc import TIMEFRAME_TO_MS
 from .timeutils import ensure_ms_epoch
 from .check_all_datas import _normalise_binance_row
+from .tracing import TraceContext, log_event, new_rid
 
 LOGGER = logging.getLogger(__name__)
 UTC = timezone.utc
@@ -122,6 +123,9 @@ async def _request_klines(
     end_ms: int,
     limit: int,
     bucket: _TokenBucket,
+    trace: TraceContext | None = None,
+    rid: str | None = None,
+    window: Mapping[str, int] | None = None,
 ) -> List[Sequence[Any]]:
     params = {
         "symbol": symbol.upper(),
@@ -136,6 +140,19 @@ async def _request_klines(
         try:
             response = await client.get(BINANCE_ENDPOINT, params=params)
         except httpx.RequestError as exc:  # pragma: no cover - network failure
+            if trace:
+                log_event(
+                    level="WARN",
+                    event="fetch.retry",
+                    cid=trace.cid,
+                    rid=rid,
+                    user_action=trace.user_action,
+                    symbol=symbol,
+                    tf=interval,
+                    window=window,
+                    details=f"request_error:{exc.__class__.__name__}",
+                    metrics={"attempt": attempt + 1},
+                )
             if attempt >= 5:
                 raise GapCollectionError(f"Request failure: {exc}") from exc
             await asyncio.sleep(backoff + random.uniform(0, backoff))
@@ -143,11 +160,37 @@ async def _request_klines(
             continue
 
         if response.status_code in {418, 429}:
+            if trace:
+                log_event(
+                    level="WARN",
+                    event="fetch.rate_limited",
+                    cid=trace.cid,
+                    rid=rid,
+                    user_action=trace.user_action,
+                    symbol=symbol,
+                    tf=interval,
+                    window=window,
+                    details=f"http_{response.status_code}",
+                    metrics={"backoff_ms": backoff * 1000.0, "attempt": attempt + 1},
+                )
             await asyncio.sleep(backoff + random.uniform(0, backoff))
             backoff = min(backoff * 2, BACKOFF_MAX_MS)
             continue
 
         if response.status_code >= 500:
+            if trace:
+                log_event(
+                    level="WARN",
+                    event="fetch.retry",
+                    cid=trace.cid,
+                    rid=rid,
+                    user_action=trace.user_action,
+                    symbol=symbol,
+                    tf=interval,
+                    window=window,
+                    details=f"http_{response.status_code}",
+                    metrics={"attempt": attempt + 1, "backoff_ms": backoff * 1000.0},
+                )
             if attempt >= 5:
                 raise GapCollectionError(f"Binance error {response.status_code}")
             await asyncio.sleep(backoff + random.uniform(0, backoff))
@@ -245,6 +288,7 @@ async def _fill_gap(
     interval_ms: int,
     client: httpx.AsyncClient,
     bucket: _TokenBucket,
+    trace: TraceContext | None = None,
 ) -> IntervalSummary:
     fetch_ms = 0.0
     db_write_ms = 0.0
@@ -275,18 +319,47 @@ async def _fill_gap(
         # still respecting the hard 1000 candle ceiling enforced by the REST API.
         approx_bars = max(1, ((page_end - cursor) // interval_ms) + 1)
         page_limit = min(MAX_PAGE_LIMIT, max(approx_bars, 50))
+        batch_window = {"from_ms": cursor, "to_ms": page_end}
+        batch_rid = trace.new_rid() if trace else new_rid()
+        if trace:
+            log_event(
+                level="INFO",
+                event="fetch.batch_start",
+                cid=trace.cid,
+                rid=batch_rid,
+                user_action=trace.user_action,
+                symbol=symbol,
+                tf=interval,
+                window=batch_window,
+                metrics={"expected_bars": approx_bars, "limit": page_limit},
+            )
         request_start = time.perf_counter()
-        raw_rows = await _request_klines(
-            client,
-            symbol=symbol,
-            interval=interval,
-            start_ms=cursor,
-            end_ms=page_end + interval_ms,
-            limit=page_limit,
-            bucket=bucket,
-        )
-        fetch_ms += (time.perf_counter() - request_start) * 1000.0
+        request_kwargs = {
+            "symbol": symbol,
+            "interval": interval,
+            "start_ms": cursor,
+            "end_ms": page_end + interval_ms,
+            "limit": page_limit,
+            "bucket": bucket,
+        }
+        if trace:
+            request_kwargs.update({"trace": trace, "rid": batch_rid, "window": batch_window})
+        raw_rows = await _request_klines(client, **request_kwargs)
+        elapsed_ms = (time.perf_counter() - request_start) * 1000.0
+        fetch_ms += elapsed_ms
         requests += 1
+        if trace:
+            log_event(
+                level="INFO",
+                event="fetch.batch_done",
+                cid=trace.cid,
+                rid=batch_rid,
+                user_action=trace.user_action,
+                symbol=symbol,
+                tf=interval,
+                window=batch_window,
+                metrics={"ms": elapsed_ms, "bars": len(raw_rows) if raw_rows else 0},
+            )
         if not raw_rows:
             cursor += page_span
             continue
@@ -321,10 +394,27 @@ async def _fill_gap(
             candles=normalised,
             stage=f"summary_fetch.{interval}",
         )
-        db_write_ms += (time.perf_counter() - write_start) * 1000.0
+        db_elapsed = (time.perf_counter() - write_start) * 1000.0
+        db_write_ms += db_elapsed
         written += stats.written
         dropped_ts += stats.dropped_ts
         dropped_ohlc += stats.dropped_ohlc
+        if trace:
+            log_event(
+                level="INFO",
+                event="db.bulk_upsert",
+                cid=trace.cid,
+                rid=new_rid(),
+                user_action=trace.user_action,
+                symbol=symbol,
+                tf=interval,
+                window=batch_window,
+                metrics={
+                    "rows": stats.written,
+                    "dropped": stats.dropped_ts + stats.dropped_ohlc,
+                    "ms": db_elapsed,
+                },
+            )
 
         if not sanitised:
             cursor += page_span
@@ -362,6 +452,7 @@ async def collect_recent_summary(
     intervals: Optional[Sequence[str]] = None,
     repository: Optional[CandleRepository] = None,
     start_ms: Optional[int] = None,
+    trace: TraceContext | None = None,
 ) -> CollectionSummary:
     """Ensure recent OHLC coverage exists for the requested symbol."""
 
@@ -437,7 +528,34 @@ async def collect_recent_summary(
                     end_ms=last_closed,
                 )
                 fetch_existing_ms = (time.perf_counter() - fetch_existing_start) * 1000.0
+                if trace:
+                    log_event(
+                        level="INFO",
+                        event="data.availability_checked",
+                        cid=trace.cid,
+                        rid=trace.new_rid(),
+                        user_action=trace.user_action,
+                        symbol=symbol,
+                        tf=interval,
+                        window={"from_ms": first_expected, "to_ms": last_closed},
+                        metrics={"bars": len(existing), "ms": fetch_existing_ms},
+                    )
                 gaps = _compute_gaps(first_expected, last_closed, interval_ms, existing)
+                if trace and gaps:
+                    total_minutes = sum(
+                        int(gap["count"]) * (interval_ms / 60_000) for gap in gaps
+                    )
+                    log_event(
+                        level="INFO",
+                        event="gaps.detected",
+                        cid=trace.cid,
+                        rid=trace.new_rid(),
+                        user_action=trace.user_action,
+                        symbol=symbol,
+                        tf=interval,
+                        window={"from_ms": first_expected, "to_ms": last_closed},
+                        metrics={"gaps": len(gaps), "minutes": total_minutes},
+                    )
                 if not gaps:
                     summary = IntervalSummary(
                         gaps_total=0,
@@ -467,6 +585,23 @@ async def collect_recent_summary(
                         current = {"from": gap_from, "to": gap_to}
                 if current is not None:
                     merged.append(current)
+                if trace and merged:
+                    merged_minutes = sum(
+                        max(0, (item["to"] - item["from"]) // 60_000 + 1)
+                        * (interval_ms / 60_000)
+                        for item in merged
+                    )
+                    log_event(
+                        level="DEBUG",
+                        event="gaps.merged",
+                        cid=trace.cid,
+                        rid=trace.new_rid(),
+                        user_action=trace.user_action,
+                        symbol=symbol,
+                        tf=interval,
+                        window={"from_ms": first_expected, "to_ms": last_closed},
+                        metrics={"windows": len(merged), "minutes": merged_minutes},
+                    )
 
                 gap_semaphore = asyncio.Semaphore(max(1, GAP_CONCURRENCY))
 
@@ -480,6 +615,7 @@ async def collect_recent_summary(
                             interval_ms=interval_ms,
                             client=client,
                             bucket=bucket,
+                            trace=trace,
                         )
 
                 gap_tasks = [_fill_single_gap(gap) for gap in merged]
