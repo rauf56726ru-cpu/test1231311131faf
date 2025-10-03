@@ -57,6 +57,9 @@ async def test_collect_recent_summary_fills_only_missing(monkeypatch):
     )
 
     assert calls, "Expected at least one REST call for missing gaps"
+    # ChartGapViewer mirrors Binance page sizing with a minimum of 50 candles,
+    # verify the collector does the same when only a handful of bars are missing.
+    assert calls[0][2] == 50
     fetched_opens = repo.fetch_open_times(symbol, interval, start_ms, end_ms)
     expected = [start_ms + i * interval_ms for i in range(5)]
     for ts in expected:

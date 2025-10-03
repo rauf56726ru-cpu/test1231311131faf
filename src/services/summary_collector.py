@@ -256,13 +256,18 @@ async def _fill_gap(
 
     while cursor <= gap_end:
         page_end = min(gap_end, cursor + page_span - interval_ms)
+        # Match the ChartGapViewer strategy by sizing the Binance page limit to the
+        # actual gap width.  This keeps requests tight to the missing window while
+        # still respecting the hard 1000 candle ceiling enforced by the REST API.
+        approx_bars = max(1, ((page_end - cursor) // interval_ms) + 1)
+        page_limit = min(MAX_PAGE_LIMIT, max(approx_bars, 50))
         raw_rows = await _request_klines(
             client,
             symbol=symbol,
             interval=interval,
             start_ms=cursor,
             end_ms=page_end + interval_ms,
-            limit=MAX_PAGE_LIMIT,
+            limit=page_limit,
             bucket=bucket,
         )
         requests += 1
