@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from src.api.app import app
+from src.api.app import app, _prepare_summary_payload
 import src.services.check_all_datas as check_all_datas
 import src.services.inspection as inspection
 from src.services import presets
@@ -168,3 +168,22 @@ def test_profile_sessions_include_extrema(client: TestClient) -> None:
     for entry in sessions:
         assert "session_high" in entry
         assert "session_low" in entry
+
+
+def test_prepare_summary_payload_compact_trims() -> None:
+    one_min = [{"t": i * 60_000} for i in range(240)]
+    orderflow = {"per_bar": [{"delta": float(i)} for i in range(200)]}
+    payload = {
+        "schema": "compact.v1",
+        "data": {
+            "ohlcv_compact": {"1m_recent": one_min},
+            "orderflow": {"15m": dict(orderflow)},
+        },
+    }
+
+    prepared = _prepare_summary_payload(payload)
+
+    compact = prepared["data"]["ohlcv_compact"]
+    assert len(compact["1m_recent"]) == 180
+    trimmed_orderflow = prepared["data"]["orderflow"]["15m"]["per_bar"]
+    assert len(trimmed_orderflow) == 120

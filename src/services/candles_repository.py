@@ -151,7 +151,12 @@ class CandleRepository:
                 volume = excluded.volume
         """
         with self._connect() as conn:
-            conn.executemany(statement, payload)
+            cursor = 0
+            batch_size = 1000
+            while cursor < len(payload):
+                batch = payload[cursor : cursor + batch_size]
+                conn.executemany(statement, batch)
+                cursor += batch_size
 
         return UpsertStats(
             written=len(payload),

@@ -355,7 +355,27 @@ async def _startup() -> None:
         app.state.snapshots = {}
 
 def _prepare_summary_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Reduce payload weight while keeping hourly context and fresh minute data."""
+    """Reduce payload weight while keeping essential context."""
+
+    schema = payload.get("schema")
+    data_section = payload.get("data") if isinstance(payload.get("data"), Mapping) else None
+
+    if schema == "compact.v1" and isinstance(data_section, MutableMapping):
+        compact_ohlcv = data_section.get("ohlcv_compact")
+        if isinstance(compact_ohlcv, Mapping):
+            recent_1m = compact_ohlcv.get("1m_recent")
+            if isinstance(recent_1m, Sequence):
+                compact_ohlcv["1m_recent"] = list(recent_1m)[-180:]
+        orderflow_section = data_section.get("orderflow")
+        if isinstance(orderflow_section, Mapping):
+            for block in orderflow_section.values():
+                if not isinstance(block, MutableMapping):
+                    continue
+                per_bar = block.get("per_bar")
+                if isinstance(per_bar, Sequence):
+                    block["per_bar"] = list(per_bar)[-120:]
+        data_section.pop("ohlcv", None)
+        return payload
 
     ohlcv_section = payload.get("ohlcv")
     if not isinstance(ohlcv_section, Mapping):
@@ -391,7 +411,7 @@ def _prepare_summary_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
                 if candidate_ts is not None:
                     last_ts = candidate_ts if last_ts is None else max(last_ts, candidate_ts)
             if normalised_candles and last_ts is not None:
-                cutoff = last_ts - 59 * 60_000
+                cutoff = last_ts - 179 * 60_000
                 for item in normalised_candles:
                     ts_value = None
                     for key in ("t", "time", "ts", "timestamp"):
@@ -404,7 +424,7 @@ def _prepare_summary_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             else:
                 trimmed = normalised_candles
             minute_section = dict(minute_block)
-            minute_section["candles"] = trimmed[-60:]
+            minute_section["candles"] = trimmed[-180:]
             summary_section["1m"] = minute_section
 
     if summary_section:

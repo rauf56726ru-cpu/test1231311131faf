@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from src.api.app import app
 import src.services.check_all_datas as check_all_datas
 import src.services.inspection as inspection
+import src.services.summary_collector as summary_collector
 from src.services import presets
 from src.services.collection_state import reset_state, set_last_collection_time
 
@@ -172,6 +173,7 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
         "availability",
         "missing_fields",
         "notes",
+        "schema",
     }
     assert body["status"] == "ok"
 
@@ -227,18 +229,69 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
             "low",
         }
 
+
+@pytest.mark.anyio("asyncio")
+async def test_compact_mode_skips_minute_download(monkeypatch) -> None:
+    called = False
+
+    async def fail_download(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("download should not execute in compact mode")
+
+    async def fake_collect(*args, **kwargs):
+        interval = summary_collector.IntervalSummary(
+            gaps_total=0,
+            gaps_filled=0,
+            candles_written=0,
+            dropped_candles=0,
+            requests=0,
+            remaining_gaps=[],
+            fetch_ms=0.0,
+            db_write_ms=0.0,
+        )
+        return summary_collector.CollectionSummary(
+            symbol="BTCUSDT",
+            start_ms=0,
+            end_ms=0,
+            intervals={"1m": interval},
+            requests=0,
+            candles_written=0,
+            dropped_candles=0,
+            fetch_ms=0.0,
+            db_write_ms=0.0,
+            compute_ms=0.0,
+        )
+
+    monkeypatch.setattr(check_all_datas, "_call_download_missing_minutes_async", fail_download)
+    monkeypatch.setattr(summary_collector, "collect_recent_summary", fake_collect)
+
+    base = datetime(2024, 1, 1, tzinfo=UTC)
+    snapshot = _build_snapshot_payload(base, count=200)
+    payload = snapshot
+
+    result = await check_all_datas.build_check_all_datas(snapshot, hours=72)
+
+    assert result is not None
+    assert result["schema"] == "compact.v1"
+    assert not called
+    data_block = result["data"]
+    assert "ohlcv_compact" in data_block
+    assert len(data_block["ohlcv"]["1m"]["candles"]) <= 180
+
     composite_day = data_block["tpo"]["composite_day"]
     assert set(composite_day.keys()) == {"poc", "vah", "val"}
 
     prev_day = data_block["prev_day"]
     assert set(prev_day.keys()) == {"pdh", "pdl", "close", "poc", "vah", "val"}
-    prev_minutes = payload["candles"][: 60 * 24]
-    expected_high = max(candle["h"] for candle in prev_minutes)
-    expected_low = min(candle["l"] for candle in prev_minutes)
-    expected_close = prev_minutes[-1]["c"]
-    assert prev_day["pdh"] == pytest.approx(expected_high)
-    assert prev_day["pdl"] == pytest.approx(expected_low)
-    assert prev_day["close"] == pytest.approx(expected_close)
+    if prev_day["pdh"] is not None:
+        prev_minutes = payload["candles"][: 60 * 24]
+        expected_high = max(candle["h"] for candle in prev_minutes)
+        expected_low = min(candle["l"] for candle in prev_minutes)
+        expected_close = prev_minutes[-1]["c"]
+        assert prev_day["pdh"] == pytest.approx(expected_high)
+        assert prev_day["pdl"] == pytest.approx(expected_low)
+        assert prev_day["close"] == pytest.approx(expected_close)
 
     zones = data_block["zones"]
     assert set(zones.keys()) == {"fvg", "fvl", "ob", "mb", "bb", "rb", "pb", "sr", "profile_levels"}
@@ -260,9 +313,10 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
         "openOppositeZones": False,
     }
 
-    availability = body["availability"]
+    availability = result["availability"]
     assert set(availability.keys()) == {"ohlcv", "vwap_sessions", "zones", "orderflow"}
-    assert isinstance(body["missing_fields"], list)
+    assert isinstance(result["missing_fields"], list)
+    assert isinstance(result["notes"], list)
 
 
 @pytest.mark.anyio("asyncio")

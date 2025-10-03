@@ -7,7 +7,7 @@ import random
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import httpx
 
@@ -22,8 +22,10 @@ UTC = timezone.utc
 
 BINANCE_ENDPOINT = "https://fapi.binance.com/fapi/v1/klines"
 MAX_PAGE_LIMIT = 1000
-DEFAULT_TOKEN_RATE = 30.0  # tokens per second
-DEFAULT_TOKEN_BURST = 30
+DEFAULT_TOKEN_RATE = 75.0  # tokens per second
+DEFAULT_TOKEN_BURST = 150
+MAX_CONCURRENCY = 4
+GAP_CONCURRENCY = 2
 RATE_DELAY_MIN = 0.020
 RATE_DELAY_MAX = 0.040
 BACKOFF_BASE_MS = 0.2
@@ -42,6 +44,8 @@ class IntervalSummary:
     dropped_candles: int
     requests: int
     remaining_gaps: List[Dict[str, int]]
+    fetch_ms: float
+    db_write_ms: float
 
 
 @dataclass(slots=True)
@@ -53,6 +57,9 @@ class CollectionSummary:
     requests: int
     candles_written: int
     dropped_candles: int
+    fetch_ms: float
+    db_write_ms: float
+    compute_ms: float
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -61,6 +68,9 @@ class CollectionSummary:
             "requests": self.requests,
             "candles_written": self.candles_written,
             "dropped_candles": self.dropped_candles,
+            "fetch_ms": self.fetch_ms,
+            "db_write_ms": self.db_write_ms,
+            "compute_ms": self.compute_ms,
             "intervals": {
                 tf: {
                     "gaps_total": summary.gaps_total,
@@ -69,6 +79,8 @@ class CollectionSummary:
                     "dropped_candles": summary.dropped_candles,
                     "requests": summary.requests,
                     "remaining_gaps": summary.remaining_gaps,
+                    "fetch_ms": summary.fetch_ms,
+                    "db_write_ms": summary.db_write_ms,
                 }
                 for tf, summary in self.intervals.items()
             },
@@ -234,6 +246,8 @@ async def _fill_gap(
     client: httpx.AsyncClient,
     bucket: _TokenBucket,
 ) -> IntervalSummary:
+    fetch_ms = 0.0
+    db_write_ms = 0.0
     gap_start = int(gap["from"])
     gap_end = int(gap["to"])
     progress = await asyncio.to_thread(
@@ -261,6 +275,7 @@ async def _fill_gap(
         # still respecting the hard 1000 candle ceiling enforced by the REST API.
         approx_bars = max(1, ((page_end - cursor) // interval_ms) + 1)
         page_limit = min(MAX_PAGE_LIMIT, max(approx_bars, 50))
+        request_start = time.perf_counter()
         raw_rows = await _request_klines(
             client,
             symbol=symbol,
@@ -270,6 +285,7 @@ async def _fill_gap(
             limit=page_limit,
             bucket=bucket,
         )
+        fetch_ms += (time.perf_counter() - request_start) * 1000.0
         requests += 1
         if not raw_rows:
             cursor += page_span
@@ -297,6 +313,7 @@ async def _fill_gap(
         for candle in normalised:
             dedup[int(candle["t"])] = candle
         normalised = [dedup[key] for key in sorted(dedup.keys())]
+        write_start = time.perf_counter()
         stats, sanitised = await _upsert_sanitised(
             repository,
             symbol=symbol,
@@ -304,6 +321,7 @@ async def _fill_gap(
             candles=normalised,
             stage=f"summary_fetch.{interval}",
         )
+        db_write_ms += (time.perf_counter() - write_start) * 1000.0
         written += stats.written
         dropped_ts += stats.dropped_ts
         dropped_ohlc += stats.dropped_ohlc
@@ -331,6 +349,8 @@ async def _fill_gap(
         dropped_candles=dropped_ts + dropped_ohlc,
         requests=requests,
         remaining_gaps=[],
+        fetch_ms=fetch_ms,
+        db_write_ms=db_write_ms,
     )
 
 
@@ -364,87 +384,140 @@ async def collect_recent_summary(
     total_requests = 0
     total_written = 0
     total_dropped = 0
+    total_fetch_ms = 0.0
+    total_db_write_ms = 0.0
+    compute_start = time.perf_counter()
 
     bucket = _TokenBucket(DEFAULT_TOKEN_RATE, DEFAULT_TOKEN_BURST)
     async with httpx.AsyncClient(timeout=httpx.Timeout(6.0, connect=3.0)) as client:
-        for interval in target_intervals:
-            interval_ms = TIMEFRAME_TO_MS.get(interval)
-            if not interval_ms:
-                continue
-            first_expected = _align_to_interval(start_ms, interval_ms)
-            last_expected = _align_to_interval(now_ms, interval_ms)
-            if end_ms is None:
-                # Live invocations should not expect the still-forming candle at the
-                # window tail.  Skipping that bar prevents an endless loop where
-                # the collector keeps re-requesting the most recent minute even
-                # though the exchange has not closed it yet.
-                tail_open = now_ms - last_expected < interval_ms
-                last_closed = last_expected - interval_ms if tail_open else last_expected
-            else:
-                last_closed = last_expected
-            if last_closed < first_expected:
-                summaries[interval] = IntervalSummary(
-                    gaps_total=0,
-                    gaps_filled=0,
-                    candles_written=0,
-                    dropped_candles=0,
-                    requests=0,
-                    remaining_gaps=[],
-                )
-                continue
-            existing = await _fetch_existing(
-                repo,
-                symbol=symbol,
-                interval=interval,
-                start_ms=first_expected,
-                end_ms=last_closed,
-            )
-            gaps = _compute_gaps(first_expected, last_closed, interval_ms, existing)
-            if not gaps:
-                summaries[interval] = IntervalSummary(
-                    gaps_total=0,
-                    gaps_filled=0,
-                    candles_written=0,
-                    dropped_candles=0,
-                    requests=0,
-                    remaining_gaps=[],
-                )
-                continue
+        interval_semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
 
-            gap_summaries: List[IntervalSummary] = []
-            for gap in gaps:
-                summary = await _fill_gap(
+        async def _collect_for_interval(interval: str) -> Tuple[str, IntervalSummary]:
+            async with interval_semaphore:
+                interval_ms = TIMEFRAME_TO_MS.get(interval)
+                if not interval_ms:
+                    empty_summary = IntervalSummary(
+                        gaps_total=0,
+                        gaps_filled=0,
+                        candles_written=0,
+                        dropped_candles=0,
+                        requests=0,
+                        remaining_gaps=[],
+                        fetch_ms=0.0,
+                        db_write_ms=0.0,
+                    )
+                    return interval, empty_summary
+
+                first_expected = _align_to_interval(start_ms, interval_ms)
+                last_expected = _align_to_interval(now_ms, interval_ms)
+                if end_ms is None:
+                    tail_open = now_ms - last_expected < interval_ms
+                    last_closed = last_expected - interval_ms if tail_open else last_expected
+                else:
+                    last_closed = last_expected
+                if last_closed < first_expected:
+                    empty_summary = IntervalSummary(
+                        gaps_total=0,
+                        gaps_filled=0,
+                        candles_written=0,
+                        dropped_candles=0,
+                        requests=0,
+                        remaining_gaps=[],
+                        fetch_ms=0.0,
+                        db_write_ms=0.0,
+                    )
+                    return interval, empty_summary
+
+                fetch_existing_start = time.perf_counter()
+                existing = await _fetch_existing(
                     repo,
                     symbol=symbol,
                     interval=interval,
-                    gap=gap,
-                    interval_ms=interval_ms,
-                    client=client,
-                    bucket=bucket,
+                    start_ms=first_expected,
+                    end_ms=last_closed,
                 )
-                gap_summaries.append(summary)
-                total_requests += summary.requests
-                total_written += summary.candles_written
-                total_dropped += summary.dropped_candles
+                fetch_existing_ms = (time.perf_counter() - fetch_existing_start) * 1000.0
+                gaps = _compute_gaps(first_expected, last_closed, interval_ms, existing)
+                if not gaps:
+                    summary = IntervalSummary(
+                        gaps_total=0,
+                        gaps_filled=0,
+                        candles_written=0,
+                        dropped_candles=0,
+                        requests=0,
+                        remaining_gaps=[],
+                        fetch_ms=fetch_existing_ms,
+                        db_write_ms=0.0,
+                    )
+                    return interval, summary
 
-            refreshed = await _fetch_existing(
-                repo,
-                symbol=symbol,
-                interval=interval,
-                start_ms=first_expected,
-                end_ms=last_closed,
-            )
-            remaining = _compute_gaps(first_expected, last_closed, interval_ms, refreshed)
-            summaries[interval] = IntervalSummary(
-                gaps_total=len(gaps),
-                gaps_filled=sum(1 for item in gap_summaries if item.candles_written > 0),
-                candles_written=sum(item.candles_written for item in gap_summaries),
-                dropped_candles=sum(item.dropped_candles for item in gap_summaries),
-                requests=sum(item.requests for item in gap_summaries),
-                remaining_gaps=remaining,
-            )
+                merged: List[Dict[str, int]] = []
+                current: Dict[str, int] | None = None
+                min_merge = max(15 * 60_000, interval_ms)
+                for gap in gaps:
+                    gap_from = int(gap["from"])
+                    gap_to = int(gap["to"])
+                    if current is None:
+                        current = {"from": gap_from, "to": gap_to}
+                        continue
+                    if gap_from - current["to"] <= min_merge:
+                        current["to"] = max(current["to"], gap_to)
+                    else:
+                        merged.append(current)
+                        current = {"from": gap_from, "to": gap_to}
+                if current is not None:
+                    merged.append(current)
 
-    return CollectionSummary(
+                gap_semaphore = asyncio.Semaphore(max(1, GAP_CONCURRENCY))
+
+                async def _fill_single_gap(merged_gap: Mapping[str, int]) -> IntervalSummary:
+                    async with gap_semaphore:
+                        return await _fill_gap(
+                            repo,
+                            symbol=symbol,
+                            interval=interval,
+                            gap=merged_gap,
+                            interval_ms=interval_ms,
+                            client=client,
+                            bucket=bucket,
+                        )
+
+                gap_tasks = [_fill_single_gap(gap) for gap in merged]
+                gap_summaries = await asyncio.gather(*gap_tasks) if gap_tasks else []
+                refreshed_start = time.perf_counter()
+                refreshed = await _fetch_existing(
+                    repo,
+                    symbol=symbol,
+                    interval=interval,
+                    start_ms=first_expected,
+                    end_ms=last_closed,
+                )
+                refreshed_ms = (time.perf_counter() - refreshed_start) * 1000.0
+                remaining = _compute_gaps(first_expected, last_closed, interval_ms, refreshed)
+                summary = IntervalSummary(
+                    gaps_total=len(gaps),
+                    gaps_filled=sum(1 for item in gap_summaries if item.candles_written > 0),
+                    candles_written=sum(item.candles_written for item in gap_summaries),
+                    dropped_candles=sum(item.dropped_candles for item in gap_summaries),
+                    requests=sum(item.requests for item in gap_summaries),
+                    remaining_gaps=remaining,
+                    fetch_ms=fetch_existing_ms + sum(item.fetch_ms for item in gap_summaries) + refreshed_ms,
+                    db_write_ms=sum(item.db_write_ms for item in gap_summaries),
+                )
+                return interval, summary
+
+        interval_tasks = [_collect_for_interval(interval) for interval in target_intervals]
+        for interval_task in asyncio.as_completed(interval_tasks):
+            interval, summary = await interval_task
+            summaries[interval] = summary
+            total_requests += summary.requests
+            total_written += summary.candles_written
+            total_dropped += summary.dropped_candles
+            total_fetch_ms += summary.fetch_ms
+            total_db_write_ms += summary.db_write_ms
+
+    compute_ms = (time.perf_counter() - compute_start) * 1000.0
+    collection = CollectionSummary(
         symbol=symbol.upper(),
         start_ms=start_ms,
         end_ms=now_ms,
@@ -452,7 +525,26 @@ async def collect_recent_summary(
         requests=total_requests,
         candles_written=total_written,
         dropped_candles=total_dropped,
+        fetch_ms=total_fetch_ms,
+        db_write_ms=total_db_write_ms,
+        compute_ms=compute_ms,
     )
+
+    bars_by_tf = {tf: summary.candles_written for tf, summary in summaries.items()}
+    LOGGER.info(
+        "summary.collect",
+        extra={
+            "symbol": symbol.upper(),
+            "requests": total_requests,
+            "candles_written": total_written,
+            "dropped_candles": total_dropped,
+            "bars_written_by_tf": bars_by_tf,
+            "fetch_ms": round(collection.fetch_ms, 3),
+            "db_write_ms": round(collection.db_write_ms, 3),
+        },
+    )
+
+    return collection
 
 
 __all__ = ["collect_recent_summary", "CollectionSummary"]

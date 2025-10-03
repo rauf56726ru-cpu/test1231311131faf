@@ -1,3 +1,4 @@
+import asyncio
 import pytest
 from datetime import datetime, timezone
 
@@ -149,3 +150,44 @@ async def test_collect_recent_summary_ignores_open_tail(monkeypatch):
     assert interval_summary.gaps_total == 0
     assert interval_summary.requests == 0
     assert interval_summary.remaining_gaps == []
+
+
+async def test_collect_recent_summary_respects_concurrency(monkeypatch):
+    active: int = 0
+    max_active: int = 0
+
+    async def fake_fetch_existing(*args, **kwargs):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        try:
+            await asyncio.sleep(0.01)
+            return []
+        finally:
+            active -= 1
+
+    async def fake_fill_gap(*args, **kwargs):
+        return summary_collector.IntervalSummary(
+            gaps_total=1,
+            gaps_filled=1,
+            candles_written=1,
+            dropped_candles=0,
+            requests=1,
+            remaining_gaps=[],
+            fetch_ms=5.0,
+            db_write_ms=1.0,
+        )
+
+    monkeypatch.setattr(summary_collector, "_fetch_existing", fake_fetch_existing)
+    monkeypatch.setattr(summary_collector, "_compute_gaps", lambda *a, **k: [{"from": 0, "to": 0}])
+    monkeypatch.setattr(summary_collector, "_fill_gap", fake_fill_gap)
+
+    result = await summary_collector.collect_recent_summary(
+        "BTCUSDT",
+        days=1,
+        intervals=["1m", "3m", "5m", "15m", "1h"],
+        start_ms=1_700_000_000_000,
+    )
+
+    assert result.requests == len(result.intervals)
+    assert max_active <= summary_collector.MAX_CONCURRENCY

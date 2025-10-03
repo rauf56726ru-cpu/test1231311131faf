@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Mapping, MutableMapping
@@ -23,7 +24,11 @@ TIMEFRAME_TO_MINUTES: Dict[str, int] = {
 TIMEFRAME_TO_MS: Dict[str, int] = {tf: minutes * 60_000 for tf, minutes in TIMEFRAME_TO_MINUTES.items()}
 
 LOGGER = logging.getLogger(__name__)
-_FETCH_LOCK = asyncio.Lock()
+_CACHE: Dict[str, Dict[str, object]] = {}
+_CACHE_LOCK = asyncio.Lock()
+_CACHE_LOCKS: Dict[str, asyncio.Lock] = {}
+_CACHE_TTL_DEFAULT = 180.0
+_CACHE_TTL_1M = 45.0
 
 
 @dataclass(slots=True)
@@ -164,6 +169,15 @@ def _validate_series(series: List[Candle], tf: str) -> None:
         last_ts = candle.ts
 
 
+async def _get_lock_for_key(cache_key: str) -> asyncio.Lock:
+    async with _CACHE_LOCK:
+        lock = _CACHE_LOCKS.get(cache_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _CACHE_LOCKS[cache_key] = lock
+        return lock
+
+
 async def fetch_ohlcv(
     symbol: str,
     tf: str,
@@ -181,15 +195,35 @@ async def fetch_ohlcv(
         raise ValueError("symbol is required")
 
     cache_key = f"{symbol_clean}:{tf}:{lookback_days}"
-    if cache is not None:
-        cached = cache.get(cache_key)
-        if isinstance(cached, Mapping):
-            cached_list = cached.get("candles")
-            if isinstance(cached_list, list) and cached_list:
-                LOGGER.debug("Serving OHLCV for %s from cache", cache_key)
-                return dict(cached)
+    ttl = _CACHE_TTL_1M if tf == "1m" else _CACHE_TTL_DEFAULT
+    now = time.monotonic()
+    shared_cache: MutableMapping[str, Dict[str, object]]
+    if cache is None:
+        shared_cache = _CACHE
+    else:
+        shared_cache = cache
+    cached_payload = shared_cache.get(cache_key)
+    if isinstance(cached_payload, Mapping):
+        expires_at = cached_payload.get("_expires")
+        if isinstance(expires_at, (int, float)) and expires_at > now:
+            LOGGER.debug("Serving OHLCV for %s from cache", cache_key)
+            result = dict(cached_payload)
+            result.pop("_expires", None)
+            return result
+        if isinstance(expires_at, (int, float)) and expires_at <= now:
+            shared_cache.pop(cache_key, None)
 
-    async with _FETCH_LOCK:
+    lock = await _get_lock_for_key(cache_key)
+    async with lock:
+        cached_payload = shared_cache.get(cache_key)
+        if isinstance(cached_payload, Mapping):
+            expires_at = cached_payload.get("_expires")
+            if isinstance(expires_at, (int, float)) and expires_at > time.monotonic():
+                LOGGER.debug("Serving OHLCV for %s from cache after lock", cache_key)
+                result = dict(cached_payload)
+                result.pop("_expires", None)
+                return result
+
         base_candles = await _collect_1m_candles(symbol_clean, lookback_days)
         if tf == "1m":
             series = base_candles
@@ -203,8 +237,9 @@ async def fetch_ohlcv(
             "candles": [candle.to_wire() for candle in series],
             "fetched_at": datetime.now(timezone.utc).isoformat(),
         }
-        if cache is not None:
-            cache[cache_key] = payload
+        cache_entry = dict(payload)
+        cache_entry["_expires"] = time.monotonic() + ttl
+        shared_cache[cache_key] = cache_entry
         return payload
 
 
