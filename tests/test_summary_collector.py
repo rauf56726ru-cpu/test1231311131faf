@@ -149,3 +149,41 @@ async def test_collect_recent_summary_ignores_open_tail(monkeypatch):
     assert interval_summary.gaps_total == 0
     assert interval_summary.requests == 0
     assert interval_summary.remaining_gaps == []
+
+
+async def test_collect_recent_summary_reports_progress(monkeypatch):
+    symbol = "ADAUSDT"
+    interval = "1m"
+    repo = candles_repository.get_repository()
+    interval_ms = TIMEFRAME_TO_MS[interval]
+    start_ms = 1_702_000_000_000
+    start_ms = (start_ms // interval_ms) * interval_ms
+    end_ms = start_ms + interval_ms * 2
+
+    events: list[str] = []
+
+    async def fake_request(client, *, symbol, interval, start_ms, end_ms, limit, bucket):
+        rows = []
+        cursor = start_ms
+        while cursor <= end_ms - interval_ms:
+            rows.append([cursor, 100.0, 101.0, 99.0, 100.5, 1.0])
+            cursor += interval_ms
+        return rows
+
+    async def reporter(event: str, payload):
+        events.append(event)
+
+    monkeypatch.setattr(summary_collector, "_request_klines", fake_request)
+
+    await collect_recent_summary(
+        symbol,
+        days=1,
+        end_ms=end_ms,
+        intervals=[interval],
+        start_ms=start_ms,
+        progress=reporter,
+    )
+
+    assert "summary_collector:start" in events
+    assert any(event.startswith("summary_collector:gap") for event in events)
+    assert "summary_collector:finished" in events

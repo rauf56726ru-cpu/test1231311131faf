@@ -8,7 +8,8 @@ from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence,
 from datetime import datetime, timedelta, timezone
 from math import ceil
 
-from fastapi import Body, FastAPI, HTTPException, Query, Request, Response
+from fastapi import Body, FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -45,7 +46,9 @@ from ..services import (
     collect_last_session_detailed,
     SessionCollectionResult,
 )
+from ..services import tracing as tracing_utils
 from ..services.zones import Config as ZonesConfig, detect_zones
+from ..services.progress import ProgressReporter, emit_progress
 
 from ..services.book import fetch_orderbook
 from ..services.derivatives import fetch_derivatives
@@ -61,6 +64,7 @@ from ..version import APP_VERSION
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 LOGGER = logging.getLogger(__name__)
+TRACE_LOGGER = tracing_utils.LOGGER.getChild("api.inspection")
 CHECK_ALL_BUILD_TIMEOUT = 5.0
 
 
@@ -209,6 +213,156 @@ def _fallback_footprint(candles: Sequence[CandleIn]) -> List[Dict[str, object]]:
             "absorption": abs(delta) > 100,
         })
     return footprint
+
+
+async def _run_summary_workflow(
+    target_snapshot: Mapping[str, Any],
+    *,
+    days: int,
+    window_hours: int,
+    now_override: datetime | None,
+    branch_log: Dict[str, Any],
+    progress: ProgressReporter | None = None,
+) -> Tuple[Dict[str, Any] | None, Dict[str, Any] | None]:
+    symbol = target_snapshot.get("symbol") if isinstance(target_snapshot, Mapping) else None
+    if not symbol:
+        meta_block = target_snapshot.get("meta") if isinstance(target_snapshot, Mapping) else None
+        if isinstance(meta_block, Mapping):
+            symbol = meta_block.get("symbol")
+
+    collection_summary_payload: Dict[str, Any] | None = None
+    if isinstance(symbol, str) and symbol:
+        TRACE_LOGGER.debug(
+            "inspection.summary_collection:starting",
+            extra={**branch_log, "symbol": symbol, "days": days},
+        )
+        await emit_progress(
+            progress,
+            "inspection.summary_collection:starting",
+            symbol=symbol,
+            days=days,
+            window_hours=window_hours,
+        )
+        try:
+            summary_result = await collect_recent_summary(symbol, days=days, progress=progress)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            LOGGER.warning(
+                "inspection_check_all:summary_collection_failed",
+                extra={**branch_log, "symbol": symbol, "error": str(exc)},
+            )
+            TRACE_LOGGER.debug(
+                "inspection.summary_collection:failed",
+                extra={**branch_log, "symbol": symbol, "error": str(exc)},
+            )
+            await emit_progress(
+                progress,
+                "inspection.summary_collection:failed",
+                symbol=symbol,
+                error=str(exc),
+            )
+        else:
+            collection_summary_payload = summary_result.as_dict()
+            branch_log["summary_collection"] = {
+                "requests": summary_result.requests,
+                "candles_written": summary_result.candles_written,
+                "dropped_candles": summary_result.dropped_candles,
+            }
+            TRACE_LOGGER.debug(
+                "inspection.summary_collection:completed",
+                extra={
+                    **branch_log,
+                    "symbol": symbol,
+                    "requests": summary_result.requests,
+                    "candles_written": summary_result.candles_written,
+                    "dropped_candles": summary_result.dropped_candles,
+                },
+            )
+            await emit_progress(
+                progress,
+                "inspection.summary_collection:completed",
+                symbol=symbol,
+                requests=summary_result.requests,
+                candles_written=summary_result.candles_written,
+                dropped_candles=summary_result.dropped_candles,
+            )
+
+    TRACE_LOGGER.debug(
+        "inspection.summary_collection:building_payload",
+        extra={**branch_log, "has_summary": collection_summary_payload is not None},
+    )
+    await emit_progress(
+        progress,
+        "inspection.summary_collection:building_payload",
+        has_summary=collection_summary_payload is not None,
+        window_hours=window_hours,
+    )
+    payload = await build_check_all_datas_async(
+        target_snapshot,
+        now_utc=now_override,
+        window_hours=window_hours,
+        timeout=CHECK_ALL_BUILD_TIMEOUT,
+    )
+    TRACE_LOGGER.debug(
+        "inspection.summary_collection:payload_ready",
+        extra={
+            **branch_log,
+            "status": payload.get("status") if isinstance(payload, Mapping) else None,
+        },
+    )
+    await emit_progress(
+        progress,
+        "inspection.summary_collection:payload_ready",
+        status=payload.get("status") if isinstance(payload, Mapping) else None,
+    )
+    return payload, collection_summary_payload
+
+
+async def _run_session_workflow(
+    symbol: str,
+    *,
+    now_override: datetime | None,
+    progress: ProgressReporter | None = None,
+) -> SessionCollectionResult:
+    TRACE_LOGGER.debug(
+        "inspection.session_collection:starting",
+        extra={"symbol": symbol},
+    )
+    await emit_progress(
+        progress,
+        "inspection.session_collection:starting",
+        symbol=symbol,
+    )
+    try:
+        result = await collect_last_session_detailed(symbol, now_override, progress=progress)
+    except Exception as exc:
+        TRACE_LOGGER.debug(
+            "inspection.session_collection:failed",
+            extra={"symbol": symbol, "error": str(exc)},
+        )
+        await emit_progress(
+            progress,
+            "inspection.session_collection:failed",
+            symbol=symbol,
+            error=str(exc),
+        )
+        raise
+    result_payload = result.as_dict()
+    TRACE_LOGGER.debug(
+        "inspection.session_collection:completed",
+        extra={
+            "symbol": symbol,
+            "status": result_payload.get("status"),
+            "coverage_pct": result_payload.get("session", {}).get("coverage_pct"),
+        },
+    )
+    await emit_progress(
+        progress,
+        "inspection.session_collection:completed",
+        symbol=symbol,
+        status=result.status,
+        coverage_pct=result.coverage_pct,
+    )
+    return result
 
 
 def _fallback_cvd(footprint: Sequence[Mapping[str, object]]) -> List[Dict[str, object]]:
@@ -916,32 +1070,14 @@ async def inspection_check_all(
         window_hours = max(1, days * 24)
         branch_log = dict(log_extra)
         branch_log["window_hours"] = window_hours
-        symbol = target_snapshot.get("symbol") if isinstance(target_snapshot, Mapping) else None
-        if not symbol:
-            meta_block = target_snapshot.get("meta") if isinstance(target_snapshot, Mapping) else None
-            if isinstance(meta_block, Mapping):
-                symbol = meta_block.get("symbol")
         collection_summary_payload: Dict[str, Any] | None = None
-        if isinstance(symbol, str) and symbol:
-            try:
-                summary_result = await collect_recent_summary(symbol, days=days)
-                collection_summary_payload = summary_result.as_dict()
-                branch_log["summary_collection"] = {
-                    "requests": summary_result.requests,
-                    "candles_written": summary_result.candles_written,
-                    "dropped_candles": summary_result.dropped_candles,
-                }
-            except Exception as exc:  # pragma: no cover - defensive logging
-                LOGGER.warning(
-                    "inspection_check_all:summary_collection_failed",
-                    extra={**branch_log, "error": str(exc)},
-                )
         try:
-            payload = await build_check_all_datas_async(
+            payload, collection_summary_payload = await _run_summary_workflow(
                 target_snapshot,
-                now_utc=now_override,
+                days=days,
                 window_hours=window_hours,
-                timeout=CHECK_ALL_BUILD_TIMEOUT,
+                now_override=now_override,
+                branch_log=branch_log,
             )
         except DataQualityError as exc:
             LOGGER.warning(
@@ -989,7 +1125,10 @@ async def inspection_check_all(
         if not symbol:
             raise HTTPException(status_code=400, detail="Snapshot symbol missing")
         try:
-            session_result: SessionCollectionResult = await collect_last_session_detailed(symbol, now_override)
+            session_result: SessionCollectionResult = await _run_session_workflow(
+                symbol,
+                now_override=now_override,
+            )
         except Exception as exc:  # pragma: no cover - defensive logging
             LOGGER.exception(
                 "inspection_check_all:session_detailed_failed",
@@ -1108,6 +1247,284 @@ async def inspection_check_all(
     )
 
     return JSONResponse(payload)
+
+
+@app.websocket("/inspection/ws/progress")
+async def inspection_progress_ws(websocket: WebSocket) -> None:
+    await websocket.accept()
+
+    async def reporter(event: str, payload: Dict[str, Any]) -> None:
+        if websocket.client_state is not WebSocketState.CONNECTED:
+            return
+        message = {"type": "progress", "event": event, "data": payload}
+        try:
+            await websocket.send_json(message)
+        except (RuntimeError, WebSocketDisconnect):
+            pass
+
+    def _normalise_payload(value: Any) -> Dict[str, Any]:
+        if isinstance(value, Mapping):
+            return dict(value)
+        return {}
+
+    def _parse_mode(value: Any) -> str | None:
+        if isinstance(value, str):
+            candidate = value.strip().lower()
+            if candidate in {"summary", "session_detailed"}:
+                return candidate
+        return None
+
+    def _parse_summary_days(value: Any) -> int | None:
+        try:
+            candidate = int(value)
+        except (TypeError, ValueError):
+            return None
+        return candidate if candidate > 0 else None
+
+    def _parse_now(value: Any) -> datetime | None:
+        if isinstance(value, str) and value:
+            try:
+                parsed = datetime.fromisoformat(value)
+            except ValueError:
+                return None
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        return None
+
+    def _effective_summary_days(mode: str, override: int | None) -> int | None:
+        if mode != "summary":
+            return None
+        return override if override is not None else 3
+
+    mode_value = "summary"
+    summary_days_override: int | None = None
+    now_override: datetime | None = None
+
+    while True:
+        try:
+            incoming = await websocket.receive_json()
+        except WebSocketDisconnect:
+            return
+        except Exception:
+            await websocket.send_json({"type": "error", "message": "invalid_initial_payload"})
+            await websocket.close(code=1003)
+            return
+
+        message_type = incoming.get("type")
+        if message_type == "client_progress":
+            event_name = str(incoming.get("event") or "client.progress").strip() or "client.progress"
+            payload_dict = _normalise_payload(incoming.get("data"))
+            TRACE_LOGGER.debug(
+                "inspection.ws_client_progress",
+                extra={"event": event_name, "payload": payload_dict},
+            )
+            await reporter(
+                "inspection.ws:client_progress",
+                {"event": event_name, "payload": payload_dict},
+            )
+            continue
+        if message_type == "prepare":
+            mode_candidate = _parse_mode(incoming.get("mode"))
+            if mode_candidate is not None:
+                mode_value = mode_candidate
+            summary_candidate = _parse_summary_days(incoming.get("summary_days"))
+            if summary_candidate is not None:
+                summary_days_override = summary_candidate
+            now_candidate = _parse_now(incoming.get("now"))
+            if now_candidate is not None:
+                now_override = now_candidate
+            TRACE_LOGGER.debug(
+                "inspection.ws_prepare",
+                extra={
+                    "mode": mode_value,
+                    "summary_days": _effective_summary_days(mode_value, summary_days_override),
+                    "has_now_override": now_override is not None,
+                },
+            )
+            await reporter(
+                "inspection.ws:prepared",
+                {
+                    "mode": mode_value,
+                    "summary_days": _effective_summary_days(mode_value, summary_days_override),
+                    "has_now_override": now_override is not None,
+                },
+            )
+            continue
+        if message_type in {None, "start"}:
+            initial = incoming
+            break
+        await websocket.send_json({"type": "error", "message": "unsupported_message"})
+        await websocket.close(code=1003)
+        return
+
+    mode_candidate = _parse_mode(initial.get("mode"))
+    if mode_candidate is not None:
+        mode_value = mode_candidate
+    if mode_value not in {"summary", "session_detailed"}:
+        mode_value = "summary"
+
+    summary_candidate = _parse_summary_days(initial.get("summary_days"))
+    if summary_candidate is not None:
+        summary_days_override = summary_candidate
+
+    now_candidate = _parse_now(initial.get("now"))
+    if now_candidate is not None:
+        now_override = now_candidate
+
+    snapshot_id = initial.get("snapshot")
+    if not snapshot_id or not isinstance(snapshot_id, str):
+        await websocket.send_json({"type": "error", "message": "snapshot_id required"})
+        await websocket.close(code=1003)
+        return
+
+    target_snapshot = get_snapshot(snapshot_id)
+    if target_snapshot is None:
+        await websocket.send_json({"type": "error", "message": "snapshot not found"})
+        await websocket.close(code=1003)
+        return
+
+    await reporter(
+        "inspection.ws:start",
+        {
+            "mode": mode_value,
+            "snapshot": snapshot_id,
+            "summary_days": _effective_summary_days(mode_value, summary_days_override),
+            "has_now_override": now_override is not None,
+        },
+    )
+
+    collection_reference = now_override or datetime.now(timezone.utc)
+    log_extra: Dict[str, Any] = {
+        "snapshot_id": target_snapshot.get("id"),
+        "mode": mode_value,
+        "selection_start": None,
+        "selection_end": None,
+        "hours": None,
+        "has_now_override": now_override is not None,
+    }
+    LOGGER.info("inspection_check_all:start", extra=log_extra)
+
+    if mode_value == "summary":
+        days = summary_days_override if summary_days_override is not None else 3
+        window_hours = max(1, days * 24)
+        branch_log = dict(log_extra)
+        branch_log["window_hours"] = window_hours
+        branch_log["summary_days"] = days
+        collection_summary_payload: Dict[str, Any] | None = None
+        try:
+            payload, collection_summary_payload = await _run_summary_workflow(
+                target_snapshot,
+                days=days,
+                window_hours=window_hours,
+                now_override=now_override,
+                branch_log=branch_log,
+                progress=reporter,
+            )
+        except DataQualityError as exc:
+            LOGGER.warning(
+                "inspection_check_all:data_quality_error",
+                extra={**branch_log, "error": str(exc)},
+            )
+            await reporter(
+                "inspection.summary_collection:failed",
+                {"error": str(exc), "data_quality": exc.detail},
+            )
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "message": str(exc),
+                    "detail": exc.detail,
+                }
+            )
+            await websocket.close(code=1011)
+            return
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            LOGGER.exception(
+                "inspection_check_all:summary_failed",
+                extra={**branch_log, "error": str(exc)},
+            )
+            await reporter(
+                "inspection.summary_collection:failed",
+                {"error": str(exc)},
+            )
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "message": "summary collection failed",
+                    "detail": str(exc),
+                }
+            )
+            await websocket.close(code=1011)
+            return
+        if payload is None:
+            LOGGER.info("inspection_check_all:finished", extra={**branch_log, "status": None})
+            await reporter("inspection.summary_collection:finished", {"status": None})
+            await websocket.send_json({"type": "result", "mode": mode_value, "payload": None})
+            await websocket.close(code=1000)
+            return
+        payload = _prepare_summary_payload(dict(payload))
+        if collection_summary_payload:
+            meta_block = payload.get("meta")
+            if isinstance(meta_block, MutableMapping):
+                meta_block["summary_collection"] = collection_summary_payload
+        status_value = payload.get("status") if isinstance(payload, Mapping) else None
+        LOGGER.info(
+            "inspection_check_all:finished",
+            extra={**branch_log, "status": status_value},
+        )
+        await reporter(
+            "inspection.summary_collection:finished",
+            {"status": status_value, "window_hours": window_hours},
+        )
+        set_last_collection_time(collection_reference)
+        await websocket.send_json({"type": "result", "mode": mode_value, "payload": payload})
+        await websocket.close(code=1000)
+        return
+
+    symbol = target_snapshot.get("symbol") if isinstance(target_snapshot, Mapping) else None
+    if not symbol:
+        meta_block = target_snapshot.get("meta") if isinstance(target_snapshot, Mapping) else None
+        if isinstance(meta_block, Mapping):
+            symbol = meta_block.get("symbol")
+    if not symbol:
+        await websocket.send_json({"type": "error", "message": "snapshot symbol missing"})
+        await websocket.close(code=1003)
+        return
+    try:
+        session_result = await _run_session_workflow(
+            symbol,
+            now_override=now_override,
+            progress=reporter,
+        )
+    except Exception as exc:  # pragma: no cover - defensive logging
+        LOGGER.exception(
+            "inspection_check_all:session_detailed_failed",
+            extra={**log_extra, "error": str(exc)},
+        )
+        await websocket.send_json(
+            {
+                "type": "error",
+                "message": "session collection failed",
+                "detail": str(exc),
+            }
+        )
+        await websocket.close(code=1011)
+        return
+    payload = session_result.as_dict()
+    LOGGER.info(
+        "inspection_check_all:finished",
+        extra={**log_extra, "mode": mode_value, "status": payload.get("status")},
+    )
+    await reporter(
+        "inspection.session_collection:finished",
+        {
+            "status": payload.get("status"),
+            "coverage_pct": payload.get("session", {}).get("coverage_pct"),
+        },
+    )
+    await websocket.send_json({"type": "result", "mode": mode_value, "payload": payload})
+    await websocket.close(code=1000)
 
 
 @app.get("/presets")

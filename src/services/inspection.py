@@ -1956,6 +1956,19 @@ def render_inspection_page(
       border-color: rgba(250, 204, 21, 0.6);
       background: rgba(113, 63, 18, 0.35);
     }
+    .progress-log {
+      font-family: "JetBrains Mono", "SFMono-Regular", ui-monospace, monospace;
+      background: rgba(15, 23, 42, 0.68);
+      border: 1px solid rgba(148, 163, 184, 0.25);
+      border-radius: 12px;
+      padding: 0.75rem 1rem;
+      max-height: 220px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 0.7rem;
+      line-height: 1.45;
+    }
     .preset-controls {
       margin-top: 0.8rem;
       margin-bottom: 0.8rem;
@@ -2515,6 +2528,7 @@ def render_inspection_page(
     const sessionDetailedButton = document.getElementById("btn_collect_last_session_detailed");
     const topupButton = document.getElementById("collect-topup");
     const collectSelectionButton = document.getElementById("collect-selection");
+    const progressLogEl = document.getElementById("inspection-progress-log");
     const checkAllHours = document.getElementById("checkall-hours");
     const snapshotMeta = document.getElementById("snapshot-meta");
     const chartContainer = document.getElementById("inspection-chart");
@@ -2629,6 +2643,7 @@ def render_inspection_page(
       liveFrames: {},
       liveMeta: null,
       liveMismatch: false,
+      progressEvents: [],
     };
 
     const AUTO_PRESET_SYMBOLS = new Set(["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
@@ -3095,6 +3110,38 @@ def render_inspection_page(
       statusEl.hidden = !message;
     }
 
+    function resetProgressLog() {
+      if (!state) return;
+      state.progressEvents = [];
+      if (progressLogEl) {
+        progressLogEl.textContent = "";
+      }
+    }
+
+    function appendProgress(eventName, data = {}) {
+      if (!state) return;
+      if (!Array.isArray(state.progressEvents)) {
+        state.progressEvents = [];
+      }
+      const timestamp = new Date().toISOString();
+      const entry = { ts: timestamp, event: eventName, data };
+      state.progressEvents.push(entry);
+      if (state.progressEvents.length > 200) {
+        state.progressEvents.shift();
+      }
+      if (progressLogEl) {
+        const clock = timestamp.substring(11, 19);
+        const details = data && Object.keys(data).length ? ` ${JSON.stringify(data)}` : "";
+        const line = `[${clock}] ${eventName}${details}`;
+        if (progressLogEl.textContent) {
+          progressLogEl.textContent += `\n${line}`;
+        } else {
+          progressLogEl.textContent = line;
+        }
+        progressLogEl.scrollTop = progressLogEl.scrollHeight;
+      }
+    }
+
     function updateSelectionLabel() {
       const start = state.selection && state.selection.start;
       const end = state.selection && state.selection.end;
@@ -3353,58 +3400,300 @@ def render_inspection_page(
         ? Math.max(1, Math.floor(lookbackDaysRaw))
         : 3;
       const mode = typeof options?.mode === "string" ? options.mode : "summary";
+      const progressFn = typeof options?.progress === "function" ? options.progress : null;
+      const notifyProgress = (eventName, data = {}) => {
+        if (!progressFn) return;
+        try {
+          const result = progressFn(eventName, data);
+          if (result && typeof result.then === "function") {
+            result.catch((error) => console.warn("progress callback failed", error));
+          }
+        } catch (error) {
+          console.warn("progress callback failed", error);
+        }
+      };
+      const measureNow = () =>
+        typeof performance !== "undefined" && typeof performance.now === "function"
+          ? performance.now()
+          : Date.now();
+
       const symbol = activeSymbol();
       if (!symbol) {
         throw new Error("live-snapshot-symbol-missing");
       }
-      const liveMeta = resolveLiveMetaSnapshot();
-      const endMs = resolveLiveRangeEndMs(liveMeta);
-      const lookbackMs = lookbackDays * 24 * 60 * 60 * 1000;
-      const startMs = Math.max(0, Math.floor(endMs - lookbackMs));
-      const rawCandles = await fetchCandles(symbol, "1m", startMs, endMs, { limit: 1500 });
-      const candles = normaliseSnapshotCandles(rawCandles);
-      if (!candles.length) {
-        throw new Error("live-snapshot-empty");
-      }
-      const frames = { "1m": { tf: "1m", candles } };
-      const metaBlock = {
-        source: {
-          kind: "live-store",
+      try {
+        const liveMeta = resolveLiveMetaSnapshot();
+        const endMs = resolveLiveRangeEndMs(liveMeta);
+        const lookbackMs = lookbackDays * 24 * 60 * 60 * 1000;
+        const startMs = Math.max(0, Math.floor(endMs - lookbackMs));
+
+        notifyProgress("client.capture_live:preflight", {
           mode,
+          symbol,
+          start_ms: startMs,
+          end_ms: endMs,
           lookback_days: lookbackDays,
-          captured_at: new Date().toISOString(),
-        },
-        requested: {
-          frames: Object.keys(frames),
-          lookback_days: lookbackDays,
-        },
-      };
-      if (liveMeta) {
-        const livePayload = {
-          last_price: Number.isFinite(liveMeta.last_price) ? Number(liveMeta.last_price) : null,
-          last_tf: liveMeta.last_tf || "1m",
-          last_ts_ms: Number.isFinite(liveMeta.last_ts_ms) ? Number(liveMeta.last_ts_ms) : null,
-          age_sec: Number.isFinite(liveMeta.age_sec) ? Number(liveMeta.age_sec) : null,
-          stale: Boolean(liveMeta.stale),
-          mismatch: Boolean(liveMeta.mismatch),
+        });
+
+        const fetchStarted = measureNow();
+        notifyProgress("client.capture_live:fetch_start", {
+          symbol,
+          start_ms: startMs,
+          end_ms: endMs,
+          limit: 1500,
+        });
+        let rawCandles;
+        try {
+          rawCandles = await fetchCandles(symbol, "1m", startMs, endMs, { limit: 1500 });
+        } catch (error) {
+          notifyProgress("client.capture_live:fetch_error", {
+            message: error?.message || String(error),
+          });
+          throw error;
+        }
+        const fetchDuration = Math.round(measureNow() - fetchStarted);
+        const rawCount = Array.isArray(rawCandles) ? rawCandles.length : 0;
+        notifyProgress("client.capture_live:fetched", {
+          candles: rawCount,
+          duration_ms: fetchDuration,
+        });
+
+        const candles = normaliseSnapshotCandles(rawCandles);
+        if (!candles.length) {
+          notifyProgress("client.capture_live:empty", { raw_candles: rawCount });
+          throw new Error("live-snapshot-empty");
+        }
+        notifyProgress("client.capture_live:normalised", {
+          candles: candles.length,
+          removed: Math.max(0, rawCount - candles.length),
+        });
+
+        const frames = { "1m": { tf: "1m", candles } };
+        const metaBlock = {
+          source: {
+            kind: "live-store",
+            mode,
+            lookback_days: lookbackDays,
+            captured_at: new Date().toISOString(),
+          },
+          requested: {
+            frames: Object.keys(frames),
+            lookback_days: lookbackDays,
+          },
         };
-        metaBlock.live = livePayload;
-        metaBlock.stream = livePayload;
-        metaBlock.live_price = livePayload;
+        if (liveMeta) {
+          const livePayload = {
+            last_price: Number.isFinite(liveMeta.last_price) ? Number(liveMeta.last_price) : null,
+            last_tf: liveMeta.last_tf || "1m",
+            last_ts_ms: Number.isFinite(liveMeta.last_ts_ms) ? Number(liveMeta.last_ts_ms) : null,
+            age_sec: Number.isFinite(liveMeta.age_sec) ? Number(liveMeta.age_sec) : null,
+            stale: Boolean(liveMeta.stale),
+            mismatch: Boolean(liveMeta.mismatch),
+          };
+          metaBlock.live = livePayload;
+          metaBlock.stream = livePayload;
+          metaBlock.live_price = livePayload;
+        }
+        const payload = {
+          symbol,
+          tf: "1m",
+          candles,
+          frames,
+          meta: metaBlock,
+          lookback_days: lookbackDays,
+        };
+
+        notifyProgress("client.capture_live:registering", {
+          candles: candles.length,
+        });
+        const registerStarted = measureNow();
+        const result = await postSnapshot(payload);
+        const registerDuration = Math.round(measureNow() - registerStarted);
+        if (!result || !result.snapshot_id) {
+          notifyProgress("client.capture_live:register_error", {
+            duration_ms: registerDuration,
+          });
+          throw new Error("live-snapshot-registration-failed");
+        }
+        notifyProgress("client.capture_live:registered", {
+          snapshot_id: result.snapshot_id,
+          duration_ms: registerDuration,
+        });
+        return { snapshotId: result.snapshot_id, payload };
+      } catch (error) {
+        notifyProgress("client.capture_live:error", {
+          message: error?.message || String(error),
+        });
+        throw error;
       }
-      const payload = {
-        symbol,
-        tf: "1m",
-        candles,
-        frames,
-        meta: metaBlock,
-        lookback_days: lookbackDays,
-      };
-      const result = await postSnapshot(payload);
-      if (!result || !result.snapshot_id) {
-        throw new Error("live-snapshot-registration-failed");
-      }
-      return { snapshotId: result.snapshot_id, payload };
+    }
+
+    function websocketUrl(path = "") {
+      const scheme = window.location.protocol === "https:" ? "wss" : "ws";
+      const normalisedPath = path.startsWith("/") ? path : `/${path}`;
+      return `${scheme}://${window.location.host}${normalisedPath}`;
+    }
+
+    function openCollectionChannel({ mode, summaryDays }) {
+      return new Promise((resolve, reject) => {
+        const url = websocketUrl("/inspection/ws/progress");
+        appendProgress("client.connecting", { mode, url });
+        const socket = new WebSocket(url);
+        let ready = false;
+        let closedByClient = false;
+        let started = false;
+        let startResolver = null;
+        let startRejecter = null;
+        let startSettled = false;
+
+        const settleStartSuccess = (value) => {
+          if (startResolver) {
+            startResolver(value);
+          }
+          startResolver = null;
+          startRejecter = null;
+          startSettled = true;
+        };
+
+        const settleStartFailure = (error) => {
+          if (startRejecter) {
+            startRejecter(error);
+          }
+          startResolver = null;
+          startRejecter = null;
+          startSettled = true;
+        };
+
+        const channel = {
+          sendProgress(eventName, data = {}) {
+            if (!eventName || socket.readyState !== WebSocket.OPEN) {
+              return;
+            }
+            const payload = {
+              type: "client_progress",
+              event: String(eventName),
+              data: data && typeof data === "object" ? data : { value: data },
+            };
+            try {
+              socket.send(JSON.stringify(payload));
+            } catch (error) {
+              console.warn("Не удалось отправить клиентский прогресс", error);
+            }
+          },
+          start({ snapshotId, summaryDays: overrideDays } = {}) {
+            if (started) {
+              throw new Error("collection_already_started");
+            }
+            if (!snapshotId) {
+              throw new Error("snapshot_required");
+            }
+            if (socket.readyState !== WebSocket.OPEN) {
+              throw new Error("ws_not_ready");
+            }
+            started = true;
+            startSettled = false;
+            const message = {
+              type: "start",
+              mode,
+              snapshot: snapshotId,
+            };
+            const summaryValue = Number.isFinite(overrideDays)
+              ? Number(overrideDays)
+              : Number.isFinite(summaryDays)
+              ? Number(summaryDays)
+              : null;
+            if (mode === "summary" && Number.isFinite(summaryValue)) {
+              message.summary_days = Number(summaryValue);
+            }
+            socket.send(JSON.stringify(message));
+            return new Promise((resolveStart, rejectStart) => {
+              startResolver = resolveStart;
+              startRejecter = rejectStart;
+            });
+          },
+          close(code = 1000) {
+            closedByClient = true;
+            try {
+              socket.close(code);
+            } catch (closeError) {
+              console.debug("ws close error", closeError);
+            }
+          },
+        };
+
+        socket.addEventListener("open", () => {
+          ready = true;
+          appendProgress("client.open", { mode });
+          const payload = { type: "prepare", mode };
+          if (mode === "summary" && Number.isFinite(summaryDays)) {
+            payload.summary_days = Number(summaryDays);
+          }
+          socket.send(JSON.stringify(payload));
+          resolve(channel);
+        });
+
+        socket.addEventListener("message", (event) => {
+          let parsed;
+          try {
+            parsed = JSON.parse(event.data);
+          } catch (parseError) {
+            appendProgress("client.message_parse_error", { raw: String(event.data).slice(0, 200) });
+            return;
+          }
+          if (parsed.type === "progress") {
+            appendProgress(parsed.event || "progress", parsed.data || {});
+            return;
+          }
+          if (parsed.type === "ack") {
+            appendProgress(parsed.event || "ack", parsed.data || {});
+            return;
+          }
+          if (parsed.type === "result") {
+            appendProgress("client.result", { mode: parsed.mode || mode });
+            settleStartSuccess(parsed.payload);
+            return;
+          }
+          if (parsed.type === "error") {
+            appendProgress("client.error", { message: parsed.message, detail: parsed.detail });
+            const error = new Error(parsed.message || "ws-error");
+            if (parsed.detail !== undefined) {
+              error.detail = parsed.detail;
+            }
+            if (!started) {
+              reject(error);
+            } else {
+              settleStartFailure(error);
+            }
+            return;
+          }
+          appendProgress("client.message", parsed);
+        });
+
+        socket.addEventListener("error", () => {
+          appendProgress("client.socket_error");
+          const error = new Error("ws-error");
+          if (!ready) {
+            reject(error);
+          } else if (started && !startSettled) {
+            settleStartFailure(error);
+          }
+        });
+
+        socket.addEventListener("close", (event) => {
+          appendProgress("client.close", { code: event.code, reason: event.reason || "" });
+          if (closedByClient) {
+            return;
+          }
+          const error = new Error(`ws-closed-${event.code}`);
+          if (!ready) {
+            reject(error);
+            return;
+          }
+          if (started && !startSettled) {
+            settleStartFailure(error);
+          }
+        });
+      });
     }
 
     async function requestSummaryData() {
@@ -3413,10 +3702,35 @@ def render_inspection_page(
       }
 
       let createdSnapshotId = null;
+      let channel = null;
+
+      const closeChannel = (code = 1000) => {
+        if (!channel) return;
+        try {
+          channel.close(code);
+        } catch (error) {
+          console.debug("ws close error", error);
+        }
+        channel = null;
+      };
 
       try {
         updateStatus("Собираем лайв-данные за последние 3 дня...", "info");
-        const { snapshotId } = await captureLiveSnapshot({ lookbackDays: 3, mode: "summary" });
+        resetProgressLog();
+        channel = await openCollectionChannel({ mode: "summary", summaryDays: 3 });
+        const report = (eventName, data = {}) => {
+          appendProgress(eventName, data);
+          if (channel) {
+            channel.sendProgress(eventName, data);
+          }
+        };
+        report("client.flow:channel_ready", { mode: "summary" });
+        report("client.flow:capture_snapshot", { mode: "summary" });
+        const { snapshotId } = await captureLiveSnapshot({
+          lookbackDays: 3,
+          mode: "summary",
+          progress: report,
+        });
         createdSnapshotId = snapshotId;
         state.snapshotId = snapshotId;
         updateCheckAllState();
@@ -3426,33 +3740,32 @@ def render_inspection_page(
         if (snapshotSelect) {
           snapshotSelect.value = snapshotId;
         }
-        const url = new URL("/inspection/check-all", window.location.origin);
-        url.searchParams.set("snapshot", snapshotId);
-        url.searchParams.set("mode", "summary");
-        url.searchParams.set("summary_days", "3");
-        const response = await fetch(url.toString(), {
-          headers: { Accept: "application/json" },
-          cache: "no-store",
-        });
-        if (response.status === 204) {
+        report("client.flow:server_start", { snapshot: snapshotId, summary_days: 3 });
+        const payload = await channel.start({ snapshotId, summaryDays: 3 });
+        if (!payload) {
           state.checkAll = null;
           setJson(checkAllPre, null);
           updateStatus("Не удалось собрать 3-дневный контекст", "warning");
+          report("client.flow:server_empty", { snapshot: snapshotId });
           return;
         }
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-        const payload = await response.json();
         state.checkAll = payload;
         setJson(checkAllPre, payload);
         updateStatus("3-дневный контекст готов", "success");
+        report("client.flow:completed", { status: payload?.status ?? null });
       } catch (error) {
         console.error(error);
+        if (channel) {
+          channel.sendProgress("client.flow:error", {
+            message: error?.message || String(error),
+          });
+        }
         state.checkAll = null;
         setJson(checkAllPre, null);
-        updateStatus("Ошибка при сборе 3-дневного контекста", "error");
+        const detail = error && typeof error.detail !== "undefined" ? `: ${JSON.stringify(error.detail)}` : "";
+        updateStatus(`Ошибка при сборе 3-дневного контекста${detail}`, "error");
       } finally {
+        closeChannel();
         if (summaryButton) {
           summaryButton.disabled = false;
         }
@@ -3471,10 +3784,35 @@ def render_inspection_page(
       }
 
       let createdSnapshotId = null;
+      let channel = null;
+
+      const closeChannel = (code = 1000) => {
+        if (!channel) return;
+        try {
+          channel.close(code);
+        } catch (error) {
+          console.debug("ws close error", error);
+        }
+        channel = null;
+      };
 
       try {
         updateStatus("Собираем подробные данные по последней сессии...", "info");
-        const { snapshotId } = await captureLiveSnapshot({ lookbackDays: 1, mode: "session_detailed" });
+        resetProgressLog();
+        channel = await openCollectionChannel({ mode: "session_detailed" });
+        const report = (eventName, data = {}) => {
+          appendProgress(eventName, data);
+          if (channel) {
+            channel.sendProgress(eventName, data);
+          }
+        };
+        report("client.flow:channel_ready", { mode: "session_detailed" });
+        report("client.flow:capture_snapshot", { mode: "session_detailed" });
+        const { snapshotId } = await captureLiveSnapshot({
+          lookbackDays: 1,
+          mode: "session_detailed",
+          progress: report,
+        });
         createdSnapshotId = snapshotId;
         state.snapshotId = snapshotId;
         updateCheckAllState();
@@ -3484,32 +3822,32 @@ def render_inspection_page(
         if (snapshotSelect) {
           snapshotSelect.value = snapshotId;
         }
-        const url = new URL("/inspection/check-all", window.location.origin);
-        url.searchParams.set("snapshot", snapshotId);
-        url.searchParams.set("mode", "session_detailed");
-        const response = await fetch(url.toString(), {
-          headers: { Accept: "application/json" },
-          cache: "no-store",
-        });
-        if (response.status === 204) {
+        report("client.flow:server_start", { snapshot: snapshotId, mode: "session_detailed" });
+        const payload = await channel.start({ snapshotId });
+        if (!payload) {
           state.checkAll = null;
           setJson(checkAllPre, null);
           updateStatus("Не удалось собрать данные по последней сессии", "warning");
+          report("client.flow:server_empty", { snapshot: snapshotId });
           return;
         }
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-        const payload = await response.json();
         state.checkAll = payload;
         setJson(checkAllPre, payload);
         updateStatus("Сессионный отчёт готов", "success");
+        report("client.flow:completed", { status: payload?.status ?? null });
       } catch (error) {
         console.error(error);
+        if (channel) {
+          channel.sendProgress("client.flow:error", {
+            message: error?.message || String(error),
+          });
+        }
         state.checkAll = null;
         setJson(checkAllPre, null);
-        updateStatus("Ошибка при сборе данных по последней сессии", "error");
+        const detail = error && typeof error.detail !== "undefined" ? `: ${JSON.stringify(error.detail)}` : "";
+        updateStatus(`Ошибка при сборе данных по последней сессии${detail}`, "error");
       } finally {
+        closeChannel();
         if (sessionDetailedButton) {
           sessionDetailedButton.disabled = false;
         }
@@ -3531,6 +3869,8 @@ def render_inspection_page(
 
       try {
         updateStatus("Дособираем свежие лайв-данные...", "info");
+        resetProgressLog();
+        appendProgress("client.capture_snapshot", { mode: "topup" });
         const { snapshotId } = await captureLiveSnapshot({ lookbackDays: 1, mode: "topup" });
         createdSnapshotId = snapshotId;
         state.snapshotId = snapshotId;
@@ -3541,6 +3881,7 @@ def render_inspection_page(
         if (snapshotSelect) {
           snapshotSelect.value = snapshotId;
         }
+        appendProgress("client.http_request", { mode: "topup" });
         const url = new URL("/inspection/check-all", window.location.origin);
         url.searchParams.set("snapshot", snapshotId);
         url.searchParams.set("mode", "topup");
@@ -4362,6 +4703,7 @@ def render_inspection_page(
               <button id=\"collect-selection\" class=\"secondary\" type=\"button\" disabled>Собрать информацию за выбранный период</button>
             </div>
             <div class=\"status-banner\" id=\"inspection-status\" hidden data-tone=\"info\"></div>
+            <div class=\"progress-log\" id=\"inspection-progress-log\" aria-live=\"polite\"></div>
             <div class=\"preset-chip-bar\">
               <span id=\"preset-chip\" class=\"preset-chip\" hidden></span>
             </div>

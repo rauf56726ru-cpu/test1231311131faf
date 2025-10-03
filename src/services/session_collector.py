@@ -3,7 +3,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, time as dtime, timedelta, timezone
-from typing import Any, Dict, Mapping, MutableMapping
+from typing import Any, Dict, Mapping, MutableMapping, Optional
+
+from . import tracing
+from .progress import ProgressReporter, emit_progress
+
+TRACE_LOGGER = tracing.LOGGER.getChild("session_collector")
 
 try:
     from zoneinfo import ZoneInfo
@@ -152,7 +157,11 @@ def _resolve_session_window(now_utc: datetime) -> SessionWindow:
     )
 
 
-async def collect_last_session_detailed(symbol: str, now: datetime | None = None) -> SessionCollectionResult:
+async def collect_last_session_detailed(
+    symbol: str,
+    now: datetime | None = None,
+    progress: Optional[ProgressReporter] = None,
+) -> SessionCollectionResult:
     """Collect detailed data for the latest trading session.
 
     Current implementation returns a placeholder payload marking the session as insufficient
@@ -160,7 +169,39 @@ async def collect_last_session_detailed(symbol: str, now: datetime | None = None
     """
 
     now_dt = now.astimezone(timezone.utc) if isinstance(now, datetime) else datetime.now(timezone.utc)
+    TRACE_LOGGER.debug(
+        "session_collector:start",
+        extra={
+            "symbol": symbol,
+            "requested_at": now_dt.isoformat(),
+        },
+    )
+    await emit_progress(
+        progress,
+        "session_collector:start",
+        symbol=symbol,
+        requested_at=now_dt.isoformat(),
+    )
     session_window = _resolve_session_window(now_dt)
+    TRACE_LOGGER.debug(
+        "session_collector:resolved_window",
+        extra={
+            "symbol": symbol,
+            "session": session_window.name,
+            "open_utc": session_window.open_utc.isoformat(),
+            "close_utc": session_window.close_utc.isoformat(),
+            "active": session_window.is_active,
+        },
+    )
+    await emit_progress(
+        progress,
+        "session_collector:resolved_window",
+        symbol=symbol,
+        session=session_window.name,
+        open_utc=session_window.open_utc.isoformat(),
+        close_utc=session_window.close_utc.isoformat(),
+        active=session_window.is_active,
+    )
     missing_fields = (
         "ohlcv.coverage",
         "orderflow.coverage",
@@ -168,11 +209,31 @@ async def collect_last_session_detailed(symbol: str, now: datetime | None = None
         "orderflow.cvd",
         "orderflow.footprint",
     )
-    return SessionCollectionResult(
+    result = SessionCollectionResult(
         symbol=symbol,
         status="insufficient_data",
         session=session_window,
         coverage_pct=0.0,
         missing_fields=missing_fields,
     )
+
+    TRACE_LOGGER.debug(
+        "session_collector:finished",
+        extra={
+            "symbol": symbol,
+            "status": result.status,
+            "coverage_pct": result.coverage_pct,
+            "missing_fields": list(result.missing_fields),
+        },
+    )
+    await emit_progress(
+        progress,
+        "session_collector:finished",
+        symbol=symbol,
+        status=result.status,
+        coverage_pct=result.coverage_pct,
+        missing_fields=list(result.missing_fields),
+    )
+
+    return result
 
