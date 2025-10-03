@@ -373,14 +373,33 @@ async def collect_recent_summary(
                 continue
             first_expected = _align_to_interval(start_ms, interval_ms)
             last_expected = _align_to_interval(now_ms, interval_ms)
+            if end_ms is None:
+                # Live invocations should not expect the still-forming candle at the
+                # window tail.  Skipping that bar prevents an endless loop where
+                # the collector keeps re-requesting the most recent minute even
+                # though the exchange has not closed it yet.
+                tail_open = now_ms - last_expected < interval_ms
+                last_closed = last_expected - interval_ms if tail_open else last_expected
+            else:
+                last_closed = last_expected
+            if last_closed < first_expected:
+                summaries[interval] = IntervalSummary(
+                    gaps_total=0,
+                    gaps_filled=0,
+                    candles_written=0,
+                    dropped_candles=0,
+                    requests=0,
+                    remaining_gaps=[],
+                )
+                continue
             existing = await _fetch_existing(
                 repo,
                 symbol=symbol,
                 interval=interval,
                 start_ms=first_expected,
-                end_ms=last_expected,
+                end_ms=last_closed,
             )
-            gaps = _compute_gaps(first_expected, last_expected, interval_ms, existing)
+            gaps = _compute_gaps(first_expected, last_closed, interval_ms, existing)
             if not gaps:
                 summaries[interval] = IntervalSummary(
                     gaps_total=0,
@@ -413,9 +432,9 @@ async def collect_recent_summary(
                 symbol=symbol,
                 interval=interval,
                 start_ms=first_expected,
-                end_ms=last_expected,
+                end_ms=last_closed,
             )
-            remaining = _compute_gaps(first_expected, last_expected, interval_ms, refreshed)
+            remaining = _compute_gaps(first_expected, last_closed, interval_ms, refreshed)
             summaries[interval] = IntervalSummary(
                 gaps_total=len(gaps),
                 gaps_filled=sum(1 for item in gap_summaries if item.candles_written > 0),
