@@ -43,6 +43,7 @@ from .shared_candles_store import (
     get_shared_candles,
     merge_shared_candles,
 )
+from .summary_collector import collect_recent_summary, CollectionSummary
 from .ohlc import (
     TIMEFRAME_WINDOWS,
     fetch_ohlcv,
@@ -102,4 +103,6 @@ __all__ = [
     "clear_shared_candles",
     "enrich_inspection_snapshot",
     "apply_enrichment_to_payload",
+    "collect_recent_summary",
+    "CollectionSummary",
 ]

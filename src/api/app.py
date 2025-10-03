@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 from datetime import datetime, timedelta, timezone
 from math import ceil
@@ -41,6 +41,7 @@ from ..services import (
     enrich_inspection_snapshot,
     build_check_all_datas_async,
     build_inspection_error_payload,
+    collect_recent_summary,
 )
 from ..services.zones import Config as ZonesConfig, detect_zones
 
@@ -913,6 +914,26 @@ async def inspection_check_all(
         window_hours = max(1, days * 24)
         branch_log = dict(log_extra)
         branch_log["window_hours"] = window_hours
+        symbol = target_snapshot.get("symbol") if isinstance(target_snapshot, Mapping) else None
+        if not symbol:
+            meta_block = target_snapshot.get("meta") if isinstance(target_snapshot, Mapping) else None
+            if isinstance(meta_block, Mapping):
+                symbol = meta_block.get("symbol")
+        collection_summary_payload: Dict[str, Any] | None = None
+        if isinstance(symbol, str) and symbol:
+            try:
+                summary_result = await collect_recent_summary(symbol, days=days)
+                collection_summary_payload = summary_result.as_dict()
+                branch_log["summary_collection"] = {
+                    "requests": summary_result.requests,
+                    "candles_written": summary_result.candles_written,
+                    "dropped_candles": summary_result.dropped_candles,
+                }
+            except Exception as exc:  # pragma: no cover - defensive logging
+                LOGGER.warning(
+                    "inspection_check_all:summary_collection_failed",
+                    extra={**branch_log, "error": str(exc)},
+                )
         try:
             payload = await build_check_all_datas_async(
                 target_snapshot,
@@ -945,6 +966,10 @@ async def inspection_check_all(
             LOGGER.info("inspection_check_all:finished", extra={**branch_log, "status": None})
             return Response(status_code=204)
         payload = _prepare_summary_payload(dict(payload))
+        if collection_summary_payload:
+            meta_block = payload.get("meta")
+            if isinstance(meta_block, MutableMapping):
+                meta_block["summary_collection"] = collection_summary_payload
         status_value = payload.get("status") if isinstance(payload, Mapping) else None
         LOGGER.info(
             "inspection_check_all:finished",
