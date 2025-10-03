@@ -36,6 +36,16 @@ def extract_sigma_map(payload: dict[str, object]) -> dict[tuple[str, str], dict[
     }
 
 
+def assert_clean_meta(payload: dict[str, object], *, sessions_empty: bool = False) -> None:
+    meta = payload.get("meta")
+    assert isinstance(meta, dict)
+    assert meta.get("invalid_ts_count", 0) == 0
+    assert meta.get("invalid_ohlc_count", 0) == 0
+    assert meta.get("sessions_empty") == sessions_empty
+    assert meta.get("sanitized") is True
+    assert meta.get("output_count", 0) >= 0
+
+
 def test_constant_price_vwap() -> None:
     base = datetime(2024, 1, 1, tzinfo=timezone.utc)
     candles = [
@@ -49,6 +59,7 @@ def test_constant_price_vwap() -> None:
 
     result = compute_session_vwaps("btcusdt", candles)
     mapping = extract_map(result)
+    assert_clean_meta(result)
 
     assert mapping[("2024-01-01", "daily")] == pytest.approx(100.0)
     assert mapping[("2024-01-01", "asia")] == pytest.approx(100.0)
@@ -67,6 +78,7 @@ def test_session_boundaries_inclusive_start_exclusive_end() -> None:
 
     result = compute_session_vwaps("ethusdt", candles)
     mapping = extract_map(result)
+    assert_clean_meta(result)
 
     assert ("2024-01-01", "london") in mapping
     assert ("2024-01-01", "ny") in mapping
@@ -87,6 +99,7 @@ def test_zero_volume_skips_sessions() -> None:
 
     result = compute_session_vwaps("xrpusdt", candles)
     assert result["vwap"] == []
+    assert_clean_meta(result, sessions_empty=False)
 
 
 def test_lookback_respected(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -101,6 +114,7 @@ def test_lookback_respected(monkeypatch: pytest.MonkeyPatch) -> None:
     dates = {entry["date"] for entry in result["vwap"]}
     assert "2024-01-01" not in dates
     assert min(dates) >= "2024-01-04"
+    assert_clean_meta(result)
 
 
 def test_sigma_channels_structure_and_values() -> None:
@@ -115,6 +129,7 @@ def test_sigma_channels_structure_and_values() -> None:
     result = compute_session_vwaps("ltcusdt", candles)
     vwap_map = extract_map(result)
     sigma_map = extract_sigma_map(result)
+    assert_clean_meta(result)
 
     assert sigma_map
     for key, sigma_entry in sigma_map.items():

@@ -53,6 +53,10 @@ def test_session_extrema_match_high_low() -> None:
     ]
 
     result = compute_session_vwaps("btcusdt", candles)
+    meta = result.get("meta")
+    assert isinstance(meta, dict)
+    assert meta.get("invalid_ts_count", 0) == 0
+    assert meta.get("invalid_ohlc_count", 0) == 0
 
     asia_entry = find_session(result, "asia")
     london_entry = find_session(result, "london")
@@ -76,6 +80,10 @@ def test_session_boundary_bars_assigned_to_start_only() -> None:
     ]
 
     result = compute_session_vwaps("ethusdt", candles)
+    meta = result.get("meta")
+    assert isinstance(meta, dict)
+    assert meta.get("invalid_ts_count", 0) == 0
+    assert meta.get("invalid_ohlc_count", 0) == 0
 
     asia_entry = find_session(result, "asia")
     london_entry = find_session(result, "london")

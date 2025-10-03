@@ -1,12 +1,26 @@
 """Snapshot builder for the inspection check-all endpoint."""
 from __future__ import annotations
 
+import asyncio
+from collections import Counter
 import logging
 import math
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, time as dtime
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple, Set
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    MutableMapping,
+    Sequence,
+    Tuple,
+    Set,
+)
 
 import httpx
 
@@ -20,8 +34,10 @@ from .liquidity import (
 )
 from .presets import resolve_profile_config
 from .profile import build_profile_package
+from .ohlc_sanitizer import SanitizedCandles, sanitize_candles
 from .smc import SMCConfig, detect_smc_blocks
 from .zones import Config as ZonesConfig, detect_zones
+from .timeutils import safe_datetime_from_ms
 UTC = timezone.utc
 LOGGER = logging.getLogger(__name__)
 MS_IN_HOUR = 3_600_000
@@ -51,6 +67,8 @@ try:
         TIMEFRAME_TO_MS,
         aggregate_1m_to_1h,
         build_multi_timeframe_ohlcv,
+        fetch_ohlcv,
+        fetch_ohlcv_sync,
         resample_ohlcv,
     )
 except ImportError:  # pragma: no cover - circular import guard
@@ -65,6 +83,12 @@ except ImportError:  # pragma: no cover - circular import guard
     def build_multi_timeframe_ohlcv(*args, **kwargs):  # type: ignore[override]
         raise ImportError("build_multi_timeframe_ohlcv is unavailable")
 
+    async def fetch_ohlcv(*args, **kwargs):  # type: ignore[override]
+        raise ImportError("fetch_ohlcv is unavailable")
+
+    def fetch_ohlcv_sync(*args, **kwargs):  # type: ignore[override]
+        raise ImportError("fetch_ohlcv_sync is unavailable")
+
 MINUTE_INTERVAL_MS = TIMEFRAME_TO_MS.get("1m", MS_IN_HOUR // 60)
 
 VWAP_TPO_SESSIONS: Tuple[Tuple[str, dtime, dtime], ...] = (
@@ -75,6 +99,114 @@ VWAP_TPO_SESSIONS: Tuple[Tuple[str, dtime, dtime], ...] = (
 
 _RETRYABLE_STATUS = {418, 429, 500, 502, 503, 504}
 _MAX_RETRIES = 5
+
+_BUILD_TIMEOUT_SECONDS = 12.0
+_ASYNC_BUILD_TIMEOUT_SECONDS = 5.0
+
+_EXPECTED_OHLCV_TFS: Tuple[str, ...] = ("1m", "3m", "5m", "15m", "1h", "4h", "1d")
+_EXPECTED_ORDERFLOW_TFS: Tuple[str, ...] = ("15m", "1h")
+_EXPECTED_ORDERFLOW_METRICS: Tuple[str, ...] = ("footprint", "delta", "cvd")
+_EXPECTED_ZONE_KEYS: Tuple[str, ...] = (
+    "fvg",
+    "fvl",
+    "ob",
+    "mb",
+    "bb",
+    "rb",
+    "pb",
+    "sr",
+    "profile_levels",
+)
+
+_COLD_BACKFILL_MIN_REQUIRED: Dict[str, int] = {
+    tf: 1 for tf in _EXPECTED_OHLCV_TFS
+}
+
+
+@dataclass(slots=True)
+class _SnapshotContext:
+    """Prepared context for building inspection snapshots."""
+
+    symbol: str
+    now: datetime
+    frames: Dict[str, List[MutableMapping[str, Any]]]
+    raw_meta: Mapping[str, Any] | None
+    stream_price: float | None
+    stream_ts: int | None
+    has_now_override: bool
+
+
+def _iter_stream_candidates(
+    snapshot: Mapping[str, Any], raw_meta: Mapping[str, Any] | None
+) -> Iterable[Mapping[str, Any]]:
+    """Yield candidate live-tick payloads from a snapshot and its metadata."""
+
+    for key in ("stream", "live", "live_price", "live_tick"):
+        candidate = snapshot.get(key)
+        if isinstance(candidate, Mapping):
+            yield candidate
+
+    if isinstance(raw_meta, Mapping):
+        for key in ("stream", "live", "live_price", "ticker"):
+            candidate = raw_meta.get(key)
+            if isinstance(candidate, Mapping):
+                yield candidate
+
+
+def _resolve_stream_from_context(
+    snapshot: Mapping[str, Any], raw_meta: Mapping[str, Any] | None
+) -> Tuple[float | None, int | None]:
+    """Extract the first valid stream price/timestamp pair from the snapshot."""
+
+    for candidate in _iter_stream_candidates(snapshot, raw_meta):
+        price, ts = _normalise_stream_point(candidate)
+        if price is not None and ts is not None:
+            return price, ts
+    return None, None
+
+
+def _prepare_snapshot_context(
+    snapshot: Mapping[str, Any], now_utc: datetime | None
+) -> _SnapshotContext:
+    """Assemble the deterministic build context for an inspection snapshot."""
+
+    frames = _normalise_frames(snapshot) or {}
+    raw_meta = snapshot.get("meta") if isinstance(snapshot.get("meta"), Mapping) else None
+    symbol = str(snapshot.get("symbol") or snapshot.get("pair") or "UNKNOWN").upper()
+
+    if now_utc is None:
+        now_dt = datetime.now(UTC)
+    else:
+        if now_utc.tzinfo is None:
+            now_dt = now_utc.replace(tzinfo=UTC)
+        else:
+            now_dt = now_utc.astimezone(UTC)
+
+    stream_price, stream_ts = _resolve_stream_from_context(snapshot, raw_meta)
+
+    return _SnapshotContext(
+        symbol=symbol,
+        now=now_dt,
+        frames=frames,
+        raw_meta=raw_meta,
+        stream_price=stream_price,
+        stream_ts=stream_ts,
+        has_now_override=now_utc is not None,
+    )
+
+
+def _insufficient_from_context(
+    context: _SnapshotContext, *, now_override: datetime | None = None
+) -> Dict[str, Any]:
+    """Materialise an insufficient-data payload for the provided context."""
+
+    now_dt = now_override or context.now
+    return _build_insufficient_payload(
+        symbol=context.symbol,
+        now=now_dt,
+        stream_price=context.stream_price,
+        stream_ts=context.stream_ts,
+    )
 
 class DataQualityError(RuntimeError):
     """Raised when the inspected snapshot fails deterministic data checks."""
@@ -92,11 +224,77 @@ class BinanceDownloadError(RuntimeError):
         self.downloaded = int(downloaded)
 
 
+class _TimeBudgetExceeded(RuntimeError):
+    """Raised when the snapshot build exceeds the allocated time budget."""
+
+    def __init__(self, stage: str):
+        self.stage = stage
+        super().__init__(f"Time budget exceeded while {stage}")
+
+
+class _TimeBudget:
+    """Helper for enforcing a soft timeout while building the snapshot."""
+
+    __slots__ = ("deadline",)
+
+    def __init__(self, seconds: float | None):
+        if seconds is None or seconds <= 0:
+            self.deadline = None
+        else:
+            self.deadline = time.monotonic() + seconds
+
+    def remaining(self) -> float | None:
+        if self.deadline is None:
+            return None
+        return self.deadline - time.monotonic()
+
+    def raise_if_exceeded(self, stage: str) -> None:
+        if self.deadline is None:
+            return
+        if time.monotonic() >= self.deadline:
+            raise _TimeBudgetExceeded(stage)
+
+
+async def build_check_all_datas_async(
+    snapshot: Mapping[str, Any],
+    *,
+    timeout: float | None = _ASYNC_BUILD_TIMEOUT_SECONDS,
+    **kwargs: Any,
+) -> Dict[str, Any] | None:
+    """Execute ``build_check_all_datas`` with a timeout that respects cancellation."""
+
+    context = _prepare_snapshot_context(snapshot, kwargs.get("now_utc"))
+    build_kwargs = dict(kwargs)
+
+    async def _invoke() -> Dict[str, Any] | None:
+        return await build_check_all_datas(snapshot, **build_kwargs)
+
+    try:
+        if timeout is not None and timeout > 0:
+            return await asyncio.wait_for(_invoke(), timeout)
+        return await _invoke()
+    except asyncio.TimeoutError:
+        LOGGER.warning(
+            "Check-all build timed out",
+            extra={
+                "symbol": context.symbol,
+                "timeout": timeout,
+                "has_now_override": context.has_now_override,
+                "hours": build_kwargs.get("hours"),
+                "window_hours": build_kwargs.get("window_hours"),
+                "strict_window": build_kwargs.get("strict_window"),
+            },
+        )
+        return _insufficient_from_context(context)
+
+
 def _isoformat_utc(timestamp_ms: int) -> str:
     """Return a stable Z-suffixed ISO string for a millisecond timestamp."""
 
     clamped_ms = max(0, int(timestamp_ms))
-    dt = datetime.fromtimestamp(clamped_ms / 1000.0, tz=UTC)
+    dt = safe_datetime_from_ms(clamped_ms, UTC)
+    if dt is None:
+        return "1970-01-01T00:00:00Z"
     return dt.isoformat().replace("+00:00", "Z")
 
 
@@ -200,6 +398,271 @@ def _deduplicate_sorted(
 
     ordered_times = sorted(seen)
     return [seen[ts] for ts in ordered_times]
+
+
+def _normalise_external_candles(
+    payload: Sequence[Mapping[str, Any]] | Mapping[str, Any] | None,
+) -> List[Dict[str, Any]]:
+    """Normalise external candle payloads into the internal shape."""
+
+    if payload is None:
+        return []
+
+    if isinstance(payload, Mapping):
+        raw_candles = payload.get("candles")
+        if not isinstance(raw_candles, Sequence):
+            return []
+        source: Sequence[Mapping[str, Any]] = raw_candles  # type: ignore[assignment]
+    elif isinstance(payload, Sequence):
+        source = [item for item in payload if isinstance(item, Mapping)]  # type: ignore[list-item]
+    else:
+        return []
+
+    normalised: List[Dict[str, Any]] = []
+    for item in source:
+        ts = _safe_int(item.get("t"))
+        if ts is None:
+            continue
+        normalised.append(
+            {
+                "t": ts,
+                "o": _coerce_float(item.get("o")),
+                "h": _coerce_float(item.get("h")),
+                "l": _coerce_float(item.get("l")),
+                "c": _coerce_float(item.get("c")),
+                "v": _coerce_float(item.get("v")),
+            }
+        )
+
+    normalised.sort(key=lambda candle: candle["t"])
+    return normalised
+
+
+def _merge_candle_collections(
+    existing: Sequence[Mapping[str, Any]],
+    incoming: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Merge two candle collections preferring values from the existing set."""
+
+    combined: List[Mapping[str, Any]] = []
+    if incoming:
+        combined.extend(incoming)
+    if existing:
+        combined.extend(existing)
+    return _deduplicate_sorted(combined)
+
+
+def _resolve_window_end_ms(
+    frames: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    now_ms: int,
+    selection_end_ms: int | None,
+    stream_ts: int | None,
+) -> int:
+    """Resolve a best-effort window end timestamp based on available hints."""
+
+    candidates: List[int] = [now_ms]
+    if selection_end_ms is not None:
+        candidates.append(selection_end_ms)
+    if stream_ts is not None:
+        candidates.append(stream_ts)
+
+    for candles in frames.values():
+        if not candles:
+            continue
+        last_ts = _safe_int(candles[-1].get("t"))
+        if last_ts is not None:
+            candidates.append(last_ts)
+
+    return max(candidates) if candidates else now_ms
+
+
+async def _backfill_timeframe_with_rest(
+    frames: MutableMapping[str, List[MutableMapping[str, Any]]],
+    *,
+    symbol: str,
+    timeframe: str,
+    window_end_ms: int,
+    window_hours: int,
+    fetcher: Callable[..., Awaitable[Mapping[str, Any]]] | Callable[..., Mapping[str, Any]] | None = None,
+    minimum_required: int | None = None,
+) -> bool:
+    """Ensure the requested timeframe has at least the required candles."""
+
+    interval_ms = TIMEFRAME_TO_MS.get(timeframe)
+    if interval_ms is None:
+        return False
+
+    if minimum_required is None:
+        minimum_required = _COLD_BACKFILL_MIN_REQUIRED.get(timeframe, 1)
+    minimum_required = max(1, int(minimum_required))
+
+    existing = frames.get(timeframe, [])
+    window_start_ms = max(0, window_end_ms - max(1, window_hours) * MS_IN_HOUR)
+
+    available = 0
+    for candle in existing:
+        ts = _safe_int(candle.get("t"))
+        if ts is None:
+            continue
+        if window_start_ms <= ts <= window_end_ms:
+            available += 1
+            if available >= minimum_required:
+                return False
+
+    fetch_callable = fetcher or fetch_ohlcv
+    try:
+        if asyncio.iscoroutinefunction(fetch_callable):
+            fetched_payload = await fetch_callable(symbol, timeframe, hours=max(1, window_hours))  # type: ignore[arg-type]
+        else:
+            result = fetch_callable(symbol, timeframe, hours=max(1, window_hours))
+            if asyncio.iscoroutine(result):
+                fetched_payload = await result  # type: ignore[assignment]
+            else:
+                fetched_payload = result
+    except Exception as exc:  # pragma: no cover - defensive logging
+        LOGGER.warning(
+            "Cold backfill request failed",
+            exc_info=exc,
+            extra={
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "window_hours": window_hours,
+            },
+        )
+        return False
+
+    fetched_candles = _normalise_external_candles(fetched_payload)
+    if not fetched_candles:
+        return False
+
+    merged = _merge_candle_collections(existing, fetched_candles)
+    frames[timeframe] = [dict(candle) for candle in merged]
+    return True
+
+
+def _build_insufficient_payload(
+    *,
+    symbol: str,
+    now: datetime,
+    stream_price: float | None,
+    stream_ts: int | None,
+) -> Dict[str, Any]:
+    """Return a deterministic payload when cold backfill could not seed data."""
+
+    frames_stub: Dict[str, Sequence[Mapping[str, Any]]] = {
+        tf: [] for tf in _EXPECTED_OHLCV_TFS
+    }
+    (
+        last_price,
+        last_iso,
+        last_tf,
+        age_sec,
+        _,
+        price_source,
+        _diagnostics,
+    ) = _resolve_last_price(
+        frames_stub,
+        now=now,
+        stream_price=stream_price,
+        stream_ts=stream_ts,
+        tick_size=None,
+    )
+
+    meta_block: Dict[str, Any] = {
+        "symbol": symbol,
+        "tz": "Europe/Berlin",
+        "last_price": last_price,
+        "last_ts_utc": last_iso,
+        "last_tf": last_tf,
+        "last_price_source": price_source,
+        "insufficient_reason": "stale_or_unseeded_buffers",
+        "stale": True,
+    }
+    if age_sec is not None:
+        meta_block["snapshot_age_sec"] = age_sec
+
+    data_payload = {
+        "symbol": symbol,
+        "ohlcv": {tf: {"candles": []} for tf in _EXPECTED_OHLCV_TFS},
+        "orderflow": {tf: {"per_bar": []} for tf in _EXPECTED_ORDERFLOW_TFS},
+        "vwap_tpo": {
+            "daily": {},
+            "sessions": {session: {} for session in ("asia", "london", "ny")},
+        },
+        "tpo": {"composite_day": {}},
+        "prev_day": {},
+        "zones": {key: [] for key in _EXPECTED_ZONE_KEYS},
+        "liquidity": {"eqh": [], "eql": []},
+        "risk_prefs": {"rr_min": 2.5, "risk_per_trade_pct": 1.0},
+        "context": {"globalBias": "neutral", "narrative": "", "openOppositeZones": False},
+    }
+
+    availability_payload = {
+        "ohlcv": {tf: {"candles": 0, "has_data": False} for tf in _EXPECTED_OHLCV_TFS},
+        "vwap_sessions": {
+            session: {
+                "present": False,
+                "metrics": {
+                    metric: False
+                    for metric in ("poc", "vah", "val", "ib_high", "ib_low")
+                },
+            }
+            for session in ("asia", "london", "ny")
+        },
+        "zones": {key: {"count": 0} for key in _EXPECTED_ZONE_KEYS},
+        "orderflow": {
+            "timeframes": {
+                tf: {"bars": 0, "has_data": False} for tf in _EXPECTED_ORDERFLOW_TFS
+            },
+            "metrics": {metric: False for metric in _EXPECTED_ORDERFLOW_METRICS},
+        },
+    }
+
+    missing_fields: Set[str] = set()
+    missing_fields.update(f"ohlcv.{tf}" for tf in _EXPECTED_OHLCV_TFS)
+    for session in ("asia", "london", "ny"):
+        missing_fields.add(f"vwap_tpo.sessions.{session}")
+        for metric in ("poc", "vah", "val", "ib_high", "ib_low"):
+            missing_fields.add(f"vwap_tpo.sessions.{session}.{metric}")
+    missing_fields.update(f"zones.{key}" for key in _EXPECTED_ZONE_KEYS)
+    missing_fields.update(f"orderflow.{tf}" for tf in _EXPECTED_ORDERFLOW_TFS)
+    missing_fields.update(f"orderflow.{metric}" for metric in _EXPECTED_ORDERFLOW_METRICS)
+
+    payload = {
+        "status": "insufficient_data",
+        "meta": meta_block,
+        "data": data_payload,
+        "availability": availability_payload,
+        "missing_fields": sorted(missing_fields),
+    }
+    return round_floats(payload)
+
+
+def build_inspection_error_payload(
+    snapshot: Mapping[str, Any],
+    *,
+    now_utc: datetime | None = None,
+    missing_fields: Sequence[str] | None = None,
+    reason: str = "invalid_timestamps",
+) -> Dict[str, Any]:
+    """Return a deterministic insufficient-data payload for unexpected errors."""
+
+    context = _prepare_snapshot_context(snapshot, now_utc)
+    payload = _build_insufficient_payload(
+        symbol=context.symbol,
+        now=context.now,
+        stream_price=context.stream_price,
+        stream_ts=context.stream_ts,
+    )
+    if missing_fields:
+        existing = set(payload.get("missing_fields", []))
+        payload["missing_fields"] = sorted(existing.union(set(missing_fields)))
+    meta = payload.get("meta")
+    if isinstance(meta, dict):
+        meta["insufficient_reason"] = reason
+        meta["sanitized"] = True
+    return payload
 
 
 def _resolve_last_price(
@@ -381,13 +844,14 @@ def _normalise_binance_row(row: Sequence[object]) -> Dict[str, Any] | None:
     }
 
 
-def _request_binance_minutes(
-    client: httpx.Client,
+async def _request_binance_minutes_async(
+    client: httpx.AsyncClient,
     symbol: str,
     start_ms: int,
     end_ms: int,
     *,
     limit: int,
+    budget: _TimeBudget | None = None,
 ) -> List[Sequence[object]]:
     params = {
         "symbol": symbol.upper(),
@@ -399,8 +863,10 @@ def _request_binance_minutes(
 
     delay = 0.5
     for attempt in range(_MAX_RETRIES):
+        if budget is not None:
+            budget.raise_if_exceeded("request_binance_minutes")
         try:
-            response = client.get(BINANCE_FAPI_REST, params=params)
+            response = await client.get(BINANCE_FAPI_REST, params=params)
             response.raise_for_status()
             data = response.json()
             if isinstance(data, list):
@@ -409,24 +875,40 @@ def _request_binance_minutes(
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
             if status in _RETRYABLE_STATUS and attempt < _MAX_RETRIES - 1:
-                time.sleep(delay)
+                if budget is not None:
+                    budget.raise_if_exceeded("request_binance_minutes_backoff")
+                    remaining = budget.remaining()
+                    if remaining is not None and remaining <= 0:
+                        raise
+                    await asyncio.sleep(min(delay, max(0.0, remaining)))
+                else:
+                    await asyncio.sleep(delay)
                 delay *= 2
                 continue
             raise
         except httpx.RequestError:
             if attempt < _MAX_RETRIES - 1:
-                time.sleep(delay)
+                if budget is not None:
+                    budget.raise_if_exceeded("request_binance_minutes_retry")
+                    remaining = budget.remaining()
+                    if remaining is not None and remaining <= 0:
+                        raise
+                    await asyncio.sleep(min(delay, max(0.0, remaining)))
+                else:
+                    await asyncio.sleep(delay)
                 delay *= 2
                 continue
             raise
     return []
 
 
-def _download_missing_minutes(
+async def _download_missing_minutes_async(
     symbol: str,
     start_ms: int,
     end_ms: int,
     gaps: Sequence[Mapping[str, int]],
+    *,
+    budget: _TimeBudget | None = None,
 ) -> List[Dict[str, Any]]:
     if not gaps:
         return []
@@ -435,23 +917,29 @@ def _download_missing_minutes(
     downloaded = 0
 
     try:
-        with httpx.Client(timeout=15.0) as client:
+        timeout = httpx.Timeout(6.0, connect=3.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
             for gap in gaps:
+                if budget is not None:
+                    budget.raise_if_exceeded("download_missing_minutes_gap")
                 gap_start = int(gap["from"])
                 gap_end = int(gap["to"])
                 cursor = gap_start
                 while cursor <= gap_end:
+                    if budget is not None:
+                        budget.raise_if_exceeded("download_missing_minutes_cursor")
                     chunk_end = min(
                         gap_end,
                         cursor + (1000 - 1) * MINUTE_INTERVAL_MS,
                     )
                     request_end = chunk_end + MINUTE_INTERVAL_MS
-                    raw_rows = _request_binance_minutes(
+                    raw_rows = await _request_binance_minutes_async(
                         client,
                         symbol,
                         cursor,
                         request_end,
                         limit=1000,
+                        budget=budget,
                     )
                     if not raw_rows:
                         break
@@ -477,6 +965,34 @@ def _download_missing_minutes(
         raise BinanceDownloadError(downloaded, str(exc)) from exc
 
     return fetched
+
+
+async def _call_download_missing_minutes_async(
+    symbol: str,
+    start_ms: int,
+    end_ms: int,
+    gaps: Sequence[Mapping[str, int]],
+    *,
+    budget: _TimeBudget | None,
+) -> List[Dict[str, Any]]:
+    """Invoke `_download_missing_minutes` while tolerating legacy stubs without budget."""
+
+    if budget is None:
+        return await _download_missing_minutes_async(symbol, start_ms, end_ms, gaps)
+
+    try:
+        return await _download_missing_minutes_async(
+            symbol,
+            start_ms,
+            end_ms,
+            gaps,
+            budget=budget,
+        )
+    except TypeError as exc:
+        message = str(exc)
+        if "unexpected keyword argument" not in message or "budget" not in message:
+            raise
+        return await _download_missing_minutes_async(symbol, start_ms, end_ms, gaps)
 
 
 def _aggregate_from_minutes(
@@ -1489,8 +2005,8 @@ def _build_volume_profile_stats(
     tick_size: float | None,
     value_area_pct: float = VALUE_AREA_PCT,
 ) -> Dict[str, Any]:
-    window_start_iso = datetime.fromtimestamp(start_ms / 1000.0, tz=UTC).isoformat()
-    window_end_iso = datetime.fromtimestamp(end_ms / 1000.0, tz=UTC).isoformat()
+    window_start_iso = _isoformat_utc(start_ms)
+    window_end_iso = _isoformat_utc(end_ms)
 
     if end_ms < start_ms:
         return {
@@ -1681,7 +2197,9 @@ def _build_prev_day_block(
 
 
 def _start_of_day_ms(timestamp_ms: int) -> int:
-    dt = datetime.fromtimestamp(timestamp_ms / 1000.0, tz=UTC)
+    dt = safe_datetime_from_ms(timestamp_ms, UTC)
+    if dt is None:
+        return 0
     start_dt = datetime(dt.year, dt.month, dt.day, tzinfo=UTC)
     return int(start_dt.timestamp() * 1000)
 
@@ -1692,7 +2210,9 @@ def _session_window(
     end_time: dtime,
 ) -> tuple[int, int, int]:
     anchor_aligned = _align_to_interval(anchor_ms, MINUTE_INTERVAL_MS)
-    anchor_dt = datetime.fromtimestamp(anchor_aligned / 1000.0, tz=UTC)
+    anchor_dt = safe_datetime_from_ms(anchor_aligned, UTC)
+    if anchor_dt is None:
+        anchor_dt = datetime(1970, 1, 1, tzinfo=UTC)
     day_start = datetime(anchor_dt.year, anchor_dt.month, anchor_dt.day, tzinfo=UTC)
     session_start_dt = datetime.combine(day_start.date(), start_time, tzinfo=UTC)
     session_end_dt = datetime.combine(day_start.date(), end_time, tzinfo=UTC)
@@ -2003,7 +2523,7 @@ def _build_daily_vwap(
     }
 
 
-def build_check_all_datas(
+async def build_check_all_datas(
     snapshot: Mapping[str, Any],
     *,
     now_utc: datetime | None = None,
@@ -2016,17 +2536,123 @@ def build_check_all_datas(
 ) -> Dict[str, Any] | None:
     """Create an enriched payload for the snapshot health endpoint."""
 
-    frames = _normalise_frames(snapshot)
+    status = "ok"
+
+    notes: List[str] = []
+    invalid_ts_total = 0
+    invalid_ohlc_total = 0
+    invalid_candle_stages: Dict[str, Dict[str, int]] = {}
+    sanitized_applied = False
+    sessions_empty_flag = False
+
+    def _record_invalid(stage: str, *, invalid_ts: int = 0, invalid_ohlc: int = 0) -> None:
+        nonlocal invalid_ts_total, invalid_ohlc_total
+        if invalid_ts == 0 and invalid_ohlc == 0:
+            return
+        entry = invalid_candle_stages.setdefault(stage, {"invalid_ts": 0, "invalid_ohlc": 0})
+        if invalid_ts:
+            entry["invalid_ts"] += int(invalid_ts)
+            invalid_ts_total += int(invalid_ts)
+        if invalid_ohlc:
+            entry["invalid_ohlc"] += int(invalid_ohlc)
+            invalid_ohlc_total += int(invalid_ohlc)
+
+    def _apply_sanitizer(stage: str, candles: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+        nonlocal sanitized_applied
+        sanitized_applied = True
+        result = sanitize_candles(candles, stage=stage)
+        _record_invalid(stage, invalid_ts=result.invalid_ts, invalid_ohlc=result.invalid_ohlc)
+        return result.candles
+
+    def _register_invalid_candle(_ts: int, stage: str) -> None:
+        _record_invalid(stage, invalid_ts=1)
+
+    budget = _TimeBudget(_BUILD_TIMEOUT_SECONDS)
+
+    context = _prepare_snapshot_context(snapshot, now_utc)
+    frames = context.frames
+
+    for tf_key, candles in list(frames.items()):
+        stage_name = f"seed.{tf_key}"
+        frames[tf_key] = _apply_sanitizer(stage_name, candles)
+    raw_meta = context.raw_meta
+    symbol = context.symbol
+    now_dt = context.now
+    stream_price = context.stream_price
+    stream_ts = context.stream_ts
+    now_ms = int(now_dt.timestamp() * 1000)
+
+    if selection_end_ms is None:
+        selection_payload = snapshot.get("selection")
+        if isinstance(selection_payload, Mapping):
+            selection_end_candidate = _safe_int(selection_payload.get("end"))
+            if selection_end_candidate is not None:
+                selection_end_ms = selection_end_candidate
+
     if not frames:
-        return None
+        frames = {}
+
+    base_window_hours = window_hours if window_hours is not None else hours
+    if base_window_hours is None or base_window_hours <= 0:
+        base_window_hours = 4
+    base_window_hours = int(base_window_hours)
+
+    window_end_guess = _resolve_window_end_ms(
+        frames,
+        now_ms=now_ms,
+        selection_end_ms=selection_end_ms,
+        stream_ts=stream_ts,
+    )
+
+    try:
+        budget.raise_if_exceeded("seed_1m_backfill")
+    except _TimeBudgetExceeded as exc:
+        LOGGER.warning(
+            "Time budget exceeded before seeding minute frame",
+            extra={"stage": exc.stage, "symbol": symbol},
+        )
+        return _insufficient_from_context(context, now_override=now_dt)
+
+    await _backfill_timeframe_with_rest(
+        frames,
+        symbol=symbol,
+        timeframe="1m",
+        window_end_ms=window_end_guess,
+        window_hours=base_window_hours,
+    )
+    frames["1m"] = _apply_sanitizer("rest.1m", frames.get("1m", []))
+
+    minute_seed = frames.get("1m", [])
+    if minute_seed:
+        frames["1m"] = _deduplicate_sorted(minute_seed)
 
     primary_key = _primary_frame_key(snapshot, frames)
+    if not primary_key and "1m" in frames:
+        primary_key = "1m"
     if not primary_key:
-        return None
+        return _insufficient_from_context(context, now_override=now_dt)
+
+    if not frames.get(primary_key):
+        try:
+            budget.raise_if_exceeded("seed_primary_backfill")
+        except _TimeBudgetExceeded as exc:
+            LOGGER.warning(
+                "Time budget exceeded before seeding primary frame",
+                extra={"stage": exc.stage, "symbol": symbol, "primary_key": primary_key},
+            )
+            return _insufficient_from_context(context, now_override=now_dt)
+        await _backfill_timeframe_with_rest(
+            frames,
+            symbol=symbol,
+            timeframe=primary_key,
+            window_end_ms=window_end_guess,
+            window_hours=base_window_hours,
+        )
+        frames[primary_key] = _apply_sanitizer(f"rest.{primary_key}", frames.get(primary_key, []))
 
     primary_candles = frames.get(primary_key, [])
     if not primary_candles:
-        return None
+        return _insufficient_from_context(context, now_override=now_dt)
 
     # Drop unused granularities to keep the payload focused on the requested set.
     frames.pop("3m", None)
@@ -2035,33 +2661,8 @@ def build_check_all_datas(
     minute_candles = _deduplicate_sorted(frames.get("1m", []))
     frames["1m"] = minute_candles
 
-    symbol = str(snapshot.get("symbol") or snapshot.get("pair") or "UNKNOWN").upper()
-    raw_meta = snapshot.get("meta") if isinstance(snapshot.get("meta"), Mapping) else None
-
-    stream_price: float | None = None
-    stream_ts: int | None = None
-    stream_candidates: List[Mapping[str, Any]] = []
-
-    for key in ("stream", "live", "live_price", "live_tick"):
-        candidate = snapshot.get(key)
-        if isinstance(candidate, Mapping):
-            stream_candidates.append(candidate)
-
-    if isinstance(raw_meta, Mapping):
-        for key in ("stream", "live", "live_price", "ticker"):
-            candidate = raw_meta.get(key)
-            if isinstance(candidate, Mapping):
-                stream_candidates.append(candidate)
-
-    for candidate in stream_candidates:
-        price, ts = _normalise_stream_point(candidate)
-        if price is None or ts is None:
-            continue
-        stream_price = price
-        stream_ts = ts
-        break
-
     profile_config = resolve_profile_config(symbol, raw_meta)
+    profile_meta: Dict[str, Any] = {}
     sessions = list(VWAP_TPO_SESSIONS)
     profile_tpo: List[Dict[str, Any]] = []
     profile_flat: List[Dict[str, float]] = []
@@ -2109,7 +2710,8 @@ def build_check_all_datas(
             symbol,
             target_tf_key,
         )
-        (profile_tpo, profile_flat, profile_zones) = build_profile_package(
+        (profile_tpo, profile_flat, profile_zones) = await asyncio.to_thread(
+            build_profile_package,
             base_candles,
             sessions=sessions,
             last_n=int(profile_config.get("last_n", 3)),
@@ -2122,8 +2724,11 @@ def build_check_all_datas(
             smooth_window=int(profile_config.get("smooth_window", 1)),
             cache_token=cache_token,
             tf_key=target_tf_key,
+            invalid_ts_handler=_register_invalid_candle,
+            meta_out=profile_meta,
         )
         profile_level_map = _build_profile_level_map(profile_tpo)
+        sessions_empty_flag = bool(profile_meta.get("sessions_empty"))
 
     snapshot_selection = snapshot.get("selection") if isinstance(snapshot.get("selection"), Mapping) else None
     selection_start = selection_start_ms or _safe_int(snapshot_selection.get("start")) if snapshot_selection else None
@@ -2137,16 +2742,7 @@ def build_check_all_datas(
     if selection_start > selection_end:
         selection_start, selection_end = selection_end, selection_start
 
-    if now_utc is not None:
-        if now_utc.tzinfo is None:
-            now_dt = now_utc.replace(tzinfo=UTC)
-        else:
-            now_dt = now_utc.astimezone(UTC)
-    else:
-        now_dt = datetime.now(UTC)
-
-    if now_utc is not None:
-        now_ms = int(now_dt.timestamp() * 1000)
+    if context.has_now_override:
         window_end_ms = _align_to_interval(now_ms, MINUTE_INTERVAL_MS) - MINUTE_INTERVAL_MS
     else:
         window_end_ms = minute_candles[-1]["t"] if minute_candles else None
@@ -2161,7 +2757,7 @@ def build_check_all_datas(
         window_end_ms = primary_candles[-1]["t"] + max(primary_interval - MINUTE_INTERVAL_MS, 0)
 
     if window_end_ms is None:
-        return None
+        return _insufficient_from_context(context, now_override=now_dt)
 
     window_end_ms = max(0, _align_to_interval(window_end_ms, MINUTE_INTERVAL_MS))
 
@@ -2216,11 +2812,16 @@ def build_check_all_datas(
     fetched_unique = 0
     if time_gaps:
         try:
-            downloaded_minutes = _download_missing_minutes(
+            budget.raise_if_exceeded("download_missing_minutes_start")
+            downloaded_minutes = await _call_download_missing_minutes_async(
                 symbol,
                 window_start_ms,
                 window_end_ms,
                 time_gaps,
+                budget=budget,
+            )
+            downloaded_minutes = _apply_sanitizer(
+                "rest.1m.download", downloaded_minutes
             )
         except BinanceDownloadError as exc:
             detail = {
@@ -2235,6 +2836,18 @@ def build_check_all_datas(
                 "downloaded": exc.downloaded,
             }
             raise DataQualityError(detail) from exc
+        except _TimeBudgetExceeded as exc:
+            LOGGER.warning(
+                "Time budget exceeded while downloading missing 1m candles",
+                extra={
+                    "stage": exc.stage,
+                    "symbol": symbol,
+                    "window_start_ms": window_start_ms,
+                    "window_end_ms": window_end_ms,
+                    "time_gaps": time_gaps,
+                },
+            )
+            return _insufficient_from_context(context, now_override=now_dt)
         for candle in downloaded_minutes:
             ts = candle["t"]
             if ts < window_start_ms or ts > window_end_ms:
@@ -2262,6 +2875,15 @@ def build_check_all_datas(
 
     frames["1m"] = [minute_index_all[ts] for ts in sorted(minute_index_all)]
     minute_candles = frames["1m"]
+
+    try:
+        budget.raise_if_exceeded("zones_preparation")
+    except _TimeBudgetExceeded as exc:
+        LOGGER.warning(
+            "Time budget exceeded before zones preparation",
+            extra={"stage": exc.stage, "symbol": symbol},
+        )
+        return _insufficient_from_context(context, now_override=now_dt)
 
     zones_window_hours = max(1, hours_window)
     if not strict_window:
@@ -2303,11 +2925,13 @@ def build_check_all_datas(
     zone_history_gaps = _summarise_missing_times(zone_expected_minutes, minute_index_all)
     if zone_history_gaps:
         try:
-            zone_downloaded_minutes = _download_missing_minutes(
+            budget.raise_if_exceeded("zones_history_backfill_start")
+            zone_downloaded_minutes = await _call_download_missing_minutes_async(
                 symbol,
                 zones_history_start_ms,
                 window_end_ms,
                 zone_history_gaps,
+                budget=budget,
             )
         except BinanceDownloadError as exc:
             detail = {
@@ -2319,6 +2943,18 @@ def build_check_all_datas(
                 "time_gaps": zone_history_gaps,
             }
             raise DataQualityError(detail) from exc
+        except _TimeBudgetExceeded as exc:
+            LOGGER.warning(
+                "Time budget exceeded while seeding zone history",
+                extra={
+                    "stage": exc.stage,
+                    "symbol": symbol,
+                    "zones_history_start_ms": zones_history_start_ms,
+                    "window_end_ms": window_end_ms,
+                    "time_gaps": zone_history_gaps,
+                },
+            )
+            return _insufficient_from_context(context, now_override=now_dt)
         for candle in zone_downloaded_minutes:
             ts = candle["t"]
             if ts < zones_history_start_ms or ts > window_end_ms:
@@ -2452,7 +3088,7 @@ def build_check_all_datas(
     liquidity_config = raw_meta.get("liquidity") if isinstance(raw_meta, Mapping) else None
 
     reference_ts = window_end_ms + MINUTE_INTERVAL_MS
-    reference_dt = datetime.fromtimestamp(reference_ts / 1000.0, tz=UTC)
+    reference_iso = _isoformat_utc(reference_ts)
     detailed_start_ts = window_start_ms
 
     movement_anchor_ts = detailed_start_ts
@@ -2460,6 +3096,10 @@ def build_check_all_datas(
     movement_end_ts = max(selection_start, movement_anchor_ts)
     if movement_end_ts > window_end_ms:
         movement_end_ts = window_end_ms
+
+    detailed_start_iso = _isoformat_utc(detailed_start_ts)
+    movement_start_iso = _isoformat_utc(movement_start_ts)
+    movement_end_iso = _isoformat_utc(movement_end_ts)
 
     latest_minute_candle = minute_window_index.get(window_end_ms)
     latest_primary_candle = None
@@ -2478,12 +3118,6 @@ def build_check_all_datas(
         latest_candle_ts = base_candles[-1]["t"]
     if latest_candle_ts is None:
         latest_candle_ts = window_end_ms
-    latest_candle_dt = datetime.fromtimestamp(latest_candle_ts / 1000.0, tz=UTC)
-
-    detailed_start_dt = datetime.fromtimestamp(detailed_start_ts / 1000.0, tz=UTC)
-    movement_start_dt = datetime.fromtimestamp(movement_start_ts / 1000.0, tz=UTC)
-    movement_end_dt = datetime.fromtimestamp(movement_end_ts / 1000.0, tz=UTC)
-
     detailed_frames: Dict[str, Any] = {}
     for tf_key, candles in frames.items():
         filtered = _filter_candles(candles, start_ms=detailed_start_ts, end_ms=reference_ts)
@@ -2508,8 +3142,8 @@ def build_check_all_datas(
     detailed_section = {
         "hours": hours_window,
         "range": {
-            "start_utc": detailed_start_dt.isoformat(),
-            "end_utc": reference_dt.isoformat(),
+            "start_utc": detailed_start_iso,
+            "end_utc": reference_iso,
         },
         "frames": detailed_frames,
         "indicators": {
@@ -2538,8 +3172,8 @@ def build_check_all_datas(
         delta_series = _build_delta_series(filtered)
         movement_frames[tf_key] = {
             "summary": _summarise(filtered),
-            "first_candle_utc": datetime.fromtimestamp(filtered[0]["t"] / 1000.0, tz=UTC).isoformat(),
-            "last_candle_utc": datetime.fromtimestamp(filtered[-1]["t"] / 1000.0, tz=UTC).isoformat(),
+            "first_candle_utc": _isoformat_utc(filtered[0]["t"]),
+            "last_candle_utc": _isoformat_utc(filtered[-1]["t"]),
         }
         delta_summaries[tf_key] = _summarise_delta_series(delta_series)
         vwap_summaries[tf_key] = {
@@ -2569,8 +3203,8 @@ def build_check_all_datas(
     movement_section = {
         "days": movement_days,
         "range": {
-            "start_utc": movement_start_dt.isoformat(),
-            "end_utc": movement_end_dt.isoformat(),
+            "start_utc": movement_start_iso,
+            "end_utc": movement_end_iso,
         },
         "frames": movement_frames,
         "indicators": {
@@ -2695,7 +3329,8 @@ def build_check_all_datas(
 
     if zone_frames_full:
         try:
-            detected_zones = detect_zones(
+            detected_zones = await asyncio.to_thread(
+                detect_zones,
                 frames=zone_frames_full,
                 profile_levels=profile_level_map,
                 liquidity_levels=liquidity_equal_levels,
@@ -2866,7 +3501,8 @@ def build_check_all_datas(
             if any(not zone_availability.get(tf, {}).get("ok", False) for tf in tf_candidates):
                 zones_container[zone_key] = []
 
-    liquidity_payload = build_liquidity_snapshot(
+    liquidity_payload = await asyncio.to_thread(
+        build_liquidity_snapshot,
         liquidity_frames,
         symbol=symbol,
         tick_size=tick_size_numeric,
@@ -2927,7 +3563,8 @@ def build_check_all_datas(
         liquidity_source = liquidity_payload
     elif isinstance(snapshot.get("liquidity"), Mapping):
         liquidity_source = snapshot.get("liquidity")  # type: ignore[assignment]
-    smc_blocks_list, smc_stats = detect_smc_blocks(
+    smc_blocks_list, smc_stats = await asyncio.to_thread(
+        detect_smc_blocks,
         hourly_htf,
         timeframe="1h",
         structure_flags=structure_events,
@@ -3407,11 +4044,48 @@ def build_check_all_datas(
     if last_price_diag.get("mismatch"):
         meta_block["stream_vs_ohlcv_mismatch"] = True
 
+    invalid_total = invalid_ts_total + invalid_ohlc_total
+    meta_block["invalid_candles_count"] = invalid_total
+    meta_block["invalid_ts_count"] = invalid_ts_total
+    meta_block["invalid_ohlc_count"] = invalid_ohlc_total
+    meta_block["sanitized"] = sanitized_applied
+    meta_block["sessions_empty"] = sessions_empty_flag
+
+    stage_breakdown: Dict[str, Dict[str, int]] = {}
+    for stage, counts in sorted(invalid_candle_stages.items()):
+        filtered_counts = {key: value for key, value in counts.items() if value}
+        if filtered_counts:
+            stage_breakdown[stage] = filtered_counts
+    meta_block["invalid_candle_stages"] = stage_breakdown
+
+    if invalid_ts_total:
+        if stage_breakdown:
+            ts_stages = {stage: counts.get("invalid_ts", 0) for stage, counts in stage_breakdown.items()}
+            ts_summary = ", ".join(
+                f"{stage}:{count}" for stage, count in ts_stages.items() if count
+            )
+        else:
+            ts_summary = ""
+        if ts_summary:
+            notes.append(
+                f"Filtered {invalid_ts_total} candles with invalid timestamps ({ts_summary})"
+            )
+        else:
+            notes.append(
+                f"Filtered {invalid_ts_total} candles with invalid timestamps"
+            )
+    if invalid_ohlc_total:
+        notes.append(
+            f"Filtered {invalid_ohlc_total} candles with invalid OHLC ranges"
+        )
+
     final_payload = {
+        "status": status,
         "meta": meta_block,
         "data": data_payload,
         "availability": availability,
         "missing_fields": missing_fields_list,
+        "notes": notes,
     }
 
     return round_floats(final_payload)

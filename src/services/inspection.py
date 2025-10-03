@@ -25,6 +25,8 @@ from typing import (
 
 import httpx
 
+LOGGER = logging.getLogger(__name__)
+
 from .binance import BINANCE_FAPI_REST
 from .liquidity import (
     build_liquidity_snapshot,
@@ -39,6 +41,8 @@ from .ohlc import (
     resample_ohlcv,
 )
 from .profile import build_profile_package
+from .ohlc_sanitizer import sanitize_candles
+from .timeutils import ensure_ms_epoch, safe_datetime_from_ms
 from .presets import resolve_profile_config
 from .zones import Config as ZonesConfig, detect_zones
 from ..meta import Meta
@@ -759,35 +763,89 @@ def _compute_vwap_stats(entries: Iterable[Mapping[str, Any]]) -> Tuple[float, fl
 def compute_session_vwaps(symbol: str, candles: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     """Compute VWAP for daily and configured sessions across recent days."""
 
-    if not candles:
-        return {"symbol": symbol.upper(), "vwap": []}
+    input_count = len(candles) if isinstance(candles, Sequence) else 0
+    stage = "session_vwaps"
 
-    bars: List[Tuple[int, float, float, float, float]] = []
-    for candle in candles:
+    sanitized = sanitize_candles(candles, stage=stage)
+    filtered_candles = sanitized.candles
+
+    meta: Dict[str, Any] = {
+        "sanitized": True,
+        "invalid_ts_count": sanitized.invalid_ts,
+        "invalid_ohlc_count": sanitized.invalid_ohlc,
+        "sessions_empty": False,
+        "input_count": input_count,
+        "output_count": len(filtered_candles),
+    }
+    if sanitized.earliest_ms is not None:
+        meta["earliest_ms"] = sanitized.earliest_ms
+    if sanitized.latest_ms is not None:
+        meta["latest_ms"] = sanitized.latest_ms
+
+    if not filtered_candles:
+        meta["sessions_empty"] = bool(input_count)
+        LOGGER.info(
+            "Session VWAP sanitisation produced no candles",
+            extra={
+                "stage": stage,
+                "symbol": symbol,
+                "input_count": input_count,
+                "invalid_ts": sanitized.invalid_ts,
+                "invalid_ohlc": sanitized.invalid_ohlc,
+            },
+        )
+        return {"symbol": symbol.upper(), "vwap": [], "vwap_sigma": [], "meta": meta}
+
+    bars: List[Tuple[int, datetime, float, float, float, float]] = []
+    for candle in filtered_candles:
         if not isinstance(candle, Mapping):
             continue
-        raw_ts = (
-            candle.get("t")
-            or candle.get("time")
-            or candle.get("openTime")
-        )
-        if raw_ts is None:
+        timestamp_ms = ensure_ms_epoch(candle.get("t"))
+        if timestamp_ms is None:
+            meta["invalid_ts_count"] += 1
+            LOGGER.warning(
+                "Invalid candle timestamp encountered after sanitisation",
+                extra={"stage": stage, "symbol": symbol, "ts": candle.get("t")},
+            )
+            continue
+        dt = safe_datetime_from_ms(timestamp_ms, timezone.utc)
+        if dt is None:
+            meta["invalid_ts_count"] += 1
+            LOGGER.warning(
+                "Timestamp conversion failed for session VWAP",
+                extra={"stage": stage, "symbol": symbol, "ts": timestamp_ms},
+            )
             continue
         try:
-            open_ms = int(raw_ts)
             high = float(candle.get("h", candle.get("high", 0.0)))
             low = float(candle.get("l", candle.get("low", 0.0)))
             close = float(candle.get("c", candle.get("close", 0.0)))
+        except (TypeError, ValueError):
+            meta["invalid_ohlc_count"] += 1
+            LOGGER.warning(
+                "Invalid OHLC values encountered after sanitisation",
+                extra={"stage": stage, "symbol": symbol, "ts": timestamp_ms},
+            )
+            continue
+        try:
             volume = float(candle.get("v", candle.get("volume", 0.0)))
         except (TypeError, ValueError):
-            continue
-        bars.append((open_ms, high, low, close, volume))
+            volume = 0.0
+        if not math.isfinite(volume) or volume < 0.0:
+            volume = 0.0
+        bars.append((timestamp_ms, dt, high, low, close, volume))
 
     if not bars:
-        return {"symbol": symbol.upper(), "vwap": []}
+        meta["sessions_empty"] = True
+        LOGGER.info(
+            "No usable candles for session VWAP after validation",
+            extra={"stage": stage, "symbol": symbol},
+        )
+        return {"symbol": symbol.upper(), "vwap": [], "vwap_sigma": [], "meta": meta}
 
     bars.sort(key=lambda item: item[0])
-    last_date = datetime.fromtimestamp(bars[-1][0] / 1000.0, tz=timezone.utc).date()
+    last_dt = bars[-1][1]
+    last_date = last_dt.date()
     lookback = max(1, int(Meta.VWAP_LOOKBACK_DAYS))
     start_date = last_date - timedelta(days=lookback - 1)
     sessions = list(Meta.iter_vwap_sessions())
@@ -798,8 +856,7 @@ def compute_session_vwaps(symbol: str, candles: Sequence[Mapping[str, Any]]) -> 
     ] = defaultdict(list)
     session_extrema: Dict[Tuple[datetime.date, str], Tuple[float, float]] = {}
 
-    for open_ms, high, low, close, volume in bars:
-        dt = datetime.fromtimestamp(open_ms / 1000.0, tz=timezone.utc)
+    for open_ms, dt, high, low, close, volume in bars:
         if dt.date() < start_date:
             continue
         entry = {"h": high, "l": low, "c": close, "v": volume}
@@ -867,7 +924,23 @@ def compute_session_vwaps(symbol: str, candles: Sequence[Mapping[str, Any]]) -> 
                 }
             )
 
-    return {"symbol": symbol.upper(), "vwap": results, "vwap_sigma": sigma_results}
+    LOGGER.info(
+        "Computed session VWAP payload",
+        extra={
+            "stage": stage,
+            "symbol": symbol,
+            "bars": len(bars),
+            "start_ms": bars[0][0],
+            "end_ms": bars[-1][0],
+        },
+    )
+
+    return {
+        "symbol": symbol.upper(),
+        "vwap": results,
+        "vwap_sigma": sigma_results,
+        "meta": meta,
+    }
 def _coerce_frame(tf_key: str, frame: Mapping[str, Any] | Sequence[Any]) -> Dict[str, Any]:
     if tf_key not in TIMEFRAME_WINDOWS:
         raise ValueError(f"Unsupported timeframe: {tf_key}")

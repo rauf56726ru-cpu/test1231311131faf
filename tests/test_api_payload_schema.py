@@ -47,7 +47,7 @@ def snapshot_storage(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def stub_missing_minutes(monkeypatch):
-    def filler(symbol: str, start_ms: int, end_ms: int, gaps):
+    async def filler(symbol: str, start_ms: int, end_ms: int, gaps):
         candles = []
         for gap in gaps:
             cursor = int(gap["from"])
@@ -66,7 +66,7 @@ def stub_missing_minutes(monkeypatch):
                 cursor += 60_000
         return candles
 
-    monkeypatch.setattr(check_all_datas, "_download_missing_minutes", filler)
+    monkeypatch.setattr(check_all_datas, "_download_missing_minutes_async", filler)
 
     def filler_htf(symbol: str, gaps, *, fetcher, target):
         inserted = 0
