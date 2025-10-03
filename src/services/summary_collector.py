@@ -17,6 +17,7 @@ from .ohlc_sanitizer import sanitize_candles
 from .ohlc import TIMEFRAME_TO_MS
 from .timeutils import ensure_ms_epoch
 from .check_all_datas import _normalise_binance_row
+from .progress import ProgressReporter, emit_progress
 
 LOGGER = logging.getLogger(__name__)
 TRACE_LOGGER = tracing.LOGGER.getChild("summary_collector")
@@ -247,17 +248,18 @@ async def _fill_gap(
     interval_ms: int,
     client: httpx.AsyncClient,
     bucket: _TokenBucket,
+    progress: Optional[ProgressReporter] = None,
 ) -> IntervalSummary:
     gap_start = int(gap["from"])
     gap_end = int(gap["to"])
-    progress = await asyncio.to_thread(
+    resume_marker = await asyncio.to_thread(
         repository.load_gap_progress,
         symbol,
         interval,
         gap_start,
     )
-    if progress is not None:
-        resume_from = max(gap_start, progress + interval_ms)
+    if resume_marker is not None:
+        resume_from = max(gap_start, resume_marker + interval_ms)
     else:
         resume_from = gap_start
 
@@ -267,6 +269,16 @@ async def _fill_gap(
     dropped_ts = 0
     dropped_ohlc = 0
     requests = 0
+
+    await emit_progress(
+        progress,
+        "summary_collector:gap_begin",
+        symbol=symbol,
+        interval=interval,
+        gap_start=gap_start,
+        gap_end=gap_end,
+        resume_from=resume_from,
+    )
 
     while cursor <= gap_end:
         page_end = min(gap_end, cursor + page_span - interval_ms)
@@ -315,6 +327,17 @@ async def _fill_gap(
                 "normalised_rows": len(normalised),
             },
         )
+        await emit_progress(
+            progress,
+            "summary_collector:normalised_batch",
+            symbol=symbol,
+            interval=interval,
+            gap_start=gap_start,
+            gap_end=gap_end,
+            requested_limit=page_limit,
+            raw_rows=len(raw_rows),
+            normalised_rows=len(normalised),
+        )
 
         if not normalised:
             cursor += page_span
@@ -333,6 +356,15 @@ async def _fill_gap(
                 "gap_end": gap_end,
                 "deduped_rows": len(normalised),
             },
+        )
+        await emit_progress(
+            progress,
+            "summary_collector:deduplicated_batch",
+            symbol=symbol,
+            interval=interval,
+            gap_start=gap_start,
+            gap_end=gap_end,
+            deduped_rows=len(normalised),
         )
         stats, sanitised = await _upsert_sanitised(
             repository,
@@ -354,6 +386,15 @@ async def _fill_gap(
                 "dropped_ts": stats.dropped_ts,
                 "dropped_ohlc": stats.dropped_ohlc,
             },
+        )
+        await emit_progress(
+            progress,
+            "summary_collector:batch_persisted",
+            symbol=symbol,
+            interval=interval,
+            written=stats.written,
+            dropped_ts=stats.dropped_ts,
+            dropped_ohlc=stats.dropped_ohlc,
         )
 
         if not sanitised:
@@ -379,6 +420,14 @@ async def _fill_gap(
                 "last_open": last_open,
             },
         )
+        await emit_progress(
+            progress,
+            "summary_collector:gap_progress_updated",
+            symbol=symbol,
+            interval=interval,
+            gap_start=gap_start,
+            last_open=last_open,
+        )
 
     await asyncio.to_thread(repository.clear_gap_progress, symbol, interval, gap_start)
 
@@ -394,6 +443,18 @@ async def _fill_gap(
             "dropped_ohlc": dropped_ohlc,
             "requests": requests,
         },
+    )
+    await emit_progress(
+        progress,
+        "summary_collector:gap_completed",
+        symbol=symbol,
+        interval=interval,
+        gap_start=gap_start,
+        gap_end=gap_end,
+        written=written,
+        dropped_ts=dropped_ts,
+        dropped_ohlc=dropped_ohlc,
+        requests=requests,
     )
 
     return IntervalSummary(
@@ -414,6 +475,7 @@ async def collect_recent_summary(
     intervals: Optional[Sequence[str]] = None,
     repository: Optional[CandleRepository] = None,
     start_ms: Optional[int] = None,
+    progress: Optional[ProgressReporter] = None,
 ) -> CollectionSummary:
     """Ensure recent OHLC coverage exists for the requested symbol."""
 
@@ -439,6 +501,14 @@ async def collect_recent_summary(
             "end_ms": now_ms,
             "days": span_days,
         },
+    )
+    await emit_progress(
+        progress,
+        "summary_collector:start",
+        symbol=symbol,
+        start_ms=start_ms,
+        end_ms=now_ms,
+        days=span_days,
     )
 
     target_intervals = list(intervals or TIMEFRAME_TO_MS.keys())
@@ -482,6 +552,14 @@ async def collect_recent_summary(
                         "last_closed": last_closed,
                     },
                 )
+                await emit_progress(
+                    progress,
+                    "summary_collector:interval_skipped",
+                    symbol=symbol,
+                    interval=interval,
+                    first_expected=first_expected,
+                    last_closed=last_closed,
+                )
                 continue
             existing = await _fetch_existing(
                 repo,
@@ -500,6 +578,15 @@ async def collect_recent_summary(
                     "existing": len(existing),
                 },
             )
+            await emit_progress(
+                progress,
+                "summary_collector:fetched_existing",
+                symbol=symbol,
+                interval=interval,
+                first_expected=first_expected,
+                last_closed=last_closed,
+                existing=len(existing),
+            )
             gaps = _compute_gaps(first_expected, last_closed, interval_ms, existing)
             TRACE_LOGGER.debug(
                 "summary_collector:computed_gaps",
@@ -511,6 +598,15 @@ async def collect_recent_summary(
                     "last_closed": last_closed,
                 },
             )
+            await emit_progress(
+                progress,
+                "summary_collector:computed_gaps",
+                symbol=symbol,
+                interval=interval,
+                gap_count=len(gaps),
+                first_expected=first_expected,
+                last_closed=last_closed,
+            )
             if not gaps:
                 summaries[interval] = IntervalSummary(
                     gaps_total=0,
@@ -519,6 +615,14 @@ async def collect_recent_summary(
                     dropped_candles=0,
                     requests=0,
                     remaining_gaps=[],
+                )
+                await emit_progress(
+                    progress,
+                    "summary_collector:interval_complete",
+                    symbol=symbol,
+                    interval=interval,
+                    first_expected=first_expected,
+                    last_closed=last_closed,
                 )
                 continue
 
@@ -532,6 +636,7 @@ async def collect_recent_summary(
                     interval_ms=interval_ms,
                     client=client,
                     bucket=bucket,
+                    progress=progress,
                 )
                 gap_summaries.append(summary)
                 total_requests += summary.requests
@@ -547,6 +652,16 @@ async def collect_recent_summary(
                         "written_total": total_written,
                         "requests_total": total_requests,
                     },
+                )
+                await emit_progress(
+                    progress,
+                    "summary_collector:interval_progress",
+                    symbol=symbol,
+                    interval=interval,
+                    gap_from=gap.get("from"),
+                    gap_to=gap.get("to"),
+                    written_total=total_written,
+                    requests_total=total_requests,
                 )
 
             refreshed = await _fetch_existing(
@@ -577,6 +692,17 @@ async def collect_recent_summary(
                     "remaining_gaps": len(remaining),
                 },
             )
+            await emit_progress(
+                progress,
+                "summary_collector:interval_finished",
+                symbol=symbol,
+                interval=interval,
+                gaps_total=len(gaps),
+                candles_written=summaries[interval].candles_written,
+                dropped_candles=summaries[interval].dropped_candles,
+                requests=summaries[interval].requests,
+                remaining_gaps=len(remaining),
+            )
 
     summary = CollectionSummary(
         symbol=symbol.upper(),
@@ -596,6 +722,14 @@ async def collect_recent_summary(
             "candles_written": summary.candles_written,
             "dropped_candles": summary.dropped_candles,
         },
+    )
+    await emit_progress(
+        progress,
+        "summary_collector:finished",
+        symbol=summary.symbol,
+        requests=summary.requests,
+        candles_written=summary.candles_written,
+        dropped_candles=summary.dropped_candles,
     )
 
     return summary

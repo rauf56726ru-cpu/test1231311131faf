@@ -3,9 +3,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, time as dtime, timedelta, timezone
-from typing import Any, Dict, Mapping, MutableMapping
+from typing import Any, Dict, Mapping, MutableMapping, Optional
 
 from . import tracing
+from .progress import ProgressReporter, emit_progress
 
 TRACE_LOGGER = tracing.LOGGER.getChild("session_collector")
 
@@ -156,7 +157,11 @@ def _resolve_session_window(now_utc: datetime) -> SessionWindow:
     )
 
 
-async def collect_last_session_detailed(symbol: str, now: datetime | None = None) -> SessionCollectionResult:
+async def collect_last_session_detailed(
+    symbol: str,
+    now: datetime | None = None,
+    progress: Optional[ProgressReporter] = None,
+) -> SessionCollectionResult:
     """Collect detailed data for the latest trading session.
 
     Current implementation returns a placeholder payload marking the session as insufficient
@@ -171,6 +176,12 @@ async def collect_last_session_detailed(symbol: str, now: datetime | None = None
             "requested_at": now_dt.isoformat(),
         },
     )
+    await emit_progress(
+        progress,
+        "session_collector:start",
+        symbol=symbol,
+        requested_at=now_dt.isoformat(),
+    )
     session_window = _resolve_session_window(now_dt)
     TRACE_LOGGER.debug(
         "session_collector:resolved_window",
@@ -181,6 +192,15 @@ async def collect_last_session_detailed(symbol: str, now: datetime | None = None
             "close_utc": session_window.close_utc.isoformat(),
             "active": session_window.is_active,
         },
+    )
+    await emit_progress(
+        progress,
+        "session_collector:resolved_window",
+        symbol=symbol,
+        session=session_window.name,
+        open_utc=session_window.open_utc.isoformat(),
+        close_utc=session_window.close_utc.isoformat(),
+        active=session_window.is_active,
     )
     missing_fields = (
         "ohlcv.coverage",
@@ -205,6 +225,14 @@ async def collect_last_session_detailed(symbol: str, now: datetime | None = None
             "coverage_pct": result.coverage_pct,
             "missing_fields": list(result.missing_fields),
         },
+    )
+    await emit_progress(
+        progress,
+        "session_collector:finished",
+        symbol=symbol,
+        status=result.status,
+        coverage_pct=result.coverage_pct,
+        missing_fields=list(result.missing_fields),
     )
 
     return result
