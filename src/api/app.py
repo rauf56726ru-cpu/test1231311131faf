@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 from datetime import datetime, timedelta, timezone
 from math import ceil
@@ -39,6 +39,9 @@ from ..services import (
     update_preset,
     apply_enrichment_to_payload,
     enrich_inspection_snapshot,
+    build_check_all_datas_async,
+    build_inspection_error_payload,
+    collect_recent_summary,
 )
 from ..services.zones import Config as ZonesConfig, detect_zones
 
@@ -55,6 +58,8 @@ from ..static_version import STATIC_VERSION
 from ..version import APP_VERSION
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+LOGGER = logging.getLogger(__name__)
+CHECK_ALL_BUILD_TIMEOUT = 5.0
 
 
 
@@ -893,24 +898,83 @@ async def inspection_check_all(
         mode_value = "selection"
 
     collection_reference = now_override or datetime.now(timezone.utc)
+    has_now_override = now_override is not None
+    log_extra: Dict[str, Any] = {
+        "snapshot_id": target_snapshot.get("id"),
+        "mode": mode_value,
+        "selection_start": selection_start,
+        "selection_end": selection_end,
+        "hours": hours,
+        "has_now_override": has_now_override,
+    }
+    LOGGER.info("inspection_check_all:start", extra=log_extra)
 
     if mode_value == "summary":
         days = summary_days if summary_days and summary_days > 0 else 3
         window_hours = max(1, days * 24)
+        branch_log = dict(log_extra)
+        branch_log["window_hours"] = window_hours
+        symbol = target_snapshot.get("symbol") if isinstance(target_snapshot, Mapping) else None
+        if not symbol:
+            meta_block = target_snapshot.get("meta") if isinstance(target_snapshot, Mapping) else None
+            if isinstance(meta_block, Mapping):
+                symbol = meta_block.get("symbol")
+        collection_summary_payload: Dict[str, Any] | None = None
+        if isinstance(symbol, str) and symbol:
+            try:
+                summary_result = await collect_recent_summary(symbol, days=days)
+                collection_summary_payload = summary_result.as_dict()
+                branch_log["summary_collection"] = {
+                    "requests": summary_result.requests,
+                    "candles_written": summary_result.candles_written,
+                    "dropped_candles": summary_result.dropped_candles,
+                }
+            except Exception as exc:  # pragma: no cover - defensive logging
+                LOGGER.warning(
+                    "inspection_check_all:summary_collection_failed",
+                    extra={**branch_log, "error": str(exc)},
+                )
         try:
-            payload = build_check_all_datas(
+            payload = await build_check_all_datas_async(
                 target_snapshot,
                 now_utc=now_override,
                 window_hours=window_hours,
+                timeout=CHECK_ALL_BUILD_TIMEOUT,
             )
         except DataQualityError as exc:
+            LOGGER.warning(
+                "inspection_check_all:data_quality_error",
+                extra={**branch_log, "error": str(exc)},
+            )
             raise HTTPException(
                 status_code=400,
                 detail={"message": str(exc), "data_quality": exc.detail},
             ) from exc
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            LOGGER.exception(
+                "inspection_check_all:summary_failed",
+                extra={**branch_log, "error": str(exc)},
+            )
+            fallback = build_inspection_error_payload(
+                target_snapshot,
+                now_utc=now_override,
+                missing_fields=["ohlcv.1m"],
+                reason="invalid_timestamps",
+            )
+            return JSONResponse(fallback)
         if payload is None:
+            LOGGER.info("inspection_check_all:finished", extra={**branch_log, "status": None})
             return Response(status_code=204)
         payload = _prepare_summary_payload(dict(payload))
+        if collection_summary_payload:
+            meta_block = payload.get("meta")
+            if isinstance(meta_block, MutableMapping):
+                meta_block["summary_collection"] = collection_summary_payload
+        status_value = payload.get("status") if isinstance(payload, Mapping) else None
+        LOGGER.info(
+            "inspection_check_all:finished",
+            extra={**branch_log, "status": status_value},
+        )
         set_last_collection_time(collection_reference)
         return JSONResponse(payload)
 
@@ -933,39 +997,90 @@ async def inspection_check_all(
             aligned_ms = (last_collection_ms // 60_000) * 60_000
             next_minute_ms = aligned_ms + 60_000
             window_start_override_ms = max(0, next_minute_ms)
+        branch_log = dict(log_extra)
+        branch_log["window_hours"] = window_hours
+        branch_log["window_start_override_ms"] = window_start_override_ms
         try:
-            payload = build_check_all_datas(
+            payload = await build_check_all_datas_async(
                 target_snapshot,
                 now_utc=now_override,
                 window_hours=window_hours,
                 window_start_override_ms=window_start_override_ms,
                 strict_window=True,
+                timeout=CHECK_ALL_BUILD_TIMEOUT,
             )
         except DataQualityError as exc:
+            LOGGER.warning(
+                "inspection_check_all:data_quality_error",
+                extra={**branch_log, "error": str(exc)},
+            )
             raise HTTPException(
                 status_code=400,
                 detail={"message": str(exc), "data_quality": exc.detail},
             ) from exc
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            LOGGER.exception(
+                "inspection_check_all:summary_failed",
+                extra={**branch_log, "error": str(exc)},
+            )
+            fallback = build_inspection_error_payload(
+                target_snapshot,
+                now_utc=now_override,
+                missing_fields=["ohlcv.1m"],
+                reason="invalid_timestamps",
+            )
+            return JSONResponse(fallback)
         if payload is None:
+            LOGGER.info("inspection_check_all:finished", extra={**branch_log, "status": None})
             return Response(status_code=204)
+        status_value = payload.get("status") if isinstance(payload, Mapping) else None
+        LOGGER.info(
+            "inspection_check_all:finished",
+            extra={**branch_log, "status": status_value},
+        )
         set_last_collection_time(collection_reference)
         return JSONResponse(payload)
 
+    branch_log = dict(log_extra)
     try:
-        payload = build_check_all_datas(
+        payload = await build_check_all_datas_async(
             target_snapshot,
             now_utc=now_override,
             selection_start_ms=selection_start,
             selection_end_ms=selection_end,
             hours=hours,
+            timeout=CHECK_ALL_BUILD_TIMEOUT,
         )
     except DataQualityError as exc:
+        LOGGER.warning(
+            "inspection_check_all:data_quality_error",
+            extra={**branch_log, "error": str(exc)},
+        )
         raise HTTPException(
             status_code=400,
             detail={"message": str(exc), "data_quality": exc.detail},
         ) from exc
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        LOGGER.exception(
+            "inspection_check_all:selection_failed",
+            extra={**branch_log, "error": str(exc)},
+        )
+        fallback = build_inspection_error_payload(
+            target_snapshot,
+            now_utc=now_override,
+            missing_fields=["ohlcv.1m"],
+            reason="invalid_timestamps",
+        )
+        return JSONResponse(fallback)
     if payload is None:
+        LOGGER.info("inspection_check_all:finished", extra={**branch_log, "status": None})
         return Response(status_code=204)
+
+    status_value = payload.get("status") if isinstance(payload, Mapping) else None
+    LOGGER.info(
+        "inspection_check_all:finished",
+        extra={**branch_log, "status": status_value},
+    )
 
     return JSONResponse(payload)
 

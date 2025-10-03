@@ -10,6 +10,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.services import collection_state, shared_candles_store
+import src.services.candles_repository as candles_repository
 
 
 @pytest.fixture(autouse=True)
@@ -36,3 +37,16 @@ def _reset_shared_candles(tmp_path, monkeypatch):
     shared_candles_store.reset_store()
     yield
     shared_candles_store.reset_store()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_candles_repo(tmp_path, monkeypatch):
+    """Point the candle repository to a temporary SQLite database."""
+
+    db_dir = tmp_path / "candles_db"
+    db_path = db_dir / "candles.sqlite"
+    monkeypatch.setattr(candles_repository, "DB_DIR", db_dir)
+    monkeypatch.setattr(candles_repository, "DB_PATH", db_path)
+    candles_repository.set_repository(candles_repository.CandleRepository(db_path))
+    yield
+    candles_repository.set_repository(None)

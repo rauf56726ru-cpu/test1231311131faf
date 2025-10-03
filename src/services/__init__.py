@@ -1,7 +1,12 @@
 """Service layer exports for the chart backend."""
 
 from .binance import BINANCE_FAPI_REST
-from .check_all_datas import build_check_all_datas, DataQualityError
+from .check_all_datas import (
+    build_check_all_datas,
+    build_check_all_datas_async,
+    build_inspection_error_payload,
+    DataQualityError,
+)
 from .inspection import (
     build_inspection_payload,
     build_placeholder_snapshot,
@@ -38,6 +43,7 @@ from .shared_candles_store import (
     get_shared_candles,
     merge_shared_candles,
 )
+from .summary_collector import collect_recent_summary, CollectionSummary
 from .ohlc import (
     TIMEFRAME_WINDOWS,
     fetch_ohlcv,
@@ -56,6 +62,8 @@ __all__ = [
     "build_liquidity_snapshot",
     "build_check_all_datas",
     "build_placeholder_snapshot",
+    "build_check_all_datas_async",
+    "build_inspection_error_payload",
     "DEFAULT_SYMBOL",
     "get_snapshot",
     "list_snapshots",
@@ -95,4 +103,6 @@ __all__ = [
     "clear_shared_candles",
     "enrich_inspection_snapshot",
     "apply_enrichment_to_payload",
+    "collect_recent_summary",
+    "CollectionSummary",
 ]

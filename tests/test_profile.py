@@ -161,8 +161,10 @@ def test_split_by_sessions_groups_candles() -> None:
     base = datetime(2024, 5, 1, tzinfo=timezone.utc)
     candles = make_unimodal(n=600, base=base)
     sessions = list(Meta.iter_vwap_sessions())
-    buckets = split_by_sessions(candles, sessions)
+    result = split_by_sessions(candles, sessions)
+    buckets = result.buckets
     assert buckets, "Expected session buckets"
+    assert result.sessions_empty is False
     asia_key = (base.date(), sessions[0][0])
     london_key = (base.date(), sessions[1][0])
     assert asia_key in buckets
