@@ -2661,6 +2661,30 @@ async def build_check_all_datas(
     minute_candles = _deduplicate_sorted(frames.get("1m", []))
     frames["1m"] = minute_candles
 
+    if minute_candles:
+        try:
+            aggregated_block = build_multi_timeframe_ohlcv(minute_candles)
+        except Exception:  # pragma: no cover - defensive guard
+            aggregated_block = {}
+        else:
+            for tf_key in ("3m", "5m", "15m", "1h", "4h", "1d"):
+                existing_series = frames.get(tf_key)
+                if existing_series:
+                    continue
+                tf_payload = aggregated_block.get(tf_key)
+                if not isinstance(tf_payload, Mapping):
+                    continue
+                raw_series = tf_payload.get("candles")
+                if not isinstance(raw_series, Sequence):
+                    continue
+                coerced_series = [
+                    dict(entry)
+                    for entry in raw_series
+                    if isinstance(entry, Mapping)
+                ]
+                if coerced_series:
+                    frames[tf_key] = coerced_series
+
     profile_config = resolve_profile_config(symbol, raw_meta)
     profile_meta: Dict[str, Any] = {}
     sessions = list(VWAP_TPO_SESSIONS)
