@@ -42,6 +42,8 @@ from ..services import (
     build_check_all_datas_async,
     build_inspection_error_payload,
     collect_recent_summary,
+    collect_last_session_detailed,
+    SessionCollectionResult,
 )
 from ..services.zones import Config as ZonesConfig, detect_zones
 
@@ -894,7 +896,7 @@ async def inspection_check_all(
         now_override = parsed
 
     mode_value = (mode or "selection").strip().lower()
-    if mode_value not in {"selection", "summary", "topup"}:
+    if mode_value not in {"selection", "summary", "topup", "session_detailed"}:
         mode_value = "selection"
 
     collection_reference = now_override or datetime.now(timezone.utc)
@@ -976,6 +978,29 @@ async def inspection_check_all(
             extra={**branch_log, "status": status_value},
         )
         set_last_collection_time(collection_reference)
+        return JSONResponse(payload)
+
+    if mode_value == "session_detailed":
+        symbol = target_snapshot.get("symbol") if isinstance(target_snapshot, Mapping) else None
+        if not symbol:
+            meta_block = target_snapshot.get("meta") if isinstance(target_snapshot, Mapping) else None
+            if isinstance(meta_block, Mapping):
+                symbol = meta_block.get("symbol")
+        if not symbol:
+            raise HTTPException(status_code=400, detail="Snapshot symbol missing")
+        try:
+            session_result: SessionCollectionResult = await collect_last_session_detailed(symbol, now_override)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            LOGGER.exception(
+                "inspection_check_all:session_detailed_failed",
+                extra={**log_extra, "error": str(exc)},
+            )
+            raise HTTPException(status_code=500, detail="Session collection failed") from exc
+        payload = session_result.as_dict()
+        LOGGER.info(
+            "inspection_check_all:finished",
+            extra={**log_extra, "mode": mode_value, "status": payload.get("status")},
+        )
         return JSONResponse(payload)
 
     if mode_value == "topup":

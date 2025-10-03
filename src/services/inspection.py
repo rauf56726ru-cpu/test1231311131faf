@@ -2512,6 +2512,7 @@ def render_inspection_page(
     const diagnosticsPre = document.getElementById("diagnostics-json");
     const checkAllPre = document.getElementById("checkall-json");
     const summaryButton = document.getElementById("collect-summary");
+    const sessionDetailedButton = document.getElementById("btn_collect_last_session_detailed");
     const topupButton = document.getElementById("collect-topup");
     const collectSelectionButton = document.getElementById("collect-selection");
     const checkAllHours = document.getElementById("checkall-hours");
@@ -3117,6 +3118,9 @@ def render_inspection_page(
       if (summaryButton) {
         summaryButton.disabled = !liveCapable || !presetReady;
       }
+      if (sessionDetailedButton) {
+        sessionDetailedButton.disabled = !liveCapable || !presetReady;
+      }
       if (topupButton) {
         topupButton.disabled = !liveCapable || !presetReady;
       }
@@ -3451,6 +3455,63 @@ def render_inspection_page(
       } finally {
         if (summaryButton) {
           summaryButton.disabled = false;
+        }
+        if (createdSnapshotId) {
+          refreshSnapshots({ quiet: true }).catch((err) => {
+            console.warn("Не удалось обновить список снэпшотов", err);
+          });
+        }
+        updateCheckAllState();
+      }
+    }
+
+    async function requestSessionDetailedData() {
+      if (sessionDetailedButton) {
+        sessionDetailedButton.disabled = true;
+      }
+
+      let createdSnapshotId = null;
+
+      try {
+        updateStatus("Собираем подробные данные по последней сессии...", "info");
+        const { snapshotId } = await captureLiveSnapshot({ lookbackDays: 1, mode: "session_detailed" });
+        createdSnapshotId = snapshotId;
+        state.snapshotId = snapshotId;
+        updateCheckAllState();
+        if (sessionDetailedButton) {
+          sessionDetailedButton.disabled = true;
+        }
+        if (snapshotSelect) {
+          snapshotSelect.value = snapshotId;
+        }
+        const url = new URL("/inspection/check-all", window.location.origin);
+        url.searchParams.set("snapshot", snapshotId);
+        url.searchParams.set("mode", "session_detailed");
+        const response = await fetch(url.toString(), {
+          headers: { Accept: "application/json" },
+          cache: "no-store",
+        });
+        if (response.status === 204) {
+          state.checkAll = null;
+          setJson(checkAllPre, null);
+          updateStatus("Не удалось собрать данные по последней сессии", "warning");
+          return;
+        }
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const payload = await response.json();
+        state.checkAll = payload;
+        setJson(checkAllPre, payload);
+        updateStatus("Сессионный отчёт готов", "success");
+      } catch (error) {
+        console.error(error);
+        state.checkAll = null;
+        setJson(checkAllPre, null);
+        updateStatus("Ошибка при сборе данных по последней сессии", "error");
+      } finally {
+        if (sessionDetailedButton) {
+          sessionDetailedButton.disabled = false;
         }
         if (createdSnapshotId) {
           refreshSnapshots({ quiet: true }).catch((err) => {
@@ -4131,6 +4192,14 @@ def render_inspection_page(
       });
     }
 
+    if (sessionDetailedButton) {
+      sessionDetailedButton.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        requestSessionDetailedData();
+      });
+    }
+
     if (topupButton) {
       topupButton.addEventListener("click", (event) => {
         event.preventDefault();
@@ -4288,6 +4357,7 @@ def render_inspection_page(
             <p class=\"panel-lead\">Собирайте актуальную информацию без сохранения снэпшотов на сервере.</p>
             <div class=\"collection-actions\">
               <button id=\"collect-summary\" class=\"primary\" type=\"button\">Собрать информацию за последние 3 дня</button>
+              <button id=\"btn_collect_last_session_detailed\" class=\"secondary\" type=\"button\" title=\"Последняя завершённая или текущая активная сессия с полнотой ≥90%\">Собрать информацию за последнюю сессию подробно</button>
               <button id=\"collect-topup\" class=\"secondary\" type=\"button\">Дособрать данные</button>
               <button id=\"collect-selection\" class=\"secondary\" type=\"button\" disabled>Собрать информацию за выбранный период</button>
             </div>

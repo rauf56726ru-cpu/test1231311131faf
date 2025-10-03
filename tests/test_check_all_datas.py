@@ -453,6 +453,30 @@ def test_vwap_tpo_sessions_include_aliases(client: TestClient) -> None:
     assert composite_day["val"] is not None
 
 
+def test_session_detailed_mode_returns_placeholder(client: TestClient) -> None:
+    base = datetime(2024, 5, 1, 7, 0, tzinfo=UTC)
+    payload = _build_snapshot_payload(base, count=120)
+
+    create_response = client.post("/inspection/snapshot", json=payload)
+    assert create_response.status_code == 200
+    snapshot_id = create_response.json()["snapshot_id"]
+
+    response = client.get(
+        "/inspection/check-all",
+        params={"snapshot": snapshot_id, "mode": "session_detailed"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["schema"] == "session_detailed.v1"
+    assert body["status"] == "insufficient_data"
+    assert body["meta"]["symbol"] == payload["symbol"]
+    assert body["meta"]["tz"] == "Europe/Berlin"
+    assert "session" in body
+    assert body["session"]["coverage_pct"] == 0.0
+    assert "ohlcv.coverage" in body["missing_fields"]
+
+
 @pytest.mark.anyio("asyncio")
 async def test_async_builder_timeout_returns_insufficient(monkeypatch):
     base = datetime(2024, 5, 1, 0, 0, tzinfo=UTC)
