@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import httpx
 
+from . import tracing
 from .candles_repository import CandleRepository, UpsertStats, get_repository
 from .ohlc_sanitizer import sanitize_candles
 from .ohlc import TIMEFRAME_TO_MS
@@ -18,6 +19,7 @@ from .timeutils import ensure_ms_epoch
 from .check_all_datas import _normalise_binance_row
 
 LOGGER = logging.getLogger(__name__)
+TRACE_LOGGER = tracing.LOGGER.getChild("summary_collector")
 UTC = timezone.utc
 
 BINANCE_ENDPOINT = "https://fapi.binance.com/fapi/v1/klines"
@@ -197,6 +199,18 @@ async def _upsert_sanitised(
     if not candles:
         return UpsertStats(written=0, dropped_ts=0, dropped_ohlc=0), []
     sanitised = sanitize_candles(candles, stage=stage)
+    TRACE_LOGGER.debug(
+        "summary_collector:upsert_sanitised",
+        extra={
+            "symbol": symbol,
+            "interval": interval,
+            "stage": stage,
+            "incoming": len(candles),
+            "sanitised": len(sanitised.candles),
+            "dropped_ts": getattr(sanitised, "invalid_ts", 0),
+            "dropped_ohlc": getattr(sanitised, "invalid_ohlc", 0),
+        },
+    )
     stats = await asyncio.to_thread(
         repository.upsert_candles,
         symbol,
@@ -289,6 +303,19 @@ async def _fill_gap(
             candle["t"] = aligned
             normalised.append(candle)
 
+        TRACE_LOGGER.debug(
+            "summary_collector:normalised_batch",
+            extra={
+                "symbol": symbol,
+                "interval": interval,
+                "gap_start": gap_start,
+                "gap_end": gap_end,
+                "requested_limit": page_limit,
+                "raw_rows": len(raw_rows),
+                "normalised_rows": len(normalised),
+            },
+        )
+
         if not normalised:
             cursor += page_span
             continue
@@ -297,6 +324,16 @@ async def _fill_gap(
         for candle in normalised:
             dedup[int(candle["t"])] = candle
         normalised = [dedup[key] for key in sorted(dedup.keys())]
+        TRACE_LOGGER.debug(
+            "summary_collector:deduplicated_batch",
+            extra={
+                "symbol": symbol,
+                "interval": interval,
+                "gap_start": gap_start,
+                "gap_end": gap_end,
+                "deduped_rows": len(normalised),
+            },
+        )
         stats, sanitised = await _upsert_sanitised(
             repository,
             symbol=symbol,
@@ -307,6 +344,17 @@ async def _fill_gap(
         written += stats.written
         dropped_ts += stats.dropped_ts
         dropped_ohlc += stats.dropped_ohlc
+
+        TRACE_LOGGER.debug(
+            "summary_collector:batch_persisted",
+            extra={
+                "symbol": symbol,
+                "interval": interval,
+                "written": stats.written,
+                "dropped_ts": stats.dropped_ts,
+                "dropped_ohlc": stats.dropped_ohlc,
+            },
+        )
 
         if not sanitised:
             cursor += page_span
@@ -322,7 +370,31 @@ async def _fill_gap(
         )
         cursor = last_open + interval_ms
 
+        TRACE_LOGGER.debug(
+            "summary_collector:gap_progress_updated",
+            extra={
+                "symbol": symbol,
+                "interval": interval,
+                "gap_start": gap_start,
+                "last_open": last_open,
+            },
+        )
+
     await asyncio.to_thread(repository.clear_gap_progress, symbol, interval, gap_start)
+
+    TRACE_LOGGER.debug(
+        "summary_collector:gap_completed",
+        extra={
+            "symbol": symbol,
+            "interval": interval,
+            "gap_start": gap_start,
+            "gap_end": gap_end,
+            "written": written,
+            "dropped_ts": dropped_ts,
+            "dropped_ohlc": dropped_ohlc,
+            "requests": requests,
+        },
+    )
 
     return IntervalSummary(
         gaps_total=1,
@@ -359,6 +431,16 @@ async def collect_recent_summary(
     if start_ms > now_ms:
         start_ms = now_ms
 
+    TRACE_LOGGER.debug(
+        "summary_collector:start",
+        extra={
+            "symbol": symbol,
+            "start_ms": start_ms,
+            "end_ms": now_ms,
+            "days": span_days,
+        },
+    )
+
     target_intervals = list(intervals or TIMEFRAME_TO_MS.keys())
     summaries: Dict[str, IntervalSummary] = {}
     total_requests = 0
@@ -391,6 +473,15 @@ async def collect_recent_summary(
                     requests=0,
                     remaining_gaps=[],
                 )
+                TRACE_LOGGER.debug(
+                    "summary_collector:interval_skipped",
+                    extra={
+                        "symbol": symbol,
+                        "interval": interval,
+                        "first_expected": first_expected,
+                        "last_closed": last_closed,
+                    },
+                )
                 continue
             existing = await _fetch_existing(
                 repo,
@@ -399,7 +490,27 @@ async def collect_recent_summary(
                 start_ms=first_expected,
                 end_ms=last_closed,
             )
+            TRACE_LOGGER.debug(
+                "summary_collector:fetched_existing",
+                extra={
+                    "symbol": symbol,
+                    "interval": interval,
+                    "first_expected": first_expected,
+                    "last_closed": last_closed,
+                    "existing": len(existing),
+                },
+            )
             gaps = _compute_gaps(first_expected, last_closed, interval_ms, existing)
+            TRACE_LOGGER.debug(
+                "summary_collector:computed_gaps",
+                extra={
+                    "symbol": symbol,
+                    "interval": interval,
+                    "gap_count": len(gaps),
+                    "first_expected": first_expected,
+                    "last_closed": last_closed,
+                },
+            )
             if not gaps:
                 summaries[interval] = IntervalSummary(
                     gaps_total=0,
@@ -426,6 +537,17 @@ async def collect_recent_summary(
                 total_requests += summary.requests
                 total_written += summary.candles_written
                 total_dropped += summary.dropped_candles
+                TRACE_LOGGER.debug(
+                    "summary_collector:interval_progress",
+                    extra={
+                        "symbol": symbol,
+                        "interval": interval,
+                        "gap_from": gap.get("from"),
+                        "gap_to": gap.get("to"),
+                        "written_total": total_written,
+                        "requests_total": total_requests,
+                    },
+                )
 
             refreshed = await _fetch_existing(
                 repo,
@@ -443,8 +565,20 @@ async def collect_recent_summary(
                 requests=sum(item.requests for item in gap_summaries),
                 remaining_gaps=remaining,
             )
+            TRACE_LOGGER.debug(
+                "summary_collector:interval_finished",
+                extra={
+                    "symbol": symbol,
+                    "interval": interval,
+                    "gaps_total": len(gaps),
+                    "candles_written": summaries[interval].candles_written,
+                    "dropped_candles": summaries[interval].dropped_candles,
+                    "requests": summaries[interval].requests,
+                    "remaining_gaps": len(remaining),
+                },
+            )
 
-    return CollectionSummary(
+    summary = CollectionSummary(
         symbol=symbol.upper(),
         start_ms=start_ms,
         end_ms=now_ms,
@@ -453,6 +587,18 @@ async def collect_recent_summary(
         candles_written=total_written,
         dropped_candles=total_dropped,
     )
+
+    TRACE_LOGGER.debug(
+        "summary_collector:finished",
+        extra={
+            "symbol": summary.symbol,
+            "requests": summary.requests,
+            "candles_written": summary.candles_written,
+            "dropped_candles": summary.dropped_candles,
+        },
+    )
+
+    return summary
 
 
 __all__ = ["collect_recent_summary", "CollectionSummary"]

@@ -45,6 +45,7 @@ from ..services import (
     collect_last_session_detailed,
     SessionCollectionResult,
 )
+from ..services import tracing as tracing_utils
 from ..services.zones import Config as ZonesConfig, detect_zones
 
 from ..services.book import fetch_orderbook
@@ -61,6 +62,7 @@ from ..version import APP_VERSION
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 LOGGER = logging.getLogger(__name__)
+TRACE_LOGGER = tracing_utils.LOGGER.getChild("api.inspection")
 CHECK_ALL_BUILD_TIMEOUT = 5.0
 
 
@@ -923,6 +925,10 @@ async def inspection_check_all(
                 symbol = meta_block.get("symbol")
         collection_summary_payload: Dict[str, Any] | None = None
         if isinstance(symbol, str) and symbol:
+            TRACE_LOGGER.debug(
+                "inspection.summary_collection:starting",
+                extra={**branch_log, "symbol": symbol, "days": days},
+            )
             try:
                 summary_result = await collect_recent_summary(symbol, days=days)
                 collection_summary_payload = summary_result.as_dict()
@@ -931,12 +937,30 @@ async def inspection_check_all(
                     "candles_written": summary_result.candles_written,
                     "dropped_candles": summary_result.dropped_candles,
                 }
+                TRACE_LOGGER.debug(
+                    "inspection.summary_collection:completed",
+                    extra={
+                        **branch_log,
+                        "symbol": symbol,
+                        "requests": summary_result.requests,
+                        "candles_written": summary_result.candles_written,
+                        "dropped_candles": summary_result.dropped_candles,
+                    },
+                )
             except Exception as exc:  # pragma: no cover - defensive logging
                 LOGGER.warning(
                     "inspection_check_all:summary_collection_failed",
                     extra={**branch_log, "error": str(exc)},
                 )
+                TRACE_LOGGER.debug(
+                    "inspection.summary_collection:failed",
+                    extra={**branch_log, "symbol": symbol, "error": str(exc)},
+                )
         try:
+            TRACE_LOGGER.debug(
+                "inspection.summary_collection:building_payload",
+                extra={**branch_log, "has_summary": collection_summary_payload is not None},
+            )
             payload = await build_check_all_datas_async(
                 target_snapshot,
                 now_utc=now_override,
@@ -968,6 +992,10 @@ async def inspection_check_all(
             LOGGER.info("inspection_check_all:finished", extra={**branch_log, "status": None})
             return Response(status_code=204)
         payload = _prepare_summary_payload(dict(payload))
+        TRACE_LOGGER.debug(
+            "inspection.summary_collection:payload_ready",
+            extra={**branch_log, "status": payload.get("status")},
+        )
         if collection_summary_payload:
             meta_block = payload.get("meta")
             if isinstance(meta_block, MutableMapping):
@@ -988,6 +1016,10 @@ async def inspection_check_all(
                 symbol = meta_block.get("symbol")
         if not symbol:
             raise HTTPException(status_code=400, detail="Snapshot symbol missing")
+        TRACE_LOGGER.debug(
+            "inspection.session_collection:starting",
+            extra={**log_extra, "symbol": symbol},
+        )
         try:
             session_result: SessionCollectionResult = await collect_last_session_detailed(symbol, now_override)
         except Exception as exc:  # pragma: no cover - defensive logging
@@ -995,8 +1027,21 @@ async def inspection_check_all(
                 "inspection_check_all:session_detailed_failed",
                 extra={**log_extra, "error": str(exc)},
             )
+            TRACE_LOGGER.debug(
+                "inspection.session_collection:failed",
+                extra={**log_extra, "symbol": symbol, "error": str(exc)},
+            )
             raise HTTPException(status_code=500, detail="Session collection failed") from exc
         payload = session_result.as_dict()
+        TRACE_LOGGER.debug(
+            "inspection.session_collection:completed",
+            extra={
+                **log_extra,
+                "symbol": symbol,
+                "status": payload.get("status"),
+                "coverage_pct": payload.get("session", {}).get("coverage_pct"),
+            },
+        )
         LOGGER.info(
             "inspection_check_all:finished",
             extra={**log_extra, "mode": mode_value, "status": payload.get("status")},
