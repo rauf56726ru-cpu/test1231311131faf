@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import asyncio
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -30,6 +32,11 @@ def preset_storage(tmp_path, monkeypatch):
     presets._STORAGE_LOADED = False
 
 
+@pytest.fixture
+def anyio_backend():
+    yield "asyncio"
+
+
 @pytest.fixture(autouse=True)
 def snapshot_storage(tmp_path, monkeypatch):
     storage_dir = tmp_path / "snapshots"
@@ -43,7 +50,7 @@ def snapshot_storage(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def stub_binance_minutes(monkeypatch):
-    def filler(symbol: str, start_ms: int, end_ms: int, gaps):
+    async def filler(symbol: str, start_ms: int, end_ms: int, gaps):
         candles = []
         for gap in gaps:
             cursor = int(gap["from"])
@@ -62,7 +69,7 @@ def stub_binance_minutes(monkeypatch):
                 cursor += 60_000
         return candles
 
-    monkeypatch.setattr(check_all_datas, "_download_missing_minutes", filler)
+    monkeypatch.setattr(check_all_datas, "_download_missing_minutes_async", filler)
 
     def filler_htf(symbol: str, gaps, *, fetcher, target):
         inserted = 0
@@ -158,7 +165,15 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
     assert response.status_code == 200
     body = response.json()
 
-    assert set(body.keys()) == {"meta", "data", "availability", "missing_fields"}
+    assert set(body.keys()) == {
+        "status",
+        "meta",
+        "data",
+        "availability",
+        "missing_fields",
+        "notes",
+    }
+    assert body["status"] == "ok"
 
     meta = body["meta"]
     assert meta["symbol"] == payload["symbol"]
@@ -168,6 +183,15 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
     assert "last_tf" in meta
     assert meta["last_price_source"] in {"stream", "ohlcv"}
     assert "stale" in meta
+    assert meta["invalid_candles_count"] >= 0
+    assert meta["invalid_ts_count"] >= 0
+    assert meta["invalid_ohlc_count"] >= 0
+    assert meta["invalid_candles_count"] == meta["invalid_ts_count"] + meta["invalid_ohlc_count"]
+    assert isinstance(meta["invalid_candle_stages"], dict)
+    assert meta.get("sanitized") is True
+    assert isinstance(meta.get("sessions_empty"), bool)
+    for stage_counts in meta["invalid_candle_stages"].values():
+        assert isinstance(stage_counts, dict)
 
     data_block = body["data"]
 
@@ -180,6 +204,9 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
     assert set(orderflow.keys()) == {"15m", "1h"}
     for block in orderflow.values():
         assert isinstance(block["per_bar"], list)
+
+    assert isinstance(body["notes"], list)
+    assert not body["notes"]
 
     vwap_tpo = data_block["vwap_tpo"]
     assert vwap_tpo["daily"]["open_utc"].startswith("2024-01-02T00:00:00")
@@ -236,6 +263,38 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
     availability = body["availability"]
     assert set(availability.keys()) == {"ohlcv", "vwap_sessions", "zones", "orderflow"}
     assert isinstance(body["missing_fields"], list)
+
+
+@pytest.mark.anyio("asyncio")
+async def test_check_all_reports_invalid_timestamps() -> None:
+    base = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
+    payload = _build_snapshot_payload(base, count=120)
+    candles = payload["candles"]
+    bad_index = len(candles) // 2
+    candles[bad_index]["t"] = -1
+
+    snapshot = {
+        "id": "invalid-ts",  # stable identifier for caching paths
+        "symbol": payload["symbol"],
+        "tf": "1m",
+        "frames": {"1m": {"tf": "1m", "candles": candles}},
+        "selection": {"start": candles[0]["t"], "end": candles[-1]["t"]},
+    }
+
+    result = await check_all_datas.build_check_all_datas(
+        snapshot,
+        now_utc=base + timedelta(hours=4),
+        hours=4,
+    )
+
+    assert result is not None
+    assert result["status"] == "ok"
+    meta = result["meta"]
+    assert meta["invalid_ts_count"] >= 1
+    assert meta["invalid_candles_count"] >= meta["invalid_ts_count"]
+    assert meta["invalid_candle_stages"]
+    assert result["notes"], "expected notes for invalid timestamps"
+    assert any("invalid timestamps" in note for note in result["notes"])
 
 
 def test_topup_limits_window_to_last_collection(client: TestClient) -> None:
@@ -392,3 +451,65 @@ def test_vwap_tpo_sessions_include_aliases(client: TestClient) -> None:
     assert composite_day["poc"] is not None
     assert composite_day["vah"] is not None
     assert composite_day["val"] is not None
+
+
+@pytest.mark.anyio("asyncio")
+async def test_async_builder_timeout_returns_insufficient(monkeypatch):
+    base = datetime(2024, 5, 1, 0, 0, tzinfo=UTC)
+    snapshot = _build_snapshot_payload(base, count=5)
+
+    async def slow_builder(snapshot, **kwargs):
+        await asyncio.sleep(0.2)
+        return {
+            "status": "ok",
+            "meta": {"symbol": snapshot.get("symbol", "UNKNOWN")},
+            "data": {},
+            "availability": {},
+            "missing_fields": [],
+        }
+
+    monkeypatch.setattr(check_all_datas, "build_check_all_datas", slow_builder)
+
+    result = await check_all_datas.build_check_all_datas_async(snapshot, timeout=0.05)
+
+    assert result is not None
+    assert result["status"] == "insufficient_data"
+    assert result["meta"]["insufficient_reason"] == "stale_or_unseeded_buffers"
+
+def test_build_inspection_error_payload_sets_reason() -> None:
+    now = datetime(2024, 1, 1, tzinfo=UTC)
+    snapshot = {
+        "symbol": "BTCUSDT",
+        "tf": "1m",
+        "frames": {"1m": {"tf": "1m", "candles": []}},
+    }
+    payload = check_all_datas.build_inspection_error_payload(
+        snapshot,
+        now_utc=now,
+        missing_fields=["ohlcv.1m"],
+        reason="invalid_timestamps",
+    )
+    assert payload["status"] == "insufficient_data"
+    assert "ohlcv.1m" in payload["missing_fields"]
+    meta = payload["meta"]
+    assert meta["insufficient_reason"] == "invalid_timestamps"
+    assert meta.get("sanitized") is True
+
+def test_check_all_returns_insufficient_on_internal_error(client: TestClient, monkeypatch) -> None:
+    base = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
+    payload = _build_snapshot_payload(base, count=60)
+
+    create_response = client.post("/inspection/snapshot", json=payload)
+    assert create_response.status_code == 200
+    snapshot_id = create_response.json()["snapshot_id"]
+
+    async def boom(*args, **kwargs):  # pragma: no cover - monkeypatch helper
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("src.api.app.build_check_all_datas_async", boom)
+
+    response = client.get("/inspection/check-all", params={"snapshot": snapshot_id})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "insufficient_data"
+    assert body["meta"].get("insufficient_reason") == "invalid_timestamps"

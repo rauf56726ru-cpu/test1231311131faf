@@ -1,7 +1,12 @@
 """Service layer exports for the chart backend."""
 
 from .binance import BINANCE_FAPI_REST
-from .check_all_datas import build_check_all_datas, DataQualityError
+from .check_all_datas import (
+    build_check_all_datas,
+    build_check_all_datas_async,
+    build_inspection_error_payload,
+    DataQualityError,
+)
 from .inspection import (
     build_inspection_payload,
     build_placeholder_snapshot,
@@ -56,6 +61,8 @@ __all__ = [
     "build_liquidity_snapshot",
     "build_check_all_datas",
     "build_placeholder_snapshot",
+    "build_check_all_datas_async",
+    "build_inspection_error_payload",
     "DEFAULT_SYMBOL",
     "get_snapshot",
     "list_snapshots",
