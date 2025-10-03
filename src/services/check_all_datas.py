@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
+import json
 import logging
 import math
 import time
@@ -38,6 +39,7 @@ from .ohlc_sanitizer import SanitizedCandles, sanitize_candles
 from .smc import SMCConfig, detect_smc_blocks
 from .zones import Config as ZonesConfig, detect_zones
 from .timeutils import safe_datetime_from_ms
+from .tracing import TraceContext, log_event, new_rid
 UTC = timezone.utc
 LOGGER = logging.getLogger(__name__)
 MS_IN_HOUR = 3_600_000
@@ -259,12 +261,15 @@ async def build_check_all_datas_async(
     snapshot: Mapping[str, Any],
     *,
     timeout: float | None = _ASYNC_BUILD_TIMEOUT_SECONDS,
+    trace: TraceContext | None = None,
     **kwargs: Any,
 ) -> Dict[str, Any] | None:
     """Execute ``build_check_all_datas`` with a timeout that respects cancellation."""
 
     context = _prepare_snapshot_context(snapshot, kwargs.get("now_utc"))
     build_kwargs = dict(kwargs)
+    if trace is not None:
+        build_kwargs.setdefault("trace", trace)
 
     async def _invoke() -> Dict[str, Any] | None:
         return await build_check_all_datas(snapshot, **build_kwargs)
@@ -274,17 +279,29 @@ async def build_check_all_datas_async(
             return await asyncio.wait_for(_invoke(), timeout)
         return await _invoke()
     except asyncio.TimeoutError:
-        LOGGER.warning(
-            "Check-all build timed out",
-            extra={
-                "symbol": context.symbol,
-                "timeout": timeout,
-                "has_now_override": context.has_now_override,
-                "hours": build_kwargs.get("hours"),
-                "window_hours": build_kwargs.get("window_hours"),
-                "strict_window": build_kwargs.get("strict_window"),
-            },
-        )
+        if trace:
+            log_event(
+                level="WARN",
+                event="pipeline.cancelled",
+                cid=trace.cid,
+                rid=new_rid(),
+                user_action=trace.user_action,
+                symbol=context.symbol,
+                details="timeout",
+                metrics={"timeout_s": timeout or 0.0},
+            )
+        else:
+            LOGGER.warning(
+                "Check-all build timed out",
+                extra={
+                    "symbol": context.symbol,
+                    "timeout": timeout,
+                    "has_now_override": context.has_now_override,
+                    "hours": build_kwargs.get("hours"),
+                    "window_hours": build_kwargs.get("window_hours"),
+                    "strict_window": build_kwargs.get("strict_window"),
+                },
+            )
         return _insufficient_from_context(context)
 
 
@@ -2523,6 +2540,34 @@ def _build_daily_vwap(
     }
 
 
+def _limit_candles(series: Sequence[Mapping[str, Any]] | None, limit: int | None = None) -> List[Dict[str, Any]]:
+    if not isinstance(series, Sequence):
+        return []
+    normalised = [dict(item) for item in series if isinstance(item, Mapping)]
+    if limit is None or limit <= 0 or len(normalised) <= limit:
+        return normalised
+    return normalised[-limit:]
+
+
+def _summarise_orderflow_compact(series: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    if not series:
+        return {"bars": 0, "delta_sum": 0.0, "cvd_last": None}
+    delta_sum = 0.0
+    cvd_last: float | None = None
+    for entry in series:
+        delta_value = _safe_float(entry.get("delta"))
+        if delta_value is not None:
+            delta_sum += delta_value
+        cvd_value = _safe_float(entry.get("cvd"))
+        if cvd_value is not None:
+            cvd_last = cvd_value
+    return {
+        "bars": len(series),
+        "delta_sum": delta_sum,
+        "cvd_last": cvd_last,
+    }
+
+
 async def build_check_all_datas(
     snapshot: Mapping[str, Any],
     *,
@@ -2533,8 +2578,19 @@ async def build_check_all_datas(
     window_hours: int | None = None,
     window_start_override_ms: int | None = None,
     strict_window: bool = False,
+    trace: TraceContext | None = None,
 ) -> Dict[str, Any] | None:
     """Create an enriched payload for the snapshot health endpoint."""
+
+    build_started = time.perf_counter()
+    metrics: Dict[str, float] = {
+        "fetch_ms": 0.0,
+        "db_write_ms": 0.0,
+        "compute_ms": 0.0,
+        "serialize_ms": 0.0,
+    }
+    summary_collection = None
+    schema = "session_detailed.v1"
 
     status = "ok"
 
@@ -2596,6 +2652,8 @@ async def build_check_all_datas(
     if base_window_hours is None or base_window_hours <= 0:
         base_window_hours = 4
     base_window_hours = int(base_window_hours)
+    requested_hours = window_hours if window_hours is not None else hours
+    compact_mode = bool(requested_hours and int(requested_hours) >= 72)
 
     window_end_guess = _resolve_window_end_ms(
         frames,
@@ -2750,6 +2808,8 @@ async def build_check_all_datas(
             tf_key=target_tf_key,
             invalid_ts_handler=_register_invalid_candle,
             meta_out=profile_meta,
+            trace=trace,
+            symbol=symbol,
         )
         profile_level_map = _build_profile_level_map(profile_tpo)
         sessions_empty_flag = bool(profile_meta.get("sessions_empty"))
@@ -2822,6 +2882,44 @@ async def build_check_all_datas(
         if target_interval_ms > MINUTE_INTERVAL_MS:
             window_start_ms = max(0, _align_to_interval(window_start_ms, target_interval_ms))
 
+    if hours_window >= 72:
+        compact_mode = True
+
+    if compact_mode:
+        schema = "compact.v1"
+        try:
+            from .summary_collector import collect_recent_summary as _collect_recent_summary
+
+            summary_collection = await _collect_recent_summary(
+                symbol,
+                days=3,
+                start_ms=window_start_ms,
+                end_ms=window_end_ms,
+                intervals=("1m", "15m", "1h", "4h", "1d"),
+                trace=trace,
+            )
+        except Exception as exc:  # pragma: no cover - defensive guard
+            if trace:
+                log_event(
+                    level="ERROR",
+                    event="error.fetch",
+                    cid=trace.cid,
+                    rid=new_rid(),
+                    user_action=trace.user_action,
+                    symbol=symbol,
+                    window={"from_ms": window_start_ms, "to_ms": window_end_ms},
+                    details=f"summary_collect_failed:{exc.__class__.__name__}",
+                )
+            else:
+                LOGGER.warning(
+                    "Failed to collect recent summary for compact mode",
+                    exc_info=exc,
+                    extra={"symbol": symbol, "window_start_ms": window_start_ms, "window_end_ms": window_end_ms},
+                )
+        else:
+            metrics["fetch_ms"] += summary_collection.fetch_ms
+            metrics["db_write_ms"] += summary_collection.db_write_ms
+
     minute_index_all = {candle["t"]: candle for candle in minute_candles}
     minute_window_index = {
         ts: candle
@@ -2834,7 +2932,7 @@ async def build_check_all_datas(
     minute_missing_before = sum(gap["count"] for gap in time_gaps)
 
     fetched_unique = 0
-    if time_gaps:
+    if time_gaps and not compact_mode:
         try:
             budget.raise_if_exceeded("download_missing_minutes_start")
             downloaded_minutes = await _call_download_missing_minutes_async(
@@ -2880,6 +2978,11 @@ async def build_check_all_datas(
                 fetched_unique += 1
             minute_window_index[ts] = candle
             minute_index_all[ts] = candle
+    elif time_gaps and compact_mode:
+        LOGGER.debug(
+            "Skipping minute gap download in compact mode",
+            extra={"symbol": symbol, "gaps": time_gaps},
+        )
 
     minute_missing_after = sum(1 for ts in expected_minutes if ts not in minute_window_index)
     data_quality = {
@@ -2893,7 +2996,7 @@ async def build_check_all_datas(
         "time_gaps": time_gaps,
     }
 
-    if minute_missing_after > 0:
+    if minute_missing_after > 0 and not compact_mode:
         data_quality["downloaded"] = fetched_unique
         raise DataQualityError(data_quality)
 
@@ -2947,7 +3050,7 @@ async def build_check_all_datas(
         zones_history_start_ms, window_end_ms, MINUTE_INTERVAL_MS
     )
     zone_history_gaps = _summarise_missing_times(zone_expected_minutes, minute_index_all)
-    if zone_history_gaps:
+    if zone_history_gaps and not compact_mode:
         try:
             budget.raise_if_exceeded("zones_history_backfill_start")
             zone_downloaded_minutes = await _call_download_missing_minutes_async(
@@ -2984,6 +3087,11 @@ async def build_check_all_datas(
             if ts < zones_history_start_ms or ts > window_end_ms:
                 continue
             minute_index_all[ts] = candle
+    elif zone_history_gaps and compact_mode:
+        LOGGER.debug(
+            "Skipping zone history download in compact mode",
+            extra={"symbol": symbol, "gaps": zone_history_gaps},
+        )
 
     frames["1m"] = [minute_index_all[ts] for ts in sorted(minute_index_all)]
     minute_candles = frames["1m"]
@@ -3894,6 +4002,74 @@ async def build_check_all_datas(
                 per_bar = [dict(entry) for entry in raw_series if isinstance(entry, Mapping)]
         orderflow_public[tf] = {"per_bar": per_bar}
 
+    compact_recent_1m: List[Dict[str, Any]] = []
+    compact_rollups_15m: List[Dict[str, Any]] = []
+    compact_one_hour: List[Dict[str, Any]] = []
+    if compact_mode:
+        rollup_start = time.perf_counter()
+        minute_block = ohlcv_public.get("1m")
+        if isinstance(minute_block, Mapping):
+            compact_recent_1m = _limit_candles(minute_block.get("candles"), 180)
+            minute_block["candles"] = compact_recent_1m
+        fifteen_block = ohlcv_public.get("15m")
+        if isinstance(fifteen_block, Mapping):
+            compact_rollups_15m = _limit_candles(fifteen_block.get("candles"))
+            fifteen_block["candles"] = compact_rollups_15m
+        hour_block = ohlcv_public.get("1h")
+        if isinstance(hour_block, Mapping):
+            compact_one_hour = _limit_candles(hour_block.get("candles"))
+            hour_block["candles"] = compact_one_hour
+        rollup_ms = (time.perf_counter() - rollup_start) * 1000.0
+        if trace:
+            log_event(
+                level="INFO",
+                event="compute.rollups",
+                cid=trace.cid,
+                rid=new_rid(),
+                user_action=trace.user_action,
+                symbol=symbol,
+                metrics={
+                    "ms": rollup_ms,
+                    "recent_1m": len(compact_recent_1m),
+                    "rollups_15m": len(compact_rollups_15m),
+                    "rollups_1h": len(compact_one_hour),
+                },
+            )
+        orderflow_start = time.perf_counter()
+        total_per_bar = 0
+        total_trimmed = 0
+        delta_present = 0
+        cvd_present = 0
+        for tf_key, payload in orderflow_public.items():
+            per_bar_series = payload.get("per_bar", [])
+            trimmed = per_bar_series[-120:]
+            payload["per_bar"] = list(trimmed)
+            summary_compact = _summarise_orderflow_compact(per_bar_series)
+            payload["summary"] = summary_compact
+            total_per_bar += len(per_bar_series)
+            total_trimmed += len(trimmed)
+            if summary_compact.get("delta_sum"):
+                delta_present += 1
+            if summary_compact.get("cvd_last") is not None:
+                cvd_present += 1
+        orderflow_ms = (time.perf_counter() - orderflow_start) * 1000.0
+        if trace:
+            log_event(
+                level="INFO",
+                event="compute.orderflow.aggregate",
+                cid=trace.cid,
+                rid=new_rid(),
+                user_action=trace.user_action,
+                symbol=symbol,
+                metrics={
+                    "ms": orderflow_ms,
+                    "per_bar": total_per_bar,
+                    "retained": total_trimmed,
+                    "delta_series": delta_present,
+                    "cvd_series": cvd_present,
+                },
+            )
+
     zones_container = detected_zones.get("zones") if isinstance(detected_zones, Mapping) else None
     zone_keys = ("fvg", "fvl", "ob", "mb", "bb", "rb", "pb", "sr", "profile_levels")
     zones_public: Dict[str, List[Dict[str, Any]]] = {key: [] for key in zone_keys}
@@ -3939,6 +4115,25 @@ async def build_check_all_datas(
         "eql": list(liquidity_equal_levels.get("eql", [])),
     }
 
+    poi_start = time.perf_counter()
+    compact_zone_counts = {key: len(series) for key, series in zones_public.items()}
+    compact_zone_top = {key: series[:5] for key, series in zones_public.items() if series}
+    poi_ms = (time.perf_counter() - poi_start) * 1000.0
+    if trace:
+        log_event(
+            level="INFO",
+            event="compute.poi.topN",
+            cid=trace.cid,
+            rid=new_rid(),
+            user_action=trace.user_action,
+            symbol=symbol,
+            metrics={
+                "ms": poi_ms,
+                "zones": sum(compact_zone_counts.values()),
+                "top": sum(len(series) for series in compact_zone_top.values()),
+            },
+        )
+
     risk_prefs_public = {"rr_min": 2.5, "risk_per_trade_pct": 1.0}
 
     context_meta = raw_meta.get("context") if isinstance(raw_meta, Mapping) else None
@@ -3977,6 +4172,19 @@ async def build_check_all_datas(
         "risk_prefs": risk_prefs_public,
         "context": context_public,
     }
+
+    if compact_mode:
+        data_payload["ohlcv_compact"] = {
+            "1m_recent": list(compact_recent_1m),
+            "1m_rollups": list(compact_rollups_15m),
+            "15m": list(compact_rollups_15m),
+            "1h": list(compact_one_hour),
+            "1d": _limit_candles(ohlcv_public.get("1d", {}).get("candles")),
+        }
+        data_payload["zones_summary"] = {
+            "counts": compact_zone_counts,
+            "top": compact_zone_top,
+        }
 
     availability: Dict[str, Any] = {
         "ohlcv": {},
@@ -4048,7 +4256,19 @@ async def build_check_all_datas(
 
     missing_fields_list = sorted(missing_fields)
     if missing_fields_list:
-        LOGGER.info("Missing fields detected", extra={"missing_fields": missing_fields_list})
+        if trace:
+            log_event(
+                level="WARN",
+                event="error.validation",
+                cid=trace.cid,
+                rid=new_rid(),
+                user_action=trace.user_action,
+                symbol=symbol,
+                details="missing_fields",
+                extra={"missing": missing_fields_list},
+            )
+        else:
+            LOGGER.info("Missing fields detected", extra={"missing_fields": missing_fields_list})
 
     meta_block: Dict[str, Any] = {
         "symbol": symbol,
@@ -4099,9 +4319,25 @@ async def build_check_all_datas(
                 f"Filtered {invalid_ts_total} candles with invalid timestamps"
             )
     if invalid_ohlc_total:
-        notes.append(
-            f"Filtered {invalid_ohlc_total} candles with invalid OHLC ranges"
-        )
+            notes.append(
+                f"Filtered {invalid_ohlc_total} candles with invalid OHLC ranges"
+            )
+
+    if summary_collection is not None:
+        try:
+            meta_block["summary_collection"] = summary_collection.as_dict()
+        except Exception:  # pragma: no cover - defensive guard
+            meta_block["summary_collection"] = {
+                "symbol": symbol,
+                "error": "summary_serialisation_failed",
+            }
+
+    metrics["compute_ms"] = max(
+        0.0,
+        (time.perf_counter() - build_started) * 1000.0
+        - metrics.get("fetch_ms", 0.0)
+        - metrics.get("db_write_ms", 0.0),
+    )
 
     final_payload = {
         "status": status,
@@ -4111,5 +4347,70 @@ async def build_check_all_datas(
         "missing_fields": missing_fields_list,
         "notes": notes,
     }
+    before_bytes = len(json.dumps(final_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    serialize_start = time.perf_counter()
+    rounded_payload = round_floats(final_payload)
+    metrics["serialize_ms"] = (time.perf_counter() - serialize_start) * 1000.0
+    after_bytes = len(json.dumps(rounded_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    diagnostics_payload = {key: round(value, 3) for key, value in metrics.items()}
+    rounded_payload.setdefault("meta", {})
+    rounded_payload["meta"]["diagnostics"] = diagnostics_payload
+    rounded_payload["schema"] = schema
+    if trace:
+        log_event(
+            level="INFO",
+            event="output.prepare_payload",
+            cid=trace.cid,
+            rid=new_rid(),
+            user_action=trace.user_action,
+            symbol=symbol,
+            details=f"schema:{schema}",
+            metrics={
+                "ms": metrics.get("serialize_ms", 0.0),
+                "bytes_before": before_bytes,
+                "bytes_after": after_bytes,
+            },
+        )
+    else:
+        LOGGER.info(
+            "check_all.build",
+            extra={
+                "symbol": symbol,
+                "schema": schema,
+                "fetch_ms": diagnostics_payload.get("fetch_ms"),
+                "db_write_ms": diagnostics_payload.get("db_write_ms"),
+                "compute_ms": diagnostics_payload.get("compute_ms"),
+                "serialize_ms": diagnostics_payload.get("serialize_ms"),
+            },
+        )
 
-    return round_floats(final_payload)
+    if trace:
+        pipeline_metrics = {
+            "fetch_ms": metrics.get("fetch_ms", 0.0),
+            "db_ms": metrics.get("db_write_ms", 0.0),
+            "compute_ms": metrics.get("compute_ms", 0.0),
+            "serialize_ms": metrics.get("serialize_ms", 0.0),
+            "requests": summary_collection.requests if summary_collection is not None else 0,
+        }
+        log_event(
+            level="INFO",
+            event="pipeline.done",
+            cid=trace.cid,
+            rid=new_rid(),
+            user_action=trace.user_action,
+            symbol=symbol,
+            details=status,
+            metrics=pipeline_metrics,
+        )
+        log_event(
+            level="INFO",
+            event="output.publish",
+            cid=trace.cid,
+            rid=new_rid(),
+            user_action=trace.user_action,
+            symbol=symbol,
+            details="check_all_datas",
+            metrics={"status_ok": 1 if status == "ok" else 0},
+        )
+
+    return rounded_payload
