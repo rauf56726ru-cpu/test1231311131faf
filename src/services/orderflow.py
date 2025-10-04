@@ -23,7 +23,7 @@ LOGGER = logging.getLogger(__name__)
 _FOOTPRINT_LOCK = asyncio.Lock()
 _MAX_WINDOW_HOURS = 4
 _PER_BAR_MINUTES = 120
-_PAGE_WINDOW_MS = 10 * 60_000
+_PAGE_WINDOW_MS = 5 * 60_000
 _MAX_BATCHES = 48
 _AGG_INTERVALS_MINUTES: Mapping[str, int] = {"15m": 15, "1h": 60}
 
@@ -81,48 +81,28 @@ def _compute_aggregates(rows: Sequence[Mapping[str, Any]]) -> Dict[str, List[Dic
     for tf, minutes in _AGG_INTERVALS_MINUTES.items():
         interval_ms = minutes * 60_000
         buckets: List[Dict[str, Any]] = []
-        running_cvd = 0.0
         bucket_start: int | None = None
         bucket_delta = 0.0
-        bucket_bid = 0.0
-        bucket_ask = 0.0
-        bucket_large = 0
+        bucket_volume = 0.0
         bucket_rows = 0
-        bucket_abs_high = False
-        bucket_abs_low = False
-        bucket_imbalance_buy = False
-        bucket_imbalance_sell = False
+        running_cvd = 0.0
 
         def _flush(current_start: int) -> None:
-            nonlocal bucket_delta, bucket_bid, bucket_ask, bucket_large
-            nonlocal bucket_rows, running_cvd, bucket_abs_high, bucket_abs_low
-            nonlocal bucket_imbalance_buy, bucket_imbalance_sell
+            nonlocal bucket_delta, bucket_volume, bucket_rows, running_cvd
             running_cvd += bucket_delta
             buckets.append(
                 {
                     "t": _isoformat(current_start),
                     "ts": current_start,
-                    "delta": bucket_delta,
-                    "cvd": running_cvd,
-                    "ask_vol": bucket_ask,
-                    "bid_vol": bucket_bid,
-                    "large_trades_count": bucket_large,
-                    "absorption_high": bucket_abs_high,
-                    "absorption_low": bucket_abs_low,
-                    "imbalance_buy": bucket_imbalance_buy,
-                    "imbalance_sell": bucket_imbalance_sell,
+                    "delta_sum": bucket_delta,
+                    "cvd_close": running_cvd,
+                    "vol_sum": bucket_volume,
                     "bars": bucket_rows,
                 }
             )
             bucket_delta = 0.0
-            bucket_bid = 0.0
-            bucket_ask = 0.0
-            bucket_large = 0
+            bucket_volume = 0.0
             bucket_rows = 0
-            bucket_abs_high = False
-            bucket_abs_low = False
-            bucket_imbalance_buy = False
-            bucket_imbalance_sell = False
 
         for row in sorted_rows:
             ts = int(row["ts"])
@@ -133,17 +113,16 @@ def _compute_aggregates(rows: Sequence[Mapping[str, Any]]) -> Dict[str, List[Dic
                 _flush(bucket_start)
                 bucket_start = bucket_id
             delta = float(row.get("delta", 0.0))
-            ask = float(row.get("ask", row.get("ask_vol", 0.0)))
-            bid = float(row.get("bid", row.get("bid_vol", 0.0)))
+            volume = float(
+                row.get(
+                    "volume",
+                    float(row.get("ask", row.get("ask_vol", 0.0)))
+                    + float(row.get("bid", row.get("bid_vol", 0.0))),
+                )
+            )
             bucket_delta += delta
-            bucket_ask += ask
-            bucket_bid += bid
-            bucket_large += int(row.get("large_trades_count", 0))
+            bucket_volume += volume
             bucket_rows += 1
-            bucket_abs_high = bucket_abs_high or bool(row.get("absorption_high"))
-            bucket_abs_low = bucket_abs_low or bool(row.get("absorption_low"))
-            bucket_imbalance_buy = bucket_imbalance_buy or bool(row.get("imbalance_buy"))
-            bucket_imbalance_sell = bucket_imbalance_sell or bool(row.get("imbalance_sell"))
 
         if bucket_start is not None and bucket_rows:
             _flush(bucket_start)
@@ -160,7 +139,7 @@ async def _fetch_trades(
     end_ms: int,
     *,
     trace: TraceContext | None = None,
-) -> List[Mapping[str, object]] | None:
+) -> tuple[List[Mapping[str, object]] | None, int | None]:
     params = {
         "symbol": symbol.upper(),
         "startTime": str(start_ms),
@@ -184,19 +163,19 @@ async def _fetch_trades(
             rate_limit_statuses=RATE_LIMIT_STATUSES,
         )
     except httpx.RequestError:  # pragma: no cover - network failure
-        return None
+        return None, None
 
     if response.status_code == 200:
         payload = response.json()
         if not isinstance(payload, list):
             raise OrderflowError("Invalid trade payload structure")
-        return payload
+        return payload, 200
 
     if response.status_code in RATE_LIMIT_STATUSES or response.status_code >= 500:
-        return None
+        return None, response.status_code
 
     response.raise_for_status()
-    return None
+    return None, response.status_code
 
 
 def _build_minute_rows(trades: Iterable[Mapping[str, Any]]) -> List[Dict[str, Any]]:
@@ -288,29 +267,55 @@ async def fetch_footprint(
         cursor = start_ms
         batches = 0
         trades: List[Mapping[str, Any]] = []
+        fallback_status: int | None = None
+        last_window_end: int | None = None
+        fallback_triggered = False
         async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
             while cursor < end_ms and batches < _MAX_BATCHES:
                 page_end = min(end_ms, cursor + _PAGE_WINDOW_MS)
-                rows = await _fetch_trades(
+                rows, status = await _fetch_trades(
                     client, symbol_clean, cursor, page_end, trace=trace_ctx
                 )
                 batches += 1
-                if rows is None:
-                    if trace_ctx is not None:
-                        trace_ctx.warn(
-                            "fallback.engaged",
-                            scope="orderflow.aggTrades",
-                            symbol=symbol_clean,
-                            window={"from": cursor, "to": page_end},
-                            details="upstream_error",
-                        )
-                    return _empty_snapshot().as_dict()
+                last_window_end = page_end
+                if status != 200:
+                    if status in RATE_LIMIT_STATUSES or (
+                        isinstance(status, int) and status >= 500
+                    ) or status is None:
+                        fallback_status = status or 0
+                        fallback_triggered = True
+                        break
+                    raise OrderflowError(f"Unexpected aggTrades status: {status}")
+
                 if not rows:
                     cursor = page_end + 1
                     continue
                 trades.extend(rows)
                 last_trade_time = max(int(row.get("T", cursor)) for row in rows)
                 cursor = max(last_trade_time + 1, page_end + 1)
+
+            if cursor < end_ms and not fallback_triggered:
+                fallback_triggered = True
+                if fallback_status is None:
+                    fallback_status = 0
+
+        if fallback_status is not None and trace_ctx is not None:
+            trace_ctx.warn(
+                "fallback.engaged",
+                scope="orderflow.aggTrades",
+                symbol=symbol_clean,
+                window={"from": cursor, "to": last_window_end or cursor},
+                details=f"status={fallback_status}",
+            )
+
+    if fallback_status is not None and trades and trace_ctx is not None:
+        trace_ctx.warn(
+            "fallback.engaged",
+            scope="orderflow",
+            symbol=symbol_clean,
+            details=f"partial_status={fallback_status}",
+            preserved=len(trades),
+        )
 
     if not trades:
         if trace_ctx is not None:
@@ -320,7 +325,17 @@ async def fetch_footprint(
                 symbol=symbol_clean,
                 details="no_trades",
             )
-        return _empty_snapshot().as_dict()
+        snapshot = _empty_snapshot().as_dict()
+        if fallback_triggered:
+            snapshot["meta"] = {
+                "partial": True,
+                "fallback": {
+                    "status": fallback_status,
+                    "preserved_trades": 0,
+                    "batches": batches,
+                },
+            }
+        return snapshot
 
     minute_rows = _build_minute_rows(trades)
     if not minute_rows:
@@ -335,7 +350,16 @@ async def fetch_footprint(
 
     latest_ts = minute_rows[-1]["ts"]
     cutoff_ms = latest_ts - (_PER_BAR_MINUTES - 1) * 60_000
-    per_bar = [row for row in minute_rows if row["ts"] >= cutoff_ms]
+    per_bar_source = [row for row in minute_rows if row["ts"] >= cutoff_ms]
+    running_cvd = 0.0
+    per_bar: List[Dict[str, Any]] = []
+    for row in per_bar_source:
+        delta_value = float(row.get("delta", 0.0))
+        running_cvd += delta_value
+        entry = dict(row)
+        entry["cvd"] = running_cvd
+        per_bar.append(entry)
+
     aggregates = _compute_aggregates(minute_rows)
 
     if trace_ctx is not None:
@@ -355,8 +379,17 @@ async def fetch_footprint(
                 tf=tf,
             )
 
-    snapshot = OrderflowSnapshot(per_bar=per_bar, aggregates=aggregates)
-    return snapshot.as_dict()
+    snapshot = OrderflowSnapshot(per_bar=per_bar, aggregates=aggregates).as_dict()
+    if fallback_triggered:
+        snapshot["meta"] = {
+            "partial": True,
+            "fallback": {
+                "status": fallback_status,
+                "preserved_trades": len(trades),
+                "batches": batches,
+            },
+        }
+    return snapshot
 
 
 def compute_orderflow_aggregates(

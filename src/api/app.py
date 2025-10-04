@@ -5,8 +5,9 @@ import json
 import logging
 import math
 import time
+from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 from datetime import datetime, timedelta, timezone
 from math import ceil
@@ -369,8 +370,8 @@ async def _run_summary_workflow(
     )
     if isinstance(payload, MutableMapping):
         timing_block = payload.setdefault("_timing", {})
-        timing_block.setdefault("fetch_ms", round(fetch_ms, 2))
-        timing_block.setdefault("compute_ms", round(compute_ms, 2))
+        timing_block["fetch_ms"] = round(fetch_ms, 2)
+        timing_block["compute_ms"] = round(compute_ms, 2)
         timing_block.setdefault("db_ms", 0.0)
     return payload, collection_summary_payload, trace_ctx
 
@@ -617,12 +618,19 @@ def _filter_compact_zones(
     now_dt: datetime,
     limit: int = 12,
     trace: TraceContext | None = None,
-) -> tuple[list[Dict[str, Any]], Dict[str, int]]:
+) -> tuple[list[Dict[str, Any]], Dict[str, int], Dict[str, Any]]:
     if not isinstance(zones_payload, Mapping):
-        return [], {}
+        return [], {}, {"raw_counts": {}, "candidate_counts": {}, "dropped_reasons": {}, "total_candidates": 0}
 
     candidates: list[Dict[str, Any]] = []
     raw_counts: Dict[str, int] = {}
+    candidate_counts: Dict[str, int] = defaultdict(int)
+    dropped_reasons: Dict[str, int] = defaultdict(int)
+
+    def _mark_drop(reason: str) -> None:
+        dropped_reasons[reason] += 1
+
+    allowed_statuses = {"open", "fresh", "tapped"}
 
     for zone_type, entries in zones_payload.items():
         if not isinstance(entries, Sequence):
@@ -630,72 +638,117 @@ def _filter_compact_zones(
         raw_counts[zone_type] = len(entries)
         for entry in entries:
             if not isinstance(entry, Mapping):
+                _mark_drop("invalid_entry")
                 continue
-            status = str(entry.get('status') or '').lower()
-            formed = _parse_iso8601(entry.get('formed_at_utc') or entry.get('origin_utc') or entry.get('created_utc'))
-            last_touched = _parse_iso8601(entry.get('last_touched_utc') or entry.get('last_touch_utc'))
+            status = str(entry.get("status") or "").lower()
+            formed = _parse_iso8601(
+                entry.get("formed_at_utc")
+                or entry.get("origin_utc")
+                or entry.get("created_utc")
+            )
+            last_touched = _parse_iso8601(
+                entry.get("last_touched_utc") or entry.get("last_touch_utc")
+            )
             if last_touched is None:
                 last_touched = formed
             if formed is None:
+                _mark_drop("missing_formed_at")
                 continue
             if formed < now_dt - timedelta(hours=72):
+                _mark_drop("stale_formed_at")
                 continue
-            if status not in {'open', 'fresh', 'tapped'} and (last_touched is None or last_touched < now_dt - timedelta(hours=24)):
+            if status not in allowed_statuses and (
+                last_touched is None or last_touched < now_dt - timedelta(hours=24)
+            ):
+                _mark_drop("stale_status")
                 continue
             price_range = _zone_price_range(entry)
             if price_range is None:
+                _mark_drop("invalid_price_range")
                 continue
-            tf_value = str(entry.get('tf') or entry.get('timeframe') or '').lower()
+            tf_value = str(entry.get("tf") or entry.get("timeframe") or "").lower()
             priority_ts = last_touched or formed
             candidate = {
-                'type': zone_type,
-                'tf': tf_value,
-                'status': status or 'unknown',
-                'open': price_range[0],
-                'close': price_range[1],
-                'mean': entry.get('mean'),
-                'formed_at': formed,
-                'last_touched': last_touched,
-                'priority_ts': priority_ts,
-                'source': entry.get('source') or entry.get('preset'),
+                "type": zone_type,
+                "tf": tf_value,
+                "status": status or "unknown",
+                "open": price_range[0],
+                "close": price_range[1],
+                "mean": entry.get("mean"),
+                "formed_at": formed,
+                "last_touched": last_touched,
+                "priority_ts": priority_ts,
+                "source": entry.get("source") or entry.get("preset"),
             }
             candidates.append(candidate)
+            candidate_counts[zone_type] += 1
 
-    candidates.sort(key=lambda item: item['priority_ts'] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    if trace is not None:
+        trace.info(
+            "compute.poi.candidates",
+            scope="zones",
+            counts={key: int(value) for key, value in candidate_counts.items()},
+            total=sum(candidate_counts.values()),
+        )
+
+    candidates.sort(
+        key=lambda item: item["priority_ts"] or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
 
     selected: list[Dict[str, Any]] = []
     seen_keys: set[tuple[str, str, Any]] = set()
 
-    for candidate in candidates:
-        day_key = candidate['formed_at'].date() if candidate['formed_at'] else None
-        dedup_key = (candidate['type'], candidate['tf'], day_key)
+    for index, candidate in enumerate(candidates):
+        dedup_key = (
+            candidate["type"],
+            candidate["tf"],
+            round(candidate["open"], 8),
+            round(candidate["close"], 8),
+        )
         if dedup_key in seen_keys:
+            _mark_drop("duplicate_range")
             continue
         overlap = False
         for existing in selected:
-            if existing['type'] != candidate['type']:
+            if existing["type"] != candidate["type"]:
                 continue
-            if existing['tf'] != candidate['tf']:
+            if existing["tf"] != candidate["tf"]:
                 continue
-            if _ranges_overlap((existing['open'], existing['close']), (candidate['open'], candidate['close']), tolerance=0.0):
+            if _ranges_overlap(
+                (existing["open"], existing["close"]),
+                (candidate["open"], candidate["close"]),
+                tolerance=0.0,
+            ):
                 overlap = True
                 break
         if overlap:
+            _mark_drop("overlap")
             continue
         selected.append(candidate)
         seen_keys.add(dedup_key)
         if len(selected) >= limit:
+            remaining = len(candidates) - (index + 1)
+            if remaining > 0:
+                dropped_reasons["limit_truncated"] += remaining
             break
 
-    counts: Dict[str, int] = {}
+    counts: Dict[str, int] = {zone_type: 0 for zone_type in raw_counts}
     for item in selected:
-        counts[item['type']] = counts.get(item['type'], 0) + 1
+        counts[item["type"]] = counts.get(item["type"], 0) + 1
 
     if trace is not None:
         trace.info(
-            'compute.poi.topN',
-            total=len(candidates),
-            selected=len(selected),
+            "compute.poi.filtered",
+            scope="zones",
+            kept=len(selected),
+            dropped_reasons={key: int(value) for key, value in dropped_reasons.items()},
+            candidates=len(candidates),
+        )
+        trace.info(
+            "compute.poi.topN",
+            scope="zones",
+            final=len(selected),
             limit=limit,
         )
 
@@ -703,19 +756,26 @@ def _filter_compact_zones(
     for item in selected:
         compact.append(
             {
-                'type': item['type'],
-                'tf': item['tf'],
-                'status': item['status'],
-                'open': item['open'],
-                'close': item['close'],
-                'mean': item['mean'],
-                'formed_at_utc': _format_iso8601(item['formed_at']),
-                'last_touched_utc': _format_iso8601(item['last_touched']),
-                'source': item['source'],
+                "type": item["type"],
+                "tf": item["tf"],
+                "status": item["status"],
+                "open": item["open"],
+                "close": item["close"],
+                "mean": item["mean"],
+                "formed_at_utc": _format_iso8601(item["formed_at"]),
+                "last_touched_utc": _format_iso8601(item["last_touched"]),
+                "source": item["source"],
             }
         )
 
-    return compact, counts
+    diagnostics = {
+        "raw_counts": raw_counts,
+        "candidate_counts": dict(candidate_counts),
+        "dropped_reasons": dict(dropped_reasons),
+        "total_candidates": len(candidates),
+    }
+
+    return compact, counts, diagnostics
 
 
 def _prepare_summary_payload(
@@ -734,7 +794,16 @@ def _prepare_summary_payload(
     availability = payload.get("availability") if isinstance(payload.get("availability"), Mapping) else {}
 
     ohlcv_source = data_source.get("ohlcv") if isinstance(data_source.get("ohlcv"), Mapping) else {}
-    orderflow_source = data_source.get("orderflow") if isinstance(data_source.get("orderflow"), Mapping) else {}
+    orderflow_source = (
+        data_source.get("orderflow")
+        if isinstance(data_source.get("orderflow"), Mapping)
+        else {}
+    )
+    orderflow_source_meta = (
+        orderflow_source.get("meta")
+        if isinstance(orderflow_source.get("meta"), Mapping)
+        else {}
+    )
     vwap_tpo_source = data_source.get("vwap_tpo") if isinstance(data_source.get("vwap_tpo"), Mapping) else {}
     zones_source = data_source.get("zones") if isinstance(data_source.get("zones"), Mapping) else {}
     liquidity_source = data_source.get("liquidity") if isinstance(data_source.get("liquidity"), Mapping) else {}
@@ -791,8 +860,39 @@ def _prepare_summary_payload(
     window_end_ts = int(last_ts_dt.timestamp() * 1000) if last_ts_dt is not None else None
     if window_end_ts is None and minute_all:
         window_end_ts = minute_all[-1]["t"]
+
+    if window_end_ts is None:
+        latest_orderflow_ts: list[int] = []
+        for block in orderflow_source.values():
+            if not isinstance(block, Mapping):
+                continue
+            series = block.get("per_bar")
+            if not isinstance(series, Sequence):
+                continue
+            for item in reversed(series):
+                if not isinstance(item, Mapping):
+                    continue
+                ts_candidate: int | None = None
+                for key in ("t", "ts", "timestamp", "time"):
+                    raw_ts = item.get(key)
+                    if raw_ts is None:
+                        continue
+                    try:
+                        ts_candidate = int(raw_ts)
+                    except (TypeError, ValueError):
+                        continue
+                    else:
+                        break
+                if ts_candidate is not None:
+                    latest_orderflow_ts.append(ts_candidate)
+                    break
+        if latest_orderflow_ts:
+            window_end_ts = max(latest_orderflow_ts)
+
     if window_end_ts is None:
         window_end_ts = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+    window_end_dt = datetime.fromtimestamp(window_end_ts / 1000, tz=timezone.utc)
 
     cutoff_72h = max(0, window_end_ts - 72 * 3_600_000)
     cutoff_3h = max(0, window_end_ts - 180 * 60_000)
@@ -818,7 +918,7 @@ def _prepare_summary_payload(
     }
     ohlcv_compact.update({"15m": tf_windows["15m"], "1h": tf_windows["1h"]})
 
-    def _normalise_orderflow(series: Any) -> list[Dict[str, Any]]:
+    def _normalise_per_bar(series: Any, *, cutoff_ms: int, limit: int) -> list[Dict[str, Any]]:
         result: list[Dict[str, Any]] = []
         if not isinstance(series, Sequence):
             return result
@@ -826,7 +926,7 @@ def _prepare_summary_payload(
             if not isinstance(item, Mapping):
                 continue
             ts_value: int | None = None
-            for key in ("t", "ts", "timestamp", "time"):
+            for key in ("ts", "t", "timestamp", "time"):
                 raw_ts = item.get(key)
                 if raw_ts is None:
                     continue
@@ -836,46 +936,135 @@ def _prepare_summary_payload(
                     continue
                 else:
                     break
-            if ts_value is None or ts_value < cutoff_2h:
+            if ts_value is None or ts_value < cutoff_ms:
                 continue
-            entry: Dict[str, Any] = {"t": ts_value}
-            for key in ("delta", "cvd", "cvd_net", "cvd_buy", "cvd_sell"):
-                value = _float_or_none(item.get(key))
-                if value is not None:
-                    entry[key] = value
+            entry: Dict[str, Any] = {"t": ts_value, "ts": ts_value}
+            for field in (
+                "delta",
+                "cvd",
+                "bid",
+                "ask",
+                "bid_vol",
+                "ask_vol",
+                "volume",
+                "imbalance",
+                "imbalance_buy",
+                "imbalance_sell",
+                "absorption",
+                "absorption_high",
+                "absorption_low",
+                "large_trades_count",
+            ):
+                value = item.get(field)
+                if isinstance(value, (int, float)):
+                    entry[field] = float(value)
+                elif isinstance(value, bool):
+                    entry[field] = bool(value)
+            for alt_field, target in (("cvd_net", "cvd"), ("cvd_buy", "cvd_buy"), ("cvd_sell", "cvd_sell")):
+                numeric = _float_or_none(item.get(alt_field))
+                if numeric is not None:
+                    entry[target] = numeric
+            result.append(entry)
+        result.sort(key=lambda entry: entry["t"])
+        return result[-limit:]
+
+    def _normalise_aggregates(series: Any, *, cutoff_ms: int) -> list[Dict[str, Any]]:
+        result: list[Dict[str, Any]] = []
+        if not isinstance(series, Sequence):
+            return result
+        for item in series:
+            if not isinstance(item, Mapping):
+                continue
+            ts_value: int | None = None
+            for key in ("ts", "t", "timestamp", "time"):
+                raw_ts = item.get(key)
+                if raw_ts is None:
+                    continue
+                try:
+                    ts_value = int(raw_ts)
+                except (TypeError, ValueError):
+                    continue
+                else:
+                    break
+            if ts_value is None or ts_value < cutoff_ms:
+                continue
+            delta_sum = _float_or_none(item.get("delta_sum"))
+            cvd_close = _float_or_none(item.get("cvd_close"))
+            vol_sum = _float_or_none(item.get("vol_sum"))
+            if None in (delta_sum, cvd_close, vol_sum):
+                continue
+            bars_value = item.get("bars")
+            bars_numeric = int(bars_value) if isinstance(bars_value, (int, float)) else None
+            entry = {
+                "t": ts_value,
+                "ts": ts_value,
+                "delta_sum": delta_sum,
+                "cvd_close": cvd_close,
+                "vol_sum": vol_sum,
+            }
+            if bars_numeric is not None:
+                entry["bars"] = bars_numeric
             result.append(entry)
         result.sort(key=lambda entry: entry["t"])
         return result
 
     orderflow_per_bar: Dict[str, list[Dict[str, Any]]] = {}
-    delta_cvd_compact: Dict[str, Dict[str, Any]] = {}
-    for tf_key, block in orderflow_source.items():
+    delta_cvd_compact: Dict[str, list[Dict[str, Any]]] = {}
+
+    one_minute_block = (
+        orderflow_source.get("1m")
+        if isinstance(orderflow_source.get("1m"), Mapping)
+        else None
+    )
+    if one_minute_block is not None:
+        per_bar_series = _normalise_per_bar(
+            one_minute_block.get("per_bar"),
+            cutoff_ms=cutoff_2h,
+            limit=120,
+        )
+        if per_bar_series:
+            orderflow_per_bar["1m"] = per_bar_series
+
+    for tf_key in ("15m", "1h"):
+        block = orderflow_source.get(tf_key)
         if not isinstance(block, Mapping):
             continue
-        per_bar_series = _normalise_orderflow(block.get("per_bar"))
-        orderflow_per_bar[tf_key] = per_bar_series
-        last_entry = per_bar_series[-1] if per_bar_series else {}
-        delta_cvd_compact[tf_key] = {
-            "delta": last_entry.get("delta"),
-            "cvd": last_entry.get("cvd") or last_entry.get("cvd_net"),
-            "bars": len(per_bar_series),
-        }
-        if per_bar_series and tf_key in ("1m", "15m", "1h"):
-            # Keep at most 120 chronological entries (two hours of data).
-            orderflow_per_bar[tf_key] = per_bar_series[-120:]
-        elif per_bar_series:
-            orderflow_per_bar[tf_key] = per_bar_series
+        aggregates = _normalise_aggregates(block.get("per_bar"), cutoff_ms=cutoff_72h)
+        if aggregates:
+            delta_cvd_compact[tf_key] = aggregates
 
-    orderflow_per_bar = {
-        key: series
-        for key, series in orderflow_per_bar.items()
-        if key in {"1m", "15m", "1h"} and series
-    }
-    delta_cvd_compact = {
-        key: value
-        for key, value in delta_cvd_compact.items()
-        if key in {"15m", "1h"}
-    }
+    if trace_ctx is not None:
+        for tf_key, series in orderflow_per_bar.items():
+            trace_ctx.info(
+                "orderflow.per_bar_compact",
+                scope=f"orderflow.{tf_key}",
+                tf=tf_key,
+                rows=len(series),
+            )
+        for tf_key, series in delta_cvd_compact.items():
+            trace_ctx.info(
+                "orderflow.delta_cvd_compact",
+                scope=f"orderflow.{tf_key}",
+                tf=tf_key,
+                rows=len(series),
+            )
+
+    expected_aggregate_counts = {"15m": 72 * 4, "1h": 72}
+    missing_aggregate_keys: list[str] = []
+    aggregates_ok = True
+    for tf_key in ("15m", "1h"):
+        series = delta_cvd_compact.get(tf_key)
+        if not series:
+            aggregates_ok = False
+            missing_aggregate_keys.append(tf_key)
+            continue
+        last_entry = series[-1]
+        if not isinstance(last_entry, Mapping) or (
+            last_entry.get("delta_sum") is None
+            or last_entry.get("cvd_close") is None
+        ):
+            aggregates_ok = False
+            missing_aggregate_keys.append(tf_key)
 
     def _sd_block(source: Mapping[str, Any] | None, key: str) -> Dict[str, float | None]:
         if not isinstance(source, Mapping):
@@ -928,12 +1117,33 @@ def _prepare_summary_payload(
             "ib_low": _float_or_none(session_block.get("ib_low")),
         }
 
-    zones_top, zone_counts = _filter_compact_zones(
+    zones_top, zone_counts, zone_filter_diag = _filter_compact_zones(
         zones_source,
-        now_dt=datetime.now(timezone.utc),
+        now_dt=window_end_dt,
         limit=12,
         trace=trace_ctx,
     )
+
+    if trace_ctx is not None and not zones_top:
+        ohlcv_lengths = {
+            "15m": len(tf_windows.get("15m", [])),
+            "1h": len(tf_windows.get("1h", [])),
+            "4h": len(tf_windows.get("4h", [])),
+            "1d": len(tf_windows.get("1d", [])),
+        }
+        candidate_counts = zone_filter_diag.get("candidate_counts", {})
+        dropped_reasons = zone_filter_diag.get("dropped_reasons", {})
+        total_candidates = int(zone_filter_diag.get("total_candidates", 0) or 0)
+        log_fields = {
+            "scope": "zones",
+            "ohlcv_lengths": ohlcv_lengths,
+            "candidate_counts": candidate_counts,
+            "dropped_reasons": dropped_reasons,
+        }
+        if total_candidates == 0:
+            trace_ctx.error("compute.poi.empty", reason="no_candidates", **log_fields)
+        else:
+            trace_ctx.warn("compute.poi.empty", reason="filtered_out", **log_fields)
 
     liquidity_marks: list[Dict[str, Any]] = []
     for mark_type, entries in liquidity_source.items():
@@ -1018,17 +1228,110 @@ def _prepare_summary_payload(
         "sessions": session_compact,
     }
 
-    orderflow_ok = any(
-        details.get("delta") is not None and details.get("cvd") is not None
-        for details in delta_cvd_compact.values()
-    )
+    def _build_orderflow_meta() -> Dict[str, Any]:
+        meta: Dict[str, Any] = {
+            "expected_minutes": 120,
+            "available_minutes": len(orderflow_per_bar.get("1m", [])),
+            "expected_aggregates": expected_aggregate_counts,
+            "available_aggregates": {
+                tf: len(delta_cvd_compact.get(tf, [])) for tf in ("15m", "1h")
+            },
+        }
+        partial = False
 
-    status = str(payload.get("status") or "ok").lower()
-    coverage_ok = all(item["coverage_pct"] >= 90.0 for item in coverage if item["tf"] in {"1m", "15m", "1h"})
-    if not coverage_ok or not orderflow_ok or status != "ok":
+        missing_minutes = max(0, 120 - meta["available_minutes"])
+        if missing_minutes:
+            meta["missing_minutes"] = missing_minutes
+            partial = True
+
+        missing_aggregates: Dict[str, int] = {}
+        aggregates_missing_entirely = False
+        for tf_key, expected_count in expected_aggregate_counts.items():
+            available = meta["available_aggregates"].get(tf_key, 0)
+            if available <= 0:
+                missing_aggregates[tf_key] = expected_count
+                aggregates_missing_entirely = True
+            elif available < expected_count:
+                missing_aggregates[tf_key] = expected_count - available
+        if missing_aggregates:
+            meta["missing_aggregates"] = missing_aggregates
+            if aggregates_missing_entirely:
+                partial = True
+
+        orderflow_availability = (
+            availability.get("orderflow") if isinstance(availability, Mapping) else {}
+        )
+        tf_availability = (
+            orderflow_availability.get("timeframes")
+            if isinstance(orderflow_availability, Mapping)
+            else {}
+        )
+        unavailable = [
+            tf
+            for tf in ("1m", "15m", "1h")
+            if isinstance(tf_availability, Mapping)
+            and isinstance(tf_availability.get(tf), Mapping)
+            and not tf_availability[tf].get("has_data", False)
+        ]
+        if unavailable:
+            meta["missing_timeframes"] = sorted(set(unavailable))
+            availability_partial = False
+            for tf in meta["missing_timeframes"]:
+                if tf == "1m":
+                    if not orderflow_per_bar.get("1m"):
+                        availability_partial = True
+                        break
+                elif not delta_cvd_compact.get(tf):
+                    availability_partial = True
+                    break
+            if availability_partial:
+                partial = True
+
+        if missing_aggregate_keys:
+            meta["missing_required"] = sorted(set(missing_aggregate_keys))
+            partial = True
+
+        if orderflow_source_meta:
+            fallback_info = orderflow_source_meta.get("fallback")
+            if fallback_info is not None:
+                meta["fallback"] = fallback_info
+                partial = True
+            if orderflow_source_meta.get("partial"):
+                partial = True
+
+        meta["partial"] = partial
+        return meta
+
+    orderflow_meta = _build_orderflow_meta()
+
+    status_seed = str(payload.get("status") or "ok").lower()
+    coverage_ok = all(
+        item["coverage_pct"] >= 90.0 for item in coverage if item["tf"] in {"1m", "15m", "1h"}
+    )
+    has_per_bar = bool(orderflow_per_bar.get("1m"))
+
+    if not coverage_ok or not has_per_bar:
         status = "insufficient_data"
     else:
-        status = "ok"
+        aggregates_missing_entirely = any(
+            not delta_cvd_compact.get(tf) for tf in ("15m", "1h")
+        )
+        structural_partial = bool(orderflow_meta.get("missing_minutes")) or bool(
+            orderflow_meta.get("missing_required")
+        ) or aggregates_missing_entirely
+        availability_partial = False
+        for tf in orderflow_meta.get("missing_timeframes", []) or []:
+            if tf == "1m":
+                if not has_per_bar:
+                    availability_partial = True
+                    break
+            elif not delta_cvd_compact.get(tf):
+                availability_partial = True
+                break
+        is_partial = structural_partial or availability_partial or not aggregates_ok
+        if status_seed in {"partial", "insufficient_data"}:
+            is_partial = True
+        status = "partial" if is_partial else "ok"
 
     compact_payload = {
         "schema": "compact.v1",
@@ -1037,6 +1340,7 @@ def _prepare_summary_payload(
         "orderflow": {
             "delta_cvd_compact": delta_cvd_compact,
             "per_bar": orderflow_per_bar,
+            "meta": orderflow_meta,
         },
         "vwap_tpo": vwap_tpo_compact,
         "zones": {"top": zones_top, "counts": zone_counts},
@@ -1047,10 +1351,102 @@ def _prepare_summary_payload(
         "status": status,
     }
 
-    serialize_start = time.perf_counter()
-    encoded = json.dumps(compact_payload, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
-    timing["serialize_ms"] = round((time.perf_counter() - serialize_start) * 1000.0, 2)
-    timing["json_bytes"] = len(encoded)
+    max_json_bytes = 4 * 1024 * 1024
+
+    def _encode_payload() -> tuple[bytes, float]:
+        start = time.perf_counter()
+        encoded_payload = json.dumps(
+            compact_payload, separators=(",", ":"), ensure_ascii=True
+        ).encode("utf-8")
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        return encoded_payload, elapsed_ms
+
+    def _truncate_list(path: Sequence[str], keep: int) -> bool:
+        node: Any = compact_payload
+        for key in path[:-1]:
+            if not isinstance(node, Mapping):
+                return False
+            node = node.get(key)
+        if not isinstance(node, MutableMapping):
+            return False
+        series = node.get(path[-1])
+        if not isinstance(series, list) or len(series) <= keep:
+            return False
+        del series[:-keep]
+        return True
+
+    def _clear_list(path: Sequence[str]) -> bool:
+        node: Any = compact_payload
+        for key in path[:-1]:
+            if not isinstance(node, Mapping):
+                return False
+            node = node.get(key)
+        if not isinstance(node, MutableMapping):
+            return False
+        series = node.get(path[-1])
+        if not isinstance(series, list) or not series:
+            return False
+        series.clear()
+        return True
+
+    encoded, serialize_ms = _encode_payload()
+    json_bytes = len(encoded)
+    prune_actions: list[str] = []
+
+    if json_bytes > max_json_bytes:
+        shrink_plan: list[tuple[str, Callable[[], bool]]] = [
+            ("ohlcv.1m_rollups:150", lambda: _truncate_list(["ohlcv", "1m_rollups"], 150)),
+            ("ohlcv.1m_rollups:120", lambda: _truncate_list(["ohlcv", "1m_rollups"], 120)),
+            ("orderflow.per_bar.1m:90", lambda: _truncate_list(["orderflow", "per_bar", "1m"], 90)),
+            ("orderflow.per_bar.1m:60", lambda: _truncate_list(["orderflow", "per_bar", "1m"], 60)),
+            (
+                "orderflow.delta_cvd_compact.15m:192",
+                lambda: _truncate_list(["orderflow", "delta_cvd_compact", "15m"], 192),
+            ),
+            (
+                "orderflow.delta_cvd_compact.1h:64",
+                lambda: _truncate_list(["orderflow", "delta_cvd_compact", "1h"], 64),
+            ),
+            ("liquidity_marks", lambda: _clear_list(["liquidity_marks"])),
+            ("zones.top:8", lambda: _truncate_list(["zones", "top"], 8)),
+            ("zones.top:4", lambda: _truncate_list(["zones", "top"], 4)),
+        ]
+
+        for description, action in shrink_plan:
+            if json_bytes <= max_json_bytes:
+                break
+            if not action():
+                continue
+            prune_actions.append(description)
+            encoded, serialize_ms = _encode_payload()
+            json_bytes = len(encoded)
+
+        if json_bytes > max_json_bytes:
+            LOGGER.error(
+                "Compact summary exceeds size limit",
+                extra={"json_bytes": json_bytes, "limit": max_json_bytes},
+            )
+            if trace_ctx is not None:
+                trace_ctx.error(
+                    "output.prepare_payload", status=status, json_bytes=json_bytes, limit=max_json_bytes
+                )
+        elif prune_actions:
+            LOGGER.warning(
+                "Compact summary pruned to satisfy size limit",
+                extra={"steps": prune_actions, "json_bytes": json_bytes},
+            )
+            if trace_ctx is not None:
+                trace_ctx.warn(
+                    "output.prepare_payload.pruned",
+                    status=status,
+                    json_bytes=json_bytes,
+                    steps=prune_actions,
+                )
+
+    compact_payload["orderflow"]["meta"] = _build_orderflow_meta()
+
+    timing["serialize_ms"] = round(serialize_ms, 2)
+    timing["json_bytes"] = json_bytes
 
     if trace_ctx is not None:
         trace_ctx.info(
@@ -1059,6 +1455,19 @@ def _prepare_summary_payload(
             json_bytes=timing.get("json_bytes"),
             serialize_ms=timing.get("serialize_ms"),
         )
+
+    LOGGER.info(
+        "Summary payload timing",
+        extra={
+            "status": status,
+            "fetch_ms": timing.get("fetch_ms"),
+            "db_ms": timing.get("db_ms"),
+            "compute_ms": timing.get("compute_ms"),
+            "serialize_ms": timing.get("serialize_ms"),
+            "json_bytes": timing.get("json_bytes"),
+            "pruned": prune_actions or None,
+        },
+    )
 
     return compact_payload
 

@@ -227,9 +227,11 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
         assert isinstance(series["candles"], list)
 
     orderflow = data_block["orderflow"]
-    assert set(orderflow.keys()) == {"15m", "1h"}
-    for block in orderflow.values():
+    assert set(orderflow.keys()) == {"1m", "15m", "1h"}
+    for tf, block in orderflow.items():
         assert isinstance(block["per_bar"], list)
+        if tf == "1m":
+            assert len(block["per_bar"]) <= 120
 
     assert isinstance(body["notes"], list)
     assert not body["notes"]
@@ -432,27 +434,32 @@ def test_orderflow_block_matches_spec(client: TestClient) -> None:
     body = response.json()
 
     orderflow_block = body["data"]["orderflow"]
-    assert set(orderflow_block.keys()) == {"15m", "1h"}
+    assert set(orderflow_block.keys()) == {"1m", "15m", "1h"}
+
+    minute_series = orderflow_block["1m"]["per_bar"]
+    assert isinstance(minute_series, list)
+    assert minute_series
+    assert len(minute_series) <= 120
+    minute_entry = minute_series[-1]
+    assert "delta" in minute_entry and "cvd" in minute_entry
 
     fifteen_series = orderflow_block["15m"]["per_bar"]
     assert isinstance(fifteen_series, list)
     assert fifteen_series
     fifteen_entry = fifteen_series[0]
-    for key in ("delta", "cvd", "ask_vol", "bid_vol"):
+    for key in ("delta_sum", "cvd_close", "vol_sum"):
         assert isinstance(fifteen_entry[key], (int, float))
-    assert isinstance(fifteen_entry["large_trades_count"], int)
-    assert isinstance(fifteen_entry["imbalance_buy"], bool)
-    assert isinstance(fifteen_entry["imbalance_sell"], bool)
-    assert isinstance(fifteen_entry["absorption_low"], bool)
-    assert isinstance(fifteen_entry["absorption_high"], bool)
+    if "bars" in fifteen_entry:
+        assert isinstance(fifteen_entry["bars"], int)
 
     hourly_series = orderflow_block["1h"]["per_bar"]
     assert isinstance(hourly_series, list)
     if hourly_series:
         hourly_entry = hourly_series[0]
-        for key in ("delta", "cvd", "ask_vol", "bid_vol"):
+        for key in ("delta_sum", "cvd_close", "vol_sum"):
             assert isinstance(hourly_entry[key], (int, float))
-        assert isinstance(hourly_entry["large_trades_count"], int)
+        if "bars" in hourly_entry:
+            assert isinstance(hourly_entry["bars"], int)
 
 
 def test_vwap_tpo_sessions_include_aliases(client: TestClient) -> None:
