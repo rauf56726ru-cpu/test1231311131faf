@@ -57,7 +57,6 @@ from ..services.book import fetch_orderbook
 from ..services.derivatives import fetch_derivatives
 from ..services.inspection import validate_enhanced_snapshot
 from ..services.liquidity import generate_liquidity_map
-from ..services.news import fetch_news
 from ..services.ohlcv import build_multi_tf_ohlcv, fetch_ohlcv as fetch_ohlcv_enhanced
 from ..services.orderflow import (
     calculate_cvd,
@@ -134,7 +133,6 @@ class SnapshotIn(BaseModel):
     liquidity_map: Optional[Dict[str, Any]] = None
     derivatives: Optional[List[Dict[str, Any]]] = None
     book: Optional[Dict[str, Any]] = None
-    news_events: Optional[List[Dict[str, Any]]] = None
     meta: Optional[Dict[str, Any]] = None
     lookback_days: int = Field(7, ge=1, le=30)
 
@@ -492,19 +490,6 @@ def _fallback_book(symbol: str, candle: CandleIn) -> Dict[str, object]:
         "imbalance": imbalance,
         "spoofing_flags": [],
     }
-
-
-def _fallback_news(symbol: str) -> List[Dict[str, object]]:
-    now = datetime.now(timezone.utc)
-    return [
-        {
-            "symbol": symbol,
-            "time_utc": _to_iso(int(now.timestamp() * 1000)),
-            "title": "System snapshot",
-            "impact": "low",
-            "tag": "mock",
-        }
-    ]
 
 
 def _coerce_candle_entry(row: Mapping[str, Any]) -> CandleIn:
@@ -1157,12 +1142,6 @@ async def register_inspection_snapshot(payload: SnapshotIn) -> Dict[str, str]:
         last_candle = source_candles[-1] if source_candles else CandleIn(t=0, o=0, h=0, l=0, c=0, v=1)
         book_state = _fallback_book(symbol, last_candle)
 
-    try:
-        news_items = await fetch_news(symbol, 72)
-    except Exception as exc:
-        logging.getLogger(__name__).warning("News fallback engaged: %s", exc)
-        news_items = _fallback_news(symbol)
-
     orderflow_payload["footprint"] = (
         footprint_snapshot.get("per_bar", [])
         if isinstance(footprint_snapshot, Mapping)
@@ -1215,7 +1194,6 @@ async def register_inspection_snapshot(payload: SnapshotIn) -> Dict[str, str]:
     snapshot["liquidity_map"] = liquidity_map
     snapshot["derivatives"] = derivatives_rows
     snapshot["book"] = book_state
-    snapshot["news_events"] = news_items
 
     enrichment: Dict[str, Any] | None = None
     try:
@@ -1317,18 +1295,6 @@ async def book_endpoint(
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Failed to fetch orderbook: {exc}") from exc
     return JSONResponse(data)
-
-
-@app.get("/news_events")
-async def news_events_endpoint(
-    symbol: str = Query(...),
-    hours: int = Query(72, ge=1, le=168),
-) -> JSONResponse:
-    try:
-        events = await fetch_news(symbol, hours)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch news: {exc}") from exc
-    return JSONResponse({"symbol": symbol.upper(), "hours": hours, "events": events})
 
 
 @app.get("/shared-candles")
@@ -1454,7 +1420,7 @@ async def inspection(
                 logging.getLogger(__name__).warning("Inspection enrichment failed: %s", exc)
                 enrichment_payload = None
         data_section = payload.setdefault("DATA", {})
-        for key in ("ohlcv", "orderflow", "liquidity_map", "derivatives", "book", "news_events"):
+        for key in ("ohlcv", "orderflow", "liquidity_map", "derivatives", "book"):
             if key in enriched_snapshot and key not in data_section:
                 data_section[key] = enriched_snapshot[key]
         if enrichment_payload:

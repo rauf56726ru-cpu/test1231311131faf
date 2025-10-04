@@ -668,13 +668,6 @@
         `<section><h3>Liquidity Map</h3><p>PDH: ${formatNumber(payload.liquidity_map.PDH)} | PDL: ${formatNumber(payload.liquidity_map.PDL)}</p></section>`
       );
     }
-    if (payload.news_events) {
-      const items = payload.news_events
-        .slice(-3)
-        .map((event) => `<li><time>${event.time_utc}</time> — <span>${event.title}</span> (${event.impact})</li>`)
-        .join("");
-      sections.push(`<section><h3>Новости</h3><ul>${items}</ul></section>`);
-    }
     dashboardEl.innerHTML = sections.join("");
   }
 
@@ -776,7 +769,6 @@
         orderflow: data.orderflow ?? null,
         derivatives: data.derivatives ?? null,
         liquidity_map: data.liquidity_map ?? null,
-        news_events: data.news_events ?? null,
       };
       renderDashboard(snapshotData);
       const tpo = data?.tpo?.sessions || [];
@@ -816,7 +808,6 @@
         orderflow: null,
         derivatives: null,
         liquidity_map: type === "liquidity" ? data?.liquidity_map : null,
-        news_events: null,
       });
       showToast("Анализ завершен", "success");
     } catch (error) {
