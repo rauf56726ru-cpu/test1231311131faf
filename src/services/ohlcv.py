@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Iterable, List, Mapping, MutableMapping
+from typing import Dict, Iterable, List, Mapping, MutableMapping, Tuple
 
 import httpx
+
+from .rate_limiter import get_global_rate_limiter
+from .tracing import TraceContext
 
 BINANCE_SPOT_KLINES = "https://api.binance.com/api/v3/klines"
 SUPPORTED_TIMEFRAMES: tuple[str, ...] = ("1m", "3m", "5m", "15m", "1h", "4h", "1d")
@@ -24,6 +28,10 @@ TIMEFRAME_TO_MS: Dict[str, int] = {tf: minutes * 60_000 for tf, minutes in TIMEF
 
 LOGGER = logging.getLogger(__name__)
 _FETCH_LOCK = asyncio.Lock()
+_RATE_LIMITER = get_global_rate_limiter()
+_ONE_MINUTE_CACHE_TTL = 45.0
+_ONE_MINUTE_CACHE: Dict[str, Tuple[float, List["Candle"]]] = {}
+_ONE_MINUTE_LOCKS: Dict[str, asyncio.Lock] = {}
 
 
 @dataclass(slots=True)
@@ -51,7 +59,13 @@ class Candle:
         }
 
 
-async def _fetch_klines(symbol: str, start_ms: int, end_ms: int) -> List[List[float]]:
+async def _fetch_klines(
+    symbol: str,
+    start_ms: int,
+    end_ms: int,
+    *,
+    trace: TraceContext | None = None,
+) -> List[List[float]]:
     """Fetch raw klines from Binance spot API within the requested range."""
 
     params = {
@@ -61,16 +75,28 @@ async def _fetch_klines(symbol: str, start_ms: int, end_ms: int) -> List[List[fl
         "endTime": str(end_ms),
         "limit": "1000",
     }
+    scope = "ohlcv.klines"
     async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
-        response = await client.get(BINANCE_SPOT_KLINES, params=params)
-        response.raise_for_status()
-        data = response.json()
-        if not isinstance(data, list):
-            raise ValueError("Unexpected klines payload from Binance")
-        return data  # type: ignore[return-value]
+        async with _RATE_LIMITER.limit(scope=scope, trace=trace):
+            response = await client.get(BINANCE_SPOT_KLINES, params=params)
+    await _RATE_LIMITER.note_used_weight(
+        _parse_used_weight(response), scope=scope, trace=trace
+    )
+    if response.status_code in {418, 429}:
+        await _RATE_LIMITER.apply_backoff(
+            _parse_retry_after(response), scope=scope, trace=trace, reason="klines"
+        )
+        raise ValueError("Binance rate limit exceeded for klines")
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, list):
+        raise ValueError("Unexpected klines payload from Binance")
+    return data  # type: ignore[return-value]
 
 
-async def _collect_1m_candles(symbol: str, lookback_days: int) -> List[Candle]:
+async def _collect_1m_candles(
+    symbol: str, lookback_days: int, *, trace: TraceContext | None = None
+) -> List[Candle]:
     """Collect minute candles for the specified lookback window."""
 
     if lookback_days <= 0:
@@ -84,7 +110,7 @@ async def _collect_1m_candles(symbol: str, lookback_days: int) -> List[Candle]:
     candles: List[Candle] = []
     while cursor < end_ms:
         batch_end = min(end_ms, cursor + 1000 * 60_000)
-        rows = await _fetch_klines(symbol, cursor, batch_end)
+        rows = await _fetch_klines(symbol, cursor, batch_end, trace=trace)
         if not rows:
             break
         for row in rows:
@@ -164,12 +190,73 @@ def _validate_series(series: List[Candle], tf: str) -> None:
         last_ts = candle.ts
 
 
+async def _load_cached_minutes(
+    symbol: str,
+    lookback_days: int,
+    *,
+    trace: TraceContext | None = None,
+) -> List[Candle]:
+    cache_key = f"{symbol}:{lookback_days}"
+    now = time.monotonic()
+    entry = _ONE_MINUTE_CACHE.get(cache_key)
+    if entry and entry[0] > now:
+        if trace is not None:
+            trace.debug("cache.hit", scope="ohlcv.1m", symbol=symbol, lookback_days=lookback_days)
+        return entry[1]
+
+    lock = _ONE_MINUTE_LOCKS.setdefault(cache_key, asyncio.Lock())
+    async with lock:
+        now = time.monotonic()
+        entry = _ONE_MINUTE_CACHE.get(cache_key)
+        if entry and entry[0] > now:
+            if trace is not None:
+                trace.debug(
+                    "cache.hit",
+                    scope="ohlcv.1m",
+                    symbol=symbol,
+                    lookback_days=lookback_days,
+                )
+            return entry[1]
+        if trace is not None:
+            trace.debug(
+                "cache.miss",
+                scope="ohlcv.1m",
+                symbol=symbol,
+                lookback_days=lookback_days,
+            )
+        async with _FETCH_LOCK:
+            candles = await _collect_1m_candles(symbol, lookback_days, trace=trace)
+        _ONE_MINUTE_CACHE[cache_key] = (time.monotonic() + _ONE_MINUTE_CACHE_TTL, candles)
+        return candles
+
+
+def _parse_retry_after(response: httpx.Response) -> float | None:
+    value = response.headers.get("Retry-After")
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def _parse_used_weight(response: httpx.Response) -> int | None:
+    value = response.headers.get("X-MBX-USED-WEIGHT-1m")
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
 async def fetch_ohlcv(
     symbol: str,
     tf: str,
     lookback_days: int,
     *,
     cache: MutableMapping[str, Dict[str, object]] | None = None,
+    trace: TraceContext | None = None,
 ) -> Dict[str, object]:
     """Fetch OHLCV candles for a Binance symbol and timeframe."""
 
@@ -189,23 +276,25 @@ async def fetch_ohlcv(
                 LOGGER.debug("Serving OHLCV for %s from cache", cache_key)
                 return dict(cached)
 
-    async with _FETCH_LOCK:
-        base_candles = await _collect_1m_candles(symbol_clean, lookback_days)
-        if tf == "1m":
-            series = base_candles
-        else:
-            series = _aggregate(base_candles, tf)
-        _validate_series(series, tf)
+    base_trace = trace.child(stage=f"ohlcv.{tf}") if trace is not None else None
+    base_candles = await _load_cached_minutes(
+        symbol_clean, lookback_days, trace=base_trace
+    )
+    if tf == "1m":
+        series = base_candles
+    else:
+        series = _aggregate(base_candles, tf)
+    _validate_series(series, tf)
 
-        payload = {
-            "symbol": symbol_clean,
-            "tf": tf,
-            "candles": [candle.to_wire() for candle in series],
-            "fetched_at": datetime.now(timezone.utc).isoformat(),
-        }
-        if cache is not None:
-            cache[cache_key] = payload
-        return payload
+    payload = {
+        "symbol": symbol_clean,
+        "tf": tf,
+        "candles": [candle.to_wire() for candle in series],
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if cache is not None:
+        cache[cache_key] = payload
+    return payload
 
 
 async def build_multi_tf_ohlcv(
@@ -214,6 +303,7 @@ async def build_multi_tf_ohlcv(
     *,
     timeframes: Iterable[str] | None = None,
     cache: MutableMapping[str, Dict[str, object]] | None = None,
+    trace: TraceContext | None = None,
 ) -> Dict[str, object]:
     """Collect OHLCV series for multiple timeframes with shared caching."""
 
@@ -222,7 +312,13 @@ async def build_multi_tf_ohlcv(
     base_cache: MutableMapping[str, Dict[str, object]] | None = cache
     for tf in requested:
         try:
-            frames[tf] = await fetch_ohlcv(symbol, tf, lookback_days, cache=base_cache)
+            frames[tf] = await fetch_ohlcv(
+                symbol,
+                tf,
+                lookback_days,
+                cache=base_cache,
+                trace=trace.child(stage=f"ohlcv.{tf}") if trace is not None else None,
+            )
         except Exception as exc:  # pragma: no cover - defensive logging
             LOGGER.exception("Failed to build OHLCV for %s %s: %s", symbol, tf, exc)
             raise
