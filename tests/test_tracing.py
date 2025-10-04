@@ -7,6 +7,8 @@ import logging
 
 import pytest
 
+from src.services.tracing import TraceContext
+
 MODULE_PATH = "src.services.tracing"
 
 
@@ -40,3 +42,23 @@ def test_tracing_logger_promoted_to_debug(monkeypatch: pytest.MonkeyPatch, caplo
         tracing.LOGGER.info("tracing-event", extra={"stage": "test"})
 
     assert any(record.message == "tracing-event" for record in caplog.records)
+
+
+def test_child_inherits_identifiers_and_static_fields():
+    root_ctx = TraceContext(symbol="BTCUSDT", stage="root", enabled=True)
+    child_ctx = root_ctx.child(stage="pipeline", rid="r_custom")
+
+    assert child_ctx.cid == root_ctx.cid
+    assert child_ctx.rid == "r_custom"
+    assert child_ctx._static["stage"] == "pipeline"
+    assert child_ctx._static["symbol"] == "BTCUSDT"
+    assert child_ctx._enabled is True
+
+
+def test_span_generates_new_request_id():
+    ctx = TraceContext(symbol="ETHUSDT")
+    span_ctx = ctx.span("pipeline.start", stage="pipeline")
+
+    assert span_ctx.cid == ctx.cid
+    assert span_ctx.rid != ctx.rid
+    assert span_ctx._static["stage"] == "pipeline"
