@@ -42,6 +42,8 @@ class IntervalSummary:
     dropped_candles: int
     requests: int
     remaining_gaps: List[Dict[str, int]]
+    expected_candles: int
+    coverage_pct: float
 
 
 @dataclass(slots=True)
@@ -53,6 +55,13 @@ class CollectionSummary:
     requests: int
     candles_written: int
     dropped_candles: int
+
+    def coverage_by_interval(self) -> Dict[str, float]:
+        return {tf: summary.coverage_pct for tf, summary in self.intervals.items()}
+
+    @property
+    def coverage(self) -> Dict[str, float]:
+        return self.coverage_by_interval()
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -69,9 +78,22 @@ class CollectionSummary:
                     "dropped_candles": summary.dropped_candles,
                     "requests": summary.requests,
                     "remaining_gaps": summary.remaining_gaps,
+                    "expected_candles": summary.expected_candles,
+                    "coverage_pct": summary.coverage_pct,
                 }
                 for tf, summary in self.intervals.items()
             },
+            "coverage": [
+                {
+                    "tf": tf,
+                    "coverage_pct": summary.coverage_pct,
+                    "expected_candles": summary.expected_candles,
+                    "missing_candles": sum(
+                        int(gap.get("count", 0)) for gap in summary.remaining_gaps
+                    ),
+                }
+                for tf, summary in self.intervals.items()
+            ],
         }
 
 
@@ -120,6 +142,8 @@ async def _request_klines(
 
     response.raise_for_status()
     return []
+
+
 def _align_to_interval(timestamp_ms: int, interval_ms: int) -> int:
     if interval_ms <= 0:
         raise ValueError("interval_ms must be positive")
@@ -159,6 +183,17 @@ def _gap_count(start_ms: int, end_ms: int, interval_ms: int) -> int:
     if end_ms < start_ms:
         return 0
     return int((end_ms - start_ms) // interval_ms + 1)
+
+
+def _compute_coverage_pct(existing: int, expected: int) -> float:
+    if expected <= 0:
+        return 100.0
+    coverage = (existing / expected) * 100.0
+    if coverage < 0.0:
+        return 0.0
+    if coverage > 100.0:
+        return 100.0
+    return round(coverage, 5)
 
 
 def _merge_adjacent_gaps(
@@ -587,6 +622,10 @@ async def _fill_gap(
         requests=requests,
     )
 
+    expected = int(gap.get("count", 0)) if "count" in gap else _gap_count(
+        gap_start, gap_end, interval_ms
+    )
+    coverage = _compute_coverage_pct(written, expected)
     return IntervalSummary(
         gaps_total=1,
         gaps_filled=1 if written > 0 else 0,
@@ -594,6 +633,8 @@ async def _fill_gap(
         dropped_candles=dropped_ts + dropped_ohlc,
         requests=requests,
         remaining_gaps=[],
+        expected_candles=expected,
+        coverage_pct=coverage,
     )
 
 
@@ -697,6 +738,8 @@ async def collect_recent_summary(
             else:
                 last_closed = last_expected
 
+            expected_total = _gap_count(first_expected, last_closed, interval_ms)
+
             if last_closed < first_expected:
                 summaries[interval] = IntervalSummary(
                     gaps_total=0,
@@ -705,6 +748,8 @@ async def collect_recent_summary(
                     dropped_candles=0,
                     requests=0,
                     remaining_gaps=[],
+                    expected_candles=0,
+                    coverage_pct=100.0,
                 )
                 TRACE_LOGGER.debug(
                     "summary_collector:interval_skipped",
@@ -739,6 +784,7 @@ async def collect_recent_summary(
                 start_ms=first_expected,
                 end_ms=last_closed,
             )
+            existing_count = len(existing)
             TRACE_LOGGER.debug(
                 "summary_collector:fetched_existing",
                 extra={
@@ -810,6 +856,8 @@ async def collect_recent_summary(
                 minute_last_closed = last_closed
 
                 if not merged_gaps:
+                    existing_count = len(existing)
+                    coverage_pct = _compute_coverage_pct(existing_count, expected_total)
                     summaries[interval] = IntervalSummary(
                         gaps_total=0,
                         gaps_filled=0,
@@ -817,6 +865,8 @@ async def collect_recent_summary(
                         dropped_candles=0,
                         requests=0,
                         remaining_gaps=[],
+                        expected_candles=expected_total,
+                        coverage_pct=coverage_pct,
                     )
                     await emit_progress(
                         progress,
@@ -869,6 +919,8 @@ async def collect_recent_summary(
                 remaining_minutes = _compute_gaps(
                     first_expected, last_closed, interval_ms, refreshed_minutes
                 )
+                refreshed_count = len(refreshed_minutes)
+                coverage_pct = _compute_coverage_pct(refreshed_count, expected_total)
                 summaries[interval] = IntervalSummary(
                     gaps_total=len(merged_gaps),
                     gaps_filled=sum(1 for item in gap_summaries if item.candles_written > 0),
@@ -876,6 +928,8 @@ async def collect_recent_summary(
                     dropped_candles=sum(item.dropped_candles for item in gap_summaries),
                     requests=sum(item.requests for item in gap_summaries),
                     remaining_gaps=remaining_minutes,
+                    expected_candles=expected_total,
+                    coverage_pct=coverage_pct,
                 )
                 TRACE_LOGGER.debug(
                     "summary_collector:interval_finished",
@@ -925,6 +979,8 @@ async def collect_recent_summary(
                     dropped_candles=0,
                     requests=0,
                     remaining_gaps=merged_gaps,
+                    expected_candles=expected_total,
+                    coverage_pct=_compute_coverage_pct(existing_count, expected_total),
                 )
                 if trace_ctx is not None:
                     trace_ctx.warn(
@@ -942,6 +998,8 @@ async def collect_recent_summary(
                     "last_closed": last_closed,
                     "existing": existing,
                     "gaps": merged_gaps,
+                    "expected_total": expected_total,
+                    "existing_count": existing_count,
                 }
             )
 
@@ -952,6 +1010,8 @@ async def collect_recent_summary(
         last_closed = params["last_closed"]
         existing = params["existing"]
         gaps = params["gaps"]
+        expected_total = params.get("expected_total", 0)
+        existing_count = params.get("existing_count", len(existing))
 
         filtered = [
             candle
@@ -1000,6 +1060,8 @@ async def collect_recent_summary(
         refreshed_set = {int(ts) for ts in refreshed}
         new_candles = max(0, len(refreshed_set - existing_set))
 
+        refreshed_count = len(refreshed)
+        coverage_pct = _compute_coverage_pct(refreshed_count, expected_total)
         summary = IntervalSummary(
             gaps_total=len(gaps),
             gaps_filled=gaps_filled,
@@ -1007,6 +1069,8 @@ async def collect_recent_summary(
             dropped_candles=stats.dropped_ts + stats.dropped_ohlc,
             requests=0,
             remaining_gaps=remaining,
+            expected_candles=expected_total,
+            coverage_pct=coverage_pct,
         )
         if trace_ctx is not None:
             trace_ctx.info(
@@ -1015,6 +1079,7 @@ async def collect_recent_summary(
                 written=new_candles,
                 dropped=stats.dropped_ts + stats.dropped_ohlc,
                 remaining=len(remaining),
+                coverage_pct=coverage_pct,
             )
         return interval, summary, new_candles, stats.dropped_ts + stats.dropped_ohlc
 
