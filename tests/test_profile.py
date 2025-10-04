@@ -13,6 +13,7 @@ import src.services.inspection as inspection
 from src.meta import Meta
 from src.services import presets
 from src.services.profile import (
+    build_compact_vwap_profiles,
     build_profile_package,
     build_volume_profile,
     compute_session_profiles,
@@ -381,3 +382,58 @@ def test_profile_endpoint_marks_missing_preset(client: TestClient) -> None:
     assert body["symbol"] == "ABCUSDT"
     assert body.get("preset") is None
     assert body.get("preset_required") is True
+
+
+def test_compact_vwap_profiles_incremental_updates() -> None:
+    base = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    minute_ms = 60_000
+    start_ms = int(base.timestamp() * 1000)
+    candles = [
+        {"t": start_ms, "h": 101.0, "l": 99.0, "c": 100.0, "v": 5.0},
+        {"t": start_ms + minute_ms, "h": 102.0, "l": 100.0, "c": 101.0, "v": 6.0},
+        {"t": start_ms + 2 * minute_ms, "h": 103.0, "l": 101.0, "c": 102.0, "v": 7.0},
+    ]
+    daily_window = (start_ms, start_ms + 3 * minute_ms)
+    session_windows = {
+        "asia": (start_ms, start_ms + 3 * minute_ms, start_ms + 4 * minute_ms),
+    }
+    token = ("compact_test", "BTCUSDT")
+
+    result_initial = build_compact_vwap_profiles(
+        candles,
+        daily_window=daily_window,
+        composite_window=daily_window,
+        session_windows=session_windows,
+        tick_size=0.5,
+        value_area_pct=0.7,
+        cache_token=token,
+    )
+
+    assert result_initial.daily is not None
+    assert result_initial.daily["bars"] == 3
+    assert "asia" in result_initial.sessions
+    assert result_initial.session_sigma["asia"]["basis"] == "session"
+
+    extended = candles + [
+        {"t": start_ms + 3 * minute_ms, "h": 104.0, "l": 102.0, "c": 103.0, "v": 8.0}
+    ]
+
+    result_extended = build_compact_vwap_profiles(
+        extended,
+        daily_window=daily_window,
+        composite_window=daily_window,
+        session_windows=session_windows,
+        tick_size=0.5,
+        value_area_pct=0.7,
+        cache_token=token,
+    )
+
+    assert result_extended.daily is not None
+    assert result_extended.daily["bars"] == 4
+    assert result_extended.daily["incremental_bars"] == 1
+    assert result_extended.bars_processed >= 1
+    asia_session = result_extended.sessions["asia"]
+    assert asia_session["bars"] == 4
+    assert asia_session["incremental_bars"] == 1
+    boundaries = result_extended.session_boundaries["asia"]
+    assert boundaries["start_ms"] == session_windows["asia"][0]

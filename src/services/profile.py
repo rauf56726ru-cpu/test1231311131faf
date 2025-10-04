@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time as dtime, timedelta, timezone
 import logging
 import math
+import time
 from typing import (
     Any,
     Callable,
@@ -20,6 +21,9 @@ from typing import (
 )
 
 from .timeutils import ensure_ms_epoch, safe_datetime_from_ms
+from .tpo import ValueAreaState, compute_compact_value_area
+from .tracing import TraceContext
+from .vwap import VWAPWindowState, compute_compact_vwap
 
 
 LOGGER = logging.getLogger(__name__)
@@ -83,6 +87,30 @@ def _datetime_from_ms(
 
 
 _PROFILE_CACHE: Dict[Tuple[Any, ...], "VolumeProfile"] = {}
+
+
+@dataclass(slots=True)
+class CompactWindowState:
+    """Bundles VWAP and value-area state for a specific window."""
+
+    vwap_state: VWAPWindowState
+    value_state: ValueAreaState
+
+
+@dataclass(slots=True)
+class CompactVWAPResult:
+    """Container for compact VWAP/TPO outputs."""
+
+    daily: Dict[str, Any] | None
+    daily_sigma: Dict[str, Any]
+    sessions: Dict[str, Dict[str, Any]]
+    session_sigma: Dict[str, Dict[str, Any]]
+    session_boundaries: Dict[str, Dict[str, Any]]
+    composite: Dict[str, Any] | None = None
+    bars_processed: int = 0
+
+
+_COMPACT_PROFILE_CACHE: Dict[Any, Dict[str, CompactWindowState]] = {}
 
 
 @dataclass(slots=True)
@@ -777,3 +805,180 @@ def build_profile_package(
 
     return tpo_entries, flattened, zones
 
+
+def _sigma_levels(center: float, sigma: float) -> List[Dict[str, float]]:
+    return [
+        {"k": order, "price_minus": center - sigma * order, "price_plus": center + sigma * order}
+        for order in (1, 2)
+    ]
+
+
+def build_compact_vwap_profiles(
+    candles: Sequence[Mapping[str, Any]],
+    *,
+    daily_window: Tuple[int, int] | None,
+    composite_window: Tuple[int, int] | None,
+    session_windows: Mapping[str, Tuple[int, int, int]],
+    tick_size: float | None,
+    value_area_pct: float,
+    cache_token: Any | None = None,
+    ib_minutes: int = 60,
+    trace_ctx: TraceContext | None = None,
+) -> CompactVWAPResult:
+    """Build compact VWAP/TPO payloads for the strict three-day pipeline."""
+
+    start_time = time.perf_counter()
+    cache_store: Dict[str, CompactWindowState]
+    if cache_token is None:
+        cache_store = {}
+    else:
+        cache_store = _COMPACT_PROFILE_CACHE.setdefault(cache_token, {})
+
+    bars_processed = 0
+    window_count = 0
+
+    def _iso(ms: int | None) -> str | None:
+        if ms is None:
+            return None
+        dt = safe_datetime_from_ms(ms, timezone.utc)
+        if dt is None:
+            return None
+        return dt.isoformat().replace("+00:00", "Z")
+
+    def _empty_sigma(basis: str) -> Dict[str, Any]:
+        return {"basis": basis, "sigma": _sigma_levels(0.0, 0.0)}
+
+    def process_window(
+        label: str,
+        start_ms: int,
+        end_ms: int,
+        *,
+        basis: str,
+        ib_window: int,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        nonlocal bars_processed, window_count
+        window_count += 1
+        state = cache_store.get(label)
+        if state is None:
+            state = CompactWindowState(
+                vwap_state=VWAPWindowState(start_ms=start_ms, end_ms=end_ms),
+                value_state=ValueAreaState(
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    tick_size=tick_size,
+                    value_area_pct=value_area_pct,
+                    ib_minutes=ib_window,
+                ),
+            )
+        else:
+            state.vwap_state.ensure_bounds(start_ms=start_ms, end_ms=end_ms)
+            state.value_state.ensure_bounds(
+                start_ms=start_ms,
+                end_ms=end_ms,
+                tick_size=tick_size,
+                value_area_pct=value_area_pct,
+                ib_minutes=ib_window,
+            )
+
+        vwap_payload, sigma_block, vwap_state, inc_vwap = compute_compact_vwap(
+            candles,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            basis=basis,
+            state=state.vwap_state,
+        )
+        value_payload, value_state, inc_value = compute_compact_value_area(
+            candles,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            tick_size=tick_size,
+            value_area_pct=value_area_pct,
+            ib_minutes=ib_window,
+            state=state.value_state,
+        )
+
+        state.vwap_state = vwap_state
+        state.value_state = value_state
+        if cache_token is not None:
+            cache_store[label] = state
+
+        incremental = max(inc_vwap, inc_value)
+        bars_processed += incremental
+        payload = {
+            "open_ms": start_ms,
+            "close_ms": end_ms,
+            "vwap": vwap_payload["vwap"],
+            "sd1": vwap_payload["sd1"],
+            "sd2": vwap_payload["sd2"],
+            "poc": value_payload["poc"],
+            "vah": value_payload["vah"],
+            "val": value_payload["val"],
+            "high": value_payload["session_high"],
+            "low": value_payload["session_low"],
+            "ib_high": value_payload["ib_high"],
+            "ib_low": value_payload["ib_low"],
+            "bars": max(vwap_payload["bars"], value_payload["bars"]),
+            "volume": vwap_payload["volume"],
+            "total_volume": value_payload["total_volume"],
+            "incremental_bars": incremental,
+            "window": {"start": _iso(start_ms), "end": _iso(end_ms)},
+        }
+        return payload, sigma_block
+
+    daily_payload: Dict[str, Any] | None = None
+    daily_sigma: Dict[str, Any] = _empty_sigma("daily")
+    if daily_window is not None:
+        start_ms, end_ms = daily_window
+        daily_payload, daily_sigma = process_window(
+            "daily", start_ms, end_ms, basis="daily", ib_window=0
+        )
+
+    composite_payload: Dict[str, Any] | None = None
+    if composite_window is not None:
+        comp_start, comp_end = composite_window
+        composite_payload, _ = process_window(
+            "composite", comp_start, comp_end, basis="composite", ib_window=0
+        )
+
+    session_payloads: Dict[str, Dict[str, Any]] = {}
+    session_sigma: Dict[str, Dict[str, Any]] = {}
+    session_boundaries: Dict[str, Dict[str, Any]] = {}
+    for session_name, (start_ms, end_ms, close_ms) in session_windows.items():
+        payload, sigma_block = process_window(
+            f"session:{session_name}",
+            start_ms,
+            end_ms,
+            basis="session",
+            ib_window=ib_minutes,
+        )
+        payload["open_ms"] = start_ms
+        payload["close_ms"] = close_ms
+        payload["window"]["close"] = _iso(close_ms)
+        session_payloads[session_name] = payload
+        session_sigma[session_name] = sigma_block
+        session_boundaries[session_name] = {
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "close_ms": close_ms,
+            "ib_high": payload.get("ib_high"),
+            "ib_low": payload.get("ib_low"),
+        }
+
+    duration_ms = (time.perf_counter() - start_time) * 1000.0
+    if trace_ctx is not None:
+        trace_ctx.info(
+            "compute.vwap_tpo",
+            scope="vwap_tpo.compact",
+            metrics={"bars": bars_processed, "ms": round(duration_ms, 3)},
+            windows=window_count,
+        )
+
+    return CompactVWAPResult(
+        daily=daily_payload,
+        daily_sigma=daily_sigma,
+        sessions=session_payloads,
+        session_sigma=session_sigma,
+        session_boundaries=session_boundaries,
+        composite=composite_payload,
+        bars_processed=bars_processed,
+    )

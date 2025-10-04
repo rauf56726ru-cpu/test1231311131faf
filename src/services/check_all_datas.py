@@ -36,7 +36,7 @@ from .liquidity import (
     resolve_liquidity_tick_size,
 )
 from .presets import resolve_profile_config
-from .profile import build_profile_package
+from .profile import build_compact_vwap_profiles, build_profile_package
 from .ohlc_sanitizer import SanitizedCandles, sanitize_candles
 from .smc import SMCConfig, detect_smc_blocks
 from .zones import Config as ZonesConfig, detect_zones
@@ -4110,79 +4110,123 @@ async def build_check_all_datas(
 
     minute_series = frames.get("1m", [])
     daily_start_ms = _start_of_day_ms(window_end_ms)
-    daily_filtered_minutes = _filter_candles(
-        minute_series, start_ms=daily_start_ms, end_ms=window_end_ms
-    )
-    daily_vwap_profile = _build_volume_profile_stats(
-        minute_series,
-        start_ms=daily_start_ms,
-        end_ms=window_end_ms,
-        tick_size=tick_size_numeric,
-        value_area_pct=VALUE_AREA_PCT,
-    )
-
     composite_day_end_ms = daily_start_ms + MS_IN_DAY - MINUTE_INTERVAL_MS
     if composite_day_end_ms < daily_start_ms:
         composite_day_end_ms = daily_start_ms
-    composite_day_profile = _build_volume_profile_stats(
-        minute_series,
-        start_ms=daily_start_ms,
-        end_ms=min(window_end_ms, composite_day_end_ms),
-        tick_size=tick_size_numeric,
-        value_area_pct=VALUE_AREA_PCT,
-    )
-
     session_profiles: Dict[str, Dict[str, Any]] = {}
     session_sigma_blocks: Dict[str, Dict[str, Any]] = {}
     session_boundaries: Dict[str, Dict[str, Any]] = {}
-    for session_name, session_start, session_end in sessions:
-        (
-            session_start_ms,
-            session_end_ms,
-            session_close_ms,
-        ) = _session_window(window_end_ms, session_start, session_end)
-        session_filtered = _filter_candles(
-            minute_series, start_ms=session_start_ms, end_ms=session_end_ms
-        )
-        ib_high, ib_low = _compute_initial_balance_extrema(
-            session_filtered, session_start_ms=session_start_ms
-        )
-        profile_entry = _build_volume_profile_stats(
+
+    if strict_three_day:
+        session_window_map: Dict[str, Tuple[int, int, int]] = {}
+        for session_name, session_start, session_end in sessions:
+            session_start_ms, session_end_ms, session_close_ms = _session_window(
+                window_end_ms, session_start, session_end
+            )
+            session_window_map[session_name] = (
+                session_start_ms,
+                session_end_ms,
+                session_close_ms,
+            )
+        compact_result = build_compact_vwap_profiles(
             minute_series,
-            start_ms=session_start_ms,
-            end_ms=session_end_ms,
+            daily_window=(daily_start_ms, window_end_ms),
+            composite_window=(daily_start_ms, min(window_end_ms, composite_day_end_ms)),
+            session_windows=session_window_map,
+            tick_size=tick_size_numeric,
+            value_area_pct=VALUE_AREA_PCT,
+            cache_token=("compact_vwap", symbol),
+            ib_minutes=60,
+            trace_ctx=trace_ctx,
+        )
+        daily_vwap_profile = compact_result.daily or {
+            "vwap": 0.0,
+            "sd1": {"minus": None, "plus": None},
+            "sd2": {"minus": None, "plus": None},
+        }
+        if isinstance(daily_vwap_profile, MutableMapping):
+            daily_vwap_profile.setdefault("open_utc", _isoformat_utc(daily_start_ms))
+            daily_vwap_profile.setdefault("close_utc", _isoformat_utc(window_end_ms))
+        composite_day_profile = compact_result.composite or {}
+        session_profiles = {
+            name: dict(payload) for name, payload in compact_result.sessions.items()
+        }
+        session_sigma_blocks = compact_result.session_sigma
+        session_boundaries = compact_result.session_boundaries
+        for session_name, profile_entry in session_profiles.items():
+            boundary = session_boundaries.get(session_name, {})
+            start_ms = boundary.get("start_ms")
+            close_ms = boundary.get("close_ms")
+            if isinstance(profile_entry, MutableMapping):
+                profile_entry.setdefault("open_utc", _isoformat_utc(start_ms))
+                profile_entry.setdefault("close_utc", _isoformat_utc(close_ms))
+        vwap_sigma_payload = {
+            "daily": compact_result.daily_sigma,
+            "sessions": session_sigma_blocks,
+        }
+    else:
+        daily_filtered_minutes = _filter_candles(
+            minute_series, start_ms=daily_start_ms, end_ms=window_end_ms
+        )
+        daily_vwap_profile = _build_volume_profile_stats(
+            minute_series,
+            start_ms=daily_start_ms,
+            end_ms=window_end_ms,
             tick_size=tick_size_numeric,
             value_area_pct=VALUE_AREA_PCT,
         )
-        if isinstance(profile_entry, MutableMapping):
-            if "session_high" in profile_entry and "high" not in profile_entry:
-                profile_entry["high"] = profile_entry.get("session_high")
-            if "session_low" in profile_entry and "low" not in profile_entry:
-                profile_entry["low"] = profile_entry.get("session_low")
-            profile_entry["open_utc"] = _isoformat_utc(session_start_ms)
-            profile_entry["close_utc"] = _isoformat_utc(session_close_ms)
-            profile_entry["ib_high"] = ib_high
-            profile_entry["ib_low"] = ib_low
-        session_profiles[session_name] = profile_entry
-        session_sigma_blocks[session_name] = _build_vwap_sigma_block(
-            session_filtered, basis="session"
+        composite_day_profile = _build_volume_profile_stats(
+            minute_series,
+            start_ms=daily_start_ms,
+            end_ms=min(window_end_ms, composite_day_end_ms),
+            tick_size=tick_size_numeric,
+            value_area_pct=VALUE_AREA_PCT,
         )
-        session_boundaries[session_name] = {
-            "start_ms": session_start_ms,
-            "end_ms": session_end_ms,
-            "close_ms": session_close_ms,
-            "ib_high": ib_high,
-            "ib_low": ib_low,
+        for session_name, session_start, session_end in sessions:
+            session_start_ms, session_end_ms, session_close_ms = _session_window(
+                window_end_ms, session_start, session_end
+            )
+            session_filtered = _filter_candles(
+                minute_series, start_ms=session_start_ms, end_ms=session_end_ms
+            )
+            ib_high, ib_low = _compute_initial_balance_extrema(
+                session_filtered, session_start_ms=session_start_ms
+            )
+            profile_entry = _build_volume_profile_stats(
+                minute_series,
+                start_ms=session_start_ms,
+                end_ms=session_end_ms,
+                tick_size=tick_size_numeric,
+                value_area_pct=VALUE_AREA_PCT,
+            )
+            if isinstance(profile_entry, MutableMapping):
+                if "session_high" in profile_entry and "high" not in profile_entry:
+                    profile_entry["high"] = profile_entry.get("session_high")
+                if "session_low" in profile_entry and "low" not in profile_entry:
+                    profile_entry["low"] = profile_entry.get("session_low")
+                profile_entry["open_utc"] = _isoformat_utc(session_start_ms)
+                profile_entry["close_utc"] = _isoformat_utc(session_close_ms)
+                profile_entry["ib_high"] = ib_high
+                profile_entry["ib_low"] = ib_low
+            session_profiles[session_name] = profile_entry
+            session_sigma_blocks[session_name] = _build_vwap_sigma_block(
+                session_filtered, basis="session"
+            )
+            session_boundaries[session_name] = {
+                "start_ms": session_start_ms,
+                "end_ms": session_end_ms,
+                "close_ms": session_close_ms,
+                "ib_high": ib_high,
+                "ib_low": ib_low,
+            }
+        vwap_sigma_payload = {
+            "daily": _build_vwap_sigma_block(daily_filtered_minutes, basis="daily"),
+            "sessions": session_sigma_blocks,
         }
 
     vwap_payload = {
         "daily": daily_vwap_profile,
         "sessions": session_profiles,
-    }
-
-    vwap_sigma_payload = {
-        "daily": _build_vwap_sigma_block(daily_filtered_minutes, basis="daily"),
-        "sessions": session_sigma_blocks,
     }
 
     session_time_lookup = {
