@@ -21,6 +21,7 @@ from typing import (
     Sequence,
     Tuple,
     Set,
+    TYPE_CHECKING,
 )
 
 import httpx
@@ -40,6 +41,9 @@ from .ohlc_sanitizer import SanitizedCandles, sanitize_candles
 from .smc import SMCConfig, detect_smc_blocks
 from .zones import Config as ZonesConfig, detect_zones
 from .timeutils import safe_datetime_from_ms
+
+if TYPE_CHECKING:  # pragma: no cover - typing helper
+    from .summary_collector import CollectionSummary
 UTC = timezone.utc
 LOGGER = logging.getLogger(__name__)
 MS_IN_HOUR = 3_600_000
@@ -738,7 +742,14 @@ def _finalise_payload(
 
     if trace_ctx is not None:
         trace_ctx.info(
+            "output.publish",
+            scope="output",
+            status=status,
+            size_bytes=size_bytes,
+        )
+        trace_ctx.info(
             "pipeline.done",
+            scope="pipeline",
             status=status,
             fetch_ms=timing_block["fetch_ms"],
             db_ms=timing_block["db_ms"],
@@ -2706,7 +2717,15 @@ async def build_check_all_datas(
 
     if trace_ctx is not None:
         trace_ctx.info(
+            "ui.click_received",
+            scope="ui",
+            symbol=symbol,
+            strict_window=strict_window,
+            network_backfill=network_backfill,
+        )
+        trace_ctx.info(
             "pipeline.start",
+            scope="pipeline",
             symbol=symbol,
             strict_window=strict_window,
             network_backfill=network_backfill,
@@ -2727,6 +2746,10 @@ async def build_check_all_datas(
         base_window_hours = 4
     base_window_hours = int(base_window_hours)
 
+    strict_three_day = bool(strict_window and base_window_hours >= 72)
+    if strict_three_day and network_backfill:
+        network_backfill = False
+
     window_end_guess = _resolve_window_end_ms(
         frames,
         now_ms=now_ms,
@@ -2734,9 +2757,119 @@ async def build_check_all_datas(
         stream_ts=stream_ts,
     )
 
+    if strict_three_day:
+        aligned_end = _align_to_interval(window_end_guess, MINUTE_INTERVAL_MS)
+        if aligned_end > window_end_guess:
+            aligned_end -= MINUTE_INTERVAL_MS
+        window_end_guess = max(aligned_end, MINUTE_INTERVAL_MS)
+
+    if trace_ctx is not None:
+        trace_ctx.info(
+            "pipeline.contract_ok",
+            scope="pipeline",
+            base_window_hours=base_window_hours,
+            strict_three_day=strict_three_day,
+            window_end_ms=window_end_guess,
+        )
+
+    summary_result: "CollectionSummary" | None = None
+    if strict_three_day:
+        summary_end_ms = window_end_guess
+        summary_start_ms = max(
+            0,
+            summary_end_ms - 72 * MS_IN_HOUR + MINUTE_INTERVAL_MS,
+        )
+        summary_trace = (
+            trace_ctx.child(stage="summary_collect") if trace_ctx is not None else None
+        )
+        summary_start = time.perf_counter()
+        if trace_ctx is not None:
+            trace_ctx.info(
+                "fetch.batch_start",
+                scope="summary.1m",
+                window={"from": summary_start_ms, "to": summary_end_ms},
+                details="collect_recent_summary",
+            )
+        try:
+            from . import summary_collector  # local import to avoid circular deps
+
+            summary_result = await summary_collector.collect_recent_summary(
+                symbol,
+                start_ms=summary_start_ms,
+                end_ms=summary_end_ms,
+                intervals=("1m",),
+                trace=summary_trace,
+            )
+        except Exception as exc:  # pragma: no cover - defensive guard
+            LOGGER.exception(
+                "Failed to collect strict 3-day summary", extra={"symbol": symbol}
+            )
+            if trace_ctx is not None:
+                trace_ctx.error(
+                    "error.summary_collection",
+                    scope="summary.1m",
+                    details=str(exc),
+                    window={"from": summary_start_ms, "to": summary_end_ms},
+                )
+            expected_count = int(
+                (summary_end_ms - summary_start_ms) // MINUTE_INTERVAL_MS + 1
+            )
+            missing = MinuteDataUnavailable(
+                symbol=symbol,
+                start_ms=summary_start_ms,
+                end_ms=summary_end_ms,
+                missing_count=expected_count,
+                expected_count=expected_count,
+                coverage_pct=0.0,
+                gaps=[(summary_start_ms, summary_end_ms)],
+            )
+            minute_payload = _build_minute_missing_payload(
+                context,
+                now=now_dt,
+                missing=missing,
+            )
+            if trace_ctx is not None:
+                trace_ctx.info(
+                    "output.prepare_payload",
+                    scope="output",
+                    status="minute_missing",
+                    missing_fields=0,
+                )
+            return _finalise_payload(
+                minute_payload,
+                status="minute_missing",
+                pipeline_start=pipeline_start,
+                fetch_ms=fetch_ms,
+                db_ms=db_ms,
+                trace_ctx=trace_ctx,
+            )
+        summary_elapsed_ms = (time.perf_counter() - summary_start) * 1000.0
+        fetch_ms += summary_elapsed_ms
+        if trace_ctx is not None:
+            trace_ctx.info(
+                "fetch.batch_done",
+                scope="summary.1m",
+                window={"from": summary_start_ms, "to": summary_end_ms},
+                metrics={
+                    "requests": getattr(summary_result, "requests", 0),
+                    "ms": round(summary_elapsed_ms, 2),
+                    "candles_written": getattr(summary_result, "candles_written", 0),
+                },
+                details="collect_recent_summary",
+            )
+
     repo_window_ms = max(REPOSITORY_LOOKBACK_MS, base_window_hours * MS_IN_HOUR)
     repo_start_ms = max(0, _align_to_interval(window_end_guess - repo_window_ms, MINUTE_INTERVAL_MS))
     db_start = time.perf_counter()
+    repository_minutes: List[Dict[str, Any]] = []
+    repo_error: Exception | None = None
+    if trace_ctx is not None:
+        trace_ctx.info(
+            "fetch.batch_start",
+            scope="repository.1m",
+            window={"from": repo_start_ms, "to": window_end_guess},
+            details="repository.fetch_candles",
+        )
     try:
         repository_minutes = await _load_repository_candles(
             symbol,
@@ -2745,6 +2878,7 @@ async def build_check_all_datas(
             window_end_guess,
         )
     except Exception as exc:  # pragma: no cover - defensive logging
+        repo_error = exc
         LOGGER.debug(
             "Failed to seed minutes from repository",
             exc_info=exc,
@@ -2752,7 +2886,22 @@ async def build_check_all_datas(
         )
         repository_minutes = []
     finally:
-        db_ms += (time.perf_counter() - db_start) * 1000.0
+        repo_elapsed_ms = (time.perf_counter() - db_start) * 1000.0
+        db_ms += repo_elapsed_ms
+        if trace_ctx is not None:
+            event_level = "warn" if repo_error else "info"
+            emitter = getattr(trace_ctx, event_level)
+            emitter(
+                "fetch.batch_done",
+                scope="repository.1m",
+                window={"from": repo_start_ms, "to": window_end_guess},
+                metrics={
+                    "candles": len(repository_minutes),
+                    "ms": round(repo_elapsed_ms, 2),
+                },
+                details="repository.fetch_candles",
+                error=str(repo_error) if repo_error else None,
+            )
     if repository_minutes:
         frames["1m"] = _merge_candle_collections(frames.get("1m", []), repository_minutes)
 
@@ -2765,16 +2914,33 @@ async def build_check_all_datas(
         )
         return _insufficient_from_context(context, now_override=now_dt)
 
-    fetch_start = time.perf_counter()
-    await _backfill_timeframe_with_rest(
-        frames,
-        symbol=symbol,
-        timeframe="1m",
-        window_end_ms=window_end_guess,
-        window_hours=base_window_hours,
-        allow_network=network_backfill,
-    )
-    fetch_ms += (time.perf_counter() - fetch_start) * 1000.0
+    if not strict_three_day:
+        if trace_ctx is not None:
+            trace_ctx.info(
+                "fetch.batch_start",
+                scope="rest.1m",
+                window={"from": repo_start_ms, "to": window_end_guess},
+                details="backfill_timeframe",
+            )
+        fetch_start = time.perf_counter()
+        backfilled = await _backfill_timeframe_with_rest(
+            frames,
+            symbol=symbol,
+            timeframe="1m",
+            window_end_ms=window_end_guess,
+            window_hours=base_window_hours,
+            allow_network=network_backfill,
+        )
+        elapsed_ms = (time.perf_counter() - fetch_start) * 1000.0
+        fetch_ms += elapsed_ms
+        if trace_ctx is not None:
+            trace_ctx.info(
+                "fetch.batch_done",
+                scope="rest.1m",
+                window={"from": repo_start_ms, "to": window_end_guess},
+                metrics={"fetched": int(backfilled), "ms": round(elapsed_ms, 2)},
+                details="backfill_timeframe",
+            )
     frames["1m"] = _apply_sanitizer("rest.1m", frames.get("1m", []))
 
     minute_seed = frames.get("1m", [])
@@ -3021,20 +3187,64 @@ async def build_check_all_datas(
     }
 
     expected_minutes = _build_expected_times(window_start_ms, window_end_ms, MINUTE_INTERVAL_MS)
+    expected_count = len(expected_minutes)
     time_gaps = _summarise_missing_times(expected_minutes, minute_window_index)
     minute_missing_before = sum(gap["count"] for gap in time_gaps)
 
     if trace_ctx is not None and time_gaps:
         trace_ctx.info(
             "gaps.detected",
+            scope="ohlcv.1m",
             tf="1m",
             count=len(time_gaps),
-            window_start=window_start_ms,
-            window_end=window_end_ms,
+            window={"from": window_start_ms, "to": window_end_ms},
         )
 
     fetched_unique = 0
     if time_gaps:
+        if strict_three_day:
+            coverage_pct = (
+                ((expected_count - minute_missing_before) / expected_count) * 100.0
+                if expected_count
+                else 100.0
+            )
+            missing = MinuteDataUnavailable(
+                symbol=symbol,
+                start_ms=window_start_ms,
+                end_ms=window_end_ms,
+                missing_count=minute_missing_before,
+                expected_count=expected_count,
+                coverage_pct=round(coverage_pct, 3),
+                gaps=[(int(gap.get("from", window_start_ms)), int(gap.get("to", window_start_ms))) for gap in time_gaps],
+            )
+            if trace_ctx is not None:
+                trace_ctx.warn(
+                    "availability.checked",
+                    scope="ohlcv.1m",
+                    missing_minutes=minute_missing_before,
+                    coverage_pct=round(coverage_pct, 3),
+                    window={"from": window_start_ms, "to": window_end_ms},
+                )
+            minute_payload = _build_minute_missing_payload(
+                context,
+                now=now_dt,
+                missing=missing,
+            )
+            if trace_ctx is not None:
+                trace_ctx.info(
+                    "output.prepare_payload",
+                    scope="output",
+                    status="minute_missing",
+                    missing_fields=0,
+                )
+            return _finalise_payload(
+                minute_payload,
+                status="minute_missing",
+                pipeline_start=pipeline_start,
+                fetch_ms=fetch_ms,
+                db_ms=db_ms,
+                trace_ctx=trace_ctx,
+            )
         if not network_backfill:
             data_quality = {
                 "tf": target_tf_key,
@@ -3170,12 +3380,61 @@ async def build_check_all_datas(
             window_end=window_end_ms,
         )
     if zone_history_gaps:
+        gap_missing = sum(gap["count"] for gap in zone_history_gaps)
+        zone_expected_minutes = _build_expected_times(
+            zones_history_start_ms,
+            window_end_ms,
+            MINUTE_INTERVAL_MS,
+        )
+        zone_expected_count = len(zone_expected_minutes)
+        if strict_three_day:
+            coverage_pct = (
+                ((zone_expected_count - gap_missing) / zone_expected_count) * 100.0
+                if zone_expected_count
+                else 100.0
+            )
+            missing = MinuteDataUnavailable(
+                symbol=symbol,
+                start_ms=zones_history_start_ms,
+                end_ms=window_end_ms,
+                missing_count=gap_missing,
+                expected_count=zone_expected_count,
+                coverage_pct=round(coverage_pct, 3),
+                gaps=[(int(gap.get("from", zones_history_start_ms)), int(gap.get("to", zones_history_start_ms))) for gap in zone_history_gaps],
+            )
+            if trace_ctx is not None:
+                trace_ctx.warn(
+                    "availability.checked",
+                    scope="ohlcv.1m.zones",
+                    missing_minutes=gap_missing,
+                    window={"from": zones_history_start_ms, "to": window_end_ms},
+                )
+            minute_payload = _build_minute_missing_payload(
+                context,
+                now=now_dt,
+                missing=missing,
+            )
+            if trace_ctx is not None:
+                trace_ctx.info(
+                    "output.prepare_payload",
+                    scope="output",
+                    status="minute_missing",
+                    missing_fields=0,
+                )
+            return _finalise_payload(
+                minute_payload,
+                status="minute_missing",
+                pipeline_start=pipeline_start,
+                fetch_ms=fetch_ms,
+                db_ms=db_ms,
+                trace_ctx=trace_ctx,
+            )
         if not network_backfill:
             detail = {
                 "tf": target_tf_key,
                 "window": {"start_ms": zones_history_start_ms, "end_ms": window_end_ms},
                 "stage": "zones_history",
-                "minute_missing_before": sum(gap["count"] for gap in zone_history_gaps),
+                "minute_missing_before": gap_missing,
                 "fetched_1m_count": 0,
                 "time_gaps": zone_history_gaps,
             }
@@ -3195,7 +3454,7 @@ async def build_check_all_datas(
                 "tf": target_tf_key,
                 "window": {"start_ms": zones_history_start_ms, "end_ms": window_end_ms},
                 "stage": "zones_history",
-                "minute_missing_before": sum(gap["count"] for gap in zone_history_gaps),
+                "minute_missing_before": gap_missing,
                 "fetched_1m_count": exc.downloaded,
                 "time_gaps": zone_history_gaps,
             }
@@ -3803,6 +4062,7 @@ async def build_check_all_datas(
     if trace_ctx is not None:
         trace_ctx.info(
             "compute.rollups",
+            scope="rollups",
             frames=len(ohlcv_block) if isinstance(ohlcv_block, Mapping) else 0,
         )
     hourly_htf = aggregate_1m_to_1h(minute_htf_source) if minute_frame_present else []
@@ -4053,6 +4313,7 @@ async def build_check_all_datas(
     if trace_ctx is not None:
         trace_ctx.info(
             "compute.vwap_tpo",
+            scope="vwap_tpo",
             sessions=len(vwap_tpo_sessions),
         )
 
@@ -4181,6 +4442,13 @@ async def build_check_all_datas(
                 )
                 zones_public[zone_key] = [{"message": message, "period": "topup"}]
 
+    if trace_ctx is not None:
+        trace_ctx.info(
+            "compute.poi.topN",
+            scope="zones",
+            counts={key: len(value) for key, value in zones_public.items()},
+        )
+
     liquidity_public = {
         "eqh": list(liquidity_equal_levels.get("eqh", [])),
         "eql": list(liquidity_equal_levels.get("eql", [])),
@@ -4234,7 +4502,11 @@ async def build_check_all_datas(
     missing_fields: Set[str] = set()
 
     if trace_ctx is not None:
-        trace_ctx.info("availability.checked", blocks=list(availability.keys()))
+        trace_ctx.info(
+            "availability.checked",
+            scope="payload",
+            blocks=list(availability.keys()),
+        )
 
     for tf in ("1m", "3m", "5m", "15m", "1h", "4h", "1d"):
         candles_payload = ohlcv_public.get(tf, {})
@@ -4351,6 +4623,14 @@ async def build_check_all_datas(
     if invalid_ohlc_total:
         notes.append(
             f"Filtered {invalid_ohlc_total} candles with invalid OHLC ranges"
+        )
+
+    if trace_ctx is not None:
+        trace_ctx.info(
+            "output.prepare_payload",
+            scope="output",
+            status=status,
+            missing_fields=len(missing_fields_list),
         )
 
     final_payload = {
