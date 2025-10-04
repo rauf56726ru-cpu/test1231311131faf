@@ -39,7 +39,7 @@ async def test_collect_recent_summary_fills_only_missing(monkeypatch):
 
     calls = []
 
-    async def fake_request(client, *, symbol, interval, start_ms, end_ms, limit, bucket):
+    async def fake_request(client, *, symbol, interval, start_ms, end_ms, limit, trace=None):
         calls.append((start_ms, end_ms, limit))
         cursor = start_ms
         rows = []
@@ -162,7 +162,7 @@ async def test_collect_recent_summary_reports_progress(monkeypatch):
 
     events: list[str] = []
 
-    async def fake_request(client, *, symbol, interval, start_ms, end_ms, limit, bucket):
+    async def fake_request(client, *, symbol, interval, start_ms, end_ms, limit, trace=None):
         rows = []
         cursor = start_ms
         while cursor <= end_ms - interval_ms:

@@ -3,8 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import random
-import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional, Sequence
@@ -19,6 +17,7 @@ from .ohlc import TIMEFRAME_TO_MS, resample_ohlcv
 from .timeutils import ensure_ms_epoch
 from .check_all_datas import _normalise_binance_row
 from .progress import ProgressReporter, emit_progress
+from .rate_limiter import get_global_rate_limiter
 
 LOGGER = logging.getLogger(__name__)
 TRACE_LOGGER = tracing.LOGGER.getChild("summary_collector")
@@ -26,15 +25,10 @@ UTC = timezone.utc
 
 BINANCE_ENDPOINT = "https://fapi.binance.com/fapi/v1/klines"
 MAX_PAGE_LIMIT = 1000
-DEFAULT_TOKEN_RATE = 80.0  # tokens per second
-DEFAULT_TOKEN_BURST = 160
-RATE_DELAY_MIN = 0.020
-RATE_DELAY_MAX = 0.040
-BACKOFF_BASE_MS = 0.2
-BACKOFF_MAX_MS = 1.6
 MAX_CONCURRENCY = 4
 MERGE_GAP_JOIN_MS = 15 * 60_000
 BULK_UPSERT_CHUNK = 750
+_RATE_LIMITER = get_global_rate_limiter()
 
 
 class GapCollectionError(RuntimeError):
@@ -82,32 +76,6 @@ class CollectionSummary:
         }
 
 
-class _TokenBucket:
-    __slots__ = ("_rate", "_capacity", "_tokens", "_updated")
-
-    def __init__(self, rate: float, capacity: int) -> None:
-        self._rate = max(0.1, float(rate))
-        self._capacity = max(1, int(capacity))
-        self._tokens = float(self._capacity)
-        self._updated = time.monotonic()
-
-    async def acquire(self) -> None:
-        while True:
-            now = time.monotonic()
-            elapsed = max(0.0, now - self._updated)
-            self._updated = now
-            self._tokens = min(
-                self._capacity,
-                self._tokens + elapsed * self._rate,
-            )
-            if self._tokens >= 1.0:
-                self._tokens -= 1.0
-                return
-            deficit = 1.0 - self._tokens
-            delay = max(deficit / self._rate, RATE_DELAY_MIN)
-            await asyncio.sleep(min(delay, RATE_DELAY_MAX))
-
-
 async def _request_klines(
     client: httpx.AsyncClient,
     *,
@@ -116,7 +84,6 @@ async def _request_klines(
     start_ms: int,
     end_ms: int,
     limit: int,
-    bucket: _TokenBucket,
     trace: TraceContext | None = None,
 ) -> List[Sequence[Any]]:
     params = {
@@ -126,74 +93,127 @@ async def _request_klines(
         "endTime": str(end_ms),
         "limit": str(limit),
     }
-    backoff = BACKOFF_BASE_MS
-    for attempt in range(6):
-        await bucket.acquire()
+    scope = f"summary.{interval}"
+    for attempt in range(1, 3):
+        if trace is not None:
+            trace.debug(
+                "fetch.batch_start",
+                scope=scope,
+                symbol=symbol,
+                interval=interval,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                attempt=attempt,
+            )
         try:
-            response = await client.get(BINANCE_ENDPOINT, params=params)
+            async with _RATE_LIMITER.limit(scope=scope, trace=trace):
+                response = await client.get(BINANCE_ENDPOINT, params=params)
         except httpx.RequestError as exc:  # pragma: no cover - network failure
+            await _RATE_LIMITER.apply_backoff(
+                1.0,
+                scope=scope,
+                trace=trace,
+                reason="request_error",
+            )
+            if attempt >= 2:
+                raise GapCollectionError(f"Request failure: {exc}") from exc
             if trace is not None:
                 trace.warn(
-                    "retry",
-                    symbol=symbol,
-                    interval=interval,
-                    start_ms=start_ms,
-                    end_ms=end_ms,
-                    attempt=attempt + 1,
+                    "fetch.batch_retry",
+                    scope=scope,
+                    attempt=attempt,
                     reason="request_error",
                 )
-            if attempt >= 5:
-                raise GapCollectionError(f"Request failure: {exc}") from exc
-            await asyncio.sleep(backoff + random.uniform(0, backoff))
-            backoff = min(backoff * 2, BACKOFF_MAX_MS)
             continue
 
+        await _RATE_LIMITER.note_used_weight(
+            _parse_used_weight(response), scope=scope, trace=trace
+        )
+
+        if response.status_code == 200:
+            payload = response.json()
+            if not isinstance(payload, list):
+                return []
+            if trace is not None:
+                trace.info(
+                    "fetch.batch_done",
+                    scope=scope,
+                    symbol=symbol,
+                    interval=interval,
+                    rows=len(payload),
+                    attempt=attempt,
+                )
+            return payload  # type: ignore[return-value]
+
         if response.status_code in {418, 429}:
+            await _RATE_LIMITER.apply_backoff(
+                _parse_retry_after(response),
+                scope=scope,
+                trace=trace,
+                reason=str(response.status_code),
+            )
             if trace is not None:
                 trace.warn(
                     "rate_limited",
-                    symbol=symbol,
-                    interval=interval,
+                    scope=scope,
                     status=response.status_code,
-                    attempt=attempt + 1,
-                    delay_ms=int((backoff + random.uniform(0, backoff)) * 1000),
+                    attempt=attempt,
                 )
-            await asyncio.sleep(backoff + random.uniform(0, backoff))
-            backoff = min(backoff * 2, BACKOFF_MAX_MS)
+            if attempt >= 2:
+                return []
             continue
 
         if response.status_code >= 500:
+            await _RATE_LIMITER.apply_backoff(
+                _parse_retry_after(response),
+                scope=scope,
+                trace=trace,
+                reason=str(response.status_code),
+            )
             if trace is not None:
                 trace.warn(
-                    "retry",
-                    symbol=symbol,
-                    interval=interval,
+                    "fetch.batch_retry",
+                    scope=scope,
                     status=response.status_code,
-                    attempt=attempt + 1,
+                    attempt=attempt,
                 )
-            if attempt >= 5:
-                raise GapCollectionError(f"Binance error {response.status_code}")
-            await asyncio.sleep(backoff + random.uniform(0, backoff))
-            backoff = min(backoff * 2, BACKOFF_MAX_MS)
+            if attempt >= 2:
+                return []
             continue
 
         response.raise_for_status()
-        payload = response.json()
-        if not isinstance(payload, list):
-            return []
-        await asyncio.sleep(random.uniform(RATE_DELAY_MIN, RATE_DELAY_MAX))
-        return payload  # type: ignore[return-value]
 
     if trace is not None:
         trace.error(
             "fetch.failed",
+            scope=scope,
             symbol=symbol,
             interval=interval,
             start_ms=start_ms,
             end_ms=end_ms,
-            attempts=6,
+            attempts=2,
         )
     return []
+
+
+def _parse_retry_after(response: httpx.Response) -> float | None:
+    header = response.headers.get("Retry-After")
+    if not header:
+        return None
+    try:
+        return float(header)
+    except ValueError:
+        return None
+
+
+def _parse_used_weight(response: httpx.Response) -> int | None:
+    header = response.headers.get("X-MBX-USED-WEIGHT-1m")
+    if not header:
+        return None
+    try:
+        return int(header)
+    except ValueError:
+        return None
 
 
 def _align_to_interval(timestamp_ms: int, interval_ms: int) -> int:
@@ -374,7 +394,6 @@ async def _fill_gap(
     gap: Mapping[str, int],
     interval_ms: int,
     client: httpx.AsyncClient,
-    bucket: _TokenBucket,
     progress: Optional[ProgressReporter] = None,
     trace: TraceContext | None = None,
 ) -> IntervalSummary:
@@ -444,7 +463,6 @@ async def _fill_gap(
             "start_ms": cursor,
             "end_ms": page_end + interval_ms,
             "limit": page_limit,
-            "bucket": bucket,
         }
         if trace is not None:
             request_kwargs["trace"] = trace
@@ -755,8 +773,6 @@ async def collect_recent_summary(
     total_written = 0
     total_dropped = 0
 
-    bucket = _TokenBucket(DEFAULT_TOKEN_RATE, DEFAULT_TOKEN_BURST)
-
     minute_first_expected: Optional[int] = None
     minute_last_closed: Optional[int] = None
     minute_series: Optional[List[Dict[str, Any]]] = None
@@ -931,7 +947,6 @@ async def collect_recent_summary(
                         gap=gap,
                         interval_ms=interval_ms,
                         client=client,
-                        bucket=bucket,
                         progress=progress,
                         trace=trace_ctx,
                     )

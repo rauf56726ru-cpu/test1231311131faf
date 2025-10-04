@@ -1056,7 +1056,7 @@ async def register_inspection_snapshot(payload: SnapshotIn) -> Dict[str, str]:
         footprint = _fallback_footprint(source_candles)
 
     try:
-        cvd_series = await calculate_cvd(symbol, 24)
+        cvd_series = await calculate_cvd(symbol, 24, footprint_rows=footprint)
     except Exception as exc:
         logging.getLogger(__name__).warning("CVD fallback engaged: %s", exc)
         cvd_series = _fallback_cvd(footprint)

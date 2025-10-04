@@ -189,7 +189,10 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
         "availability",
         "missing_fields",
         "notes",
+        "timing",
     }
+    timing_block = body["timing"]
+    assert {"fetch_ms", "db_ms", "compute_ms"}.issubset(timing_block.keys())
     assert body["status"] == "ok"
 
     meta = body["meta"]

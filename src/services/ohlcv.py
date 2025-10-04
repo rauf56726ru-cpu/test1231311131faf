@@ -1,4 +1,4 @@
-"""High-level OHLCV utilities for Binance symbols."""
+"""High-level OHLCV utilities backed by the local minute repository."""
 from __future__ import annotations
 
 import asyncio
@@ -6,14 +6,11 @@ import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Iterable, List, Mapping, MutableMapping, Tuple
+from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple
 
-import httpx
-
-from .rate_limiter import get_global_rate_limiter
+from .candles_repository import get_repository
 from .tracing import TraceContext
 
-BINANCE_SPOT_KLINES = "https://api.binance.com/api/v3/klines"
 SUPPORTED_TIMEFRAMES: tuple[str, ...] = ("1m", "3m", "5m", "15m", "1h", "4h", "1d")
 TIMEFRAME_TO_MINUTES: Dict[str, int] = {
     "1m": 1,
@@ -28,7 +25,6 @@ TIMEFRAME_TO_MS: Dict[str, int] = {tf: minutes * 60_000 for tf, minutes in TIMEF
 
 LOGGER = logging.getLogger(__name__)
 _FETCH_LOCK = asyncio.Lock()
-_RATE_LIMITER = get_global_rate_limiter()
 _ONE_MINUTE_CACHE_TTL = 45.0
 _ONE_MINUTE_CACHE: Dict[str, Tuple[float, List["Candle"]]] = {}
 _ONE_MINUTE_LOCKS: Dict[str, asyncio.Lock] = {}
@@ -48,7 +44,11 @@ class Candle:
     def to_wire(self) -> Dict[str, float | str]:
         """Return a serialisable payload."""
 
-        iso_time = datetime.fromtimestamp(self.ts / 1000, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+        iso_time = (
+            datetime.fromtimestamp(self.ts / 1000, tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
         return {
             "t": iso_time,
             "o": round(self.open, 8),
@@ -59,45 +59,10 @@ class Candle:
         }
 
 
-async def _fetch_klines(
-    symbol: str,
-    start_ms: int,
-    end_ms: int,
-    *,
-    trace: TraceContext | None = None,
-) -> List[List[float]]:
-    """Fetch raw klines from Binance spot API within the requested range."""
-
-    params = {
-        "symbol": symbol.upper(),
-        "interval": "1m",
-        "startTime": str(start_ms),
-        "endTime": str(end_ms),
-        "limit": "1000",
-    }
-    scope = "ohlcv.klines"
-    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
-        async with _RATE_LIMITER.limit(scope=scope, trace=trace):
-            response = await client.get(BINANCE_SPOT_KLINES, params=params)
-    await _RATE_LIMITER.note_used_weight(
-        _parse_used_weight(response), scope=scope, trace=trace
-    )
-    if response.status_code in {418, 429}:
-        await _RATE_LIMITER.apply_backoff(
-            _parse_retry_after(response), scope=scope, trace=trace, reason="klines"
-        )
-        raise ValueError("Binance rate limit exceeded for klines")
-    response.raise_for_status()
-    data = response.json()
-    if not isinstance(data, list):
-        raise ValueError("Unexpected klines payload from Binance")
-    return data  # type: ignore[return-value]
-
-
 async def _collect_1m_candles(
     symbol: str, lookback_days: int, *, trace: TraceContext | None = None
 ) -> List[Candle]:
-    """Collect minute candles for the specified lookback window."""
+    """Load minute candles from the local repository for the requested range."""
 
     if lookback_days <= 0:
         raise ValueError("lookback_days must be positive")
@@ -105,40 +70,64 @@ async def _collect_1m_candles(
     end_dt = datetime.now(timezone.utc).replace(second=0, microsecond=0)
     start_dt = end_dt - timedelta(days=lookback_days)
     end_ms = int(end_dt.timestamp() * 1000)
-    cursor = int(start_dt.timestamp() * 1000)
+    start_ms = int(start_dt.timestamp() * 1000)
+
+    repository = get_repository()
+    if trace is not None:
+        trace.debug(
+            "fetch.batch_start",
+            scope="ohlcv.repo",
+            symbol=symbol,
+            start_ms=start_ms,
+            end_ms=end_ms,
+        )
+
+    rows = await asyncio.to_thread(
+        repository.fetch_candles,
+        symbol,
+        "1m",
+        start_ms,
+        end_ms,
+    )
 
     candles: List[Candle] = []
-    while cursor < end_ms:
-        batch_end = min(end_ms, cursor + 1000 * 60_000)
-        rows = await _fetch_klines(symbol, cursor, batch_end, trace=trace)
-        if not rows:
-            break
-        for row in rows:
-            try:
-                open_time = int(row[0])
-                open_price = float(row[1])
-                high_price = float(row[2])
-                low_price = float(row[3])
-                close_price = float(row[4])
-                volume = float(row[5])
-            except (IndexError, TypeError, ValueError):
-                LOGGER.debug("Skipping malformed kline row: %s", row)
-                continue
-            candles.append(
-                Candle(
-                    ts=open_time,
-                    open=open_price,
-                    high=high_price,
-                    low=low_price,
-                    close=close_price,
-                    volume=max(volume, 0.0),
-                )
+    for row in rows:
+        try:
+            open_time = int(row["t"])
+            open_price = float(row["o"])
+            high_price = float(row["h"])
+            low_price = float(row["l"])
+            close_price = float(row["c"])
+            volume = float(row.get("v", 0.0))
+        except (KeyError, TypeError, ValueError):
+            LOGGER.debug("Skipping malformed repository candle: %s", row)
+            continue
+        candles.append(
+            Candle(
+                ts=open_time,
+                open=open_price,
+                high=high_price,
+                low=low_price,
+                close=close_price,
+                volume=max(volume, 0.0),
             )
-        cursor = int(rows[-1][6]) + 1 if rows else batch_end
-        if len(rows) < 1000:
-            break
+        )
 
     candles.sort(key=lambda candle: candle.ts)
+
+    if trace is not None:
+        trace.info(
+            "fetch.batch_done",
+            scope="ohlcv.repo",
+            symbol=symbol,
+            rows=len(candles),
+            start_ms=start_ms,
+            end_ms=end_ms,
+        )
+
+    if not candles:
+        raise ValueError("No minute candles available in repository")
+
     return candles
 
 
@@ -176,15 +165,17 @@ def _validate_series(series: List[Candle], tf: str) -> None:
     """Validate chronological order and price/volume constraints."""
 
     if not series:
-        raise ValueError("No candles returned from Binance")
+        raise ValueError("No candles returned from repository")
 
     interval_ms = TIMEFRAME_TO_MS[tf]
     last_ts: Optional[int] = None
     for candle in series:
-        if candle.high < max(candle.open, candle.close) or candle.low > min(candle.open, candle.close):
+        if candle.high < max(candle.open, candle.close) or candle.low > min(
+            candle.open, candle.close
+        ):
             raise ValueError("Inconsistent OHLC bounds detected")
-        if candle.volume <= 0:
-            raise ValueError("Detected non-positive volume in OHLCV series")
+        if candle.volume < 0:
+            raise ValueError("Detected negative volume in OHLCV series")
         if last_ts is not None and candle.ts - last_ts > interval_ms + 60_000:
             raise ValueError("Detected temporal gaps in OHLCV series")
         last_ts = candle.ts
@@ -228,26 +219,6 @@ async def _load_cached_minutes(
             candles = await _collect_1m_candles(symbol, lookback_days, trace=trace)
         _ONE_MINUTE_CACHE[cache_key] = (time.monotonic() + _ONE_MINUTE_CACHE_TTL, candles)
         return candles
-
-
-def _parse_retry_after(response: httpx.Response) -> float | None:
-    value = response.headers.get("Retry-After")
-    if not value:
-        return None
-    try:
-        return float(value)
-    except ValueError:
-        return None
-
-
-def _parse_used_weight(response: httpx.Response) -> int | None:
-    value = response.headers.get("X-MBX-USED-WEIGHT-1m")
-    if not value:
-        return None
-    try:
-        return int(value)
-    except ValueError:
-        return None
 
 
 async def fetch_ohlcv(

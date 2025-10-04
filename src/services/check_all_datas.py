@@ -2571,6 +2571,11 @@ async def build_check_all_datas(
 ) -> Dict[str, Any] | None:
     """Create an enriched payload for the snapshot health endpoint."""
 
+    trace_ctx = trace
+    pipeline_start = time.perf_counter()
+    fetch_ms = 0.0
+    db_ms = 0.0
+
     status = "ok"
 
     notes: List[str] = []
@@ -2617,6 +2622,14 @@ async def build_check_all_datas(
     stream_ts = context.stream_ts
     now_ms = int(now_dt.timestamp() * 1000)
 
+    if trace_ctx is not None:
+        trace_ctx.info(
+            "pipeline.start",
+            symbol=symbol,
+            strict_window=strict_window,
+            network_backfill=network_backfill,
+        )
+
     if selection_end_ms is None:
         selection_payload = snapshot.get("selection")
         if isinstance(selection_payload, Mapping):
@@ -2641,6 +2654,7 @@ async def build_check_all_datas(
 
     repo_window_ms = max(REPOSITORY_LOOKBACK_MS, base_window_hours * MS_IN_HOUR)
     repo_start_ms = max(0, _align_to_interval(window_end_guess - repo_window_ms, MINUTE_INTERVAL_MS))
+    db_start = time.perf_counter()
     try:
         repository_minutes = await _load_repository_candles(
             symbol,
@@ -2655,6 +2669,8 @@ async def build_check_all_datas(
             extra={"symbol": symbol, "repo_start_ms": repo_start_ms, "repo_end_ms": window_end_guess},
         )
         repository_minutes = []
+    finally:
+        db_ms += (time.perf_counter() - db_start) * 1000.0
     if repository_minutes:
         frames["1m"] = _merge_candle_collections(frames.get("1m", []), repository_minutes)
 
@@ -2667,6 +2683,7 @@ async def build_check_all_datas(
         )
         return _insufficient_from_context(context, now_override=now_dt)
 
+    fetch_start = time.perf_counter()
     await _backfill_timeframe_with_rest(
         frames,
         symbol=symbol,
@@ -2675,6 +2692,7 @@ async def build_check_all_datas(
         window_hours=base_window_hours,
         allow_network=network_backfill,
     )
+    fetch_ms += (time.perf_counter() - fetch_start) * 1000.0
     frames["1m"] = _apply_sanitizer("rest.1m", frames.get("1m", []))
 
     minute_seed = frames.get("1m", [])
@@ -2696,6 +2714,7 @@ async def build_check_all_datas(
                 extra={"stage": exc.stage, "symbol": symbol, "primary_key": primary_key},
             )
             return _insufficient_from_context(context, now_override=now_dt)
+        fetch_start = time.perf_counter()
         await _backfill_timeframe_with_rest(
             frames,
             symbol=symbol,
@@ -2704,6 +2723,7 @@ async def build_check_all_datas(
             window_hours=base_window_hours,
             allow_network=network_backfill,
         )
+        fetch_ms += (time.perf_counter() - fetch_start) * 1000.0
         frames[primary_key] = _apply_sanitizer(f"rest.{primary_key}", frames.get(primary_key, []))
 
     primary_candles = frames.get(primary_key, [])
@@ -2889,6 +2909,15 @@ async def build_check_all_datas(
     time_gaps = _summarise_missing_times(expected_minutes, minute_window_index)
     minute_missing_before = sum(gap["count"] for gap in time_gaps)
 
+    if trace_ctx is not None and time_gaps:
+        trace_ctx.info(
+            "gaps.detected",
+            tf="1m",
+            count=len(time_gaps),
+            window_start=window_start_ms,
+            window_end=window_end_ms,
+        )
+
     fetched_unique = 0
     if time_gaps:
         if not network_backfill:
@@ -3016,6 +3045,15 @@ async def build_check_all_datas(
         zones_history_start_ms, window_end_ms, MINUTE_INTERVAL_MS
     )
     zone_history_gaps = _summarise_missing_times(zone_expected_minutes, minute_index_all)
+    if trace_ctx is not None and zone_history_gaps:
+        trace_ctx.info(
+            "gaps.detected",
+            tf="1m",
+            scope="zones_history",
+            count=len(zone_history_gaps),
+            window_start=zones_history_start_ms,
+            window_end=window_end_ms,
+        )
     if zone_history_gaps:
         if not network_backfill:
             detail = {
@@ -3644,6 +3682,11 @@ async def build_check_all_datas(
         config=orderflow_config,
     )
     ohlcv_block = build_multi_timeframe_ohlcv(minute_htf_source, symbol=symbol)
+    if trace_ctx is not None:
+        trace_ctx.info(
+            "compute.rollups",
+            frames=len(ohlcv_block) if isinstance(ohlcv_block, Mapping) else 0,
+        )
     hourly_htf = aggregate_1m_to_1h(minute_htf_source) if minute_frame_present else []
     htf_blocks: List[Dict[str, Any]] = []
     if minute_frame_present:
@@ -3889,6 +3932,12 @@ async def build_check_all_datas(
         "sessions": vwap_tpo_sessions,
     }
 
+    if trace_ctx is not None:
+        trace_ctx.info(
+            "compute.vwap_tpo",
+            sessions=len(vwap_tpo_sessions),
+        )
+
     prev_day_block = _build_prev_day_block(
         minute_series,
         daily_start_ms=daily_start_ms,
@@ -4066,6 +4115,9 @@ async def build_check_all_datas(
     }
     missing_fields: Set[str] = set()
 
+    if trace_ctx is not None:
+        trace_ctx.info("availability.checked", blocks=list(availability.keys()))
+
     for tf in ("1m", "3m", "5m", "15m", "1h", "4h", "1d"):
         candles_payload = ohlcv_public.get(tf, {})
         candles = candles_payload.get("candles") if isinstance(candles_payload, Mapping) else []
@@ -4191,6 +4243,23 @@ async def build_check_all_datas(
         "missing_fields": missing_fields_list,
         "notes": notes,
     }
+
+    total_ms = (time.perf_counter() - pipeline_start) * 1000.0
+    compute_component = max(0.0, total_ms - fetch_ms - db_ms)
+    final_payload["timing"] = {
+        "fetch_ms": round(fetch_ms, 2),
+        "db_ms": round(db_ms, 2),
+        "compute_ms": round(compute_component, 2),
+    }
+
+    if trace_ctx is not None:
+        trace_ctx.info(
+            "pipeline.done",
+            status=status,
+            fetch_ms=final_payload["timing"]["fetch_ms"],
+            db_ms=final_payload["timing"]["db_ms"],
+            compute_ms=final_payload["timing"]["compute_ms"],
+        )
 
     return round_floats(final_payload)
 

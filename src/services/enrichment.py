@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
 
 import httpx
-BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+BINANCE_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
 MAX_DELTA_BARS = 50
 MAX_FOOTPRINT_ROWS = 10
 
