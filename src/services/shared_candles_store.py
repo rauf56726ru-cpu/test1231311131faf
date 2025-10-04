@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import json
+import os
+from datetime import datetime, timezone
 from math import isfinite
 from pathlib import Path
 from threading import Lock
+from time import monotonic
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -17,6 +19,12 @@ DEFAULT_MAX_BARS = 2000
 
 _STORE_CACHE: Dict[str, Any] | None = None
 _STORE_LOCK = Lock()
+_WRITE_TRACKER_LOCK = Lock()
+_WRITE_RATE_LIMIT_SECONDS = max(
+    0.0,
+    float(os.environ.get("SHARED_CANDLES_RATE_LIMIT_SECONDS", "0.0")),
+)
+_WRITE_TRACKER: Dict[str, float] = {}
 
 
 def _ensure_store_dir() -> None:
@@ -199,63 +207,159 @@ def merge_shared_candles(
     reset: bool = False,
     max_bars: int | None = None,
 ) -> Dict[str, Any]:
-    """Merge incoming candles into the persistent store and return the updated state."""
+    """Merge incoming candles into the persistent store and return a compact status."""
 
     key = _make_key(symbol, interval)
-
-    incoming = list(candles or [])
-    if not incoming and not reset:
-        current = get_shared_candles(symbol, interval)
-        if current is None:
-            return {
-                "candles": [],
-                "intervalMs": None,
-                "lastUpdateMs": None,
-                "updatedAt": None,
-            }
-        return current
-
     store = _load_store()
-    existing_entry = store.get(key) if not reset else None
-    existing_candles: Sequence[Mapping[str, Any]]
+    existing_entry = store.get(key)
+
     if isinstance(existing_entry, dict):
-        existing_candles = existing_entry.get("candles", [])  # type: ignore[assignment]
+        existing_candles_raw = existing_entry.get("candles", [])
     else:
-        existing_candles = []
+        existing_candles_raw = []
 
-    merged = _merge_bars(existing_candles, incoming, max_bars=max_bars)
+    existing_candles = [
+        result
+        for bar in existing_candles_raw
+        if isinstance(bar, Mapping)
+        for result in (_normalise_bar(bar),)
+        if result is not None
+    ]
 
-    interval_ms_value = None
-    if isinstance(interval_ms, (int, float)) and isfinite(interval_ms):
-        interval_ms_value = int(interval_ms)
-    elif isinstance(existing_entry, dict):
-        previous = existing_entry.get("interval_ms")
-        if isinstance(previous, (int, float)) and isfinite(previous):
-            interval_ms_value = int(previous)
+    incoming_candles = [
+        result
+        for bar in (candles or [])
+        if isinstance(bar, Mapping)
+        for result in (_normalise_bar(bar),)
+        if result is not None
+    ]
 
-    last_update_value = None
-    if isinstance(last_update_ms, (int, float)) and isfinite(last_update_ms):
-        last_update_value = int(last_update_ms)
-    elif isinstance(existing_entry, dict):
-        previous = existing_entry.get("last_update_ms")
-        if isinstance(previous, (int, float)) and isfinite(previous):
-            last_update_value = int(previous)
+    incoming_last_update = (
+        int(last_update_ms)
+        if isinstance(last_update_ms, (int, float)) and isfinite(last_update_ms)
+        else None
+    )
+    existing_last_update = (
+        int(existing_entry.get("last_update_ms"))
+        if isinstance(existing_entry, dict)
+        and isinstance(existing_entry.get("last_update_ms"), (int, float))
+        and isfinite(existing_entry.get("last_update_ms"))
+        else None
+    )
+    existing_interval_ms = (
+        int(existing_entry.get("interval_ms"))
+        if isinstance(existing_entry, dict)
+        and isinstance(existing_entry.get("interval_ms"), (int, float))
+        and isfinite(existing_entry.get("interval_ms"))
+        else None
+    )
+    existing_updated_at = (
+        int(existing_entry.get("updated_at"))
+        if isinstance(existing_entry, dict)
+        and isinstance(existing_entry.get("updated_at"), (int, float))
+        and isfinite(existing_entry.get("updated_at"))
+        else None
+    )
+
+    if (
+        incoming_last_update is not None
+        and existing_last_update is not None
+        and incoming_last_update <= existing_last_update
+    ):
+        return {
+            "status": "noop",
+            "symbol": symbol.strip().upper(),
+            "interval": interval.strip().lower(),
+            "written": False,
+            "lastUpdateMs": existing_last_update,
+            "updatedAt": existing_updated_at,
+        }
+
+    effective_max_bars = (
+        max(1, int(max_bars))
+        if isinstance(max_bars, (int, float)) and isfinite(max_bars)
+        else None
+    )
+    if effective_max_bars is None and isinstance(existing_entry, dict):
+        stored_limit = existing_entry.get("max_bars")
+        if isinstance(stored_limit, (int, float)) and isfinite(stored_limit):
+            effective_max_bars = max(1, int(stored_limit))
+
+    merged_candles = _merge_bars(
+        [] if reset else existing_candles,
+        incoming_candles,
+        max_bars=effective_max_bars,
+    )
+
+    candles_changed = merged_candles != existing_candles
+
+    next_interval_ms = (
+        int(interval_ms)
+        if isinstance(interval_ms, (int, float)) and isfinite(interval_ms)
+        else existing_interval_ms
+    )
+
+    next_last_update = existing_last_update
+    if incoming_last_update is not None:
+        next_last_update = incoming_last_update
+    elif reset:
+        next_last_update = None
+
+    requires_write = reset or candles_changed or next_interval_ms != existing_interval_ms
+    if incoming_last_update is not None and incoming_last_update != existing_last_update:
+        requires_write = True
+
+    if not requires_write:
+        return {
+            "status": "noop",
+            "symbol": symbol.strip().upper(),
+            "interval": interval.strip().lower(),
+            "written": False,
+            "lastUpdateMs": existing_last_update,
+            "updatedAt": existing_updated_at,
+        }
+
+    now_monotonic = monotonic()
+    if not reset:
+        with _WRITE_TRACKER_LOCK:
+            last_write = _WRITE_TRACKER.get(key)
+            if last_write is not None and now_monotonic - last_write < _WRITE_RATE_LIMIT_SECONDS:
+                retry_after_ms = int(
+                    max(0, (_WRITE_RATE_LIMIT_SECONDS - (now_monotonic - last_write)) * 1000)
+                )
+                return {
+                    "status": "rate_limited",
+                    "symbol": symbol.strip().upper(),
+                    "interval": interval.strip().lower(),
+                    "written": False,
+                    "retryAfterMs": retry_after_ms,
+                    "lastUpdateMs": existing_last_update,
+                    "updatedAt": existing_updated_at,
+                }
 
     updated_at_value = _now_ms()
 
-    next_entry = {
-        "candles": merged,
-        "interval_ms": interval_ms_value,
-        "last_update_ms": last_update_value,
+    next_entry: Dict[str, Any] = {
+        "candles": merged_candles,
+        "interval_ms": next_interval_ms,
+        "last_update_ms": next_last_update,
         "updated_at": updated_at_value,
     }
+    if effective_max_bars is not None:
+        next_entry["max_bars"] = effective_max_bars
+
     store[key] = next_entry
     _persist_store(store)
 
+    with _WRITE_TRACKER_LOCK:
+        _WRITE_TRACKER[key] = now_monotonic
+
     return {
-        "candles": merged,
-        "intervalMs": interval_ms_value,
-        "lastUpdateMs": last_update_value,
+        "status": "ok",
+        "symbol": symbol.strip().upper(),
+        "interval": interval.strip().lower(),
+        "written": True,
+        "lastUpdateMs": next_last_update,
         "updatedAt": updated_at_value,
     }
 
@@ -266,6 +370,8 @@ def clear_shared_candles(symbol: str | None = None, interval: str | None = None)
     if not symbol and not interval:
         store: Dict[str, Any] = {}
         _persist_store(store)
+        with _WRITE_TRACKER_LOCK:
+            _WRITE_TRACKER.clear()
         return
 
     try:
@@ -276,6 +382,8 @@ def clear_shared_candles(symbol: str | None = None, interval: str | None = None)
     if key in store:
         del store[key]
         _persist_store(store)
+    with _WRITE_TRACKER_LOCK:
+        _WRITE_TRACKER.pop(key, None)
 
 
 def reset_store() -> None:
@@ -288,4 +396,6 @@ def reset_store() -> None:
             STORE_FILE.unlink()
         except FileNotFoundError:
             pass
+    with _WRITE_TRACKER_LOCK:
+        _WRITE_TRACKER.clear()
 

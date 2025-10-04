@@ -1297,15 +1297,7 @@ async def update_shared_candles(payload: Dict[str, Any] = Body(...)) -> JSONResp
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    response_payload = {
-        "symbol": symbol.strip().upper(),
-        "interval": interval.strip().lower(),
-        "candles": result.get("candles", []),
-        "intervalMs": result.get("intervalMs"),
-        "lastUpdateMs": result.get("lastUpdateMs"),
-        "updatedAt": result.get("updatedAt"),
-    }
-    return JSONResponse(response_payload)
+    return JSONResponse(result)
 
 
 @app.get("/inspection", response_class=HTMLResponse)

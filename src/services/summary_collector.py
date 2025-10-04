@@ -438,15 +438,19 @@ async def _fill_gap(
                 limit=page_limit,
                 request_index=requests + 1,
             )
+        request_kwargs = {
+            "symbol": symbol,
+            "interval": interval,
+            "start_ms": cursor,
+            "end_ms": page_end + interval_ms,
+            "limit": page_limit,
+            "bucket": bucket,
+        }
+        if trace is not None:
+            request_kwargs["trace"] = trace
         raw_rows = await _request_klines(
             client,
-            symbol=symbol,
-            interval=interval,
-            start_ms=cursor,
-            end_ms=page_end + interval_ms,
-            limit=page_limit,
-            bucket=bucket,
-            trace=trace,
+            **request_kwargs,
         )
         requests += 1
         if trace is not None:

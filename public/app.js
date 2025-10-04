@@ -52,16 +52,6 @@
     valSeries: null,
     inspectProgressTimer: null,
     lastSnapshotId: null,
-    shared: {
-      pending: new Map(),
-      resetPending: false,
-      lastUpdateMs: null,
-      flushTimer: null,
-      inFlight: false,
-      dirty: false,
-      lastFlushMs: 0,
-      flushPromise: null,
-    },
   };
 
   const marketStore =
@@ -209,151 +199,40 @@
   }
 
   function persistSharedCandles({ bars = null, reset = false, lastUpdateMs = null, immediate = false } = {}) {
-    const shared = state.shared;
-    if (reset) {
-      shared.pending = new Map();
-      shared.resetPending = true;
-    }
-    const entries = Array.isArray(bars) ? bars : [];
-    for (const bar of entries) {
-      const sharedBar = toSharedBar(bar);
-      if (!sharedBar) continue;
-      shared.pending.set(sharedBar.time, sharedBar);
-    }
-    if (Number.isFinite(lastUpdateMs)) {
-      shared.lastUpdateMs = Number(lastUpdateMs);
-    }
-    if (shared.pending.size || shared.resetPending) {
-      scheduleSharedFlush({ immediate: immediate || reset });
-    }
-  }
-
-  function scheduleSharedFlush({ immediate = false, waitMs = null, force = false } = {}) {
-    const shared = state.shared;
-    const now = Date.now();
-    const sinceLast = now - (shared.lastFlushMs || 0);
-    let delay;
-    if (Number.isFinite(waitMs)) {
-      delay = Math.max(0, waitMs);
-    } else {
-      const baseDelay = Math.max(0, 1000 - sinceLast);
-      delay = immediate ? baseDelay : Math.max(250, baseDelay);
-    }
-    if (delay === 0 && shared.flushTimer) {
-      clearTimeout(shared.flushTimer);
-      shared.flushTimer = null;
-    }
-    if (shared.flushTimer) {
+    if (!SharedCandles || typeof SharedCandles.merge !== "function") {
       return;
     }
-    shared.flushTimer = setTimeout(() => {
-      shared.flushTimer = null;
-      flushSharedCandles({ force }).catch((error) => {
-        console.warn("SharedCandles flush failed", error);
+    const payload = Array.isArray(bars)
+      ? bars.map((bar) => toSharedBar(bar)).filter(Boolean)
+      : [];
+    try {
+      SharedCandles.merge(state.symbol, state.interval, payload, {
+        intervalMs: intervalToMs(state.interval),
+        lastUpdateMs,
+        maxBars: 2000,
+        reset,
+        immediate,
       });
-    }, delay);
-  }
-
-  function wait(ms) {
-    return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+      if (immediate && SharedCandles.flush) {
+        SharedCandles.flush(state.symbol, state.interval, { force: true }).catch((error) => {
+          console.warn("SharedCandles flush failed", error);
+        });
+      }
+    } catch (error) {
+      console.warn("SharedCandles merge failed", error);
+    }
   }
 
   async function flushSharedCandles({ force = false } = {}) {
-    const shared = state.shared;
-    if (!shared.pending.size && !shared.resetPending) {
-      return;
+    if (!SharedCandles || typeof SharedCandles.flush !== "function") {
+      return Promise.resolve();
     }
-    if (shared.inFlight) {
-      shared.dirty = true;
-      return shared.flushPromise || Promise.resolve();
+    try {
+      return await SharedCandles.flush(state.symbol, state.interval, { force });
+    } catch (error) {
+      console.warn("SharedCandles flush failed", error);
+      return Promise.resolve();
     }
-
-    const execute = async () => {
-      const now = Date.now();
-      const sinceLast = now - (shared.lastFlushMs || 0);
-      if (!force && sinceLast < 1000) {
-        scheduleSharedFlush({ waitMs: 1000 - sinceLast });
-        return;
-      }
-      if (force && sinceLast < 1000) {
-        await wait(1000 - sinceLast);
-      }
-      if (shared.flushTimer) {
-        clearTimeout(shared.flushTimer);
-        shared.flushTimer = null;
-      }
-      const pendingEntries = Array.from(shared.pending.values());
-      const reset = shared.resetPending;
-      const lastUpdateMs = Number.isFinite(shared.lastUpdateMs) ? Number(shared.lastUpdateMs) : Date.now();
-      shared.pending = new Map();
-      shared.resetPending = false;
-      shared.inFlight = true;
-      shared.dirty = false;
-
-      const payload = pendingEntries
-        .map((bar) => ({ ...bar }))
-        .sort((a, b) => Number(a.time) - Number(b.time));
-
-      if (SharedCandles && typeof SharedCandles.merge === "function") {
-        try {
-          SharedCandles.merge(state.symbol, state.interval, payload, {
-            intervalMs: intervalToMs(state.interval),
-            lastUpdateMs,
-            maxBars: 2000,
-            reset,
-            syncRemote: false,
-          });
-        } catch (error) {
-          console.warn("SharedCandles local merge failed", error);
-        }
-      }
-
-      try {
-        const response = await fetch("/shared-candles", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          cache: "no-store",
-          body: JSON.stringify({
-            symbol: state.symbol,
-            interval: state.interval,
-            candles: payload,
-            reset,
-            intervalMs: intervalToMs(state.interval),
-            lastUpdateMs,
-            maxBars: 2000,
-          }),
-        });
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-        shared.lastFlushMs = Date.now();
-        shared.lastUpdateMs = lastUpdateMs;
-      } catch (error) {
-        console.warn("SharedCandles remote sync failed", error);
-        const buffer = shared.pending;
-        if (reset) {
-          buffer.clear();
-        }
-        for (const bar of payload) {
-          buffer.set(Number(bar.time), { ...bar });
-        }
-        shared.resetPending = reset || shared.resetPending;
-        shared.dirty = true;
-      } finally {
-        shared.inFlight = false;
-        if (!shared.dirty) {
-          shared.lastFlushMs = shared.lastFlushMs || Date.now();
-        }
-        if (shared.dirty || shared.pending.size) {
-          scheduleSharedFlush();
-        }
-      }
-    };
-
-    shared.flushPromise = execute().finally(() => {
-      shared.flushPromise = null;
-    });
-    return shared.flushPromise;
   }
 
   function mergeCandles(bars, { reset = false, lastUpdateMs = null, immediate = false } = {}) {
@@ -727,6 +606,13 @@
 
   async function loadSymbol(symbol, interval) {
     notifyStatus("Загружаем историю...", "info");
+    const previousSymbol = state.symbol;
+    const previousInterval = state.interval;
+    if (SharedCandles && typeof SharedCandles.flush === "function") {
+      SharedCandles.flush(previousSymbol, previousInterval, { force: true }).catch((error) => {
+        console.warn("SharedCandles flush before switch failed", error);
+      });
+    }
     const normalizedSymbol = symbol.trim().toUpperCase();
     const normalizedInterval = interval.trim();
     state.symbol = normalizedSymbol;
@@ -735,17 +621,6 @@
     setActiveSymbolButton(normalizedSymbol);
     fetchPreset(normalizedSymbol);
     initChart();
-    if (state.shared.flushTimer) {
-      clearTimeout(state.shared.flushTimer);
-      state.shared.flushTimer = null;
-    }
-    state.shared.pending = new Map();
-    state.shared.resetPending = false;
-    state.shared.lastUpdateMs = null;
-    state.shared.inFlight = false;
-    state.shared.dirty = false;
-    state.shared.lastFlushMs = 0;
-    state.shared.flushPromise = null;
     const restored = await restoreFromSharedStore(normalizedSymbol, normalizedInterval);
     if (restored) {
       applyCandles();
