@@ -1952,21 +1952,18 @@ def _aggregate_orderflow_series(
         aggregated.append(
             {
                 "ts": bucket_start,
-                "delta": delta,
-                "cvd": running_cvd,
-                "bid_vol": bid_volume,
-                "ask_vol": ask_volume,
-                "large_trades_count": int(
-                    sum(int(entry.get("large_trades_count", 0)) for entry in bucket_entries)
-                ),
-                "absorption_high": any(bool(entry.get("absorption_high")) for entry in bucket_entries),
-                "absorption_low": any(bool(entry.get("absorption_low")) for entry in bucket_entries),
-                "imbalance_buy": any(bool(entry.get("imbalance_buy")) for entry in bucket_entries),
-                "imbalance_sell": any(bool(entry.get("imbalance_sell")) for entry in bucket_entries),
+                "t": _isoformat_utc(bucket_start),
+                "delta_sum": delta,
+                "cvd_close": running_cvd,
+                "vol_sum": ask_volume + bid_volume,
+                "bars": len(bucket_entries),
             }
         )
 
     return aggregated
+
+
+_PER_BAR_WINDOW_MINUTES = 120
 
 
 def _build_orderflow_block(
@@ -2014,6 +2011,18 @@ def _build_orderflow_block(
     )
 
     result: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+
+    if minute_series:
+        last_ts = max(_safe_int(entry.get("ts")) or 0 for entry in minute_series)
+        cutoff = last_ts - (_PER_BAR_WINDOW_MINUTES - 1) * minute_interval
+        trimmed = [
+            entry
+            for entry in minute_series
+            if (_safe_int(entry.get("ts")) or 0) >= cutoff
+        ]
+        result["1m"] = {"per_bar": trimmed[-_PER_BAR_WINDOW_MINUTES:]}
+    else:
+        result["1m"] = {"per_bar": []}
 
     for tf in ("15m", "1h"):
         interval_ms = TIMEFRAME_TO_MS.get(tf)
@@ -4437,7 +4446,7 @@ async def build_check_all_datas(
         ohlcv_public[tf] = {"candles": candles}
 
     orderflow_public: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
-    for tf in ("15m", "1h"):
+    for tf in ("1m", "15m", "1h"):
         tf_payload = orderflow_block.get(tf) if isinstance(orderflow_block, Mapping) else None
         per_bar: List[Dict[str, Any]] = []
         if isinstance(tf_payload, Mapping):
