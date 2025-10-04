@@ -9,43 +9,19 @@ from typing import Dict, List, Mapping, MutableMapping, Tuple
 
 import httpx
 
-from .rate_limiter import get_global_rate_limiter
+from .http_client import RATE_LIMIT_STATUSES, TRANSIENT_STATUSES, request as http_request
 from .tracing import TraceContext
 
 BINANCE_FUTURES_AGG_TRADES = "https://fapi.binance.com/fapi/v1/aggTrades"
 LOGGER = logging.getLogger(__name__)
 _FOOTPRINT_LOCK = asyncio.Lock()
-_RATE_LIMITER = get_global_rate_limiter()
 _MAX_WINDOW_HOURS = 4
 _PER_BAR_MINUTES = 120
 _PAGE_WINDOW_MS = 30 * 60_000
-_RETRYABLE_STATUS = {418, 429, 500, 502, 503, 504}
 
 
 class OrderflowError(RuntimeError):
     """Raised when upstream orderflow data are invalid."""
-
-
-def _retry_after_seconds(response: httpx.Response) -> float | None:
-    retry_after = response.headers.get("Retry-After")
-    if retry_after is None:
-        return None
-    try:
-        return float(retry_after)
-    except ValueError:
-        return None
-
-
-def _used_weight(response: httpx.Response) -> int | None:
-    header = response.headers.get("X-MBX-USED-WEIGHT-1m")
-    if not header:
-        return None
-    try:
-        return int(header)
-    except ValueError:
-        return None
-
-
 async def _fetch_trades(
     client: httpx.AsyncClient,
     symbol: str,
@@ -61,76 +37,34 @@ async def _fetch_trades(
         "limit": "1000",
     }
     scope = "orderflow.aggTrades"
-
-    for attempt in range(1, 3):
-        if trace is not None:
-            trace.debug(
-                "fetch.batch_start",
-                scope=scope,
-                attempt=attempt,
-                start_ms=start_ms,
-                end_ms=end_ms,
-            )
-        try:
-            async with _RATE_LIMITER.limit(scope=scope, trace=trace):
-                response = await client.get(BINANCE_FUTURES_AGG_TRADES, params=params)
-        except httpx.RequestError:  # pragma: no cover - network failure
-            await _RATE_LIMITER.apply_backoff(
-                1.0,
-                scope=scope,
-                trace=trace,
-                reason="request_error",
-            )
-            if attempt >= 2:
-                return None
-            if trace is not None:
-                trace.warn(
-                    "fetch.batch_retry",
-                    scope=scope,
-                    attempt=attempt,
-                    reason="request_error",
-                )
-            continue
-
-        await _RATE_LIMITER.note_used_weight(
-            _used_weight(response), scope=scope, trace=trace
+    try:
+        response = await http_request(
+            "GET",
+            BINANCE_FUTURES_AGG_TRADES,
+            scope=scope,
+            trace=trace,
+            client=client,
+            params=params,
+            symbol=symbol,
+            window=(start_ms, end_ms),
+            details="limit=1000",
+            max_retries=0,
+            retry_statuses=TRANSIENT_STATUSES,
+            rate_limit_statuses=RATE_LIMIT_STATUSES,
         )
+    except httpx.RequestError:  # pragma: no cover - network failure
+        return None
 
-        if response.status_code == 200:
-            payload = response.json()
-            if not isinstance(payload, list):
-                raise OrderflowError("Invalid trade payload structure")
-            if trace is not None:
-                trace.info(
-                    "fetch.batch_done",
-                    scope=scope,
-                    attempt=attempt,
-                    rows=len(payload),
-                    start_ms=start_ms,
-                    end_ms=end_ms,
-                )
-            return payload  # type: ignore[return-value]
+    if response.status_code == 200:
+        payload = response.json()
+        if not isinstance(payload, list):
+            raise OrderflowError("Invalid trade payload structure")
+        return payload
 
-        if response.status_code in RETRYABLE_STATUS:
-            await _RATE_LIMITER.apply_backoff(
-                _retry_after_seconds(response),
-                scope=scope,
-                trace=trace,
-                reason=str(response.status_code),
-            )
-            if trace is not None:
-                trace.warn(
-                    "rate_limited" if response.status_code in {418, 429} else "fetch.batch_retry",
-                    scope=scope,
-                    status=response.status_code,
-                    attempt=attempt,
-                )
-            if response.status_code in {418, 429} or attempt >= 2:
-                return None
-            continue
+    if response.status_code in RATE_LIMIT_STATUSES or response.status_code >= 500:
+        return None
 
-        response.raise_for_status()
-
+    response.raise_for_status()
     return None
 
 

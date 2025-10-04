@@ -8,14 +8,13 @@ from typing import Dict, List, Tuple
 
 import httpx
 
-from .rate_limiter import get_global_rate_limiter
+from .http_client import RATE_LIMIT_STATUSES, request as http_request
 from .tracing import TraceContext
 
 BINANCE_FUTURES_BOOK = "https://fapi.binance.com/fapi/v1/depth"
 _CACHE_TTL_SECONDS = 20.0
 _CACHE: Dict[str, Tuple[float, Dict[str, object]]] = {}
 _CACHE_LOCK = asyncio.Lock()
-_RATE_LIMITER = get_global_rate_limiter()
 
 
 async def _request_orderbook(
@@ -24,43 +23,25 @@ async def _request_orderbook(
     params = {"symbol": symbol, "limit": "100"}
     scope = "orderbook.depth"
     async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
-        async with _RATE_LIMITER.limit(scope=scope, trace=trace):
-            response = await client.get(BINANCE_FUTURES_BOOK, params=params)
-    await _RATE_LIMITER.note_used_weight(
-        _parse_used_weight(response), scope=scope, trace=trace
-    )
-    if response.status_code in {418, 429}:
-        await _RATE_LIMITER.apply_backoff(
-            _parse_retry_after(response), scope=scope, trace=trace, reason="depth"
+        response = await http_request(
+            "GET",
+            BINANCE_FUTURES_BOOK,
+            scope=scope,
+            trace=trace,
+            client=client,
+            params=params,
+            symbol=symbol,
+            details="limit=100",
+            max_retries=0,
+            rate_limit_statuses=RATE_LIMIT_STATUSES,
         )
+    if response.status_code in RATE_LIMIT_STATUSES:
         raise RuntimeError(f"Orderbook rate limited: {response.status_code}")
     response.raise_for_status()
     payload = response.json()
     if not isinstance(payload, dict):
         raise ValueError("Unexpected book payload")
     return payload
-
-
-def _parse_retry_after(response: httpx.Response) -> float | None:
-    value = response.headers.get("Retry-After")
-    if not value:
-        return None
-    try:
-        return float(value)
-    except ValueError:
-        return None
-
-
-def _parse_used_weight(response: httpx.Response) -> int | None:
-    value = response.headers.get("X-MBX-USED-WEIGHT-1m")
-    if not value:
-        return None
-    try:
-        return int(value)
-    except ValueError:
-        return None
-
-
 async def fetch_orderbook(
     symbol: str,
     window_minutes: int,

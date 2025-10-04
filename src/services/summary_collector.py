@@ -17,7 +17,7 @@ from .ohlc import TIMEFRAME_TO_MS, resample_ohlcv
 from .timeutils import ensure_ms_epoch
 from .check_all_datas import _normalise_binance_row
 from .progress import ProgressReporter, emit_progress
-from .rate_limiter import get_global_rate_limiter
+from .http_client import RATE_LIMIT_STATUSES, TRANSIENT_STATUSES, request as http_request
 
 LOGGER = logging.getLogger(__name__)
 TRACE_LOGGER = tracing.LOGGER.getChild("summary_collector")
@@ -28,7 +28,6 @@ MAX_PAGE_LIMIT = 1000
 MAX_CONCURRENCY = 4
 MERGE_GAP_JOIN_MS = 15 * 60_000
 BULK_UPSERT_CHUNK = 750
-_RATE_LIMITER = get_global_rate_limiter()
 
 
 class GapCollectionError(RuntimeError):
@@ -94,128 +93,33 @@ async def _request_klines(
         "limit": str(limit),
     }
     scope = f"summary.{interval}"
-    for attempt in range(1, 3):
-        if trace is not None:
-            trace.debug(
-                "fetch.batch_start",
-                scope=scope,
-                symbol=symbol,
-                interval=interval,
-                start_ms=start_ms,
-                end_ms=end_ms,
-                attempt=attempt,
-            )
-        try:
-            async with _RATE_LIMITER.limit(scope=scope, trace=trace):
-                response = await client.get(BINANCE_ENDPOINT, params=params)
-        except httpx.RequestError as exc:  # pragma: no cover - network failure
-            await _RATE_LIMITER.apply_backoff(
-                1.0,
-                scope=scope,
-                trace=trace,
-                reason="request_error",
-            )
-            if attempt >= 2:
-                raise GapCollectionError(f"Request failure: {exc}") from exc
-            if trace is not None:
-                trace.warn(
-                    "fetch.batch_retry",
-                    scope=scope,
-                    attempt=attempt,
-                    reason="request_error",
-                )
-            continue
-
-        await _RATE_LIMITER.note_used_weight(
-            _parse_used_weight(response), scope=scope, trace=trace
-        )
-
-        if response.status_code == 200:
-            payload = response.json()
-            if not isinstance(payload, list):
-                return []
-            if trace is not None:
-                trace.info(
-                    "fetch.batch_done",
-                    scope=scope,
-                    symbol=symbol,
-                    interval=interval,
-                    rows=len(payload),
-                    attempt=attempt,
-                )
-            return payload  # type: ignore[return-value]
-
-        if response.status_code in {418, 429}:
-            await _RATE_LIMITER.apply_backoff(
-                _parse_retry_after(response),
-                scope=scope,
-                trace=trace,
-                reason=str(response.status_code),
-            )
-            if trace is not None:
-                trace.warn(
-                    "rate_limited",
-                    scope=scope,
-                    status=response.status_code,
-                    attempt=attempt,
-                )
-            if attempt >= 2:
-                return []
-            continue
-
-        if response.status_code >= 500:
-            await _RATE_LIMITER.apply_backoff(
-                _parse_retry_after(response),
-                scope=scope,
-                trace=trace,
-                reason=str(response.status_code),
-            )
-            if trace is not None:
-                trace.warn(
-                    "fetch.batch_retry",
-                    scope=scope,
-                    status=response.status_code,
-                    attempt=attempt,
-                )
-            if attempt >= 2:
-                return []
-            continue
-
-        response.raise_for_status()
-
-    if trace is not None:
-        trace.error(
-            "fetch.failed",
+    try:
+        response = await http_request(
+            "GET",
+            BINANCE_ENDPOINT,
             scope=scope,
+            trace=trace,
+            client=client,
+            params=params,
             symbol=symbol,
-            interval=interval,
-            start_ms=start_ms,
-            end_ms=end_ms,
-            attempts=2,
+            window=(start_ms, end_ms),
+            details=f"interval={interval},limit={limit}",
+            max_retries=1,
+            retry_statuses=TRANSIENT_STATUSES,
+            rate_limit_statuses=RATE_LIMIT_STATUSES,
         )
+    except httpx.RequestError as exc:  # pragma: no cover - network failure
+        raise GapCollectionError(f"Request failure: {exc}") from exc
+
+    if response.status_code == 200:
+        payload = response.json()
+        return payload if isinstance(payload, list) else []
+
+    if response.status_code in RATE_LIMIT_STATUSES or response.status_code >= 500:
+        return []
+
+    response.raise_for_status()
     return []
-
-
-def _parse_retry_after(response: httpx.Response) -> float | None:
-    header = response.headers.get("Retry-After")
-    if not header:
-        return None
-    try:
-        return float(header)
-    except ValueError:
-        return None
-
-
-def _parse_used_weight(response: httpx.Response) -> int | None:
-    header = response.headers.get("X-MBX-USED-WEIGHT-1m")
-    if not header:
-        return None
-    try:
-        return int(header)
-    except ValueError:
-        return None
-
-
 def _align_to_interval(timestamp_ms: int, interval_ms: int) -> int:
     if interval_ms <= 0:
         raise ValueError("interval_ms must be positive")
