@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
+import json
 import logging
 import math
 import time
@@ -73,6 +74,7 @@ try:
         fetch_ohlcv_sync,
         resample_ohlcv,
     )
+    from .ohlcv import build_multi_tf_ohlcv, MinuteDataUnavailable
 except ImportError:  # pragma: no cover - circular import guard
     TIMEFRAME_TO_MS = {"1m": MS_IN_HOUR // 60}
 
@@ -665,6 +667,86 @@ def _build_insufficient_payload(
         "availability": availability_payload,
         "missing_fields": sorted(missing_fields),
     }
+    return round_floats(payload)
+
+
+def _build_minute_missing_payload(
+    context: _SnapshotContext,
+    *,
+    now: datetime,
+    missing: MinuteDataUnavailable,
+) -> Dict[str, Any]:
+    """Return a deterministic payload when minute coverage is incomplete."""
+
+    payload = _build_insufficient_payload(
+        symbol=context.symbol,
+        now=now,
+        stream_price=context.stream_price,
+        stream_ts=context.stream_ts,
+    )
+    payload["status"] = "minute_missing"
+
+    meta = payload.get("meta")
+    if isinstance(meta, dict):
+        meta["insufficient_reason"] = "minute_missing"
+        meta["minute_missing"] = int(missing.missing_count)
+        meta["minute_window"] = {"start_ms": missing.start_ms, "end_ms": missing.end_ms}
+        meta["minute_coverage_pct"] = round(missing.coverage_pct, 3)
+
+    note = (
+        f"Missing {missing.missing_count} minute candles between "
+        f"{missing.start_ms} and {missing.end_ms}"
+    )
+    notes = payload.get("notes")
+    if isinstance(notes, list):
+        if note not in notes:
+            notes.append(note)
+    else:
+        payload["notes"] = [note]
+
+    return payload
+
+
+def _finalise_payload(
+    payload: Dict[str, Any],
+    *,
+    status: str,
+    pipeline_start: float,
+    fetch_ms: float,
+    db_ms: float,
+    trace_ctx: TraceContext | None,
+) -> Dict[str, Any]:
+    """Attach timing metadata, measure size, and emit the terminal trace event."""
+
+    total_elapsed_ms = (time.perf_counter() - pipeline_start) * 1000.0
+    compute_ms = max(0.0, total_elapsed_ms - fetch_ms - db_ms)
+    serialize_start = time.perf_counter()
+    encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    serialize_ms = (time.perf_counter() - serialize_start) * 1000.0
+    size_bytes = len(encoded.encode("utf-8"))
+
+    timing_block = payload.setdefault("timing", {})
+    timing_block.update(
+        {
+            "fetch_ms": round(fetch_ms, 2),
+            "db_ms": round(db_ms, 2),
+            "compute_ms": round(compute_ms, 2),
+            "serialize_ms": round(serialize_ms, 2),
+            "size_bytes": size_bytes,
+        }
+    )
+
+    if trace_ctx is not None:
+        trace_ctx.info(
+            "pipeline.done",
+            status=status,
+            fetch_ms=timing_block["fetch_ms"],
+            db_ms=timing_block["db_ms"],
+            compute_ms=timing_block["compute_ms"],
+            serialize_ms=timing_block["serialize_ms"],
+            size_bytes=size_bytes,
+        )
+
     return round_floats(payload)
 
 
@@ -2737,29 +2819,62 @@ async def build_check_all_datas(
     minute_candles = _deduplicate_sorted(frames.get("1m", []))
     frames["1m"] = minute_candles
 
+    rollup_payload: Dict[str, Dict[str, Any]] = {}
     if minute_candles:
+        lookback_days = max(1, int(math.ceil(base_window_hours / 24)))
         try:
-            aggregated_block = build_multi_timeframe_ohlcv(minute_candles)
-        except Exception:  # pragma: no cover - defensive guard
-            aggregated_block = {}
-        else:
-            for tf_key in ("3m", "5m", "15m", "1h", "4h", "1d"):
-                existing_series = frames.get(tf_key)
-                if existing_series:
-                    continue
-                tf_payload = aggregated_block.get(tf_key)
-                if not isinstance(tf_payload, Mapping):
-                    continue
-                raw_series = tf_payload.get("candles")
-                if not isinstance(raw_series, Sequence):
-                    continue
-                coerced_series = [
-                    dict(entry)
-                    for entry in raw_series
-                    if isinstance(entry, Mapping)
-                ]
-                if coerced_series:
-                    frames[tf_key] = coerced_series
+            rollup_payload = await build_multi_tf_ohlcv(
+                symbol,
+                lookback_days,
+                timeframes=("1m", "3m", "5m", "15m", "1h", "4h", "1d"),
+                seed_minutes=minute_candles,
+                trace=trace_ctx.child(stage="rollups.seed") if trace_ctx is not None else None,
+            )
+        except MinuteDataUnavailable as exc:
+            if strict_window and base_window_hours >= 72:
+                status = "minute_missing"
+                insufficient_reason = "minute_missing"
+                if trace_ctx is not None:
+                    trace_ctx.error(
+                        "error.minute_missing",
+                        missing_minutes=exc.missing_count,
+                        window={"from": exc.start_ms, "to": exc.end_ms},
+                        coverage_pct=round(exc.coverage_pct, 3),
+                    )
+                minute_payload = _build_minute_missing_payload(
+                    context,
+                    now=now_dt,
+                    missing=exc,
+                )
+                return _finalise_payload(
+                    minute_payload,
+                    status=status,
+                    pipeline_start=pipeline_start,
+                    fetch_ms=fetch_ms,
+                    db_ms=db_ms,
+                    trace_ctx=trace_ctx,
+                )
+            if trace_ctx is not None:
+                trace_ctx.warn(
+                    "availability.checked",
+                    scope="ohlcv.1m",
+                    missing_minutes=exc.missing_count,
+                    coverage_pct=round(exc.coverage_pct, 3),
+                )
+            rollup_payload = build_multi_timeframe_ohlcv(minute_candles, symbol=symbol)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            LOGGER.exception("Failed to build local OHLCV rollups for %s: %s", symbol, exc)
+            raise
+        for tf_key in ("3m", "5m", "15m", "1h", "4h", "1d"):
+            existing_series = frames.get(tf_key)
+            if existing_series:
+                continue
+            tf_payload = rollup_payload.get(tf_key)
+            if not isinstance(tf_payload, Mapping):
+                continue
+            normalised_series = _normalise_external_candles(tf_payload)
+            if normalised_series:
+                frames[tf_key] = normalised_series
 
     profile_config = resolve_profile_config(symbol, raw_meta)
     profile_meta: Dict[str, Any] = {}
@@ -3681,7 +3796,10 @@ async def build_check_all_datas(
         snapshot.get("agg_trades"),
         config=orderflow_config,
     )
-    ohlcv_block = build_multi_timeframe_ohlcv(minute_htf_source, symbol=symbol)
+    if rollup_payload:
+        ohlcv_block = rollup_payload
+    else:
+        ohlcv_block = build_multi_timeframe_ohlcv(minute_htf_source, symbol=symbol)
     if trace_ctx is not None:
         trace_ctx.info(
             "compute.rollups",
@@ -4244,22 +4362,12 @@ async def build_check_all_datas(
         "notes": notes,
     }
 
-    total_ms = (time.perf_counter() - pipeline_start) * 1000.0
-    compute_component = max(0.0, total_ms - fetch_ms - db_ms)
-    final_payload["timing"] = {
-        "fetch_ms": round(fetch_ms, 2),
-        "db_ms": round(db_ms, 2),
-        "compute_ms": round(compute_component, 2),
-    }
-
-    if trace_ctx is not None:
-        trace_ctx.info(
-            "pipeline.done",
-            status=status,
-            fetch_ms=final_payload["timing"]["fetch_ms"],
-            db_ms=final_payload["timing"]["db_ms"],
-            compute_ms=final_payload["timing"]["compute_ms"],
-        )
-
-    return round_floats(final_payload)
+    return _finalise_payload(
+        final_payload,
+        status=status,
+        pipeline_start=pipeline_start,
+        fetch_ms=fetch_ms,
+        db_ms=db_ms,
+        trace_ctx=trace_ctx,
+    )
 
