@@ -301,6 +301,7 @@ async def _run_summary_workflow(
         now_utc=now_override,
         window_hours=window_hours,
         timeout=CHECK_ALL_BUILD_TIMEOUT,
+        network_backfill=False,
     )
     TRACE_LOGGER.debug(
         "inspection.summary_collection:payload_ready",

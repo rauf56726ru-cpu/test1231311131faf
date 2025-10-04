@@ -26,6 +26,7 @@ import httpx
 
 import src.services.inspection as inspection
 from .binance import BINANCE_FAPI_REST
+from .candles_repository import get_repository
 from .inspection import build_htf_section
 from .liquidity import (
     build_liquidity_snapshot,
@@ -44,6 +45,7 @@ MS_IN_HOUR = 3_600_000
 MS_IN_DAY = 86_400_000
 VALID_HOUR_WINDOWS = {1, 2, 3, 4}
 VALUE_AREA_PCT = 0.70
+REPOSITORY_LOOKBACK_MS = 5 * MS_IN_DAY
 
 _EQUAL_LIQUIDITY_TIMEFRAMES: Tuple[str, ...] = ("15m", "1h", "4h")
 _EQUAL_LIQUIDITY_REL_TOLERANCE = {
@@ -259,12 +261,14 @@ async def build_check_all_datas_async(
     snapshot: Mapping[str, Any],
     *,
     timeout: float | None = _ASYNC_BUILD_TIMEOUT_SECONDS,
+    network_backfill: bool = True,
     **kwargs: Any,
 ) -> Dict[str, Any] | None:
     """Execute ``build_check_all_datas`` with a timeout that respects cancellation."""
 
     context = _prepare_snapshot_context(snapshot, kwargs.get("now_utc"))
     build_kwargs = dict(kwargs)
+    build_kwargs.setdefault("network_backfill", network_backfill)
 
     async def _invoke() -> Dict[str, Any] | None:
         return await build_check_all_datas(snapshot, **build_kwargs)
@@ -283,6 +287,7 @@ async def build_check_all_datas_async(
                 "hours": build_kwargs.get("hours"),
                 "window_hours": build_kwargs.get("window_hours"),
                 "strict_window": build_kwargs.get("strict_window"),
+                "network_backfill": build_kwargs.get("network_backfill"),
             },
         )
         return _insufficient_from_context(context)
@@ -452,6 +457,23 @@ def _merge_candle_collections(
     return _deduplicate_sorted(combined)
 
 
+async def _load_repository_candles(
+    symbol: str,
+    interval: str,
+    start_ms: int,
+    end_ms: int,
+) -> List[Dict[str, Any]]:
+    repository = get_repository()
+    candles = await asyncio.to_thread(
+        repository.fetch_candles,
+        symbol,
+        interval,
+        start_ms,
+        end_ms,
+    )
+    return [dict(item) for item in candles]
+
+
 def _resolve_window_end_ms(
     frames: Mapping[str, Sequence[Mapping[str, Any]]],
     *,
@@ -486,6 +508,7 @@ async def _backfill_timeframe_with_rest(
     window_hours: int,
     fetcher: Callable[..., Awaitable[Mapping[str, Any]]] | Callable[..., Mapping[str, Any]] | None = None,
     minimum_required: int | None = None,
+    allow_network: bool = True,
 ) -> bool:
     """Ensure the requested timeframe has at least the required candles."""
 
@@ -509,6 +532,9 @@ async def _backfill_timeframe_with_rest(
             available += 1
             if available >= minimum_required:
                 return False
+
+    if not allow_network:
+        return False
 
     fetch_callable = fetcher or fetch_ohlcv
     try:
@@ -917,7 +943,7 @@ async def _download_missing_minutes_async(
     downloaded = 0
 
     try:
-        timeout = httpx.Timeout(6.0, connect=3.0)
+        timeout = httpx.Timeout(25.0, connect=10.0)
         async with httpx.AsyncClient(timeout=timeout) as client:
             for gap in gaps:
                 if budget is not None:
@@ -974,8 +1000,12 @@ async def _call_download_missing_minutes_async(
     gaps: Sequence[Mapping[str, int]],
     *,
     budget: _TimeBudget | None,
+    allow_network: bool = True,
 ) -> List[Dict[str, Any]]:
     """Invoke `_download_missing_minutes` while tolerating legacy stubs without budget."""
+
+    if not allow_network:
+        return []
 
     if budget is None:
         return await _download_missing_minutes_async(symbol, start_ms, end_ms, gaps)
@@ -2533,6 +2563,7 @@ async def build_check_all_datas(
     window_hours: int | None = None,
     window_start_override_ms: int | None = None,
     strict_window: bool = False,
+    network_backfill: bool = True,
 ) -> Dict[str, Any] | None:
     """Create an enriched payload for the snapshot health endpoint."""
 
@@ -2604,6 +2635,25 @@ async def build_check_all_datas(
         stream_ts=stream_ts,
     )
 
+    repo_window_ms = max(REPOSITORY_LOOKBACK_MS, base_window_hours * MS_IN_HOUR)
+    repo_start_ms = max(0, _align_to_interval(window_end_guess - repo_window_ms, MINUTE_INTERVAL_MS))
+    try:
+        repository_minutes = await _load_repository_candles(
+            symbol,
+            "1m",
+            repo_start_ms,
+            window_end_guess,
+        )
+    except Exception as exc:  # pragma: no cover - defensive logging
+        LOGGER.debug(
+            "Failed to seed minutes from repository",
+            exc_info=exc,
+            extra={"symbol": symbol, "repo_start_ms": repo_start_ms, "repo_end_ms": window_end_guess},
+        )
+        repository_minutes = []
+    if repository_minutes:
+        frames["1m"] = _merge_candle_collections(frames.get("1m", []), repository_minutes)
+
     try:
         budget.raise_if_exceeded("seed_1m_backfill")
     except _TimeBudgetExceeded as exc:
@@ -2619,6 +2669,7 @@ async def build_check_all_datas(
         timeframe="1m",
         window_end_ms=window_end_guess,
         window_hours=base_window_hours,
+        allow_network=network_backfill,
     )
     frames["1m"] = _apply_sanitizer("rest.1m", frames.get("1m", []))
 
@@ -2647,6 +2698,7 @@ async def build_check_all_datas(
             timeframe=primary_key,
             window_end_ms=window_end_guess,
             window_hours=base_window_hours,
+            allow_network=network_backfill,
         )
         frames[primary_key] = _apply_sanitizer(f"rest.{primary_key}", frames.get(primary_key, []))
 
@@ -2835,6 +2887,18 @@ async def build_check_all_datas(
 
     fetched_unique = 0
     if time_gaps:
+        if not network_backfill:
+            data_quality = {
+                "tf": target_tf_key,
+                "window": {"start_ms": window_start_ms, "end_ms": window_end_ms},
+                "minute_missing_before": minute_missing_before,
+                "minute_missing_after": minute_missing_before,
+                "fetched_1m_count": 0,
+                "tf_missing_before": 0,
+                "tf_missing_after": 0,
+                "time_gaps": time_gaps,
+            }
+            raise DataQualityError(data_quality)
         try:
             budget.raise_if_exceeded("download_missing_minutes_start")
             downloaded_minutes = await _call_download_missing_minutes_async(
@@ -2843,6 +2907,7 @@ async def build_check_all_datas(
                 window_end_ms,
                 time_gaps,
                 budget=budget,
+                allow_network=network_backfill,
             )
             downloaded_minutes = _apply_sanitizer(
                 "rest.1m.download", downloaded_minutes
@@ -2948,6 +3013,16 @@ async def build_check_all_datas(
     )
     zone_history_gaps = _summarise_missing_times(zone_expected_minutes, minute_index_all)
     if zone_history_gaps:
+        if not network_backfill:
+            detail = {
+                "tf": target_tf_key,
+                "window": {"start_ms": zones_history_start_ms, "end_ms": window_end_ms},
+                "stage": "zones_history",
+                "minute_missing_before": sum(gap["count"] for gap in zone_history_gaps),
+                "fetched_1m_count": 0,
+                "time_gaps": zone_history_gaps,
+            }
+            raise DataQualityError(detail)
         try:
             budget.raise_if_exceeded("zones_history_backfill_start")
             zone_downloaded_minutes = await _call_download_missing_minutes_async(
@@ -2956,6 +3031,7 @@ async def build_check_all_datas(
                 window_end_ms,
                 zone_history_gaps,
                 budget=budget,
+                allow_network=network_backfill,
             )
         except BinanceDownloadError as exc:
             detail = {

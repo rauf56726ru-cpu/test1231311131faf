@@ -14,7 +14,7 @@ import httpx
 from . import tracing
 from .candles_repository import CandleRepository, UpsertStats, get_repository
 from .ohlc_sanitizer import sanitize_candles
-from .ohlc import TIMEFRAME_TO_MS
+from .ohlc import TIMEFRAME_TO_MS, resample_ohlcv
 from .timeutils import ensure_ms_epoch
 from .check_all_datas import _normalise_binance_row
 from .progress import ProgressReporter, emit_progress
@@ -25,8 +25,8 @@ UTC = timezone.utc
 
 BINANCE_ENDPOINT = "https://fapi.binance.com/fapi/v1/klines"
 MAX_PAGE_LIMIT = 1000
-DEFAULT_TOKEN_RATE = 30.0  # tokens per second
-DEFAULT_TOKEN_BURST = 30
+DEFAULT_TOKEN_RATE = 10.0  # tokens per second
+DEFAULT_TOKEN_BURST = 10
 RATE_DELAY_MIN = 0.020
 RATE_DELAY_MAX = 0.040
 BACKOFF_BASE_MS = 0.2
@@ -232,6 +232,23 @@ async def _fetch_existing(
 ) -> List[int]:
     return await asyncio.to_thread(
         repository.fetch_open_times,
+        symbol,
+        interval,
+        start_ms,
+        end_ms,
+    )
+
+
+async def _fetch_candle_range(
+    repository: CandleRepository,
+    *,
+    symbol: str,
+    interval: str,
+    start_ms: int,
+    end_ms: int,
+) -> List[Dict[str, Any]]:
+    return await asyncio.to_thread(
+        repository.fetch_candles,
         symbol,
         interval,
         start_ms,
@@ -511,25 +528,47 @@ async def collect_recent_summary(
         days=span_days,
     )
 
-    target_intervals = list(intervals or TIMEFRAME_TO_MS.keys())
+    requested_intervals = list(intervals or TIMEFRAME_TO_MS.keys())
+    seen_intervals: set[str] = set()
+    target_intervals: List[str] = []
+    for interval in requested_intervals:
+        if interval in seen_intervals:
+            continue
+        seen_intervals.add(interval)
+        target_intervals.append(interval)
+    if "1m" in seen_intervals:
+        target_intervals = ["1m"] + [tf for tf in target_intervals if tf != "1m"]
+    elif intervals is None:
+        target_intervals.insert(0, "1m")
+
+    aligned_starts: List[int] = []
+    for interval in target_intervals:
+        interval_ms = TIMEFRAME_TO_MS.get(interval)
+        if interval_ms is None:
+            continue
+        aligned_starts.append(_align_to_interval(start_ms, interval_ms))
+    base_start_ms = min(aligned_starts) if aligned_starts else start_ms
+
     summaries: Dict[str, IntervalSummary] = {}
     total_requests = 0
     total_written = 0
     total_dropped = 0
 
     bucket = _TokenBucket(DEFAULT_TOKEN_RATE, DEFAULT_TOKEN_BURST)
-    async with httpx.AsyncClient(timeout=httpx.Timeout(6.0, connect=3.0)) as client:
+    minute_first_expected: Optional[int] = None
+    minute_last_closed: Optional[int] = None
+    minute_cache: Optional[List[Dict[str, Any]]] = None
+    minute_cache_start: Optional[int] = None
+    minute_cache_end: Optional[int] = None
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(25.0, connect=10.0)) as client:
         for interval in target_intervals:
             interval_ms = TIMEFRAME_TO_MS.get(interval)
             if not interval_ms:
                 continue
-            first_expected = _align_to_interval(start_ms, interval_ms)
+            first_expected = _align_to_interval(base_start_ms, interval_ms)
             last_expected = _align_to_interval(now_ms, interval_ms)
             if end_ms is None:
-                # Live invocations should not expect the still-forming candle at the
-                # window tail.  Skipping that bar prevents an endless loop where
-                # the collector keeps re-requesting the most recent minute even
-                # though the exchange has not closed it yet.
                 tail_open = now_ms - last_expected < interval_ms
                 last_closed = last_expected - interval_ms if tail_open else last_expected
             else:
@@ -561,6 +600,7 @@ async def collect_recent_summary(
                     last_closed=last_closed,
                 )
                 continue
+
             existing = await _fetch_existing(
                 repo,
                 symbol=symbol,
@@ -587,6 +627,7 @@ async def collect_recent_summary(
                 last_closed=last_closed,
                 existing=len(existing),
             )
+
             gaps = _compute_gaps(first_expected, last_closed, interval_ms, existing)
             TRACE_LOGGER.debug(
                 "summary_collector:computed_gaps",
@@ -607,62 +648,171 @@ async def collect_recent_summary(
                 first_expected=first_expected,
                 last_closed=last_closed,
             )
-            if not gaps:
-                summaries[interval] = IntervalSummary(
-                    gaps_total=0,
-                    gaps_filled=0,
-                    candles_written=0,
-                    dropped_candles=0,
-                    requests=0,
-                    remaining_gaps=[],
-                )
-                await emit_progress(
-                    progress,
-                    "summary_collector:interval_complete",
-                    symbol=symbol,
-                    interval=interval,
-                    first_expected=first_expected,
-                    last_closed=last_closed,
-                )
-                continue
 
-            gap_summaries: List[IntervalSummary] = []
-            for gap in gaps:
-                summary = await _fill_gap(
+            if interval == "1m":
+                minute_first_expected = first_expected
+                minute_last_closed = last_closed
+                if not gaps:
+                    summaries[interval] = IntervalSummary(
+                        gaps_total=0,
+                        gaps_filled=0,
+                        candles_written=0,
+                        dropped_candles=0,
+                        requests=0,
+                        remaining_gaps=[],
+                    )
+                    await emit_progress(
+                        progress,
+                        "summary_collector:interval_complete",
+                        symbol=symbol,
+                        interval=interval,
+                        first_expected=first_expected,
+                        last_closed=last_closed,
+                    )
+                    continue
+
+                gap_summaries: List[IntervalSummary] = []
+                for gap in gaps:
+                    summary = await _fill_gap(
+                        repo,
+                        symbol=symbol,
+                        interval=interval,
+                        gap=gap,
+                        interval_ms=interval_ms,
+                        client=client,
+                        bucket=bucket,
+                        progress=progress,
+                    )
+                    gap_summaries.append(summary)
+                    total_requests += summary.requests
+                    total_written += summary.candles_written
+                    total_dropped += summary.dropped_candles
+                    TRACE_LOGGER.debug(
+                        "summary_collector:interval_progress",
+                        extra={
+                            "symbol": symbol,
+                            "interval": interval,
+                            "gap_from": gap.get("from"),
+                            "gap_to": gap.get("to"),
+                            "written_total": total_written,
+                            "requests_total": total_requests,
+                        },
+                    )
+                    await emit_progress(
+                        progress,
+                        "summary_collector:interval_progress",
+                        symbol=symbol,
+                        interval=interval,
+                        gap_from=gap.get("from"),
+                        gap_to=gap.get("to"),
+                        written_total=total_written,
+                        requests_total=total_requests,
+                    )
+
+                refreshed_minutes = await _fetch_existing(
                     repo,
                     symbol=symbol,
                     interval=interval,
-                    gap=gap,
-                    interval_ms=interval_ms,
-                    client=client,
-                    bucket=bucket,
-                    progress=progress,
+                    start_ms=first_expected,
+                    end_ms=last_closed,
                 )
-                gap_summaries.append(summary)
-                total_requests += summary.requests
-                total_written += summary.candles_written
-                total_dropped += summary.dropped_candles
+                remaining_minutes = _compute_gaps(
+                    first_expected, last_closed, interval_ms, refreshed_minutes
+                )
+                summaries[interval] = IntervalSummary(
+                    gaps_total=len(gaps),
+                    gaps_filled=sum(1 for item in gap_summaries if item.candles_written > 0),
+                    candles_written=sum(item.candles_written for item in gap_summaries),
+                    dropped_candles=sum(item.dropped_candles for item in gap_summaries),
+                    requests=sum(item.requests for item in gap_summaries),
+                    remaining_gaps=remaining_minutes,
+                )
                 TRACE_LOGGER.debug(
-                    "summary_collector:interval_progress",
+                    "summary_collector:interval_finished",
                     extra={
                         "symbol": symbol,
                         "interval": interval,
-                        "gap_from": gap.get("from"),
-                        "gap_to": gap.get("to"),
-                        "written_total": total_written,
-                        "requests_total": total_requests,
+                        "gaps_total": len(gaps),
+                        "candles_written": summaries[interval].candles_written,
+                        "dropped_candles": summaries[interval].dropped_candles,
+                        "requests": summaries[interval].requests,
+                        "remaining_gaps": len(remaining_minutes),
                     },
                 )
                 await emit_progress(
                     progress,
-                    "summary_collector:interval_progress",
+                    "summary_collector:interval_finished",
                     symbol=symbol,
                     interval=interval,
-                    gap_from=gap.get("from"),
-                    gap_to=gap.get("to"),
-                    written_total=total_written,
-                    requests_total=total_requests,
+                    gaps_total=len(gaps),
+                    candles_written=summaries[interval].candles_written,
+                    dropped_candles=summaries[interval].dropped_candles,
+                    requests=summaries[interval].requests,
+                    remaining_gaps=len(remaining_minutes),
                 )
+                continue
+
+            if minute_first_expected is None or minute_last_closed is None:
+                summaries[interval] = IntervalSummary(
+                    gaps_total=len(gaps),
+                    gaps_filled=0,
+                    candles_written=0,
+                    dropped_candles=0,
+                    requests=0,
+                    remaining_gaps=gaps,
+                )
+                continue
+
+            if (
+                minute_cache is None
+                or minute_cache_start is None
+                or minute_cache_end is None
+                or minute_cache_start > minute_first_expected
+                or minute_cache_end < minute_last_closed
+            ):
+                minute_cache = await _fetch_candle_range(
+                    repo,
+                    symbol=symbol,
+                    interval="1m",
+                    start_ms=minute_first_expected,
+                    end_ms=minute_last_closed,
+                )
+                minute_cache_start = minute_first_expected
+                minute_cache_end = minute_last_closed
+
+            filtered_minutes = [
+                candle
+                for candle in minute_cache
+                if minute_first_expected <= int(candle.get("t", 0)) <= minute_last_closed
+            ]
+            aggregated_raw = resample_ohlcv(filtered_minutes, interval_ms)
+            aggregated: List[Dict[str, Any]] = []
+            for item in aggregated_raw:
+                if not isinstance(item, Mapping):
+                    continue
+                ts = _align_to_interval(int(item.get("t", 0)), interval_ms)
+                if ts < first_expected or ts > last_closed:
+                    continue
+                aggregated.append(
+                    {
+                        "t": ts,
+                        "o": float(item.get("o", 0.0)),
+                        "h": float(item.get("h", 0.0)),
+                        "l": float(item.get("l", 0.0)),
+                        "c": float(item.get("c", 0.0)),
+                        "v": float(item.get("v", 0.0)),
+                    }
+                )
+
+            aggregated.sort(key=lambda candle: candle["t"])
+            stats, _ = await _upsert_sanitised(
+                repo,
+                symbol=symbol,
+                interval=interval,
+                candles=aggregated,
+                stage=f"summary_resample.{interval}",
+            )
+            total_dropped += stats.dropped_ts + stats.dropped_ohlc
 
             refreshed = await _fetch_existing(
                 repo,
@@ -672,12 +822,17 @@ async def collect_recent_summary(
                 end_ms=last_closed,
             )
             remaining = _compute_gaps(first_expected, last_closed, interval_ms, refreshed)
+            gaps_filled = max(0, len(gaps) - len(remaining))
+            existing_set = {int(ts) for ts in existing}
+            refreshed_set = {int(ts) for ts in refreshed}
+            new_candles = max(0, len(refreshed_set - existing_set))
+            total_written += new_candles
             summaries[interval] = IntervalSummary(
                 gaps_total=len(gaps),
-                gaps_filled=sum(1 for item in gap_summaries if item.candles_written > 0),
-                candles_written=sum(item.candles_written for item in gap_summaries),
-                dropped_candles=sum(item.dropped_candles for item in gap_summaries),
-                requests=sum(item.requests for item in gap_summaries),
+                gaps_filled=gaps_filled,
+                candles_written=new_candles,
+                dropped_candles=stats.dropped_ts + stats.dropped_ohlc,
+                requests=0,
                 remaining_gaps=remaining,
             )
             TRACE_LOGGER.debug(
