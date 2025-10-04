@@ -840,13 +840,20 @@ def _prepare_summary_payload(
         for item in series:
             if not isinstance(item, Mapping):
                 continue
-            try:
-                ts = int(item.get("t"))
-            except (TypeError, ValueError):
+            ts_value: int | None = None
+            for key in ("t", "ts", "timestamp", "time"):
+                raw_ts = item.get(key)
+                if raw_ts is None:
+                    continue
+                try:
+                    ts_value = int(raw_ts)
+                except (TypeError, ValueError):
+                    continue
+                else:
+                    break
+            if ts_value is None or ts_value < cutoff_2h:
                 continue
-            if ts < cutoff_2h:
-                continue
-            entry: Dict[str, Any] = {"t": ts}
+            entry: Dict[str, Any] = {"t": ts_value}
             for key in ("delta", "cvd", "cvd_net", "cvd_buy", "cvd_sell"):
                 value = _float_or_none(item.get(key))
                 if value is not None:
