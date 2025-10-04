@@ -17,6 +17,10 @@ _CACHE: Dict[str, Tuple[float, Dict[str, object]]] = {}
 _CACHE_LOCK = asyncio.Lock()
 
 
+class OrderbookUnavailable(RuntimeError):
+    """Raised when a live orderbook snapshot cannot be retrieved."""
+
+
 async def _request_orderbook(
     symbol: str, *, trace: TraceContext | None = None
 ) -> Dict[str, object]:
@@ -35,12 +39,19 @@ async def _request_orderbook(
             max_retries=0,
             rate_limit_statuses=RATE_LIMIT_STATUSES,
         )
-    if response.status_code in RATE_LIMIT_STATUSES:
-        raise RuntimeError(f"Orderbook rate limited: {response.status_code}")
-    response.raise_for_status()
+
+    status_code = response.status_code
+    if status_code in RATE_LIMIT_STATUSES:
+        raise OrderbookUnavailable(f"rate_limited:{status_code}")
+
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise OrderbookUnavailable(str(exc)) from exc
+
     payload = response.json()
     if not isinstance(payload, dict):
-        raise ValueError("Unexpected book payload")
+        raise OrderbookUnavailable("unexpected_payload")
     return payload
 async def fetch_orderbook(
     symbol: str,
@@ -61,19 +72,44 @@ async def fetch_orderbook(
     cached = _CACHE.get(cache_key)
     if cached and cached[0] > now:
         if trace is not None:
-            trace.debug("book.cache.hit", symbol=symbol_clean)
+            trace.info(
+                "book.cache.hit",
+                scope="orderbook.depth",
+                symbol=symbol_clean,
+                metrics={"ttl_ms": int((cached[0] - now) * 1000.0)},
+            )
         return dict(cached[1])
 
     async with _CACHE_LOCK:
+        now = time.monotonic()
         cached = _CACHE.get(cache_key)
         if cached and cached[0] > now:
             if trace is not None:
-                trace.debug("book.cache.hit", symbol=symbol_clean, scope="orderbook")
+                trace.info(
+                    "book.cache.hit",
+                    scope="orderbook.depth",
+                    symbol=symbol_clean,
+                    metrics={"ttl_ms": int((cached[0] - now) * 1000.0)},
+                )
             return dict(cached[1])
         if trace is not None:
-            trace.debug("book.cache.miss", symbol=symbol_clean)
-        depth = await _request_orderbook(symbol_clean, trace=trace)
-        expires = now + _CACHE_TTL_SECONDS
+            trace.info(
+                "book.cache.miss",
+                scope="orderbook.depth",
+                symbol=symbol_clean,
+            )
+        try:
+            depth = await _request_orderbook(symbol_clean, trace=trace)
+        except OrderbookUnavailable as exc:
+            if trace is not None:
+                trace.warn(
+                    "fallback.engaged",
+                    scope="orderbook.depth",
+                    symbol=symbol_clean,
+                    details=str(exc),
+                )
+            raise
+        expires = time.monotonic() + _CACHE_TTL_SECONDS
         _CACHE[cache_key] = (expires, depth)
 
     bids = depth.get("bids", [])
