@@ -790,8 +790,21 @@ def _load_existing_snapshots() -> None:
     for path in files:
         try:
             raw = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            LOGGER.warning(
+                "Failed to read persisted snapshot; skipping",
+                extra={"path": str(path)},
+                exc_info=exc,
+            )
+            continue
+        try:
             data = json.loads(raw)
-        except (OSError, json.JSONDecodeError):
+        except json.JSONDecodeError as exc:
+            LOGGER.warning(
+                "Invalid JSON in persisted snapshot; skipping",
+                extra={"path": str(path)},
+                exc_info=exc,
+            )
             continue
         if not isinstance(data, Mapping):
             continue
