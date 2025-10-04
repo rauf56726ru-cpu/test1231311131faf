@@ -262,6 +262,7 @@ async def build_check_all_datas_async(
     *,
     timeout: float | None = _ASYNC_BUILD_TIMEOUT_SECONDS,
     network_backfill: bool = True,
+    trace: TraceContext | None = None,
     **kwargs: Any,
 ) -> Dict[str, Any] | None:
     """Execute ``build_check_all_datas`` with a timeout that respects cancellation."""
@@ -269,6 +270,8 @@ async def build_check_all_datas_async(
     context = _prepare_snapshot_context(snapshot, kwargs.get("now_utc"))
     build_kwargs = dict(kwargs)
     build_kwargs.setdefault("network_backfill", network_backfill)
+    if trace is not None:
+        build_kwargs.setdefault("trace", trace)
 
     async def _invoke() -> Dict[str, Any] | None:
         return await build_check_all_datas(snapshot, **build_kwargs)
@@ -2564,6 +2567,7 @@ async def build_check_all_datas(
     window_start_override_ms: int | None = None,
     strict_window: bool = False,
     network_backfill: bool = True,
+    trace: TraceContext | None = None,
 ) -> Dict[str, Any] | None:
     """Create an enriched payload for the snapshot health endpoint."""
 
@@ -4005,8 +4009,8 @@ async def build_check_all_datas(
                     insufficient.append(f"{tf_name}: {available}/{required}")
             if tracked and insufficient and len(insufficient) == tracked:
                 message = (
-                    f"В выбранный период данных для {zone_key.upper()} нет "
-                    f"(доступно {', '.join(insufficient)})."
+                    f"?? ?????????????????? ???????????? ???????????? ?????? {zone_key.upper()} ?????? "
+                    f"(???????????????? {', '.join(insufficient)})."
                 )
                 zones_public[zone_key] = [{"message": message, "period": "topup"}]
 
@@ -4189,3 +4193,4 @@ async def build_check_all_datas(
     }
 
     return round_floats(final_payload)
+
