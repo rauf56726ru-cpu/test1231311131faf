@@ -82,9 +82,14 @@ class TraceContext:
     # Context helpers
     # ------------------------------------------------------------------
     def child(self, **extra: Any) -> "TraceContext":
+        """Return a new context inheriting identifiers and static fields."""
+
         payload = dict(self._static)
         payload.update(extra)
-        return TraceContext(cid=self.cid, **payload)
+        cid = payload.pop("cid", self.cid)
+        rid = payload.pop("rid", self.rid)
+        enabled = payload.pop("enabled", None)
+        return TraceContext(cid=cid, rid=rid, enabled=self._enabled if enabled is None else enabled, **payload)
 
     def bind(self, **extra: Any) -> "TraceContext":
         return self.child(**extra)
@@ -127,8 +132,11 @@ class TraceContext:
 
         child_rid = _make_id("r")
         payload = dict(self._static)
+        payload.update(fields)
         payload["rid"] = child_rid
-        span_ctx = TraceContext(cid=self.cid, rid=child_rid, **payload)
+        payload.pop("cid", None)
+        payload.pop("rid", None)
+        span_ctx = TraceContext(cid=self.cid, rid=child_rid, enabled=self._enabled, **payload)
         span_ctx.info(event, **fields)
         return span_ctx
 

@@ -8,11 +8,13 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, date, time as dtime, timedelta, timezone
 from typing import (
+    Any,
     Callable,
     DefaultDict,
     Dict,
     Iterable,
     List,
+    Mapping,
     Optional,
     Sequence,
     Tuple,
@@ -375,3 +377,141 @@ def fetch_session_vwap_sync(symbol: str) -> Dict[str, object]:
     """Synchronous helper for VWAP calculations."""
 
     return asyncio.run(fetch_session_vwap(symbol))
+
+
+# ---------------------------------------------------------------------------
+# Incremental VWAP helpers for the strict three-day workflow
+# ---------------------------------------------------------------------------
+
+
+def _safe_int(value: Any) -> int | None:
+    try:
+        numeric = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return numeric
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        numeric = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric):
+        return None
+    return numeric
+
+
+def _sd_payload(center: float, sigma: float, order: int) -> Dict[str, float]:
+    span = float(order) * float(sigma)
+    return {"minus": center - span, "plus": center + span}
+
+
+@dataclass(slots=True)
+class VWAPWindowState:
+    """Incremental VWAP accumulator used by compact profile builders."""
+
+    start_ms: int
+    end_ms: int
+    total_volume: float = 0.0
+    total_price_volume: float = 0.0
+    total_price2_volume: float = 0.0
+    processed_bars: int = 0
+    last_timestamp: int | None = None
+
+    def ensure_bounds(self, *, start_ms: int, end_ms: int) -> None:
+        if self.start_ms != start_ms or self.end_ms != end_ms:
+            self.start_ms = start_ms
+            self.end_ms = end_ms
+            self.total_volume = 0.0
+            self.total_price_volume = 0.0
+            self.total_price2_volume = 0.0
+            self.processed_bars = 0
+            self.last_timestamp = None
+
+    def update(self, candles: Sequence[Mapping[str, Any]]) -> int:
+        if self.end_ms < self.start_ms:
+            return 0
+        new_bars = 0
+        last_ts = self.last_timestamp
+        for candle in candles:
+            if not isinstance(candle, Mapping):
+                continue
+            ts: int | None = None
+            for key in ("t", "time", "openTime", "timestamp"):
+                ts = _safe_int(candle.get(key))
+                if ts is not None:
+                    break
+            if ts is None or ts < self.start_ms or ts > self.end_ms:
+                continue
+            if last_ts is not None and ts <= last_ts:
+                continue
+            high = _safe_float(candle.get("h") or candle.get("high"))
+            low = _safe_float(candle.get("l") or candle.get("low"))
+            close = _safe_float(candle.get("c") or candle.get("close"))
+            if high is None or low is None or close is None:
+                last_ts = ts
+                continue
+            volume = _safe_float(candle.get("v") or candle.get("volume"))
+            if volume is None or volume <= 0.0:
+                last_ts = ts
+                continue
+            typical = (high + low + close) / 3.0
+            self.total_volume += volume
+            self.total_price_volume += typical * volume
+            self.total_price2_volume += typical * typical * volume
+            self.processed_bars += 1
+            last_ts = ts
+            new_bars += 1
+        if last_ts is not None:
+            self.last_timestamp = last_ts
+        return new_bars
+
+    def compute(self) -> Tuple[float, float, int, float]:
+        if self.total_volume <= 0.0:
+            return 0.0, 0.0, self.processed_bars, 0.0
+        center = self.total_price_volume / self.total_volume
+        if self.processed_bars < 2:
+            sigma = 0.0
+        else:
+            variance = max(
+                self.total_price2_volume / self.total_volume - center * center,
+                0.0,
+            )
+            sigma = math.sqrt(variance)
+        return center, sigma, self.processed_bars, self.total_volume
+
+
+def compute_compact_vwap(
+    candles: Sequence[Mapping[str, Any]],
+    *,
+    start_ms: int,
+    end_ms: int,
+    basis: str = "window",
+    state: VWAPWindowState | None = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any], VWAPWindowState, int]:
+    """Return compact VWAP metrics and sigma levels for a fixed window.
+
+    The function updates (or creates) :class:`VWAPWindowState` so the caller can
+    reuse the state across repeated executions when only new candles were
+    appended. The returned payload intentionally mirrors the compact.v1
+    structure expected by the three-day pipeline.
+    """
+
+    if state is None:
+        state = VWAPWindowState(start_ms=start_ms, end_ms=end_ms)
+    else:
+        state.ensure_bounds(start_ms=start_ms, end_ms=end_ms)
+
+    incremental = state.update(candles)
+    vwap_value, sigma_value, bars, volume = state.compute()
+    payload = {
+        "vwap": vwap_value,
+        "sd1": _sd_payload(vwap_value, sigma_value, 1),
+        "sd2": _sd_payload(vwap_value, sigma_value, 2),
+        "bars": bars,
+        "volume": volume,
+        "incremental_bars": incremental,
+    }
+    sigma_block = {"basis": basis, "sigma": _build_sigma_levels(vwap_value, sigma_value)}
+    return payload, sigma_block, state, incremental

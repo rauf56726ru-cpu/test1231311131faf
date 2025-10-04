@@ -1,7 +1,10 @@
 """Minimal FastAPI app that exposes OHLCV history for the chart."""
 from __future__ import annotations
 
+import json
 import logging
+import math
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
@@ -54,9 +57,12 @@ from ..services.book import fetch_orderbook
 from ..services.derivatives import fetch_derivatives
 from ..services.inspection import validate_enhanced_snapshot
 from ..services.liquidity import generate_liquidity_map
-from ..services.news import fetch_news
 from ..services.ohlcv import build_multi_tf_ohlcv, fetch_ohlcv as fetch_ohlcv_enhanced
-from ..services.orderflow import calculate_cvd, fetch_footprint
+from ..services.orderflow import (
+    calculate_cvd,
+    compute_orderflow_aggregates,
+    fetch_footprint,
+)
 from ..services.tracing import TraceContext
 from ..services.tpo import calculate_session_tpo, calculate_tpo
 from ..meta import Meta
@@ -127,7 +133,6 @@ class SnapshotIn(BaseModel):
     liquidity_map: Optional[Dict[str, Any]] = None
     derivatives: Optional[List[Dict[str, Any]]] = None
     book: Optional[Dict[str, Any]] = None
-    news_events: Optional[List[Dict[str, Any]]] = None
     meta: Optional[Dict[str, Any]] = None
     lookback_days: int = Field(7, ge=1, le=30)
 
@@ -209,22 +214,35 @@ def _build_fallback_multi(symbol: str, candles: Sequence[CandleIn]) -> Dict[str,
     return frames
 
 
-def _fallback_footprint(candles: Sequence[CandleIn]) -> List[Dict[str, object]]:
-    footprint: List[Dict[str, object]] = []
+def _fallback_footprint(candles: Sequence[CandleIn]) -> Dict[str, Any]:
+    per_bar: List[Dict[str, Any]] = []
     for candle in candles[-120:]:
+        ts = int(candle.t)
         bid = candle.v * 0.45
         ask = candle.v * 0.55
         delta = ask - bid
-        footprint.append({
-            "t": _to_iso(candle.t),
-            "price": candle.c,
-            "bid": bid,
-            "ask": ask,
-            "delta": delta,
-            "imbalance": ask / bid if bid else 0.0,
-            "absorption": abs(delta) > 100,
-        })
-    return footprint
+        imbalance = ask / bid if bid else (ask if ask else 0.0)
+        absorption = abs(delta) > 100
+        per_bar.append(
+            {
+                "ts": ts,
+                "t": _to_iso(ts),
+                "price": candle.c,
+                "bid": bid,
+                "ask": ask,
+                "delta": delta,
+                "imbalance": imbalance,
+                "absorption": absorption,
+                "absorption_high": absorption and delta < 0,
+                "absorption_low": absorption and delta > 0,
+                "imbalance_buy": ask > bid,
+                "imbalance_sell": bid > ask,
+                "large_trades_count": 0,
+            }
+        )
+
+    aggregates = compute_orderflow_aggregates(per_bar)
+    return {"per_bar": per_bar, "aggregates": aggregates}
 
 
 async def _run_summary_workflow(
@@ -405,23 +423,40 @@ async def _run_session_workflow(
     return result
 
 
-def _fallback_cvd(footprint: Sequence[Mapping[str, object]]) -> List[Dict[str, object]]:
+def _fallback_cvd(
+    footprint: Mapping[str, Any] | Sequence[Mapping[str, Any]]
+) -> Dict[str, Any]:
+    if isinstance(footprint, Mapping) and "per_bar" in footprint:
+        rows = [
+            row
+            for row in footprint.get("per_bar", [])
+            if isinstance(row, Mapping)
+        ]
+    else:
+        rows = [row for row in footprint if isinstance(row, Mapping)]
+
     cumulative_buy = 0.0
     cumulative_sell = 0.0
     series: List[Dict[str, object]] = []
-    for row in footprint:
+    for row in rows:
         delta = float(row.get("delta", 0.0))
-        if delta >= 0:
-            cumulative_buy += delta
-        else:
-            cumulative_sell += abs(delta)
-        series.append({
-            "t": row.get("t"),
-            "cvd_buy": cumulative_buy,
-            "cvd_sell": cumulative_sell,
-            "cvd_net": cumulative_buy - cumulative_sell,
-        })
-    return series
+        ask_volume = float(row.get("ask", row.get("ask_vol", 0.0)))
+        bid_volume = float(row.get("bid", row.get("bid_vol", 0.0)))
+        cumulative_buy += ask_volume if ask_volume else max(delta, 0.0)
+        cumulative_sell += bid_volume if bid_volume else max(-delta, 0.0)
+        series.append(
+            {
+                "t": row.get("t"),
+                "ts": row.get("ts"),
+                "cvd_buy": cumulative_buy,
+                "cvd_sell": cumulative_sell,
+                "cvd_net": cumulative_buy - cumulative_sell,
+                "delta": delta,
+            }
+        )
+
+    aggregates = compute_orderflow_aggregates(rows)
+    return {"per_bar": series, "aggregates": aggregates}
 
 
 def _fallback_derivatives(symbol: str, candles: Sequence[CandleIn]) -> List[Dict[str, object]]:
@@ -455,19 +490,6 @@ def _fallback_book(symbol: str, candle: CandleIn) -> Dict[str, object]:
         "imbalance": imbalance,
         "spoofing_flags": [],
     }
-
-
-def _fallback_news(symbol: str) -> List[Dict[str, object]]:
-    now = datetime.now(timezone.utc)
-    return [
-        {
-            "symbol": symbol,
-            "time_utc": _to_iso(int(now.timestamp() * 1000)),
-            "title": "System snapshot",
-            "impact": "low",
-            "tag": "mock",
-        }
-    ]
 
 
 def _coerce_candle_entry(row: Mapping[str, Any]) -> CandleIn:
@@ -774,6 +796,7 @@ def _prepare_summary_payload(
 
     cutoff_72h = max(0, window_end_ts - 72 * 3_600_000)
     cutoff_3h = max(0, window_end_ts - 180 * 60_000)
+    cutoff_2h = max(0, window_end_ts - 120 * 60_000)
 
     minute_72h = [c for c in minute_all if c["t"] >= cutoff_72h]
     minute_trimmed = [c for c in minute_all if c["t"] >= cutoff_3h][-180:]
@@ -787,8 +810,13 @@ def _prepare_summary_payload(
         return [c for c in series if c["t"] >= cutoff_72h]
 
     ohlcv_compact: Dict[str, Any] = {"1m_rollups": minute_trimmed}
-    for tf_key in ("15m", "1h", "4h", "1d"):
-        ohlcv_compact[tf_key] = _filter_timeframe(tf_key)
+    tf_windows = {
+        "15m": _filter_timeframe("15m"),
+        "1h": _filter_timeframe("1h"),
+        "4h": _filter_timeframe("4h"),
+        "1d": _filter_timeframe("1d"),
+    }
+    ohlcv_compact.update({"15m": tf_windows["15m"], "1h": tf_windows["1h"]})
 
     def _normalise_orderflow(series: Any) -> list[Dict[str, Any]]:
         result: list[Dict[str, Any]] = []
@@ -797,13 +825,20 @@ def _prepare_summary_payload(
         for item in series:
             if not isinstance(item, Mapping):
                 continue
-            try:
-                ts = int(item.get("t"))
-            except (TypeError, ValueError):
+            ts_value: int | None = None
+            for key in ("t", "ts", "timestamp", "time"):
+                raw_ts = item.get(key)
+                if raw_ts is None:
+                    continue
+                try:
+                    ts_value = int(raw_ts)
+                except (TypeError, ValueError):
+                    continue
+                else:
+                    break
+            if ts_value is None or ts_value < cutoff_2h:
                 continue
-            if ts < cutoff_3h:
-                continue
-            entry: Dict[str, Any] = {"t": ts}
+            entry: Dict[str, Any] = {"t": ts_value}
             for key in ("delta", "cvd", "cvd_net", "cvd_buy", "cvd_sell"):
                 value = _float_or_none(item.get(key))
                 if value is not None:
@@ -825,6 +860,22 @@ def _prepare_summary_payload(
             "cvd": last_entry.get("cvd") or last_entry.get("cvd_net"),
             "bars": len(per_bar_series),
         }
+        if per_bar_series and tf_key in ("1m", "15m", "1h"):
+            # Keep at most 120 chronological entries (two hours of data).
+            orderflow_per_bar[tf_key] = per_bar_series[-120:]
+        elif per_bar_series:
+            orderflow_per_bar[tf_key] = per_bar_series
+
+    orderflow_per_bar = {
+        key: series
+        for key, series in orderflow_per_bar.items()
+        if key in {"1m", "15m", "1h"} and series
+    }
+    delta_cvd_compact = {
+        key: value
+        for key, value in delta_cvd_compact.items()
+        if key in {"15m", "1h"}
+    }
 
     def _sd_block(source: Mapping[str, Any] | None, key: str) -> Dict[str, float | None]:
         if not isinstance(source, Mapping):
@@ -919,10 +970,10 @@ def _prepare_summary_payload(
     }
     actual_counts = {
         "1m": len(minute_72h),
-        "15m": len(ohlcv_compact.get("15m", [])),
-        "1h": len(ohlcv_compact.get("1h", [])),
-        "4h": len(ohlcv_compact.get("4h", [])),
-        "1d": len(ohlcv_compact.get("1d", [])),
+        "15m": len(tf_windows["15m"]),
+        "1h": len(tf_windows["1h"]),
+        "4h": len(tf_windows["4h"]),
+        "1d": len(tf_windows["1d"]),
     }
     coverage: list[Dict[str, Any]] = []
     for tf_key, expected in expected_counts.items():
@@ -1006,6 +1057,7 @@ def _prepare_summary_payload(
             "output.prepare_payload",
             status=status,
             json_bytes=timing.get("json_bytes"),
+            serialize_ms=timing.get("serialize_ms"),
         )
 
     return compact_payload
@@ -1049,16 +1101,20 @@ async def register_inspection_snapshot(payload: SnapshotIn) -> Dict[str, str]:
     orderflow_payload = payload.orderflow.dict() if payload.orderflow else {}
 
     try:
-        footprint = await fetch_footprint(symbol, 4)
+        footprint_snapshot = await fetch_footprint(symbol, 4)
     except Exception as exc:
         logging.getLogger(__name__).warning("Footprint fallback engaged: %s", exc)
-        footprint = _fallback_footprint(source_candles)
+        footprint_snapshot = _fallback_footprint(source_candles)
 
     try:
-        cvd_series = await calculate_cvd(symbol, 24)
+        cvd_snapshot = await calculate_cvd(
+            symbol,
+            24,
+            footprint_rows=footprint_snapshot,
+        )
     except Exception as exc:
         logging.getLogger(__name__).warning("CVD fallback engaged: %s", exc)
-        cvd_series = _fallback_cvd(footprint)
+        cvd_snapshot = _fallback_cvd(footprint_snapshot)
 
     try:
         liquidity_map = await generate_liquidity_map(base_candles, 5)
@@ -1086,14 +1142,23 @@ async def register_inspection_snapshot(payload: SnapshotIn) -> Dict[str, str]:
         last_candle = source_candles[-1] if source_candles else CandleIn(t=0, o=0, h=0, l=0, c=0, v=1)
         book_state = _fallback_book(symbol, last_candle)
 
-    try:
-        news_items = await fetch_news(symbol, 72)
-    except Exception as exc:
-        logging.getLogger(__name__).warning("News fallback engaged: %s", exc)
-        news_items = _fallback_news(symbol)
+    orderflow_payload["footprint"] = (
+        footprint_snapshot.get("per_bar", [])
+        if isinstance(footprint_snapshot, Mapping)
+        else footprint_snapshot
+    )
+    if isinstance(footprint_snapshot, Mapping):
+        orderflow_payload["footprint_aggregates"] = footprint_snapshot.get(
+            "aggregates", {}
+        )
 
-    orderflow_payload["footprint"] = footprint
-    orderflow_payload["cvd"] = cvd_series
+    orderflow_payload["cvd"] = (
+        cvd_snapshot.get("per_bar", [])
+        if isinstance(cvd_snapshot, Mapping)
+        else cvd_snapshot
+    )
+    if isinstance(cvd_snapshot, Mapping):
+        orderflow_payload["cvd_aggregates"] = cvd_snapshot.get("aggregates", {})
 
     snapshot = payload.dict(exclude_none=True)
     if not snapshot.get("candles") and source_candles:
@@ -1129,7 +1194,6 @@ async def register_inspection_snapshot(payload: SnapshotIn) -> Dict[str, str]:
     snapshot["liquidity_map"] = liquidity_map
     snapshot["derivatives"] = derivatives_rows
     snapshot["book"] = book_state
-    snapshot["news_events"] = news_items
 
     enrichment: Dict[str, Any] | None = None
     try:
@@ -1231,18 +1295,6 @@ async def book_endpoint(
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Failed to fetch orderbook: {exc}") from exc
     return JSONResponse(data)
-
-
-@app.get("/news_events")
-async def news_events_endpoint(
-    symbol: str = Query(...),
-    hours: int = Query(72, ge=1, le=168),
-) -> JSONResponse:
-    try:
-        events = await fetch_news(symbol, hours)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch news: {exc}") from exc
-    return JSONResponse({"symbol": symbol.upper(), "hours": hours, "events": events})
 
 
 @app.get("/shared-candles")
@@ -1368,7 +1420,7 @@ async def inspection(
                 logging.getLogger(__name__).warning("Inspection enrichment failed: %s", exc)
                 enrichment_payload = None
         data_section = payload.setdefault("DATA", {})
-        for key in ("ohlcv", "orderflow", "liquidity_map", "derivatives", "book", "news_events"):
+        for key in ("ohlcv", "orderflow", "liquidity_map", "derivatives", "book"):
             if key in enriched_snapshot and key not in data_section:
                 data_section[key] = enriched_snapshot[key]
         if enrichment_payload:

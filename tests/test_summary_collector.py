@@ -39,7 +39,7 @@ async def test_collect_recent_summary_fills_only_missing(monkeypatch):
 
     calls = []
 
-    async def fake_request(client, *, symbol, interval, start_ms, end_ms, limit, bucket):
+    async def fake_request(client, *, symbol, interval, start_ms, end_ms, limit, trace=None):
         calls.append((start_ms, end_ms, limit))
         cursor = start_ms
         rows = []
@@ -70,6 +70,16 @@ async def test_collect_recent_summary_fills_only_missing(monkeypatch):
     assert interval_summary.gaps_total == 1
     assert interval_summary.gaps_filled == 1
     assert interval_summary.remaining_gaps == []
+    assert interval_summary.expected_candles == 5
+    assert interval_summary.coverage_pct == pytest.approx(100.0)
+
+    summary_payload = result.as_dict()
+    coverage_entry = next(
+        item for item in summary_payload["coverage"] if item["tf"] == interval
+    )
+    assert coverage_entry["expected_candles"] == interval_summary.expected_candles
+    assert coverage_entry["coverage_pct"] == pytest.approx(100.0)
+    assert coverage_entry["missing_candles"] == 0
 
 
 async def test_collect_recent_summary_skips_when_complete(monkeypatch):
@@ -106,6 +116,8 @@ async def test_collect_recent_summary_skips_when_complete(monkeypatch):
     assert interval_summary.gaps_total == 0
     assert interval_summary.requests == 0
     assert interval_summary.remaining_gaps == []
+    assert interval_summary.expected_candles == 5
+    assert interval_summary.coverage_pct == pytest.approx(100.0)
 
 
 async def test_collect_recent_summary_ignores_open_tail(monkeypatch):
@@ -149,6 +161,7 @@ async def test_collect_recent_summary_ignores_open_tail(monkeypatch):
     assert interval_summary.gaps_total == 0
     assert interval_summary.requests == 0
     assert interval_summary.remaining_gaps == []
+    assert interval_summary.coverage_pct == pytest.approx(100.0)
 
 
 async def test_collect_recent_summary_reports_progress(monkeypatch):
@@ -162,7 +175,7 @@ async def test_collect_recent_summary_reports_progress(monkeypatch):
 
     events: list[str] = []
 
-    async def fake_request(client, *, symbol, interval, start_ms, end_ms, limit, bucket):
+    async def fake_request(client, *, symbol, interval, start_ms, end_ms, limit, trace=None):
         rows = []
         cursor = start_ms
         while cursor <= end_ms - interval_ms:

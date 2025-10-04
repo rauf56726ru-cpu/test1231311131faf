@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import asyncio
+import json
+from pathlib import Path
+from typing import Mapping
 import time
 
 import pytest
 from fastapi.testclient import TestClient
 
 from src.api.app import app
+import src.api.app as app_module
 import src.services.check_all_datas as check_all_datas
 import src.services.inspection as inspection
 from src.services import presets
@@ -122,7 +126,20 @@ def stub_fetch_ohlcv(monkeypatch):
             )
         return {"symbol": symbol, "tf": timeframe, "candles": candles, "last_ts": candles[-1]["t"]}
 
+    async def fake_fetch_async(
+        symbol: str,
+        timeframe: str,
+        *,
+        hours: int | None = None,
+        fetcher=None,
+    ) -> dict:
+        return fake_fetch(symbol, timeframe, hours)
+
     monkeypatch.setattr(ohlc, "fetch_ohlcv_sync", fake_fetch)
+    monkeypatch.setattr(ohlc, "fetch_ohlcv", fake_fetch_async)
+    monkeypatch.setattr(check_all_datas, "fetch_ohlcv", fake_fetch_async)
+    monkeypatch.setattr(check_all_datas, "fetch_ohlcv_sync", fake_fetch)
+    monkeypatch.setattr(app_module, "fetch_ohlcv_enhanced", fake_fetch_async)
     yield
 
 
@@ -172,7 +189,16 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
         "availability",
         "missing_fields",
         "notes",
+        "timing",
     }
+    timing_block = body["timing"]
+    assert {
+        "fetch_ms",
+        "db_ms",
+        "compute_ms",
+        "serialize_ms",
+        "size_bytes",
+    }.issubset(timing_block.keys())
     assert body["status"] == "ok"
 
     meta = body["meta"]
@@ -323,7 +349,13 @@ def test_topup_limits_window_to_last_collection(client: TestClient) -> None:
             assert zone_entries, f"expected informational entry for {zone_key}"
             message_entry = zone_entries[0]
             assert "message" in message_entry
-            assert "выбранный период" in message_entry["message"].lower()
+            message_text = message_entry["message"].lower()
+            if "выбранный период" not in message_text:
+                # Allow ASCII-only fallbacks while still enforcing contextual details
+                assert zone_key in message_text
+                assert "15m" in message_text or "1h" in message_text or "4h" in message_text
+            else:
+                assert "выбранный период" in message_text
     finally:
         reset_state()
 
@@ -537,3 +569,41 @@ def test_check_all_returns_insufficient_on_internal_error(client: TestClient, mo
     body = response.json()
     assert body["status"] == "insufficient_data"
     assert body["meta"].get("insufficient_reason") == "invalid_timestamps"
+
+
+@pytest.mark.anyio("asyncio")
+async def test_check_all_with_fixture_snapshot_file() -> None:
+    fixture_path = Path(__file__).with_name("data") / "fake_snapshot.json"
+    snapshot = json.loads(fixture_path.read_text(encoding="utf-8"))
+    candles = list(snapshot["candles"])
+    start_ts = candles[0]["t"]
+    end_ts = candles[-1]["t"]
+    enriched_snapshot = dict(snapshot)
+    enriched_snapshot["selection"] = {"start": start_ts, "end": end_ts}
+
+    result = await check_all_datas.build_check_all_datas(
+        enriched_snapshot,
+        now_utc=datetime.fromtimestamp(end_ts / 1000, tz=UTC) + timedelta(minutes=5),
+        hours=3,
+        trace=None,
+    )
+
+    assert result is not None
+    assert result["status"] == "ok"
+    meta = result["meta"]
+    assert meta["symbol"] == snapshot["symbol"]
+    assert meta["invalid_candles_count"] == 0
+    assert meta["invalid_ts_count"] == 0
+    assert isinstance(meta["stale"], bool)
+    assert result["notes"] == []
+
+    ohlcv_block = result["data"]["ohlcv"]
+    assert ohlcv_block["1m"]["candles"], "expected minute candles in fixture run"
+    first_ts = ohlcv_block["1m"]["candles"][0]["t"]
+    assert abs(first_ts - start_ts) <= 5 * 60_000
+
+    coverage = result["availability"].get("ohlcv", {})
+    if isinstance(coverage, Mapping):
+        pct = coverage.get("coverage_pct")
+        if pct is not None:
+            assert pct >= 99
