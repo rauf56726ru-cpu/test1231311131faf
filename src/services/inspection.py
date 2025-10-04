@@ -213,6 +213,172 @@ def ensure_higher_timeframes(
     return generated
 
 
+def _clone_candle_series(series: Any) -> List[Dict[str, Any]]:
+    """Return a shallow copy of candle mappings with consistent dict payloads."""
+
+    if not isinstance(series, Sequence):
+        return []
+    cloned: List[Dict[str, Any]] = []
+    for candle in series:
+        if isinstance(candle, Mapping):
+            cloned.append(dict(candle))
+    return cloned
+
+
+def _is_candle_closed(flag: Any) -> bool:
+    """Determine whether a candle should be considered closed for analysis."""
+
+    if isinstance(flag, bool):
+        return flag
+    if flag is None:
+        return True
+    if isinstance(flag, (int, float)):
+        return bool(flag)
+    if isinstance(flag, str):
+        token = flag.strip().lower()
+        if not token:
+            return True
+        if token in {"false", "0", "no", "open", "pending"}:
+            return False
+        return True
+    return True
+
+
+def _normalise_zone_frames_from_snapshot(
+    frames: Mapping[str, Any]
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Extract candle sequences from snapshot frame payloads."""
+
+    normalised: Dict[str, List[Dict[str, Any]]] = {}
+    for tf_key, payload in frames.items():
+        if not isinstance(tf_key, str):
+            continue
+        if isinstance(payload, Mapping):
+            series = payload.get("candles")
+        else:
+            series = payload
+        candles = _clone_candle_series(series)
+        if candles:
+            normalised[tf_key] = candles
+    return normalised
+
+
+def _select_zone_base_from_frames(
+    frames: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    preferred: str | None = None,
+) -> Tuple[str | None, List[Dict[str, Any]]]:
+    """Pick the most suitable timeframe series for zone anchoring."""
+
+    order: List[str] = []
+    seen: set[str] = set()
+    if isinstance(preferred, str) and preferred:
+        order.append(preferred)
+        seen.add(preferred)
+    for candidate in ("1m", "3m", "5m", "15m", "1h", "4h", "1d"):
+        if candidate not in seen:
+            order.append(candidate)
+            seen.add(candidate)
+    for tf_key in frames.keys():
+        if isinstance(tf_key, str) and tf_key not in seen:
+            order.append(tf_key)
+            seen.add(tf_key)
+
+    for tf_key in order:
+        series = frames.get(tf_key)
+        candles = _clone_candle_series(series)
+        if candles:
+            return tf_key, candles
+    return None, []
+
+
+def _compute_zone_window(
+    series: Sequence[Mapping[str, Any]],
+    tf_key: str | None,
+) -> Tuple[int | None, int | None]:
+    """Compute analysis window bounds based on the provided candle series."""
+
+    if not isinstance(series, Sequence) or not series:
+        return None, None
+    closed_series = [
+        candle for candle in series if _is_candle_closed(candle.get("closed"))
+    ]
+    effective = closed_series or [
+        candle for candle in series if isinstance(candle, Mapping)
+    ]
+    timestamps: List[int] = []
+    for candle in effective:
+        ts_raw = candle.get("t") if isinstance(candle, Mapping) else None
+        try:
+            ts_value = int(ts_raw)
+        except (TypeError, ValueError):
+            continue
+        timestamps.append(ts_value)
+    if not timestamps:
+        return None, None
+    start_ms = min(timestamps)
+    interval_ms = TIMEFRAME_TO_MS.get(tf_key, MINUTE_INTERVAL_MS) if isinstance(tf_key, str) else MINUTE_INTERVAL_MS
+    if not isinstance(interval_ms, int) or interval_ms <= 0:
+        interval_ms = MINUTE_INTERVAL_MS
+    close_adjust = max(interval_ms - MINUTE_INTERVAL_MS, 0)
+    last_open = max(timestamps)
+    end_ms = last_open + close_adjust
+    start_aligned = max(0, _align_to_interval(start_ms, MINUTE_INTERVAL_MS))
+    end_aligned = max(start_aligned, _align_to_interval(end_ms, MINUTE_INTERVAL_MS))
+    return start_aligned, end_aligned
+
+
+def _build_zone_frames_for_detection(
+    frames: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    window_start_ms: int | None,
+    window_end_ms: int | None,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Filter multi-timeframe candles for zone detection."""
+
+    prepared: Dict[str, List[Dict[str, Any]]] = {}
+    for tf_key, series in frames.items():
+        if not isinstance(tf_key, str):
+            continue
+        candles = _clone_candle_series(series)
+        if not candles:
+            continue
+        interval_ms = TIMEFRAME_TO_MS.get(tf_key, MINUTE_INTERVAL_MS)
+        if not isinstance(interval_ms, int) or interval_ms <= 0:
+            interval_ms = MINUTE_INTERVAL_MS
+        filtered: List[Dict[str, Any]] = []
+        for candle in candles:
+            if not _is_candle_closed(candle.get("closed")):
+                continue
+            ts_raw = candle.get("t")
+            try:
+                open_ts = int(ts_raw)
+            except (TypeError, ValueError):
+                continue
+            close_ts = open_ts + max(interval_ms - MINUTE_INTERVAL_MS, 0)
+            if window_start_ms is not None and close_ts < window_start_ms:
+                continue
+            if window_end_ms is not None and close_ts > window_end_ms:
+                continue
+            filtered.append(candle)
+        if not filtered:
+            for candle in candles:
+                ts_raw = candle.get("t")
+                try:
+                    open_ts = int(ts_raw)
+                except (TypeError, ValueError):
+                    continue
+                close_ts = open_ts + max(interval_ms - MINUTE_INTERVAL_MS, 0)
+                if window_start_ms is not None and close_ts < window_start_ms:
+                    continue
+                if window_end_ms is not None and close_ts > window_end_ms:
+                    continue
+                filtered.append(candle)
+        if filtered:
+            prepared[tf_key] = filtered
+    return prepared
+
+
 def _expected_minute_sequence(start_ms: int, end_ms: int) -> List[int]:
     if end_ms < start_ms:
         return []
@@ -1282,14 +1448,37 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
     raw_profile_defaults = profile_config.get("raw_defaults")
     preset_payload = profile_config.get("preset_payload")
     preset_required = profile_config.get("preset_required", False)
-    target_tf_key = profile_config.get("target_tf_key", "1m")
+    target_tf_preference = str(profile_config.get("target_tf_key") or "1m")
 
-    base_candles = normalised_frames.get(target_tf_key, {}).get("candles", [])
+    normalised_candles_by_tf: Dict[str, List[Dict[str, Any]]] = {}
+    for tf_key, payload in normalised_frames.items():
+        series = payload.get("candles") if isinstance(payload, Mapping) else None
+        candles = _clone_candle_series(series)
+        if candles:
+            normalised_candles_by_tf[tf_key] = candles
+
+    zone_source_frames: Dict[str, List[Dict[str, Any]]] = {}
+    for tf_key, series in full_candles_by_tf.items():
+        candles = _clone_candle_series(series)
+        if candles:
+            zone_source_frames[tf_key] = candles
+    for tf_key, series in normalised_candles_by_tf.items():
+        zone_source_frames.setdefault(tf_key, list(series))
+
+    profile_tf_key, base_candles = _select_zone_base_from_frames(
+        normalised_candles_by_tf,
+        preferred=target_tf_preference,
+    )
     if not base_candles:
-        base_candles = normalised_frames.get("1m", {}).get("candles", [])
-    if not base_candles and normalised_frames:
-        first_key = next(iter(normalised_frames))
-        base_candles = normalised_frames[first_key].get("candles", [])
+        profile_tf_key, base_candles = _select_zone_base_from_frames(
+            zone_source_frames,
+            preferred=target_tf_preference,
+        )
+    if not profile_tf_key:
+        profile_tf_key = target_tf_preference
+    target_tf_key = profile_tf_key
+    if base_candles and profile_tf_key in normalised_candles_by_tf:
+        base_candles = normalised_candles_by_tf[profile_tf_key]
 
     session_vwap = compute_session_vwaps(symbol, base_candles)
 
@@ -1325,11 +1514,19 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
         closed_candles = [
             candle
             for candle in base_candles
-            if bool(candle.get("closed", True))
+            if _is_candle_closed(candle.get("closed"))
         ]
         profile_candles = closed_candles or list(base_candles)
 
     profile_ready = bool(profile_candles)
+
+    base_series_for_window: Sequence[Mapping[str, Any]] = zone_source_frames.get(target_tf_key, [])
+    if not base_series_for_window and base_candles:
+        base_series_for_window = base_candles
+    zones_window_start_ms, window_end_ms_prev_closed = _compute_zone_window(
+        list(base_series_for_window),
+        target_tf_key,
+    )
 
     if preset and profile_candles and sessions:
         cache_token = (
@@ -1380,12 +1577,26 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
             }
             profile_ready = False
 
-    if profile_ready and profile_candles:
+    zone_cfg = ZonesConfig(tick_size=tick_size_value)
+    zone_cfg.zones_window_start_ms = zones_window_start_ms
+    zone_cfg.window_end_ms_prev_closed = window_end_ms_prev_closed
+
+    zone_frames = _build_zone_frames_for_detection(
+        zone_source_frames,
+        window_start_ms=zones_window_start_ms,
+        window_end_ms=window_end_ms_prev_closed,
+    )
+    if target_tf_key not in zone_frames and base_candles:
+        fallback_frames = _build_zone_frames_for_detection(
+            {target_tf_key: base_candles},
+            window_start_ms=zones_window_start_ms,
+            window_end_ms=window_end_ms_prev_closed,
+        )
+        if fallback_frames.get(target_tf_key):
+            zone_frames[target_tf_key] = fallback_frames[target_tf_key]
+
+    if zone_frames:
         try:
-            zone_cfg = ZonesConfig(tick_size=tick_size_value)
-            zone_frames: Dict[str, Sequence[Mapping[str, Any]]] = {
-                target_tf_key: profile_candles
-            }
             detected_zones = detect_zones(
                 frames=zone_frames,
                 config=zone_cfg,
@@ -1412,6 +1623,7 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
                 },
                 "meta": {},
             }
+            profile_ready = False
 
     raw_meta = snapshot.get("meta") if isinstance(snapshot.get("meta"), Mapping) else {}
     liquidity_config = raw_meta.get("liquidity") if isinstance(raw_meta, Mapping) else None

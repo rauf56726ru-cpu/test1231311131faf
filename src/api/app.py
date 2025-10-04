@@ -56,7 +56,13 @@ from ..services.progress import ProgressReporter, emit_progress
 
 from ..services.book import fetch_orderbook
 from ..services.derivatives import fetch_derivatives
-from ..services.inspection import validate_enhanced_snapshot
+from ..services.inspection import (
+    _build_zone_frames_for_detection,
+    _compute_zone_window,
+    _normalise_zone_frames_from_snapshot,
+    _select_zone_base_from_frames,
+    validate_enhanced_snapshot,
+)
 from ..services.liquidity import generate_liquidity_map
 from ..services.ohlcv import build_multi_tf_ohlcv, fetch_ohlcv as fetch_ohlcv_enhanced
 from ..services.orderflow import (
@@ -1879,8 +1885,50 @@ async def inspection_analyze(request: AnalysisRequest) -> JSONResponse:
         return JSONResponse({"snapshot_id": snapshot_id, "tpo": {"daily": tpo_daily.get("days", []), "sessions": session_data}})
 
     if request.analysis_type == "zones":
-        zone_frames = {timeframe: candles_list}
-        zones = detect_zones(frames=zone_frames, config=ZonesConfig()) if candles_list else {"zones": {}}
+        frames_map = snapshot.get("frames") if isinstance(snapshot.get("frames"), Mapping) else {}
+        zone_source_frames: Dict[str, List[Dict[str, Any]]] = {}
+        if isinstance(frames_map, Mapping):
+            zone_source_frames.update(_normalise_zone_frames_from_snapshot(frames_map))
+        ohlcv_section = snapshot.get("ohlcv") if isinstance(snapshot.get("ohlcv"), Mapping) else {}
+        if isinstance(ohlcv_section, Mapping):
+            for tf_key, series in _normalise_zone_frames_from_snapshot(ohlcv_section).items():
+                zone_source_frames.setdefault(tf_key, series)
+        analysis_candles = [
+            dict(item) for item in candles_list if isinstance(item, Mapping)
+        ]
+        if analysis_candles:
+            zone_source_frames[timeframe] = analysis_candles
+        if not zone_source_frames:
+            return JSONResponse({"snapshot_id": snapshot_id, "zones": {"zones": {}}})
+        base_tf_key, base_series = _select_zone_base_from_frames(
+            zone_source_frames,
+            preferred=timeframe,
+        )
+        if not base_series and analysis_candles:
+            base_series = analysis_candles
+        if not base_tf_key:
+            base_tf_key = timeframe
+        zones_window_start_ms, window_end_ms_prev_closed = _compute_zone_window(
+            base_series,
+            base_tf_key,
+        )
+        zone_cfg = ZonesConfig()
+        zone_cfg.zones_window_start_ms = zones_window_start_ms
+        zone_cfg.window_end_ms_prev_closed = window_end_ms_prev_closed
+        zone_frames = _build_zone_frames_for_detection(
+            zone_source_frames,
+            window_start_ms=zones_window_start_ms,
+            window_end_ms=window_end_ms_prev_closed,
+        )
+        if base_tf_key and base_tf_key not in zone_frames and base_series:
+            fallback_frames = _build_zone_frames_for_detection(
+                {base_tf_key: base_series},
+                window_start_ms=zones_window_start_ms,
+                window_end_ms=window_end_ms_prev_closed,
+            )
+            if fallback_frames.get(base_tf_key):
+                zone_frames[base_tf_key] = fallback_frames[base_tf_key]
+        zones = detect_zones(frames=zone_frames, config=zone_cfg) if zone_frames else {"zones": {}}
         return JSONResponse({"snapshot_id": snapshot_id, "zones": zones})
 
     if request.analysis_type == "liquidity":
