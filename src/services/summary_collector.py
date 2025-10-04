@@ -26,13 +26,13 @@ UTC = timezone.utc
 
 BINANCE_ENDPOINT = "https://fapi.binance.com/fapi/v1/klines"
 MAX_PAGE_LIMIT = 1000
-DEFAULT_TOKEN_RATE = 75.0  # tokens per second
-DEFAULT_TOKEN_BURST = 150
+DEFAULT_TOKEN_RATE = 80.0  # tokens per second
+DEFAULT_TOKEN_BURST = 160
 RATE_DELAY_MIN = 0.020
 RATE_DELAY_MAX = 0.040
 BACKOFF_BASE_MS = 0.2
 BACKOFF_MAX_MS = 1.6
-MAX_CONCURRENCY = 3
+MAX_CONCURRENCY = 4
 MERGE_GAP_JOIN_MS = 15 * 60_000
 BULK_UPSERT_CHUNK = 750
 
@@ -134,7 +134,7 @@ async def _request_klines(
         except httpx.RequestError as exc:  # pragma: no cover - network failure
             if trace is not None:
                 trace.warn(
-                    "fetch.retry",
+                    "retry",
                     symbol=symbol,
                     interval=interval,
                     start_ms=start_ms,
@@ -165,7 +165,7 @@ async def _request_klines(
         if response.status_code >= 500:
             if trace is not None:
                 trace.warn(
-                    "fetch.retry",
+                    "retry",
                     symbol=symbol,
                     interval=interval,
                     status=response.status_code,
@@ -877,6 +877,12 @@ async def collect_recent_summary(
                     merged=len(merged_gaps),
                     first_expected=first_expected,
                     last_closed=last_closed,
+                )
+                trace_ctx.info(
+                    "gaps.merged",
+                    interval=interval,
+                    total=len(gaps),
+                    merged=len(merged_gaps),
                 )
 
             if interval == "1m":
