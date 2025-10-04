@@ -5,7 +5,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
-from typing import List, Mapping, Sequence
+from typing import Dict, List, Mapping, Sequence
 
 from .ohlc_sanitizer import sanitize_candles
 
@@ -110,6 +110,43 @@ class CandleRepository:
                 (symbol.upper(), interval.lower(), start_ms, end_ms),
             ).fetchall()
         return [int(row["open_ms"]) for row in rows]
+
+    def fetch_candles(
+        self,
+        symbol: str,
+        interval: str,
+        start_ms: int,
+        end_ms: int,
+    ) -> List[Dict[str, float | int]]:
+        """Return normalised candles for the requested window."""
+
+        self._ensure_schema()
+        query = """
+            SELECT open_ms, open, high, low, close, volume
+            FROM candles
+            WHERE symbol = ? AND interval = ?
+              AND open_ms BETWEEN ? AND ?
+            ORDER BY open_ms ASC
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                query,
+                (symbol.upper(), interval.lower(), start_ms, end_ms),
+            ).fetchall()
+
+        candles: List[Dict[str, float | int]] = []
+        for row in rows:
+            candles.append(
+                {
+                    "t": int(row["open_ms"]),
+                    "o": float(row["open"]),
+                    "h": float(row["high"]),
+                    "l": float(row["low"]),
+                    "c": float(row["close"]),
+                    "v": float(row["volume"]),
+                }
+            )
+        return candles
 
     def upsert_candles(
         self,

@@ -12,9 +12,10 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 import httpx
 
 from . import tracing
+from .tracing import TraceContext
 from .candles_repository import CandleRepository, UpsertStats, get_repository
 from .ohlc_sanitizer import sanitize_candles
-from .ohlc import TIMEFRAME_TO_MS
+from .ohlc import TIMEFRAME_TO_MS, resample_ohlcv
 from .timeutils import ensure_ms_epoch
 from .check_all_datas import _normalise_binance_row
 from .progress import ProgressReporter, emit_progress
@@ -25,12 +26,15 @@ UTC = timezone.utc
 
 BINANCE_ENDPOINT = "https://fapi.binance.com/fapi/v1/klines"
 MAX_PAGE_LIMIT = 1000
-DEFAULT_TOKEN_RATE = 30.0  # tokens per second
-DEFAULT_TOKEN_BURST = 30
+DEFAULT_TOKEN_RATE = 75.0  # tokens per second
+DEFAULT_TOKEN_BURST = 150
 RATE_DELAY_MIN = 0.020
 RATE_DELAY_MAX = 0.040
 BACKOFF_BASE_MS = 0.2
 BACKOFF_MAX_MS = 1.6
+MAX_CONCURRENCY = 3
+MERGE_GAP_JOIN_MS = 15 * 60_000
+BULK_UPSERT_CHUNK = 750
 
 
 class GapCollectionError(RuntimeError):
@@ -113,6 +117,7 @@ async def _request_klines(
     end_ms: int,
     limit: int,
     bucket: _TokenBucket,
+    trace: TraceContext | None = None,
 ) -> List[Sequence[Any]]:
     params = {
         "symbol": symbol.upper(),
@@ -127,6 +132,16 @@ async def _request_klines(
         try:
             response = await client.get(BINANCE_ENDPOINT, params=params)
         except httpx.RequestError as exc:  # pragma: no cover - network failure
+            if trace is not None:
+                trace.warn(
+                    "fetch.retry",
+                    symbol=symbol,
+                    interval=interval,
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    attempt=attempt + 1,
+                    reason="request_error",
+                )
             if attempt >= 5:
                 raise GapCollectionError(f"Request failure: {exc}") from exc
             await asyncio.sleep(backoff + random.uniform(0, backoff))
@@ -134,11 +149,28 @@ async def _request_klines(
             continue
 
         if response.status_code in {418, 429}:
+            if trace is not None:
+                trace.warn(
+                    "rate_limited",
+                    symbol=symbol,
+                    interval=interval,
+                    status=response.status_code,
+                    attempt=attempt + 1,
+                    delay_ms=int((backoff + random.uniform(0, backoff)) * 1000),
+                )
             await asyncio.sleep(backoff + random.uniform(0, backoff))
             backoff = min(backoff * 2, BACKOFF_MAX_MS)
             continue
 
         if response.status_code >= 500:
+            if trace is not None:
+                trace.warn(
+                    "fetch.retry",
+                    symbol=symbol,
+                    interval=interval,
+                    status=response.status_code,
+                    attempt=attempt + 1,
+                )
             if attempt >= 5:
                 raise GapCollectionError(f"Binance error {response.status_code}")
             await asyncio.sleep(backoff + random.uniform(0, backoff))
@@ -151,6 +183,16 @@ async def _request_klines(
             return []
         await asyncio.sleep(random.uniform(RATE_DELAY_MIN, RATE_DELAY_MAX))
         return payload  # type: ignore[return-value]
+
+    if trace is not None:
+        trace.error(
+            "fetch.failed",
+            symbol=symbol,
+            interval=interval,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            attempts=6,
+        )
     return []
 
 
@@ -189,6 +231,39 @@ def _compute_gaps(
     return gaps
 
 
+def _gap_count(start_ms: int, end_ms: int, interval_ms: int) -> int:
+    if end_ms < start_ms:
+        return 0
+    return int((end_ms - start_ms) // interval_ms + 1)
+
+
+def _merge_adjacent_gaps(
+    gaps: Sequence[Dict[str, int]],
+    *,
+    interval_ms: int,
+) -> List[Dict[str, int]]:
+    if not gaps:
+        return []
+    merged: List[Dict[str, int]] = []
+    current = dict(gaps[0])
+    for gap in gaps[1:]:
+        next_start = int(gap.get("from", 0))
+        current_end = int(current.get("to", next_start))
+        separation = max(0, next_start - (current_end + interval_ms))
+        if separation <= MERGE_GAP_JOIN_MS:
+            current["to"] = max(current_end, int(gap.get("to", current_end)))
+            current["count"] = _gap_count(int(current.get("from", next_start)), int(current["to"]), interval_ms)
+        else:
+            current.setdefault("count", _gap_count(int(current.get("from", next_start)), current_end, interval_ms))
+            merged.append(current)
+            current = dict(gap)
+    current_start = int(current.get("from", 0))
+    current_end = int(current.get("to", current_start))
+    current["count"] = _gap_count(current_start, current_end, interval_ms)
+    merged.append(current)
+    return merged
+
+
 async def _upsert_sanitised(
     repository: CandleRepository,
     *,
@@ -196,10 +271,17 @@ async def _upsert_sanitised(
     interval: str,
     candles: Sequence[Mapping[str, Any]],
     stage: str,
+    trace: TraceContext | None = None,
+    chunk_size: int = BULK_UPSERT_CHUNK,
 ) -> tuple[UpsertStats, List[Dict[str, Any]]]:
     if not candles:
         return UpsertStats(written=0, dropped_ts=0, dropped_ohlc=0), []
+
     sanitised = sanitize_candles(candles, stage=stage)
+    invalid_ts = getattr(sanitised, "invalid_ts", 0)
+    invalid_ohlc = getattr(sanitised, "invalid_ohlc", 0)
+    payload = sanitised.candles
+
     TRACE_LOGGER.debug(
         "summary_collector:upsert_sanitised",
         extra={
@@ -207,19 +289,47 @@ async def _upsert_sanitised(
             "interval": interval,
             "stage": stage,
             "incoming": len(candles),
-            "sanitised": len(sanitised.candles),
-            "dropped_ts": getattr(sanitised, "invalid_ts", 0),
-            "dropped_ohlc": getattr(sanitised, "invalid_ohlc", 0),
+            "sanitised": len(payload),
+            "dropped_ts": invalid_ts,
+            "dropped_ohlc": invalid_ohlc,
         },
     )
-    stats = await asyncio.to_thread(
-        repository.upsert_candles,
-        symbol,
-        interval,
-        sanitised.candles,
-        stage=stage,
-    )
-    return stats, sanitised.candles
+
+    if not payload:
+        return UpsertStats(written=0, dropped_ts=invalid_ts, dropped_ohlc=invalid_ohlc), []
+
+    total_written = 0
+    total_ts = invalid_ts
+    total_ohlc = invalid_ohlc
+    stored: List[Dict[str, Any]] = []
+    chunk_limit = max(1, int(chunk_size))
+
+    for index in range(0, len(payload), chunk_limit):
+        chunk = payload[index : index + chunk_limit]
+        stats = await asyncio.to_thread(
+            repository.upsert_candles,
+            symbol,
+            interval,
+            chunk,
+            stage=stage,
+        )
+        total_written += stats.written
+        total_ts += stats.dropped_ts
+        total_ohlc += stats.dropped_ohlc
+        stored.extend(chunk)
+        if trace is not None:
+            trace.info(
+                "db.bulk_upsert",
+                symbol=symbol,
+                interval=interval,
+                stage=stage,
+                chunk=len(chunk),
+                written=stats.written,
+                dropped_ts=stats.dropped_ts,
+                dropped_ohlc=stats.dropped_ohlc,
+            )
+
+    return UpsertStats(written=total_written, dropped_ts=total_ts, dropped_ohlc=total_ohlc), stored
 
 
 async def _fetch_existing(
@@ -239,6 +349,23 @@ async def _fetch_existing(
     )
 
 
+async def _fetch_candle_range(
+    repository: CandleRepository,
+    *,
+    symbol: str,
+    interval: str,
+    start_ms: int,
+    end_ms: int,
+) -> List[Dict[str, Any]]:
+    return await asyncio.to_thread(
+        repository.fetch_candles,
+        symbol,
+        interval,
+        start_ms,
+        end_ms,
+    )
+
+
 async def _fill_gap(
     repository: CandleRepository,
     *,
@@ -249,6 +376,7 @@ async def _fill_gap(
     client: httpx.AsyncClient,
     bucket: _TokenBucket,
     progress: Optional[ProgressReporter] = None,
+    trace: TraceContext | None = None,
 ) -> IntervalSummary:
     gap_start = int(gap["from"])
     gap_end = int(gap["to"])
@@ -270,6 +398,17 @@ async def _fill_gap(
     dropped_ohlc = 0
     requests = 0
 
+    if trace is not None:
+        trace.info(
+            "fetch.gap_begin",
+            symbol=symbol,
+            interval=interval,
+            gap_from=gap_start,
+            gap_to=gap_end,
+            resume_from=resume_from,
+            expected=int(gap.get("count", 0)),
+        )
+
     await emit_progress(
         progress,
         "summary_collector:gap_begin",
@@ -287,6 +426,18 @@ async def _fill_gap(
         # still respecting the hard 1000 candle ceiling enforced by the REST API.
         approx_bars = max(1, ((page_end - cursor) // interval_ms) + 1)
         page_limit = min(MAX_PAGE_LIMIT, max(approx_bars, 50))
+        if trace is not None:
+            trace.debug(
+                "fetch.batch_start",
+                symbol=symbol,
+                interval=interval,
+                gap_from=gap_start,
+                gap_to=gap_end,
+                cursor=cursor,
+                page_end=page_end,
+                limit=page_limit,
+                request_index=requests + 1,
+            )
         raw_rows = await _request_klines(
             client,
             symbol=symbol,
@@ -295,9 +446,31 @@ async def _fill_gap(
             end_ms=page_end + interval_ms,
             limit=page_limit,
             bucket=bucket,
+            trace=trace,
         )
         requests += 1
+        if trace is not None:
+            trace.info(
+                "fetch.batch_done",
+                symbol=symbol,
+                interval=interval,
+                gap_from=gap_start,
+                gap_to=gap_end,
+                cursor=cursor,
+                page_end=page_end,
+                rows=len(raw_rows),
+            )
         if not raw_rows:
+            if trace is not None:
+                trace.debug(
+                    "fetch.batch_empty",
+                    symbol=symbol,
+                    interval=interval,
+                    gap_from=gap_start,
+                    gap_to=gap_end,
+                    cursor=cursor,
+                    page_end=page_end,
+                )
             cursor += page_span
             continue
 
@@ -347,6 +520,15 @@ async def _fill_gap(
         for candle in normalised:
             dedup[int(candle["t"])] = candle
         normalised = [dedup[key] for key in sorted(dedup.keys())]
+        if trace is not None:
+            trace.debug(
+                "fetch.batch_normalised",
+                symbol=symbol,
+                interval=interval,
+                gap_from=gap_start,
+                gap_to=gap_end,
+                deduped_rows=len(normalised),
+            )
         TRACE_LOGGER.debug(
             "summary_collector:deduplicated_batch",
             extra={
@@ -372,6 +554,7 @@ async def _fill_gap(
             interval=interval,
             candles=normalised,
             stage=f"summary_fetch.{interval}",
+            trace=trace,
         )
         written += stats.written
         dropped_ts += stats.dropped_ts
@@ -410,6 +593,15 @@ async def _fill_gap(
             last_open,
         )
         cursor = last_open + interval_ms
+        if trace is not None:
+            trace.debug(
+                "fetch.progress_updated",
+                symbol=symbol,
+                interval=interval,
+                gap_from=gap_start,
+                gap_to=gap_end,
+                last_open=last_open,
+            )
 
         TRACE_LOGGER.debug(
             "summary_collector:gap_progress_updated",
@@ -430,6 +622,18 @@ async def _fill_gap(
         )
 
     await asyncio.to_thread(repository.clear_gap_progress, symbol, interval, gap_start)
+    if trace is not None:
+        trace.info(
+            "fetch.gap_complete",
+            symbol=symbol,
+            interval=interval,
+            gap_from=gap_start,
+            gap_to=gap_end,
+            written=written,
+            dropped_ts=dropped_ts,
+            dropped_ohlc=dropped_ohlc,
+            requests=requests,
+        )
 
     TRACE_LOGGER.debug(
         "summary_collector:gap_completed",
@@ -476,6 +680,7 @@ async def collect_recent_summary(
     repository: Optional[CandleRepository] = None,
     start_ms: Optional[int] = None,
     progress: Optional[ProgressReporter] = None,
+    trace: TraceContext | None = None,
 ) -> CollectionSummary:
     """Ensure recent OHLC coverage exists for the requested symbol."""
 
@@ -492,6 +697,15 @@ async def collect_recent_summary(
         start_ms = max(0, now_ms - span_days * 86_400_000)
     if start_ms > now_ms:
         start_ms = now_ms
+
+    trace_ctx = trace.child(component="summary_collector", symbol=symbol.upper()) if trace else None
+    if trace_ctx is not None:
+        trace_ctx.info(
+            "collector.start",
+            start_ms=start_ms,
+            end_ms=now_ms,
+            days=span_days,
+        )
 
     TRACE_LOGGER.debug(
         "summary_collector:start",
@@ -511,29 +725,54 @@ async def collect_recent_summary(
         days=span_days,
     )
 
-    target_intervals = list(intervals or TIMEFRAME_TO_MS.keys())
+    requested_intervals = list(intervals or TIMEFRAME_TO_MS.keys())
+    seen_intervals: set[str] = set()
+    target_intervals: List[str] = []
+    for interval in requested_intervals:
+        if interval in seen_intervals:
+            continue
+        seen_intervals.add(interval)
+        target_intervals.append(interval)
+    if "1m" in seen_intervals:
+        target_intervals = ["1m"] + [tf for tf in target_intervals if tf != "1m"]
+    elif intervals is None:
+        target_intervals.insert(0, "1m")
+
+    aligned_starts: List[int] = []
+    for interval in target_intervals:
+        interval_ms = TIMEFRAME_TO_MS.get(interval)
+        if interval_ms is None:
+            continue
+        aligned_starts.append(_align_to_interval(start_ms, interval_ms))
+    base_start_ms = min(aligned_starts) if aligned_starts else start_ms
+
     summaries: Dict[str, IntervalSummary] = {}
     total_requests = 0
     total_written = 0
     total_dropped = 0
 
     bucket = _TokenBucket(DEFAULT_TOKEN_RATE, DEFAULT_TOKEN_BURST)
-    async with httpx.AsyncClient(timeout=httpx.Timeout(6.0, connect=3.0)) as client:
+
+    minute_first_expected: Optional[int] = None
+    minute_last_closed: Optional[int] = None
+    minute_series: Optional[List[Dict[str, Any]]] = None
+
+    pending: List[Dict[str, Any]] = []
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(25.0, connect=10.0)) as client:
         for interval in target_intervals:
             interval_ms = TIMEFRAME_TO_MS.get(interval)
             if not interval_ms:
                 continue
-            first_expected = _align_to_interval(start_ms, interval_ms)
+
+            first_expected = _align_to_interval(base_start_ms, interval_ms)
             last_expected = _align_to_interval(now_ms, interval_ms)
             if end_ms is None:
-                # Live invocations should not expect the still-forming candle at the
-                # window tail.  Skipping that bar prevents an endless loop where
-                # the collector keeps re-requesting the most recent minute even
-                # though the exchange has not closed it yet.
                 tail_open = now_ms - last_expected < interval_ms
                 last_closed = last_expected - interval_ms if tail_open else last_expected
             else:
                 last_closed = last_expected
+
             if last_closed < first_expected:
                 summaries[interval] = IntervalSummary(
                     gaps_total=0,
@@ -560,7 +799,15 @@ async def collect_recent_summary(
                     first_expected=first_expected,
                     last_closed=last_closed,
                 )
+                if trace_ctx is not None:
+                    trace_ctx.debug(
+                        "interval.skipped",
+                        interval=interval,
+                        first_expected=first_expected,
+                        last_closed=last_closed,
+                    )
                 continue
+
             existing = await _fetch_existing(
                 repo,
                 symbol=symbol,
@@ -587,7 +834,18 @@ async def collect_recent_summary(
                 last_closed=last_closed,
                 existing=len(existing),
             )
+            if trace_ctx is not None:
+                trace_ctx.debug(
+                    "availability.checked",
+                    interval=interval,
+                    first_expected=first_expected,
+                    last_closed=last_closed,
+                    existing=len(existing),
+                )
+
             gaps = _compute_gaps(first_expected, last_closed, interval_ms, existing)
+            merged_gaps = _merge_adjacent_gaps(gaps, interval_ms=interval_ms)
+
             TRACE_LOGGER.debug(
                 "summary_collector:computed_gaps",
                 extra={
@@ -607,102 +865,242 @@ async def collect_recent_summary(
                 first_expected=first_expected,
                 last_closed=last_closed,
             )
-            if not gaps:
-                summaries[interval] = IntervalSummary(
-                    gaps_total=0,
-                    gaps_filled=0,
-                    candles_written=0,
-                    dropped_candles=0,
-                    requests=0,
-                    remaining_gaps=[],
-                )
-                await emit_progress(
-                    progress,
-                    "summary_collector:interval_complete",
-                    symbol=symbol,
+            if trace_ctx is not None:
+                trace_ctx.info(
+                    "gaps.detected",
                     interval=interval,
+                    total=len(gaps),
+                    merged=len(merged_gaps),
                     first_expected=first_expected,
                     last_closed=last_closed,
                 )
-                continue
 
-            gap_summaries: List[IntervalSummary] = []
-            for gap in gaps:
-                summary = await _fill_gap(
+            if interval == "1m":
+                minute_first_expected = first_expected
+                minute_last_closed = last_closed
+
+                if not merged_gaps:
+                    summaries[interval] = IntervalSummary(
+                        gaps_total=0,
+                        gaps_filled=0,
+                        candles_written=0,
+                        dropped_candles=0,
+                        requests=0,
+                        remaining_gaps=[],
+                    )
+                    await emit_progress(
+                        progress,
+                        "summary_collector:interval_complete",
+                        symbol=symbol,
+                        interval=interval,
+                        first_expected=first_expected,
+                        last_closed=last_closed,
+                    )
+                    if trace_ctx is not None:
+                        trace_ctx.info(
+                            "interval.complete",
+                            interval=interval,
+                            written=0,
+                            requests=0,
+                        )
+                    minute_series = await _fetch_candle_range(
+                        repo,
+                        symbol=symbol,
+                        interval="1m",
+                        start_ms=first_expected,
+                        end_ms=last_closed,
+                    )
+                    continue
+
+                gap_summaries: List[IntervalSummary] = []
+                for gap in merged_gaps:
+                    summary = await _fill_gap(
+                        repo,
+                        symbol=symbol,
+                        interval=interval,
+                        gap=gap,
+                        interval_ms=interval_ms,
+                        client=client,
+                        bucket=bucket,
+                        progress=progress,
+                        trace=trace_ctx,
+                    )
+                    gap_summaries.append(summary)
+                    total_requests += summary.requests
+                    total_written += summary.candles_written
+                    total_dropped += summary.dropped_candles
+
+                refreshed_minutes = await _fetch_existing(
                     repo,
                     symbol=symbol,
                     interval=interval,
-                    gap=gap,
-                    interval_ms=interval_ms,
-                    client=client,
-                    bucket=bucket,
-                    progress=progress,
+                    start_ms=first_expected,
+                    end_ms=last_closed,
                 )
-                gap_summaries.append(summary)
-                total_requests += summary.requests
-                total_written += summary.candles_written
-                total_dropped += summary.dropped_candles
+                remaining_minutes = _compute_gaps(
+                    first_expected, last_closed, interval_ms, refreshed_minutes
+                )
+                summaries[interval] = IntervalSummary(
+                    gaps_total=len(merged_gaps),
+                    gaps_filled=sum(1 for item in gap_summaries if item.candles_written > 0),
+                    candles_written=sum(item.candles_written for item in gap_summaries),
+                    dropped_candles=sum(item.dropped_candles for item in gap_summaries),
+                    requests=sum(item.requests for item in gap_summaries),
+                    remaining_gaps=remaining_minutes,
+                )
                 TRACE_LOGGER.debug(
-                    "summary_collector:interval_progress",
+                    "summary_collector:interval_finished",
                     extra={
                         "symbol": symbol,
                         "interval": interval,
-                        "gap_from": gap.get("from"),
-                        "gap_to": gap.get("to"),
-                        "written_total": total_written,
-                        "requests_total": total_requests,
+                        "gaps_total": len(merged_gaps),
+                        "candles_written": summaries[interval].candles_written,
+                        "dropped_candles": summaries[interval].dropped_candles,
+                        "requests": summaries[interval].requests,
+                        "remaining_gaps": len(remaining_minutes),
                     },
                 )
                 await emit_progress(
                     progress,
-                    "summary_collector:interval_progress",
+                    "summary_collector:interval_finished",
                     symbol=symbol,
                     interval=interval,
-                    gap_from=gap.get("from"),
-                    gap_to=gap.get("to"),
-                    written_total=total_written,
-                    requests_total=total_requests,
+                    gaps_total=len(merged_gaps),
+                    candles_written=summaries[interval].candles_written,
+                    dropped_candles=summaries[interval].dropped_candles,
+                    requests=summaries[interval].requests,
+                    remaining_gaps=len(remaining_minutes),
                 )
+                minute_series = await _fetch_candle_range(
+                    repo,
+                    symbol=symbol,
+                    interval="1m",
+                    start_ms=first_expected,
+                    end_ms=last_closed,
+                )
+                if trace_ctx is not None:
+                    trace_ctx.info(
+                        "interval.complete",
+                        interval=interval,
+                        written=summaries[interval].candles_written,
+                        requests=summaries[interval].requests,
+                        remaining=len(remaining_minutes),
+                    )
+                continue
 
-            refreshed = await _fetch_existing(
-                repo,
-                symbol=symbol,
-                interval=interval,
-                start_ms=first_expected,
-                end_ms=last_closed,
-            )
-            remaining = _compute_gaps(first_expected, last_closed, interval_ms, refreshed)
-            summaries[interval] = IntervalSummary(
-                gaps_total=len(gaps),
-                gaps_filled=sum(1 for item in gap_summaries if item.candles_written > 0),
-                candles_written=sum(item.candles_written for item in gap_summaries),
-                dropped_candles=sum(item.dropped_candles for item in gap_summaries),
-                requests=sum(item.requests for item in gap_summaries),
-                remaining_gaps=remaining,
-            )
-            TRACE_LOGGER.debug(
-                "summary_collector:interval_finished",
-                extra={
-                    "symbol": symbol,
+            if minute_first_expected is None or minute_last_closed is None or minute_series is None:
+                summaries[interval] = IntervalSummary(
+                    gaps_total=len(merged_gaps),
+                    gaps_filled=0,
+                    candles_written=0,
+                    dropped_candles=0,
+                    requests=0,
+                    remaining_gaps=merged_gaps,
+                )
+                if trace_ctx is not None:
+                    trace_ctx.warn(
+                        "interval.skipped",
+                        interval=interval,
+                        reason="missing_minute_cache",
+                    )
+                continue
+
+            pending.append(
+                {
                     "interval": interval,
-                    "gaps_total": len(gaps),
-                    "candles_written": summaries[interval].candles_written,
-                    "dropped_candles": summaries[interval].dropped_candles,
-                    "requests": summaries[interval].requests,
-                    "remaining_gaps": len(remaining),
-                },
+                    "interval_ms": interval_ms,
+                    "first_expected": first_expected,
+                    "last_closed": last_closed,
+                    "existing": existing,
+                    "gaps": merged_gaps,
+                }
             )
-            await emit_progress(
-                progress,
-                "summary_collector:interval_finished",
-                symbol=symbol,
+
+    async def _process_higher_interval(params: Dict[str, Any]) -> tuple[str, IntervalSummary, int, int]:
+        interval = params["interval"]
+        interval_ms = params["interval_ms"]
+        first_expected = params["first_expected"]
+        last_closed = params["last_closed"]
+        existing = params["existing"]
+        gaps = params["gaps"]
+
+        filtered = [
+            candle
+            for candle in (minute_series or [])
+            if first_expected <= int(candle.get("t", 0)) <= last_closed
+        ]
+        aggregated_raw = resample_ohlcv(filtered, interval_ms)
+        aggregated: List[Dict[str, Any]] = []
+        for item in aggregated_raw:
+            if not isinstance(item, Mapping):
+                continue
+            ts = _align_to_interval(int(item.get("t", 0)), interval_ms)
+            if ts < first_expected or ts > last_closed:
+                continue
+            aggregated.append(
+                {
+                    "t": ts,
+                    "o": float(item.get("o", 0.0)),
+                    "h": float(item.get("h", 0.0)),
+                    "l": float(item.get("l", 0.0)),
+                    "c": float(item.get("c", 0.0)),
+                    "v": float(item.get("v", 0.0)),
+                }
+            )
+
+        aggregated.sort(key=lambda candle: candle["t"])
+        stats, _ = await _upsert_sanitised(
+            repo,
+            symbol=symbol,
+            interval=interval,
+            candles=aggregated,
+            stage=f"summary_resample.{interval}",
+            trace=trace_ctx,
+        )
+
+        refreshed = await _fetch_existing(
+            repo,
+            symbol=symbol,
+            interval=interval,
+            start_ms=first_expected,
+            end_ms=last_closed,
+        )
+        remaining = _compute_gaps(first_expected, last_closed, interval_ms, refreshed)
+        gaps_filled = max(0, len(gaps) - len(remaining))
+        existing_set = {int(ts) for ts in existing}
+        refreshed_set = {int(ts) for ts in refreshed}
+        new_candles = max(0, len(refreshed_set - existing_set))
+
+        summary = IntervalSummary(
+            gaps_total=len(gaps),
+            gaps_filled=gaps_filled,
+            candles_written=new_candles,
+            dropped_candles=stats.dropped_ts + stats.dropped_ohlc,
+            requests=0,
+            remaining_gaps=remaining,
+        )
+        if trace_ctx is not None:
+            trace_ctx.info(
+                "interval.complete",
                 interval=interval,
-                gaps_total=len(gaps),
-                candles_written=summaries[interval].candles_written,
-                dropped_candles=summaries[interval].dropped_candles,
-                requests=summaries[interval].requests,
-                remaining_gaps=len(remaining),
+                written=new_candles,
+                dropped=stats.dropped_ts + stats.dropped_ohlc,
+                remaining=len(remaining),
             )
+        return interval, summary, new_candles, stats.dropped_ts + stats.dropped_ohlc
+
+    if pending:
+        semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
+
+        async def _runner(params: Dict[str, Any]) -> tuple[str, IntervalSummary, int, int]:
+            async with semaphore:
+                return await _process_higher_interval(params)
+
+        results = await asyncio.gather(*(_runner(params) for params in pending))
+        for interval, summary, written, dropped in results:
+            summaries[interval] = summary
+            total_written += written
+            total_dropped += dropped
 
     summary = CollectionSummary(
         symbol=symbol.upper(),
@@ -731,8 +1129,30 @@ async def collect_recent_summary(
         candles_written=summary.candles_written,
         dropped_candles=summary.dropped_candles,
     )
+    if trace_ctx is not None:
+        trace_ctx.info(
+            "collector.finished",
+            requests=summary.requests,
+            written=summary.candles_written,
+            dropped=summary.dropped_candles,
+        )
 
     return summary
 
-
 __all__ = ["collect_recent_summary", "CollectionSummary"]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

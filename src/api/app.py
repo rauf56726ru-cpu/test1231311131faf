@@ -57,6 +57,7 @@ from ..services.liquidity import generate_liquidity_map
 from ..services.news import fetch_news
 from ..services.ohlcv import build_multi_tf_ohlcv, fetch_ohlcv as fetch_ohlcv_enhanced
 from ..services.orderflow import calculate_cvd, fetch_footprint
+from ..services.tracing import TraceContext
 from ..services.tpo import calculate_session_tpo, calculate_tpo
 from ..meta import Meta
 from ..static_version import STATIC_VERSION
@@ -151,8 +152,19 @@ class SnapshotIn(BaseModel):
 
 
 
-def _to_iso(ms: int) -> str:
-    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+def _to_iso(value: Any) -> str:
+    try:
+        ms = int(value)
+    except (TypeError, ValueError):
+        return str(value)
+    try:
+        dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        try:
+            dt = datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(milliseconds=ms)
+        except OverflowError:
+            dt = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _build_fallback_multi(symbol: str, candles: Sequence[CandleIn]) -> Dict[str, Dict[str, object]]:
@@ -223,12 +235,23 @@ async def _run_summary_workflow(
     now_override: datetime | None,
     branch_log: Dict[str, Any],
     progress: ProgressReporter | None = None,
-) -> Tuple[Dict[str, Any] | None, Dict[str, Any] | None]:
+) -> Tuple[Dict[str, Any] | None, Dict[str, Any] | None, TraceContext]:
     symbol = target_snapshot.get("symbol") if isinstance(target_snapshot, Mapping) else None
     if not symbol:
         meta_block = target_snapshot.get("meta") if isinstance(target_snapshot, Mapping) else None
         if isinstance(meta_block, Mapping):
             symbol = meta_block.get("symbol")
+
+    symbol_upper = symbol.upper() if isinstance(symbol, str) else None
+    trace_ctx = TraceContext(stage="summary", symbol=symbol_upper)
+    if trace_ctx is not None:
+        trace_ctx.info(
+            "pipeline.start",
+            symbol=symbol_upper,
+            window_hours=window_hours,
+            mode="summary",
+        )
+
 
     collection_summary_payload: Dict[str, Any] | None = None
     if isinstance(symbol, str) and symbol:
@@ -244,7 +267,14 @@ async def _run_summary_workflow(
             window_hours=window_hours,
         )
         try:
-            summary_result = await collect_recent_summary(symbol, days=days, progress=progress)
+            fetch_start = time.perf_counter()
+            summary_result = await collect_recent_summary(
+                symbol,
+                days=days,
+                progress=progress,
+                trace=trace_ctx.child(stage="collector") if trace_ctx is not None else None,
+            )
+            fetch_ms = (time.perf_counter() - fetch_start) * 1000.0
         except Exception as exc:  # pragma: no cover - defensive logging
             LOGGER.warning(
                 "inspection_check_all:summary_collection_failed",
@@ -296,12 +326,17 @@ async def _run_summary_workflow(
         has_summary=collection_summary_payload is not None,
         window_hours=window_hours,
     )
+    compute_start = time.perf_counter()
     payload = await build_check_all_datas_async(
         target_snapshot,
         now_utc=now_override,
         window_hours=window_hours,
         timeout=CHECK_ALL_BUILD_TIMEOUT,
+        network_backfill=False,
+        strict_window=True,
+        trace=trace_ctx.child(stage="pipeline") if trace_ctx is not None else None,
     )
+    compute_ms = (time.perf_counter() - compute_start) * 1000.0
     TRACE_LOGGER.debug(
         "inspection.summary_collection:payload_ready",
         extra={
@@ -314,7 +349,12 @@ async def _run_summary_workflow(
         "inspection.summary_collection:payload_ready",
         status=payload.get("status") if isinstance(payload, Mapping) else None,
     )
-    return payload, collection_summary_payload
+    if isinstance(payload, MutableMapping):
+        timing_block = payload.setdefault("_timing", {})
+        timing_block.setdefault("fetch_ms", round(fetch_ms, 2))
+        timing_block.setdefault("compute_ms", round(compute_ms, 2))
+        timing_block.setdefault("db_ms", 0.0)
+    return payload, collection_summary_payload, trace_ctx
 
 
 async def _run_session_workflow(
@@ -508,63 +548,469 @@ async def _startup() -> None:
     if not hasattr(app.state, "snapshots"):
         app.state.snapshots = {}
 
-def _prepare_summary_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Reduce payload weight while keeping hourly context and fresh minute data."""
+def _parse_iso8601(value: Any) -> datetime | None:
+    if not value or not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not candidate:
+        return None
+    if candidate.endswith('Z'):
+        candidate = candidate[:-1] + '+00:00'
+    try:
+        return datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
 
-    ohlcv_section = payload.get("ohlcv")
-    if not isinstance(ohlcv_section, Mapping):
-        return payload
 
-    summary_section: Dict[str, Any] = {}
+def _format_iso8601(moment: datetime | None) -> str | None:
+    if moment is None:
+        return None
+    return moment.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
 
-    hour_block = ohlcv_section.get("1h")
-    if isinstance(hour_block, Mapping):
-        summary_section["1h"] = dict(hour_block)
 
-    four_hour_block = ohlcv_section.get("4h")
-    if isinstance(four_hour_block, Mapping):
-        summary_section["4h"] = dict(four_hour_block)
+def _zone_price_range(zone: Mapping[str, Any]) -> tuple[float, float] | None:
+    try:
+        low = float(zone.get('open') or zone.get('low') or zone.get('price_low'))
+        high = float(zone.get('close') or zone.get('high') or zone.get('price_high'))
+    except (TypeError, ValueError):
+        return None
+    if low > high:
+        low, high = high, low
+    return low, high
 
-    minute_block = ohlcv_section.get("1m")
+
+def _ranges_overlap(left: tuple[float, float], right: tuple[float, float], *, tolerance: float = 0.0) -> bool:
+    left_low, left_high = left
+    right_low, right_high = right
+    if left_high < right_low - tolerance:
+        return False
+    if right_high < left_low - tolerance:
+        return False
+    return True
+
+
+def _filter_compact_zones(
+    zones_payload: Mapping[str, Any] | None,
+    *,
+    now_dt: datetime,
+    limit: int = 12,
+    trace: TraceContext | None = None,
+) -> tuple[list[Dict[str, Any]], Dict[str, int]]:
+    if not isinstance(zones_payload, Mapping):
+        return [], {}
+
+    candidates: list[Dict[str, Any]] = []
+    raw_counts: Dict[str, int] = {}
+
+    for zone_type, entries in zones_payload.items():
+        if not isinstance(entries, Sequence):
+            continue
+        raw_counts[zone_type] = len(entries)
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                continue
+            status = str(entry.get('status') or '').lower()
+            formed = _parse_iso8601(entry.get('formed_at_utc') or entry.get('origin_utc') or entry.get('created_utc'))
+            last_touched = _parse_iso8601(entry.get('last_touched_utc') or entry.get('last_touch_utc'))
+            if last_touched is None:
+                last_touched = formed
+            if formed is None:
+                continue
+            if formed < now_dt - timedelta(hours=72):
+                continue
+            if status not in {'open', 'fresh', 'tapped'} and (last_touched is None or last_touched < now_dt - timedelta(hours=24)):
+                continue
+            price_range = _zone_price_range(entry)
+            if price_range is None:
+                continue
+            tf_value = str(entry.get('tf') or entry.get('timeframe') or '').lower()
+            priority_ts = last_touched or formed
+            candidate = {
+                'type': zone_type,
+                'tf': tf_value,
+                'status': status or 'unknown',
+                'open': price_range[0],
+                'close': price_range[1],
+                'mean': entry.get('mean'),
+                'formed_at': formed,
+                'last_touched': last_touched,
+                'priority_ts': priority_ts,
+                'source': entry.get('source') or entry.get('preset'),
+            }
+            candidates.append(candidate)
+
+    candidates.sort(key=lambda item: item['priority_ts'] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+
+    selected: list[Dict[str, Any]] = []
+    seen_keys: set[tuple[str, str, Any]] = set()
+
+    for candidate in candidates:
+        day_key = candidate['formed_at'].date() if candidate['formed_at'] else None
+        dedup_key = (candidate['type'], candidate['tf'], day_key)
+        if dedup_key in seen_keys:
+            continue
+        overlap = False
+        for existing in selected:
+            if existing['type'] != candidate['type']:
+                continue
+            if existing['tf'] != candidate['tf']:
+                continue
+            if _ranges_overlap((existing['open'], existing['close']), (candidate['open'], candidate['close']), tolerance=0.0):
+                overlap = True
+                break
+        if overlap:
+            continue
+        selected.append(candidate)
+        seen_keys.add(dedup_key)
+        if len(selected) >= limit:
+            break
+
+    counts: Dict[str, int] = {}
+    for item in selected:
+        counts[item['type']] = counts.get(item['type'], 0) + 1
+
+    if trace is not None:
+        trace.info(
+            'compute.poi.topN',
+            total=len(candidates),
+            selected=len(selected),
+            limit=limit,
+        )
+
+    compact: list[Dict[str, Any]] = []
+    for item in selected:
+        compact.append(
+            {
+                'type': item['type'],
+                'tf': item['tf'],
+                'status': item['status'],
+                'open': item['open'],
+                'close': item['close'],
+                'mean': item['mean'],
+                'formed_at_utc': _format_iso8601(item['formed_at']),
+                'last_touched_utc': _format_iso8601(item['last_touched']),
+                'source': item['source'],
+            }
+        )
+
+    return compact, counts
+
+
+def _prepare_summary_payload(
+    payload: Dict[str, Any],
+    *,
+    trace: TraceContext | None = None,
+) -> Dict[str, Any]:
+    """Transform the expansive inspection payload into the compact summary schema."""
+
+    trace_ctx = trace.child(stage="prepare") if trace else None
+    if trace_ctx is not None:
+        trace_ctx.info("output.prepare_payload.start", status=payload.get("status"))
+
+    meta_source = payload.get("meta") if isinstance(payload.get("meta"), Mapping) else {}
+    data_source = payload.get("data") if isinstance(payload.get("data"), Mapping) else {}
+    availability = payload.get("availability") if isinstance(payload.get("availability"), Mapping) else {}
+
+    ohlcv_source = data_source.get("ohlcv") if isinstance(data_source.get("ohlcv"), Mapping) else {}
+    orderflow_source = data_source.get("orderflow") if isinstance(data_source.get("orderflow"), Mapping) else {}
+    vwap_tpo_source = data_source.get("vwap_tpo") if isinstance(data_source.get("vwap_tpo"), Mapping) else {}
+    zones_source = data_source.get("zones") if isinstance(data_source.get("zones"), Mapping) else {}
+    liquidity_source = data_source.get("liquidity") if isinstance(data_source.get("liquidity"), Mapping) else {}
+
+    timing_source = payload.get("_timing") if isinstance(payload.get("_timing"), Mapping) else {}
+
+    def _float_or_none(value: Any) -> float | None:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(numeric):
+            return None
+        return numeric
+
+    def _coerce_candles(series: Any) -> list[Dict[str, Any]]:
+        result: list[Dict[str, Any]] = []
+        if not isinstance(series, Sequence):
+            return result
+        for item in series:
+            if not isinstance(item, Mapping):
+                continue
+            try:
+                ts = int(item.get("t"))
+            except (TypeError, ValueError):
+                continue
+            open_value = _float_or_none(item.get("o"))
+            high_value = _float_or_none(item.get("h"))
+            low_value = _float_or_none(item.get("l"))
+            close_value = _float_or_none(item.get("c"))
+            volume_value = _float_or_none(item.get("v"))
+            if None in (open_value, high_value, low_value, close_value, volume_value):
+                continue
+            result.append(
+                {
+                    "t": ts,
+                    "o": open_value,
+                    "h": high_value,
+                    "l": low_value,
+                    "c": close_value,
+                    "v": volume_value,
+                }
+            )
+        result.sort(key=lambda candle: candle["t"])
+        return result
+
+    minute_block = ohlcv_source.get("1m")
     if isinstance(minute_block, Mapping):
-        candles = minute_block.get("candles")
-        if isinstance(candles, Sequence):
-            trimmed: list[Dict[str, Any]] = []
-            last_ts: int | None = None
-            normalised_candles: list[Dict[str, Any]] = []
-            for entry in candles:
-                if not isinstance(entry, Mapping):
-                    continue
-                normalised_candles.append(dict(entry))
-                candidate_ts = None
-                for key in ("t", "time", "ts", "timestamp"):
-                    raw_value = entry.get(key)
-                    if isinstance(raw_value, (int, float)):
-                        candidate_ts = int(raw_value)
-                        break
-                if candidate_ts is not None:
-                    last_ts = candidate_ts if last_ts is None else max(last_ts, candidate_ts)
-            if normalised_candles and last_ts is not None:
-                cutoff = last_ts - 59 * 60_000
-                for item in normalised_candles:
-                    ts_value = None
-                    for key in ("t", "time", "ts", "timestamp"):
-                        raw_value = item.get(key)
-                        if isinstance(raw_value, (int, float)):
-                            ts_value = int(raw_value)
-                            break
-                    if ts_value is None or ts_value >= cutoff:
-                        trimmed.append(item)
+        minute_all = _coerce_candles(minute_block.get("candles"))
+    else:
+        minute_all = _coerce_candles(minute_block)
+
+    last_ts_dt = _parse_iso8601(meta_source.get("last_ts_utc"))
+    window_end_ts = int(last_ts_dt.timestamp() * 1000) if last_ts_dt is not None else None
+    if window_end_ts is None and minute_all:
+        window_end_ts = minute_all[-1]["t"]
+    if window_end_ts is None:
+        window_end_ts = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+    cutoff_72h = max(0, window_end_ts - 72 * 3_600_000)
+    cutoff_3h = max(0, window_end_ts - 180 * 60_000)
+
+    minute_72h = [c for c in minute_all if c["t"] >= cutoff_72h]
+    minute_trimmed = [c for c in minute_all if c["t"] >= cutoff_3h][-180:]
+
+    def _filter_timeframe(tf_key: str) -> list[Dict[str, Any]]:
+        block = ohlcv_source.get(tf_key)
+        if isinstance(block, Mapping):
+            series = _coerce_candles(block.get("candles"))
+        else:
+            series = _coerce_candles(block)
+        return [c for c in series if c["t"] >= cutoff_72h]
+
+    ohlcv_compact: Dict[str, Any] = {"1m_rollups": minute_trimmed}
+    for tf_key in ("15m", "1h", "4h", "1d"):
+        ohlcv_compact[tf_key] = _filter_timeframe(tf_key)
+
+    def _normalise_orderflow(series: Any) -> list[Dict[str, Any]]:
+        result: list[Dict[str, Any]] = []
+        if not isinstance(series, Sequence):
+            return result
+        for item in series:
+            if not isinstance(item, Mapping):
+                continue
+            try:
+                ts = int(item.get("t"))
+            except (TypeError, ValueError):
+                continue
+            if ts < cutoff_3h:
+                continue
+            entry: Dict[str, Any] = {"t": ts}
+            for key in ("delta", "cvd", "cvd_net", "cvd_buy", "cvd_sell"):
+                value = _float_or_none(item.get(key))
+                if value is not None:
+                    entry[key] = value
+            result.append(entry)
+        result.sort(key=lambda entry: entry["t"])
+        return result
+
+    orderflow_per_bar: Dict[str, list[Dict[str, Any]]] = {}
+    delta_cvd_compact: Dict[str, Dict[str, Any]] = {}
+    for tf_key, block in orderflow_source.items():
+        if not isinstance(block, Mapping):
+            continue
+        per_bar_series = _normalise_orderflow(block.get("per_bar"))
+        orderflow_per_bar[tf_key] = per_bar_series
+        last_entry = per_bar_series[-1] if per_bar_series else {}
+        delta_cvd_compact[tf_key] = {
+            "delta": last_entry.get("delta"),
+            "cvd": last_entry.get("cvd") or last_entry.get("cvd_net"),
+            "bars": len(per_bar_series),
+        }
+
+    def _sd_block(source: Mapping[str, Any] | None, key: str) -> Dict[str, float | None]:
+        if not isinstance(source, Mapping):
+            return {"minus": None, "plus": None}
+        node = source.get(key)
+        if not isinstance(node, Mapping):
+            return {"minus": None, "plus": None}
+        return {
+            "minus": _float_or_none(node.get("minus")),
+            "plus": _float_or_none(node.get("plus")),
+        }
+
+    daily_source = vwap_tpo_source.get("daily") if isinstance(vwap_tpo_source.get("daily"), Mapping) else {}
+    sessions_source = vwap_tpo_source.get("sessions") if isinstance(vwap_tpo_source.get("sessions"), Mapping) else {}
+
+    daily_compact = {
+        "open_utc": daily_source.get("open_utc"),
+        "vwap": _float_or_none(daily_source.get("vwap")),
+        "sd1": _sd_block(daily_source, "sd1"),
+        "sd2": _sd_block(daily_source, "sd2"),
+    }
+
+    session_compact: Dict[str, Dict[str, Any]] = {}
+    for session_name in ("asia", "london", "ny"):
+        session_block = sessions_source.get(session_name)
+        if not isinstance(session_block, Mapping):
+            session_compact[session_name] = {
+                "open_utc": None,
+                "close_utc": None,
+                "vwap": None,
+                "sd1": {"minus": None, "plus": None},
+                "sd2": {"minus": None, "plus": None},
+                "poc": None,
+                "vah": None,
+                "val": None,
+                "ib_high": None,
+                "ib_low": None,
+            }
+            continue
+        session_compact[session_name] = {
+            "open_utc": session_block.get("open_utc"),
+            "close_utc": session_block.get("close_utc"),
+            "vwap": _float_or_none(session_block.get("vwap")),
+            "sd1": _sd_block(session_block, "sd1"),
+            "sd2": _sd_block(session_block, "sd2"),
+            "poc": _float_or_none(session_block.get("poc")),
+            "vah": _float_or_none(session_block.get("vah")),
+            "val": _float_or_none(session_block.get("val")),
+            "ib_high": _float_or_none(session_block.get("ib_high")),
+            "ib_low": _float_or_none(session_block.get("ib_low")),
+        }
+
+    zones_top, zone_counts = _filter_compact_zones(
+        zones_source,
+        now_dt=datetime.now(timezone.utc),
+        limit=12,
+        trace=trace_ctx,
+    )
+
+    liquidity_marks: list[Dict[str, Any]] = []
+    for mark_type, entries in liquidity_source.items():
+        if not isinstance(entries, Sequence):
+            continue
+        for entry in entries:
+            price_value = None
+            label_value = None
+            strength_value = None
+            if isinstance(entry, Mapping):
+                price_value = entry.get("price") or entry.get("level")
+                label_value = entry.get("label")
+                strength_value = entry.get("strength")
             else:
-                trimmed = normalised_candles
-            minute_section = dict(minute_block)
-            minute_section["candles"] = trimmed[-60:]
-            summary_section["1m"] = minute_section
+                price_value = entry
+            price_numeric = _float_or_none(price_value)
+            if price_numeric is None:
+                continue
+            mark: Dict[str, Any] = {"type": mark_type, "price": price_numeric}
+            if label_value:
+                mark["label"] = str(label_value)
+            strength_numeric = _float_or_none(strength_value)
+            if strength_numeric is not None:
+                mark["strength"] = strength_numeric
+            liquidity_marks.append(mark)
+    liquidity_marks = liquidity_marks[:16]
 
-    if summary_section:
-        payload["ohlcv"] = summary_section
+    expected_counts = {
+        "1m": 72 * 60,
+        "15m": 72 * 4,
+        "1h": 72,
+        "4h": 18,
+        "1d": 3,
+    }
+    actual_counts = {
+        "1m": len(minute_72h),
+        "15m": len(ohlcv_compact.get("15m", [])),
+        "1h": len(ohlcv_compact.get("1h", [])),
+        "4h": len(ohlcv_compact.get("4h", [])),
+        "1d": len(ohlcv_compact.get("1d", [])),
+    }
+    coverage: list[Dict[str, Any]] = []
+    for tf_key, expected in expected_counts.items():
+        actual = actual_counts.get(tf_key, 0)
+        coverage_pct = 0.0
+        if expected:
+            coverage_pct = min(100.0, round((actual / expected) * 100.0, 2))
+        coverage.append({"tf": tf_key, "coverage_pct": coverage_pct})
 
-    return payload
+    risk_block: Dict[str, Any] = {}
+    for risk_key in ("event_risk_score", "structure_break_prob"):
+        risk_value = _float_or_none(meta_source.get(risk_key))
+        if risk_value is not None:
+            risk_block[risk_key] = risk_value
+
+    timing = {
+        "fetch_ms": round(_float_or_none(timing_source.get("fetch_ms")) or 0.0, 2),
+        "db_ms": round(_float_or_none(timing_source.get("db_ms")) or 0.0, 2),
+        "compute_ms": round(_float_or_none(timing_source.get("compute_ms")) or 0.0, 2),
+    }
+
+    symbol_value = meta_source.get("symbol")
+    tz_value = meta_source.get("tz") or "UTC"
+    last_price = _float_or_none(meta_source.get("last_price"))
+    data_freshness = _float_or_none(meta_source.get("snapshot_age_sec"))
+    if data_freshness is None and last_ts_dt is not None:
+        data_freshness = max(0.0, (datetime.now(timezone.utc) - last_ts_dt).total_seconds())
+
+    meta_compact: Dict[str, Any] = {
+        "symbol": symbol_value,
+        "tz": tz_value,
+        "last_price": last_price,
+        "data_freshness_sec": round(data_freshness, 2) if data_freshness is not None else None,
+    }
+    if meta_source.get("summary_collection"):
+        meta_compact["summary_collection"] = meta_source["summary_collection"]
+
+    daily_compact = {k: v for k, v in daily_compact.items() if k in {"open_utc", "vwap", "sd1", "sd2"}}
+
+    vwap_tpo_compact = {
+        "daily": daily_compact,
+        "sessions": session_compact,
+    }
+
+    orderflow_ok = any(
+        details.get("delta") is not None and details.get("cvd") is not None
+        for details in delta_cvd_compact.values()
+    )
+
+    status = str(payload.get("status") or "ok").lower()
+    coverage_ok = all(item["coverage_pct"] >= 90.0 for item in coverage if item["tf"] in {"1m", "15m", "1h"})
+    if not coverage_ok or not orderflow_ok or status != "ok":
+        status = "insufficient_data"
+    else:
+        status = "ok"
+
+    compact_payload = {
+        "schema": "compact.v1",
+        "meta": meta_compact,
+        "ohlcv": ohlcv_compact,
+        "orderflow": {
+            "delta_cvd_compact": delta_cvd_compact,
+            "per_bar": orderflow_per_bar,
+        },
+        "vwap_tpo": vwap_tpo_compact,
+        "zones": {"top": zones_top, "counts": zone_counts},
+        "liquidity_marks": liquidity_marks,
+        "coverage": coverage,
+        "risk": risk_block,
+        "timing": timing,
+        "status": status,
+    }
+
+    serialize_start = time.perf_counter()
+    encoded = json.dumps(compact_payload, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    timing["serialize_ms"] = round((time.perf_counter() - serialize_start) * 1000.0, 2)
+    timing["json_bytes"] = len(encoded)
+
+    if trace_ctx is not None:
+        trace_ctx.info(
+            "output.prepare_payload",
+            status=status,
+            json_bytes=timing.get("json_bytes"),
+        )
+
+    return compact_payload
+
+
 
 
 @app.post("/inspection/snapshot")
@@ -897,7 +1343,7 @@ async def inspection(
                 "profile_preset": profile_config.get("preset_payload"),
                 "profile_preset_required": bool(profile_config.get("preset_required", False)),
                 "profile_defaults": None,
-                "smt": {"status": "waiting", "detail": "Создайте первый снэпшот"},
+                "smt": {"status": "waiting", "detail": "???????????????? ???????????? ??????????????"},
                 "meta": {"requested": {"symbol": DEFAULT_SYMBOL, "frames": []}, "source": {}},
             },
             "DIAGNOSTICS": {"generated_at": None, "snapshot_id": None, "captured_at": None, "frames": {}},
@@ -1071,8 +1517,12 @@ async def inspection_check_all(
         branch_log = dict(log_extra)
         branch_log["window_hours"] = window_hours
         collection_summary_payload: Dict[str, Any] | None = None
+        trace_ctx: TraceContext | None = None
+        fetch_ms = 0.0
+        compute_ms = 0.0
+        trace_ctx: TraceContext | None = None
         try:
-            payload, collection_summary_payload = await _run_summary_workflow(
+            payload, collection_summary_payload, trace_ctx = await _run_summary_workflow(
                 target_snapshot,
                 days=days,
                 window_hours=window_hours,
@@ -1103,7 +1553,10 @@ async def inspection_check_all(
         if payload is None:
             LOGGER.info("inspection_check_all:finished", extra={**branch_log, "status": None})
             return Response(status_code=204)
-        payload = _prepare_summary_payload(dict(payload))
+        payload = _prepare_summary_payload(
+            dict(payload),
+            trace=trace_ctx.child(stage="payload") if trace_ctx is not None else None,
+        )
         if collection_summary_payload:
             meta_block = payload.get("meta")
             if isinstance(meta_block, MutableMapping):
@@ -1113,6 +1566,13 @@ async def inspection_check_all(
             "inspection_check_all:finished",
             extra={**branch_log, "status": status_value},
         )
+        if trace_ctx is not None:
+            trace_ctx.info(
+                "output.publish",
+                status=status_value,
+                json_bytes=(payload.get("timing") or {}).get("json_bytes"),
+            )
+            trace_ctx.info("pipeline.done", status=status_value)
         set_last_collection_time(collection_reference)
         return JSONResponse(payload)
 
@@ -1307,8 +1767,15 @@ async def inspection_progress_ws(websocket: WebSocket) -> None:
         except WebSocketDisconnect:
             return
         except Exception:
-            await websocket.send_json({"type": "error", "message": "invalid_initial_payload"})
-            await websocket.close(code=1003)
+            if websocket.application_state is WebSocketState.CONNECTED:
+                try:
+                    await websocket.send_json({"type": "error", "message": "invalid_initial_payload"})
+                except Exception:
+                    pass
+                try:
+                    await websocket.close(code=1003)
+                except Exception:
+                    pass
             return
 
         message_type = incoming.get("type")
@@ -1354,8 +1821,15 @@ async def inspection_progress_ws(websocket: WebSocket) -> None:
         if message_type in {None, "start"}:
             initial = incoming
             break
-        await websocket.send_json({"type": "error", "message": "unsupported_message"})
-        await websocket.close(code=1003)
+        if websocket.application_state is WebSocketState.CONNECTED:
+            try:
+                await websocket.send_json({"type": "error", "message": "unsupported_message"})
+            except Exception:
+                pass
+            try:
+                await websocket.close(code=1003)
+            except Exception:
+                pass
         return
 
     mode_candidate = _parse_mode(initial.get("mode"))
@@ -1412,8 +1886,12 @@ async def inspection_progress_ws(websocket: WebSocket) -> None:
         branch_log["window_hours"] = window_hours
         branch_log["summary_days"] = days
         collection_summary_payload: Dict[str, Any] | None = None
+        trace_ctx: TraceContext | None = None
+        fetch_ms = 0.0
+        compute_ms = 0.0
+        trace_ctx: TraceContext | None = None
         try:
-            payload, collection_summary_payload = await _run_summary_workflow(
+            payload, collection_summary_payload, trace_ctx = await _run_summary_workflow(
                 target_snapshot,
                 days=days,
                 window_hours=window_hours,
@@ -1463,7 +1941,10 @@ async def inspection_progress_ws(websocket: WebSocket) -> None:
             await websocket.send_json({"type": "result", "mode": mode_value, "payload": None})
             await websocket.close(code=1000)
             return
-        payload = _prepare_summary_payload(dict(payload))
+        payload = _prepare_summary_payload(
+            dict(payload),
+            trace=trace_ctx.child(stage="payload") if trace_ctx is not None else None,
+        )
         if collection_summary_payload:
             meta_block = payload.get("meta")
             if isinstance(meta_block, MutableMapping):
@@ -1477,6 +1958,13 @@ async def inspection_progress_ws(websocket: WebSocket) -> None:
             "inspection.summary_collection:finished",
             {"status": status_value, "window_hours": window_hours},
         )
+        if trace_ctx is not None:
+            trace_ctx.info(
+                "output.publish",
+                status=status_value,
+                json_bytes=(payload.get("timing") or {}).get("json_bytes"),
+            )
+            trace_ctx.info("pipeline.done", status=status_value)
         set_last_collection_time(collection_reference)
         await websocket.send_json({"type": "result", "mode": mode_value, "payload": payload})
         await websocket.close(code=1000)
@@ -1929,5 +2417,11 @@ async def index() -> HTMLResponse:
     except FileNotFoundError as exc:  # pragma: no cover - deployment guard
         raise HTTPException(status_code=500, detail="Index template is missing") from exc
     return HTMLResponse(content=html.replace("__STATIC_VERSION__", STATIC_VERSION))
+
+
+
+
+
+
 
 
