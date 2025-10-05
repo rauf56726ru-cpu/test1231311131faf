@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 import asyncio
 import json
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 import time
 
 import pytest
@@ -391,6 +391,42 @@ def test_multi_timeframe_ohlcv_alignment(client: TestClient) -> None:
     assert pytest.approx(first_hour["v"]) == sum(minute_map[ts]["v"] for ts in expected_minutes)
 
     assert ohlcv_block["1d"]["candles"]
+
+
+def _min_delta(candles: list[dict[str, Any]]) -> int | None:
+    prev_ts: int | None = None
+    delta: int | None = None
+    for candle in candles:
+        ts = candle.get("t")
+        if not isinstance(ts, int):
+            continue
+        if prev_ts is not None:
+            diff = ts - prev_ts
+            if diff > 0 and (delta is None or diff < delta):
+                delta = diff
+        prev_ts = ts
+    return delta
+
+
+def test_timeframe_series_do_not_embed_minute_data(client: TestClient) -> None:
+    base = datetime(2024, 5, 1, 0, 0, tzinfo=UTC)
+    payload = _build_snapshot_payload(base, count=6 * 60)
+
+    create_response = client.post("/inspection/snapshot", json=payload)
+    assert create_response.status_code == 200
+    snapshot_id = create_response.json()["snapshot_id"]
+
+    response = client.get("/inspection/check-all", params={"snapshot": snapshot_id, "hours": 4})
+    assert response.status_code == 200
+    body = response.json()
+
+    ohlcv_block = body["data"]["ohlcv"]
+    for tf in ("3m", "5m", "15m", "1h"):
+        candles = ohlcv_block[tf]["candles"]
+        assert candles, f"expected candles for {tf}"
+        delta = _min_delta(candles)
+        expected = check_all_datas.TIMEFRAME_TO_MS[tf]
+        assert delta is None or delta >= expected, f"{tf} frame leaked minute bars"
 
 
 def test_orderflow_block_matches_spec(client: TestClient) -> None:

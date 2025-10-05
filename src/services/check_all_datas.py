@@ -1429,6 +1429,63 @@ def _timeframe_interval_ms(tf_key: str) -> int | None:
     return TIMEFRAME_TO_MS.get(tf_key)
 
 
+def _infer_min_interval_ms(candles: Sequence[Mapping[str, Any]]) -> int | None:
+    """Return the smallest positive timestamp delta observed in a series."""
+
+    prev_ts: int | None = None
+    min_delta: int | None = None
+    for candle in candles:
+        ts = _safe_int(candle.get("t"))
+        if ts is None:
+            continue
+        if prev_ts is not None:
+            delta = ts - prev_ts
+            if delta > 0 and (min_delta is None or delta < min_delta):
+                min_delta = delta
+        prev_ts = ts
+    return min_delta
+
+
+def _series_needs_resample(
+    candles: Sequence[Mapping[str, Any]],
+    tf_key: str,
+) -> bool:
+    """Detect whether a timeframe series still contains minute-resolution bars."""
+
+    interval_ms = _timeframe_interval_ms(tf_key)
+    if interval_ms is None or interval_ms <= MINUTE_INTERVAL_MS:
+        return False
+    inferred = _infer_min_interval_ms(candles)
+    if inferred is None:
+        return False
+    return inferred < interval_ms
+
+
+def _resample_minutes_to_tf(
+    minute_candles: Sequence[Mapping[str, Any]],
+    tf_key: str,
+) -> List[Dict[str, Any]]:
+    """Aggregate 1m candles into the requested timeframe."""
+
+    interval_ms = _timeframe_interval_ms(tf_key)
+    if interval_ms is None or interval_ms <= MINUTE_INTERVAL_MS:
+        return []
+    aggregated = resample_ohlcv(minute_candles, interval_ms)
+    aggregated.sort(key=lambda candle: _safe_int(candle.get("t")) or 0)
+    return [
+        {
+            "t": _safe_int(candle.get("t")) or 0,
+            "o": _coerce_float(candle.get("o")),
+            "h": _coerce_float(candle.get("h")),
+            "l": _coerce_float(candle.get("l")),
+            "c": _coerce_float(candle.get("c")),
+            "v": _coerce_float(candle.get("v")),
+        }
+        for candle in aggregated
+        if _safe_int(candle.get("t")) is not None
+    ]
+
+
 def _ensure_minute_frame(
     frames: MutableMapping[str, List[MutableMapping[str, Any]]],
     *,
@@ -3051,6 +3108,24 @@ async def build_check_all_datas(
             if normalised_series:
                 frames[tf_key] = normalised_series
 
+    if minute_candles:
+        for tf_key, series in list(frames.items()):
+            if tf_key == "1m" or not series:
+                continue
+            if _series_needs_resample(series, tf_key):
+                resampled = _resample_minutes_to_tf(minute_candles, tf_key)
+                if resampled:
+                    LOGGER.debug(
+                        "Resampled timeframe to fix minute-resolution leak",
+                        extra={
+                            "symbol": symbol,
+                            "timeframe": tf_key,
+                            "candles_before": len(series),
+                            "candles_after": len(resampled),
+                        },
+                    )
+                    frames[tf_key] = resampled
+
     profile_config = resolve_profile_config(symbol, raw_meta)
     profile_meta: Dict[str, Any] = {}
     sessions = list(VWAP_TPO_SESSIONS)
@@ -3074,14 +3149,49 @@ async def build_check_all_datas(
     }
     zone_cfg = ZonesConfig(tick_size=profile_config.get("tick_size"))
 
-    target_tf_key = profile_config.get("target_tf_key", "1m")
+    requested_tf = str(profile_config.get("target_tf_key", "1m") or "1m")
+    target_tf_key = requested_tf
     base_candidates = frames.get(target_tf_key, [])
+    if base_candidates and _series_needs_resample(base_candidates, target_tf_key):
+        resampled = _resample_minutes_to_tf(minute_candles, target_tf_key)
+        if resampled:
+            base_candidates = resampled
     if not base_candidates:
-        base_candidates = minute_candles
+        if target_tf_key != "1m" and minute_candles:
+            resampled = _resample_minutes_to_tf(minute_candles, target_tf_key)
+            if resampled:
+                base_candidates = resampled
+        if not base_candidates and minute_candles:
+            base_candidates = minute_candles
+            target_tf_key = "1m"
     if not base_candidates and frames:
-        base_candidates = next(iter(frames.values()))
+        for fallback_tf in _EXPECTED_OHLCV_TFS:
+            candidate = frames.get(fallback_tf)
+            if candidate:
+                base_candidates = candidate
+                target_tf_key = fallback_tf
+                break
+        if not base_candidates:
+            for fallback_tf, candidate in frames.items():
+                if candidate:
+                    base_candidates = candidate
+                    target_tf_key = fallback_tf
+                    break
     base_candles = _deduplicate_sorted(base_candidates)
-    frames[target_tf_key] = base_candles
+    if base_candles:
+        frames[target_tf_key] = base_candles
+    else:
+        frames[target_tf_key] = []
+    if target_tf_key != requested_tf:
+        LOGGER.info(
+            "profile target timeframe fallback",
+            extra={
+                "symbol": symbol,
+                "requested_tf": requested_tf,
+                "resolved_tf": target_tf_key,
+                "minute_seed": len(minute_candles),
+            },
+        )
 
     if primary_key == "1m":
         primary_candles = minute_candles

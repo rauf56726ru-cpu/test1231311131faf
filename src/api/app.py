@@ -917,12 +917,10 @@ def _prepare_summary_payload(
 
     ohlcv_compact: Dict[str, Any] = {"1m_rollups": minute_trimmed}
     tf_windows = {
-        "15m": _filter_timeframe("15m"),
-        "1h": _filter_timeframe("1h"),
-        "4h": _filter_timeframe("4h"),
-        "1d": _filter_timeframe("1d"),
+        tf: _filter_timeframe(tf)
+        for tf in ("3m", "5m", "15m", "1h", "4h", "1d")
     }
-    ohlcv_compact.update({"15m": tf_windows["15m"], "1h": tf_windows["1h"]})
+    ohlcv_compact.update(tf_windows)
 
     def _normalise_per_bar(series: Any, *, cutoff_ms: int, limit: int) -> list[Dict[str, Any]]:
         result: list[Dict[str, Any]] = []
@@ -1132,6 +1130,8 @@ def _prepare_summary_payload(
 
     if trace_ctx is not None and not zones_top:
         ohlcv_lengths = {
+            "3m": len(tf_windows.get("3m", [])),
+            "5m": len(tf_windows.get("5m", [])),
             "15m": len(tf_windows.get("15m", [])),
             "1h": len(tf_windows.get("1h", [])),
             "4h": len(tf_windows.get("4h", [])),
@@ -1179,6 +1179,8 @@ def _prepare_summary_payload(
 
     expected_counts = {
         "1m": 72 * 60,
+        "3m": 72 * 20,
+        "5m": 72 * 12,
         "15m": 72 * 4,
         "1h": 72,
         "4h": 18,
@@ -1186,10 +1188,12 @@ def _prepare_summary_payload(
     }
     actual_counts = {
         "1m": len(minute_72h),
-        "15m": len(tf_windows["15m"]),
-        "1h": len(tf_windows["1h"]),
-        "4h": len(tf_windows["4h"]),
-        "1d": len(tf_windows["1d"]),
+        "3m": len(tf_windows.get("3m", [])),
+        "5m": len(tf_windows.get("5m", [])),
+        "15m": len(tf_windows.get("15m", [])),
+        "1h": len(tf_windows.get("1h", [])),
+        "4h": len(tf_windows.get("4h", [])),
+        "1d": len(tf_windows.get("1d", [])),
     }
     coverage: list[Dict[str, Any]] = []
     for tf_key, expected in expected_counts.items():

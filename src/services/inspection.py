@@ -40,6 +40,7 @@ from .ohlc import (
     normalise_ohlcv,
     resample_ohlcv,
 )
+from .ohlcv import SUPPORTED_TIMEFRAMES
 from .profile import build_profile_package
 from .ohlc_sanitizer import sanitize_candles
 from .timeutils import ensure_ms_epoch, safe_datetime_from_ms
@@ -62,8 +63,21 @@ SNAPSHOT_STORAGE_DIR = Path(
 _SNAPSHOT_ID_SANITISER = re.compile(r"[^A-Za-z0-9._-]")
 
 MS_IN_DAY = 86_400_000
-HTF_TIMEFRAMES: Tuple[str, ...] = ("15m", "1h", "4h", "1d")
+SUPPORTED_CHART_TIMEFRAMES: Tuple[str, ...] = tuple(
+    tf for tf in ("1m", "3m", "5m", "15m", "1h", "4h", "1d") if tf in SUPPORTED_TIMEFRAMES
+)
+HTF_TIMEFRAMES: Tuple[str, ...] = tuple(tf for tf in SUPPORTED_CHART_TIMEFRAMES if tf != "1m")
 MINUTE_INTERVAL_MS = TIMEFRAME_TO_MS.get("1m", 60_000)
+
+MIN_FRAME_BARS: Dict[str, int] = {
+    "1m": 40,
+    "3m": 30,
+    "5m": 24,
+    "15m": 16,
+    "1h": 12,
+    "4h": 6,
+    "1d": 4,
+}
 
 
 
@@ -176,9 +190,14 @@ def ensure_higher_timeframes(
 
     logger = logging.getLogger(__name__)
     minute_seed = candles_by_tf.get("1m")
-    minute_candles: List[Mapping[str, Any]] = (
-        list(minute_seed) if isinstance(minute_seed, Sequence) else []
-    )
+    minute_candles: List[Mapping[str, Any]] = []
+    if isinstance(minute_seed, Sequence):
+        for candle in minute_seed:
+            if not isinstance(candle, Mapping):
+                continue
+            if not _is_candle_closed(candle.get("closed")):
+                continue
+            minute_candles.append(candle)
     logger.debug(
         "Ensuring higher timeframes for liquidity",
         extra={"seed_tf": "1m", "seed_candles": len(minute_candles)},
@@ -188,7 +207,7 @@ def ensure_higher_timeframes(
     if not minute_candles:
         return generated
 
-    for target_tf in ("15m", "1h"):
+    for target_tf in HTF_TIMEFRAMES:
         existing = candles_by_tf.get(target_tf)
         existing_count = len(existing) if isinstance(existing, Sequence) else 0
         if existing_count:
@@ -412,6 +431,87 @@ def _summarise_missing_minutes(
         gaps.append({"from": current_start, "to": expected[-1], "count": current_count})
 
     return gaps
+
+
+def _extract_ts_bounds(candles: Sequence[Mapping[str, Any]]) -> Tuple[int | None, int | None]:
+    timestamps: List[int] = []
+    for candle in candles:
+        if not isinstance(candle, Mapping):
+            continue
+        ts_raw = candle.get("t")
+        try:
+            ts_value = int(ts_raw)
+        except (TypeError, ValueError):
+            continue
+        timestamps.append(ts_value)
+    if not timestamps:
+        return None, None
+    return min(timestamps), max(timestamps)
+
+
+def _build_frame_status_entry(
+    tf: str,
+    candles: Sequence[Mapping[str, Any]],
+    *,
+    source: str | None,
+    dq_entry: Mapping[str, Any] | None,
+    minute_seed_count: int,
+    now_ms: int | None = None,
+) -> Dict[str, Any]:
+    interval_ms = TIMEFRAME_TO_MS.get(tf, MINUTE_INTERVAL_MS)
+    min_required = max(2, MIN_FRAME_BARS.get(tf, 4))
+    now_value = ensure_ms_epoch(now_ms) or ensure_ms_epoch(datetime.now(timezone.utc)) or 0
+
+    closed = [c for c in candles if _is_candle_closed(c.get("closed"))]
+    effective = closed or [c for c in candles if isinstance(c, Mapping)]
+    available = len(effective)
+
+    start_ts, end_ts = _extract_ts_bounds(effective)
+    close_ts = None
+    if end_ts is not None:
+        close_ts = end_ts + max(interval_ms - MINUTE_INTERVAL_MS, 0)
+    freshness_sec: int | None = None
+    if close_ts is not None:
+        freshness_ms = max(0, now_value - close_ts)
+        freshness_sec = freshness_ms // 1000
+
+    expected = dq_entry.get("expected") if isinstance(dq_entry, Mapping) else None
+    missing_after = dq_entry.get("missing_after") if isinstance(dq_entry, Mapping) else 0
+    missing_before = dq_entry.get("missing_before") if isinstance(dq_entry, Mapping) else 0
+
+    status = "ok"
+    reason: str | None = None
+
+    if available == 0:
+        status = "empty"
+        if tf != "1m" and minute_seed_count == 0:
+            reason = "missing_seed"
+        elif missing_after:
+            reason = "missing_candles"
+        else:
+            reason = "no_candles"
+    elif available < min_required:
+        status = "insufficient"
+        reason = "insufficient_candles"
+    elif missing_after:
+        status = "insufficient"
+        reason = "insufficient_candles"
+
+    entry: Dict[str, Any] = {
+        "status": status,
+        "reason": reason,
+        "available": available,
+        "required": min_required,
+        "source": source or "unknown",
+        "interval_ms": interval_ms,
+        "range": {"start": start_ts, "end": end_ts},
+        "close_ts": close_ts,
+        "freshness_sec": freshness_sec,
+        "expected": expected,
+        "missing_after": missing_after,
+        "missing_before": missing_before,
+    }
+    return entry
 
 
 def _fetch_binance_minutes(
@@ -1121,7 +1221,7 @@ def compute_session_vwaps(symbol: str, candles: Sequence[Mapping[str, Any]]) -> 
         "meta": meta,
     }
 def _coerce_frame(tf_key: str, frame: Mapping[str, Any] | Sequence[Any]) -> Dict[str, Any]:
-    if tf_key not in TIMEFRAME_WINDOWS:
+    if tf_key not in SUPPORTED_CHART_TIMEFRAMES:
         raise ValueError(f"Unsupported timeframe: {tf_key}")
 
     if isinstance(frame, Mapping):
@@ -1142,10 +1242,44 @@ def _extract_frames(snapshot: Mapping[str, Any], primary_tf: str) -> Dict[str, D
     raw_frames = snapshot.get("frames")
     if isinstance(raw_frames, Mapping):
         for key, frame in raw_frames.items():
-            tf_value = None
+            key_tf = str(key or "").strip().lower()
+            declared_tf: str | None = None
             if isinstance(frame, Mapping):
-                tf_value = frame.get("tf")
-            tf_key = str(tf_value or key or primary_tf).lower()
+                declared_raw = frame.get("tf")
+                if isinstance(declared_raw, str):
+                    declared_tf = declared_raw.strip().lower()
+
+            tf_candidates: List[str] = []
+            if key_tf:
+                tf_candidates.append(key_tf)
+            if declared_tf and declared_tf not in tf_candidates:
+                tf_candidates.append(declared_tf)
+            primary_clean = primary_tf.strip().lower()
+            if primary_clean and primary_clean not in tf_candidates:
+                tf_candidates.append(primary_clean)
+
+            tf_key: str | None = None
+            for candidate in tf_candidates:
+                if candidate in SUPPORTED_CHART_TIMEFRAMES:
+                    tf_key = candidate
+                    break
+
+            if tf_key is None:
+                raise ValueError(
+                    f"Snapshot includes unsupported timeframe key '{key}'"
+                )
+
+            if declared_tf and declared_tf != tf_key:
+                LOGGER.warning(
+                    "Frame timeframe mismatch, normalising to key",
+                    extra={
+                        "snapshot_id": snapshot.get("id"),
+                        "frame_key": key,
+                        "declared_tf": declared_tf,
+                        "normalised_tf": tf_key,
+                    },
+                )
+
             frames[tf_key] = _coerce_frame(tf_key, frame)  # type: ignore[arg-type]
     elif "candles" in snapshot:
         try:
@@ -1346,6 +1480,7 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
     vwap_frames: Dict[str, Dict[str, Any]] = {}
     full_candles_by_tf: Dict[str, List[Mapping[str, Any]]] = {}
     liquidity_sources: Dict[str, str] = {}
+    timeframe_meta: Dict[str, Dict[str, Any]] = {}
 
     for tf_key, frame in frames.items():
         candles = frame.get("candles", []) if isinstance(frame, Mapping) else []
@@ -1373,8 +1508,8 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
         full_candles_by_tf[tf_key] = raw_candles
         if tf_key == "1m":
             liquidity_sources[tf_key] = "minute"
-        elif tf_key == "1d":
-            liquidity_sources.setdefault(tf_key, "frame")
+        else:
+            liquidity_sources.setdefault(tf_key, "snapshot")
 
         filtered_candles = _filter_by_selection(raw_candles, start=start, end=end)
         result["candles"] = filtered_candles
@@ -1477,6 +1612,67 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
             zone_source_frames[tf_key] = candles
     for tf_key, series in normalised_candles_by_tf.items():
         zone_source_frames.setdefault(tf_key, list(series))
+
+    dq_timeframes = (
+        htf_quality.get("timeframes")
+        if isinstance(htf_quality.get("timeframes"), Mapping)
+        else {}
+    )
+    minute_seed_count = len(full_candles_by_tf.get("1m", []))
+    now_ms = ensure_ms_epoch(datetime.now(timezone.utc))
+    for tf in SUPPORTED_CHART_TIMEFRAMES:
+        candles = normalised_candles_by_tf.get(tf, [])
+        entry = _build_frame_status_entry(
+            tf,
+            candles,
+            source=liquidity_sources.get(tf),
+            dq_entry=dq_timeframes.get(tf) if isinstance(dq_timeframes, Mapping) else None,
+            minute_seed_count=minute_seed_count,
+            now_ms=now_ms,
+        )
+        timeframe_meta[tf] = entry
+        frame_payload = normalised_frames.get(tf)
+        if frame_payload is None:
+            frame_payload = {"symbol": symbol, "tf": tf, "candles": []}
+            normalised_frames[tf] = frame_payload
+        frame_payload.setdefault("tf", tf)
+        frame_payload.setdefault("candles", [])
+        frame_payload["status"] = entry["status"]
+        frame_payload["reason"] = entry.get("reason")
+        frame_payload["available"] = entry["available"]
+        frame_payload["required"] = entry["required"]
+        frame_payload["expected"] = entry.get("expected")
+        frame_payload["missing_after"] = entry.get("missing_after")
+        frame_payload["missing_before"] = entry.get("missing_before")
+        frame_payload["source"] = entry.get("source")
+        frame_payload["interval_ms"] = entry.get("interval_ms")
+        frame_payload["range"] = entry.get("range")
+        frame_payload["freshness_sec"] = entry.get("freshness_sec")
+        frame_payload["last_close_ts"] = entry.get("close_ts")
+        frame_payload.setdefault("symbol", symbol)
+        if frame_payload.get("last_ts") is None and isinstance(entry.get("range"), Mapping):
+            frame_payload["last_ts"] = entry["range"].get("end")
+        normalised_candles_by_tf.setdefault(tf, frame_payload.get("candles", []))
+
+    for tf, meta_entry in timeframe_meta.items():
+        LOGGER.info(
+            "inspection.frame_status",
+            extra={
+                "symbol": symbol,
+                "tf": tf,
+                "status": meta_entry.get("status"),
+                "reason": meta_entry.get("reason"),
+                "available": meta_entry.get("available"),
+                "required": meta_entry.get("required"),
+                "range_start": meta_entry.get("range", {}).get("start")
+                if isinstance(meta_entry.get("range"), Mapping)
+                else None,
+                "range_end": meta_entry.get("range", {}).get("end")
+                if isinstance(meta_entry.get("range"), Mapping)
+                else None,
+                "source": meta_entry.get("source"),
+            },
+        )
 
     profile_tf_key, base_candles = _select_zone_base_from_frames(
         normalised_candles_by_tf,
@@ -1740,6 +1936,7 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
             },
             "source": snapshot.get("meta", {}),
             "data_quality_htf": htf_quality,
+            "timeframes": timeframe_meta,
         },
     }
 
@@ -2034,10 +2231,55 @@ def render_inspection_page(
       border: none;
       font-weight: 600;
     }
+    .tf-toggle button[data-state="empty"] {
+      color: var(--muted);
+      opacity: 0.7;
+    }
+    .tf-toggle button[data-state="insufficient"] {
+      color: #fbbf24;
+    }
+    .tf-toggle button[data-state="rate_limited"] {
+      color: #f87171;
+    }
     .tf-toggle button.active {
       background: var(--accent);
       color: #0f172a;
       box-shadow: 0 12px 26px rgba(14, 165, 233, 0.25);
+    }
+    .tf-status {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.35rem;
+      font-size: 0.75rem;
+      color: var(--muted);
+    }
+    .tf-status__item {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      padding: 0.25rem 0.6rem;
+      border-radius: 999px;
+      border: 1px solid rgba(148, 163, 184, 0.24);
+      background: rgba(15, 23, 42, 0.55);
+    }
+    .tf-status__item[data-status="ok"] {
+      color: #34d399;
+      border-color: rgba(52, 211, 153, 0.4);
+    }
+    .tf-status__item[data-status="insufficient"] {
+      color: #fbbf24;
+      border-color: rgba(251, 191, 36, 0.45);
+    }
+    .tf-status__item[data-status="empty"] {
+      color: var(--muted);
+    }
+    .tf-status__item[data-status="rate_limited"] {
+      color: #f87171;
+      border-color: rgba(248, 113, 113, 0.45);
+    }
+    .tf-status__reason {
+      font-style: italic;
+      color: var(--muted);
     }
     .badge {
       display: inline-flex;
@@ -2763,6 +3005,7 @@ def render_inspection_page(
     const clearSelection = document.getElementById("clear-selection");
     const timeframeCheckboxes = Array.from(document.querySelectorAll("[data-tf-checkbox]"));
     const timeframeToggle = document.getElementById("chart-tf-toggle");
+    const timeframeStatus = document.getElementById("tf-status");
     const statusEl = document.getElementById("inspection-status");
     const symbolInput = document.getElementById("symbol-input");
     const presetChip = document.getElementById("preset-chip");
@@ -2805,7 +3048,20 @@ def render_inspection_page(
       return Math.min(4, Math.max(1, Math.floor(parsed)));
     };
 
-    const PREFERRED_CHART_FRAMES = ["1m", "3m", "15m", "30m", "1h", "4h", "1d", "1w"];
+    const TIMEFRAME_ORDER = ["1m", "3m", "5m", "15m", "1h", "4h", "1d"];
+    const PREFERRED_CHART_FRAMES = TIMEFRAME_ORDER.slice();
+    const STATUS_LABELS = {
+      ok: "OK",
+      insufficient: "Мало данных",
+      empty: "Нет данных",
+      rate_limited: "Rate limited",
+    };
+    const REASON_LABELS = {
+      insufficient_candles: "недостаточно закрытых свечей",
+      missing_seed: "нет 1m базы",
+      missing_candles: "есть пропуски",
+      no_candles: "данные отсутствуют",
+    };
 
     let state = null;
 
@@ -2820,6 +3076,13 @@ def render_inspection_page(
       if (!entry || typeof entry !== "object") return false;
       const candles = Array.isArray(entry.candles) ? entry.candles : [];
       return candles.length > 0;
+    }
+
+    function translateReason(code) {
+      if (!code || typeof code !== "string") return "";
+      const mapped = REASON_LABELS[code];
+      if (mapped) return mapped;
+      return code.replace(/_/g, " ");
     }
 
     function selectPreferredFrame(frames, desired) {
@@ -2869,6 +3132,10 @@ def render_inspection_page(
       liveMeta: null,
       liveMismatch: false,
       progressEvents: [],
+      frameMeta: (() => {
+        const meta = initial.payload?.DATA?.meta?.timeframes;
+        return meta && typeof meta === "object" ? { ...meta } : {};
+      })(),
     };
 
     const AUTO_PRESET_SYMBOLS = new Set(["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
@@ -3419,6 +3686,12 @@ def render_inspection_page(
 
     function populateFrames(payload) {
       const frames = payload?.DATA?.frames || {};
+      const meta = payload?.DATA?.meta?.timeframes;
+      if (meta && typeof meta === "object") {
+        state.frameMeta = { ...meta };
+      } else {
+        state.frameMeta = {};
+      }
       const combined = { ...frames };
       if (state.liveFrames) {
         Object.entries(state.liveFrames).forEach(([tf, entry]) => {
@@ -3438,10 +3711,66 @@ def render_inspection_page(
       const buttons = Array.from(timeframeToggle.querySelectorAll("[data-tf]"));
       for (const button of buttons) {
         const tf = button.dataset.tf;
-        const enabled = frameHasCandles(frames, tf);
-        button.disabled = !enabled;
-        button.classList.toggle("active", enabled && state.frame === tf);
+        if (!tf) continue;
+        const meta = (state.frameMeta && typeof state.frameMeta === "object" && state.frameMeta[tf]) || {};
+        const status = meta.status || (frameHasCandles(frames, tf) ? "ok" : "empty");
+        button.disabled = false;
+        button.dataset.state = status;
+        button.classList.toggle("active", state.frame === tf);
+        button.textContent = tf;
+        const reasonText = meta.reason ? translateReason(meta.reason) : "";
+        if (reasonText) {
+          button.title = `${tf.toUpperCase()}: ${reasonText}`;
+        } else if (typeof meta.available === "number" && typeof meta.required === "number") {
+          button.title = `${tf.toUpperCase()}: ${meta.available}/${meta.required}`;
+        } else {
+          button.removeAttribute("title");
+        }
       }
+      renderTimeframeStatus();
+    }
+
+    function renderTimeframeStatus() {
+      if (!timeframeStatus) return;
+      const frames = state.availableFrames || state.payload?.DATA?.frames || {};
+      const meta = state.frameMeta && typeof state.frameMeta === "object" ? state.frameMeta : {};
+      timeframeStatus.innerHTML = "";
+      const fragment = document.createDocumentFragment();
+      let needsAttention = false;
+      TIMEFRAME_ORDER.forEach((tf) => {
+        const metaEntry = meta[tf] || {};
+        const status = metaEntry.status || (frameHasCandles(frames, tf) ? "ok" : "empty");
+        const item = document.createElement("div");
+        item.className = "tf-status__item";
+        item.dataset.status = status;
+        const label = document.createElement("span");
+        label.textContent = tf;
+        item.append(label);
+        if (typeof metaEntry.available === "number") {
+          const available = document.createElement("span");
+          const required = typeof metaEntry.required === "number" ? metaEntry.required : null;
+          available.textContent = required !== null ? `${metaEntry.available}/${required}` : `${metaEntry.available}`;
+          item.append(available);
+        }
+        const statusSpan = document.createElement("span");
+        statusSpan.textContent = STATUS_LABELS[status] || status || "—";
+        item.append(statusSpan);
+        if (metaEntry.reason) {
+          const reasonText = translateReason(metaEntry.reason);
+          if (reasonText) {
+            const reasonSpan = document.createElement("span");
+            reasonSpan.className = "tf-status__reason";
+            reasonSpan.textContent = reasonText;
+            item.append(reasonSpan);
+          }
+        }
+        if (status !== "ok") {
+          needsAttention = true;
+        }
+        fragment.append(item);
+      });
+      timeframeStatus.append(fragment);
+      timeframeStatus.dataset.state = needsAttention ? "attention" : "ok";
     }
 
     function renderMeta(payload) {
@@ -4615,7 +4944,7 @@ def render_inspection_page(
         return;
       }
       ensureChart();
-      const fitContent = options.fitContent !== false;
+      const fitContent = options.fitContent === true;
       ensureFrameData({ resetRequestedKeys: options.resetRequestedKeys, fitContent })
         .then(() => {
           updateSelectionLabel();
@@ -4689,6 +5018,17 @@ def render_inspection_page(
         state.frame = tf;
         renderChart({ resetRequestedKeys: true });
         updateTimeframeToggle();
+        const metaEntry =
+          state.frameMeta && typeof state.frameMeta === "object" ? state.frameMeta[tf] : null;
+        if (metaEntry && metaEntry.status && metaEntry.status !== "ok") {
+          const statusLabel = STATUS_LABELS[metaEntry.status] || metaEntry.status;
+          const reasonText = metaEntry.reason ? translateReason(metaEntry.reason) : "";
+          const suffix = reasonText ? ` (${reasonText})` : "";
+          updateStatus(
+            `Слой ${tf} — ${statusLabel}${suffix}. Используйте «Дособрать данные», чтобы обновить слой.`,
+            "warning",
+          );
+        }
         syncLiveStores({ force: true });
       });
     }
@@ -4894,7 +5234,7 @@ def render_inspection_page(
     populateFrames(state.payload);
     populateSnapshots(initial.snapshots || []);
     renderMeta(state.payload);
-    renderChart();
+    renderChart({ fitContent: true });
     await refreshSnapshots();
     if (state.snapshotId && snapshotSelect) {
       snapshotSelect.value = state.snapshotId;
@@ -4991,13 +5331,13 @@ def render_inspection_page(
                 <div class="tf-toggle" id="chart-tf-toggle">
                   <button type="button" data-tf="1m">1m</button>
                   <button type="button" data-tf="3m">3m</button>
+                  <button type="button" data-tf="5m">5m</button>
                   <button type="button" data-tf="15m">15m</button>
-                  <button type="button" data-tf="30m">30m</button>
                   <button type="button" data-tf="1h">1h</button>
                   <button type="button" data-tf="4h">4h</button>
                   <button type="button" data-tf="1d">1d</button>
-                  <button type="button" data-tf="1w">1w</button>
                 </div>
+                <div class="tf-status" id="tf-status"></div>
               </div>
             </div>
             <div id=\"inspection-chart\" class=\"chart-shell\" data-selection-label=\"—\"></div>
