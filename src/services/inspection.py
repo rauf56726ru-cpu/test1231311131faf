@@ -855,6 +855,90 @@ def _persist_snapshot(snapshot: Snapshot) -> None:
             pass
 
 
+def _normalise_candle_entry(entry: Any) -> tuple[Any, bool]:
+    """Return a copy of the candle with normalised timestamp."""
+
+    changed = False
+
+    if isinstance(entry, Mapping):
+        candle = dict(entry)
+        timestamp_keys = ("t", "time", "openTime", "open_time")
+        normalised_ts: int | None = None
+        for key in timestamp_keys:
+            if key not in candle:
+                continue
+            normalised_ts = ensure_ms_epoch(candle.get(key))
+            if normalised_ts is not None:
+                break
+        if normalised_ts is not None:
+            if candle.get("t") != normalised_ts:
+                changed = True
+            candle["t"] = normalised_ts
+        return candle, changed
+
+    if isinstance(entry, Sequence) and not isinstance(entry, (str, bytes, bytearray)):
+        row = list(entry)
+        if row:
+            normalised_ts = ensure_ms_epoch(row[0])
+            if normalised_ts is not None and normalised_ts != row[0]:
+                row[0] = normalised_ts
+                changed = True
+        return row, changed
+
+    return entry, changed
+
+
+
+def _normalise_frame_candles(candles: Sequence[Any]) -> tuple[list[Any], bool]:
+    """Normalise timestamps for candle collections."""
+
+    normalised: list[Any] = []
+    changed = False
+    for candle in candles:
+        converted, mutated = _normalise_candle_entry(candle)
+        normalised.append(converted)
+        changed = changed or mutated
+    return normalised, changed
+
+
+
+def _normalise_snapshot_structure(snapshot: MutableMapping[str, Any]) -> bool:
+    """Normalise timestamps within stored snapshot structures."""
+
+    changed = False
+
+    frames = snapshot.get("frames")
+    if isinstance(frames, MutableMapping):
+        for key in list(frames.keys()):
+            frame = frames[key]
+            if isinstance(frame, Mapping):
+                frame_dict = dict(frame)
+                candles = frame_dict.get("candles")
+                if isinstance(candles, Sequence) and not isinstance(candles, (str, bytes, bytearray)):
+                    normalised_candles, mutated = _normalise_frame_candles(candles)
+                    if mutated:
+                        frame_dict["candles"] = normalised_candles
+                        frames[key] = frame_dict
+                        changed = True
+                    else:
+                        frame_dict["candles"] = list(candles) if isinstance(candles, tuple) else candles
+                        frames[key] = frame_dict
+            elif isinstance(frame, Sequence) and not isinstance(frame, (str, bytes, bytearray)):
+                normalised_candles, mutated = _normalise_frame_candles(frame)
+                if mutated or not isinstance(frame, list):
+                    frames[key] = normalised_candles
+                    changed = True
+
+    top_level_candles = snapshot.get("candles")
+    if isinstance(top_level_candles, Sequence) and not isinstance(top_level_candles, (str, bytes, bytearray)):
+        normalised_candles, mutated = _normalise_frame_candles(top_level_candles)
+        if mutated:
+            snapshot["candles"] = normalised_candles
+            changed = True
+
+    return changed
+
+
 def _remove_snapshot_file(snapshot_id: str) -> None:
     path = _snapshot_path(snapshot_id)
     try:
@@ -911,6 +995,14 @@ def _load_existing_snapshots() -> None:
         snapshot_id = str(data.get("id") or path.stem)
         snapshot = dict(data)
         snapshot["id"] = snapshot_id
+        normalised = False
+        if isinstance(snapshot, MutableMapping):
+            normalised = _normalise_snapshot_structure(snapshot)
+        if normalised:
+            try:
+                _persist_snapshot(snapshot)
+            except Exception:
+                LOGGER.warning("Failed to persist normalised snapshot", extra={"id": snapshot_id})
         _SNAPSHOT_STORE[snapshot_id] = snapshot
         _SNAPSHOT_STORE.move_to_end(snapshot_id)
 
@@ -1234,7 +1326,9 @@ def _coerce_frame(tf_key: str, frame: Mapping[str, Any] | Sequence[Any]) -> Dict
     except TypeError as exc:  # pragma: no cover - defensive guard
         raise ValueError("Frame candles must be iterable") from exc
 
-    return {"tf": tf_key, "candles": candles}
+    normalised_candles, _ = _normalise_frame_candles(candles)
+
+    return {"tf": tf_key, "candles": normalised_candles}
 
 
 def _extract_frames(snapshot: Mapping[str, Any], primary_tf: str) -> Dict[str, Dict[str, Any]]:
@@ -1366,6 +1460,8 @@ def register_snapshot(snapshot: Mapping[str, Any]) -> str:
         "captured_at": snapshot.get("captured_at") or _now_iso(),
         "meta": meta,
     }
+
+    _normalise_snapshot_structure(stored)
 
     if selection_data:
         stored["selection"] = selection_data

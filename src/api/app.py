@@ -184,7 +184,7 @@ def _build_fallback_multi(symbol: str, candles: Sequence[CandleIn]) -> Dict[str,
     base_rows: List[Dict[str, object]] = []
     for candle in candles:
         base_rows.append({
-            "t": _to_iso(candle.t),
+            "t": candle.t,
             "o": candle.o,
             "h": candle.h,
             "l": candle.l,
@@ -201,7 +201,7 @@ def _build_fallback_multi(symbol: str, candles: Sequence[CandleIn]) -> Dict[str,
             bucket_row = grouped.get(bucket)
             if bucket_row is None:
                 grouped[bucket] = {
-                    "t": _to_iso(bucket),
+                    "t": bucket,
                     "o": row.o,
                     "h": row.h,
                     "l": row.l,
@@ -598,14 +598,36 @@ def _format_iso8601(moment: datetime | None) -> str | None:
 
 
 def _zone_price_range(zone: Mapping[str, Any]) -> tuple[float, float] | None:
-    try:
-        low = float(zone.get('open') or zone.get('low') or zone.get('price_low'))
-        high = float(zone.get('close') or zone.get('high') or zone.get('price_high'))
-    except (TypeError, ValueError):
+    def _extract(keys: tuple[str, ...]) -> float | None:
+        for key in keys:
+            value = zone.get(key)
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    low = _extract(("open", "low", "price_low", "bot", "bottom", "lower"))
+    high = _extract(("close", "high", "price_high", "top", "upper"))
+
+    if low is None and high is None:
+        pivot = _extract(("price", "level", "mean"))
+        if pivot is None:
+            return None
+        low = pivot
+        high = pivot
+    elif low is None:
+        low = high
+    elif high is None:
+        high = low
+
+    if low is None or high is None:
         return None
     if low > high:
         low, high = high, low
-    return low, high
+    return float(low), float(high)
 
 
 def _ranges_overlap(left: tuple[float, float], right: tuple[float, float], *, tolerance: float = 0.0) -> bool:
