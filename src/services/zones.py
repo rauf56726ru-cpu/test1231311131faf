@@ -27,6 +27,9 @@ class Config:
 
     tick_size: float | None = None
     atr_period: int = 14
+    k_impulse: float = 0.25
+    w_swing: int = 2
+    r_zone_pct: float = 0.15
     displacement_body: float = 0.6
     displacement_range: float = 1.1
     displacement_body_floor: float = 0.25

@@ -198,3 +198,33 @@ def test_zones_endpoint_returns_structured_payload(client: TestClient) -> None:
     assert any(zones[key] for key in ("fvg", "ob", "mb", "bb", "rb", "pb", "sr")), (
         "Expected at least one populated zone list"
     )
+
+
+def test_zones_endpoint_uses_latest_snapshot_defaults(client: TestClient) -> None:
+    candles: List[Dict[str, float]] = []
+    for idx in range(18):
+        base = 100.0 + idx * 0.15
+        candles.append(make_candle(idx, base, base + 0.6, base - 0.6, base + 0.2))
+
+    gap_start = len(candles)
+    candles.append(make_candle(gap_start, 103.5, 103.8, 102.9, 103.6))
+    candles.append(make_candle(gap_start + 1, 104.1, 104.4, 103.8, 104.2))
+    candles.append(make_candle(gap_start + 2, 107.2, 107.8, 106.9, 107.5))
+
+    for tail in range(3):
+        idx = len(candles)
+        base = 106.8 - tail * 0.25
+        candles.append(make_candle(idx, base, base + 0.7, base - 0.7, base + 0.15))
+    snapshot_payload = {
+        "symbol": "SNAP",
+        "tf": "15m",
+        "candles": candles,
+    }
+    create_response = client.post("/inspection/snapshot", json=snapshot_payload)
+    assert create_response.status_code == 200
+
+    response = client.get("/zones")
+    assert response.status_code == 200
+    payload = response.json()
+    zones = payload.get("zones", {})
+    assert zones.get("fvg") or zones.get("ob"), "Expected FVG or OB zones from latest snapshot"

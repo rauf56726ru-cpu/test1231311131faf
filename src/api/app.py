@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import time
+from decimal import Decimal, InvalidOperation
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
@@ -29,6 +30,7 @@ from ..services import (
     DEFAULT_SYMBOL,
     delete_preset,
     get_last_collection_time,
+    get_latest_snapshot,
     get_shared_candles,
     get_snapshot,
     list_presets_configs,
@@ -3280,6 +3282,35 @@ async def profile_endpoint(
     return JSONResponse(payload)
 
 
+def _last_price_from_candles(candles: Sequence[Mapping[str, Any]]) -> float | None:
+    for candle in reversed(candles):
+        if not isinstance(candle, Mapping):
+            continue
+        for key in ("c", "o", "h", "l"):
+            value = candle.get(key)
+            if value is None:
+                continue
+            try:
+                price = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(price) and price > 0:
+                return price
+    return None
+
+
+def _tick_size_from_price(price: float | None) -> float | None:
+    if price is None or not math.isfinite(price) or price <= 0:
+        return None
+    try:
+        decimal_price = Decimal(str(price)).normalize()
+    except (InvalidOperation, ValueError):  # pragma: no cover - defensive guard
+        return None
+    exponent = decimal_price.as_tuple().exponent
+    decimals = max(0, -exponent)
+    return float(10 ** (-decimals))
+
+
 @app.get("/zones")
 async def zones_endpoint(
     snapshot: str | None = Query(None, description="Snapshot identifier"),
@@ -3315,27 +3346,40 @@ async def zones_endpoint(
     symbol_value = str(symbol or payload_body.get("symbol") or "").upper()
     timeframe_value = str(tf or payload_body.get("tf") or "").lower()
 
+    snapshot_payload: Mapping[str, Any] | None = None
     if snapshot:
-        target_snapshot = get_snapshot(snapshot)
-        if target_snapshot is None:
+        snapshot_payload = get_snapshot(snapshot)
+        if snapshot_payload is None:
             raise HTTPException(status_code=404, detail="Snapshot not found")
+    else:
+        candles_candidate = payload_body.get("candles")
+        has_body_candles = isinstance(candles_candidate, Sequence) and len(candles_candidate) > 0
+        if not has_body_candles:
+            snapshot_payload = get_latest_snapshot()
+            if snapshot_payload is None:
+                raise HTTPException(status_code=404, detail="Snapshot not found")
 
+    profile_config: Mapping[str, Any] | Dict[str, Any] = {}
+    body_tick = _num(payload_body, "tick_size")
+
+    if snapshot_payload is not None:
         symbol_value = str(
             symbol
-            or target_snapshot.get("symbol")
-            or target_snapshot.get("pair")
-            or "UNKNOWN"
+            or snapshot_payload.get("symbol")
+            or snapshot_payload.get("pair")
+            or symbol_value
+            or DEFAULT_SYMBOL
         ).upper()
 
-        timeframe_value = str(tf or target_snapshot.get("tf") or "1m").lower()
+        timeframe_value = str(tf or snapshot_payload.get("tf") or timeframe_value or "1m").lower()
 
-        frames_data = target_snapshot.get("frames")
+        frames_data = snapshot_payload.get("frames")
         frames = frames_data if isinstance(frames_data, Mapping) else {}
         raw_frame = None
         if isinstance(frames, dict):
             raw_frame = frames.get(timeframe_value) or frames.get(timeframe_value.upper())
-        if raw_frame is None and "candles" in target_snapshot:
-            raw_frame = {"candles": target_snapshot.get("candles")}
+        if raw_frame is None and "candles" in snapshot_payload:
+            raw_frame = {"candles": snapshot_payload.get("candles")}
 
         if isinstance(raw_frame, Mapping):
             raw_candles = raw_frame.get("candles", [])
@@ -3346,22 +3390,34 @@ async def zones_endpoint(
 
         candles_data = list(raw_candles)
 
-        profile_config = resolve_profile_config(
-            symbol_value, target_snapshot.get("meta") if isinstance(target_snapshot.get("meta"), Mapping) else None
-        )
-        body_tick = _num(payload_body, "tick_size")
+        try:
+            profile_config = resolve_profile_config(
+                symbol_value,
+                snapshot_payload.get("meta")
+                if isinstance(snapshot_payload.get("meta"), Mapping)
+                else None,
+            )
+        except Exception:  # pragma: no cover - resolve_profile_config may raise
+            profile_config = {}
+
         if tick_size_value is None:
-            tick_size_value = body_tick if body_tick is not None else profile_config.get("tick_size")
+            if body_tick is not None:
+                tick_size_value = body_tick
+            elif isinstance(profile_config, Mapping):
+                tick_candidate = profile_config.get("tick_size")
+                if isinstance(tick_candidate, (int, float)):
+                    tick_size_value = float(tick_candidate)
     else:
         candles_raw = payload_body.get("candles")
+        if not isinstance(candles_raw, Sequence) or not candles_raw:
+            raise HTTPException(status_code=400, detail="No candles provided")
+        candles_data = list(candles_raw)  # type: ignore[list-item]
+
         if not symbol_value:
             symbol_value = DEFAULT_SYMBOL
         if not timeframe_value:
             raise HTTPException(status_code=400, detail="tf is required")
-        if not isinstance(candles_raw, Sequence):
-            raise HTTPException(status_code=400, detail="candles must be a sequence")
-        candles_data = list(candles_raw)  # type: ignore[list-item]
-        body_tick = _num(payload_body, "tick_size")
+
         if tick_size_value is None and body_tick is not None:
             tick_size_value = body_tick
 
@@ -3369,8 +3425,11 @@ async def zones_endpoint(
             profile_config = resolve_profile_config(symbol_value, None)
         except Exception:  # pragma: no cover - resolve_profile_config may raise
             profile_config = {}
-        if tick_size_value is None:
-            tick_size_value = profile_config.get("tick_size") if isinstance(profile_config, Mapping) else None
+
+        if tick_size_value is None and isinstance(profile_config, Mapping):
+            tick_candidate = profile_config.get("tick_size")
+            if isinstance(tick_candidate, (int, float)):
+                tick_size_value = float(tick_candidate)
 
     if not candles_data:
         raise HTTPException(status_code=400, detail="No candles provided")
@@ -3381,42 +3440,64 @@ async def zones_endpoint(
     if not timeframe_value:
         raise HTTPException(status_code=400, detail="tf is required")
 
+    if tick_size_value is None:
+        tick_size_value = _tick_size_from_price(_last_price_from_candles(candles_data))
+
     cfg_kwargs: Dict[str, Any] = {}
     body_min_gap = _num(payload_body, "min_gap_pct")
-    if min_gap_pct is not None:
-        cfg_kwargs["min_gap_pct"] = float(min_gap_pct)
-    elif body_min_gap is not None:
-        cfg_kwargs["min_gap_pct"] = float(body_min_gap)
+    cfg_kwargs["min_gap_pct"] = float(
+        min_gap_pct
+        if min_gap_pct is not None
+        else body_min_gap
+        if body_min_gap is not None
+        else 0.0003
+    )
 
     body_atr_period = _int(payload_body, "atr_period")
-    if atr_period is not None:
-        cfg_kwargs["atr_period"] = int(atr_period)
-    elif body_atr_period is not None:
-        cfg_kwargs["atr_period"] = int(body_atr_period)
+    cfg_kwargs["atr_period"] = int(
+        atr_period
+        if atr_period is not None
+        else body_atr_period
+        if body_atr_period is not None
+        else 14
+    )
 
     body_k_impulse = _num(payload_body, "k_impulse")
-    if k_impulse is not None:
-        cfg_kwargs["k_impulse"] = float(k_impulse)
-    elif body_k_impulse is not None:
-        cfg_kwargs["k_impulse"] = float(body_k_impulse)
+    cfg_kwargs["k_impulse"] = float(
+        k_impulse
+        if k_impulse is not None
+        else body_k_impulse
+        if body_k_impulse is not None
+        else 0.25
+    )
 
     body_w_swing = _int(payload_body, "w_swing")
-    if w_swing is not None:
-        cfg_kwargs["w_swing"] = int(w_swing)
-    elif body_w_swing is not None:
-        cfg_kwargs["w_swing"] = int(body_w_swing)
+    default_w_swing = 3 if timeframe_value in {"1h", "4h"} else 2
+    cfg_kwargs["w_swing"] = int(
+        w_swing
+        if w_swing is not None
+        else body_w_swing
+        if body_w_swing is not None
+        else default_w_swing
+    )
 
     body_r_zone_pct = _num(payload_body, "r_zone_pct")
-    if r_zone_pct is not None:
-        cfg_kwargs["r_zone_pct"] = float(r_zone_pct)
-    elif body_r_zone_pct is not None:
-        cfg_kwargs["r_zone_pct"] = float(body_r_zone_pct)
+    cfg_kwargs["r_zone_pct"] = float(
+        r_zone_pct
+        if r_zone_pct is not None
+        else body_r_zone_pct
+        if body_r_zone_pct is not None
+        else 0.15
+    )
 
     body_m_wick_atr = _num(payload_body, "m_wick_atr")
-    if m_wick_atr is not None:
-        cfg_kwargs["m_wick_atr"] = float(m_wick_atr)
-    elif body_m_wick_atr is not None:
-        cfg_kwargs["m_wick_atr"] = float(body_m_wick_atr)
+    cfg_kwargs["m_wick_atr"] = float(
+        m_wick_atr
+        if m_wick_atr is not None
+        else body_m_wick_atr
+        if body_m_wick_atr is not None
+        else 3.0
+    )
 
     cfg_kwargs["tick_size"] = tick_size_value
 
