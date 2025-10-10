@@ -98,7 +98,12 @@ def test_prepare_summary_payload_uses_data_window_for_orderflow_and_zones() -> N
     assert counts.get("ob") == 1
     filter_diag = compact["zones"].get("diag", {}).get("filter")
     assert filter_diag
-    assert filter_diag.get("allowed_statuses") == ["open", "fresh", "tapped"]
+    assert filter_diag.get("allowed_statuses") == [
+        "open",
+        "fresh",
+        "tapped",
+        "mitigated",
+    ]
 
 
 def test_prepare_summary_payload_filters_zones_by_status_and_counts() -> None:

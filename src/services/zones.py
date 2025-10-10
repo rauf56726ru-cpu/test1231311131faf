@@ -11,6 +11,7 @@ import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from collections import deque
+from decimal import Decimal
 from typing import Any, Deque, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple
 
 from .ohlc import TIMEFRAME_TO_MS, resample_ohlcv
@@ -26,28 +27,38 @@ class Config:
 
     tick_size: float | None = None
     atr_period: int = 14
-    displacement_body: float = 1.0
-    displacement_range: float = 1.5
+    k_impulse: float = 0.25
+    w_swing: int = 2
+    r_zone_pct: float = 0.15
+    displacement_body: float = 0.6
+    displacement_range: float = 1.1
+    displacement_body_floor: float = 0.25
+    displacement_range_floor: float = 0.5
     base_min_bars: int = 1
     base_max_bars: int = 4
     base_max_atr: float = 0.8
     base_min_overlap: float = 0.5
     impulse_min_cover: float = 0.6
-    ob_body_max_atr: float = 0.7
-    ob_overlap_ratio: float = 0.6
-    ob_distance_atr: float = 0.5
+    ob_body_max_atr: float = 1.0
+    ob_overlap_ratio: float = 0.75
+    ob_distance_atr: float = 0.25
     min_block_ratio: float = 0.2
     epsilon_ticks: float = 1.0
     liquidity_window: int = 3
     sr_merge_pct: float = 0.0002
     zones_window_start_ms: int | None = None
     window_end_ms_prev_closed: int | None = None
-    allow_base_fallback: bool = False
+    allow_base_fallback: bool = True
     base_fallback_max_age: int = 200
     base_fallback_max_distance_atr: float = 3.0
+    min_gap_atr_ratio: float = 0.1
+    min_gap_tick_multiple: float = 2.0
+    min_gap_pct: float = 0.0003
+    m_wick_atr: float = 3.0
 
 
 _PIVOT_WINDOWS: Dict[str, int] = {"15m": 2, "1h": 3, "4h": 4}
+_WARMUP_REQUIREMENTS: Dict[str, int] = {"15m": 24, "1h": 48, "4h": 12}
 
 
 def _ms_to_iso(timestamp_ms: int) -> str:
@@ -91,6 +102,60 @@ def _round_tick(value: float, tick_size: float | None) -> float:
     if tick_size is None or tick_size <= 0:
         return float(value)
     return round(value / tick_size) * tick_size
+
+
+def _tick_size_from_price(price: float) -> float | None:
+    if not math.isfinite(price) or price <= 0:
+        return None
+    decimal_price = Decimal(str(price)).normalize()
+    exponent = decimal_price.as_tuple().exponent
+    decimals = max(0, -exponent)
+    tick = 10 ** (-decimals)
+    return float(tick)
+
+
+def _last_price_from_frames(frames: Mapping[str, Sequence[Candle]]) -> float | None:
+    if not isinstance(frames, Mapping):
+        return None
+    ordered_frames = sorted(frames.keys(), key=lambda tf: TIMEFRAME_TO_MS.get(tf, math.inf))
+    for tf in ordered_frames:
+        candles = frames.get(tf)
+        if not candles:
+            continue
+        for candle in reversed(candles):
+            for key in ("c", "o", "h", "l"):
+                value = candle.get(key)
+                try:
+                    price = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(price) and price > 0:
+                    return price
+    return None
+
+
+def _resolve_tick_size(cfg: Config, frames: Mapping[str, Sequence[Candle]], timeframes: Mapping[str, Sequence[Candle]]) -> float | None:
+    tick = cfg.tick_size
+    if tick is not None and tick > 0:
+        return float(tick)
+
+    last_price = _last_price_from_frames(frames)
+    if last_price is None:
+        last_price = _last_price_from_frames(timeframes)
+
+    tick_from_price = _tick_size_from_price(last_price) if last_price is not None else None
+    if tick_from_price is not None and tick_from_price > 0:
+        cfg.tick_size = float(tick_from_price)
+        return float(tick_from_price)
+
+    inferred = _infer_tick_size(frames.get("1m", []))
+    if inferred is None or inferred <= 0:
+        inferred = _infer_tick_size(timeframes.get("15m", []))
+    if inferred is not None and inferred > 0:
+        cfg.tick_size = float(inferred)
+        return float(inferred)
+
+    return None
 
 
 def _rolling_return_sigma(
@@ -146,6 +211,54 @@ def _rolling_return_sigma(
     return result
 
 
+def _rolling_std_close(
+    candles: Sequence[Candle],
+    *,
+    window: int = 20,
+) -> List[float]:
+    """Compute rolling standard deviation of close prices."""
+
+    if window <= 1 or not candles:
+        return [math.nan] * len(candles)
+
+    normalised_window = max(2, int(window))
+    values: Deque[float | None] = deque()
+    result: List[float] = [math.nan] * len(candles)
+    window_sum = 0.0
+    window_sum_sq = 0.0
+    window_count = 0
+
+    for idx, candle in enumerate(candles):
+        close_raw = candle.get("c")
+        try:
+            close_value = float(close_raw)
+        except (TypeError, ValueError):
+            close_value = math.nan
+        if math.isfinite(close_value):
+            values.append(close_value)
+            window_sum += close_value
+            window_sum_sq += close_value * close_value
+            window_count += 1
+        else:
+            values.append(None)
+
+        if len(values) > normalised_window:
+            old = values.popleft()
+            if old is not None:
+                window_sum -= old
+                window_sum_sq -= old * old
+                window_count -= 1
+
+        if window_count >= normalised_window:
+            mean = window_sum / window_count
+            variance = max(0.0, (window_sum_sq / window_count) - mean * mean)
+            result[idx] = math.sqrt(variance)
+        else:
+            result[idx] = math.nan
+
+    return result
+
+
 def _true_range(current: Candle, previous: Candle) -> float:
     high = float(current["h"])
     low = float(current["l"])
@@ -187,6 +300,40 @@ def _candle_range(candle: Candle) -> Tuple[float, float]:
 
 def _pivot_span(tf: str) -> int:
     return _PIVOT_WINDOWS.get(tf, 2)
+
+
+def _series_value(series: Sequence[float] | None, index: int) -> float:
+    if not series or index < 0 or index >= len(series):
+        return math.nan
+    value = series[index]
+    try:
+        value_f = float(value)
+    except (TypeError, ValueError):
+        return math.nan
+    if not math.isfinite(value_f):
+        return math.nan
+    return value_f
+
+
+def _combine_atr_series(
+    primary: Sequence[float],
+    fallback: Sequence[float] | None,
+    length: int,
+) -> Tuple[List[float], int]:
+    combined: List[float] = []
+    fallback_used = 0
+    for idx in range(length):
+        primary_value = _series_value(primary, idx)
+        if math.isfinite(primary_value) and primary_value > 0:
+            combined.append(primary_value)
+            continue
+        fallback_value = _series_value(fallback, idx)
+        if math.isfinite(fallback_value) and fallback_value > 0:
+            combined.append(fallback_value)
+            fallback_used += 1
+        else:
+            combined.append(math.nan)
+    return combined, fallback_used
 
 
 def _epsilon(cfg: Config, tick_size: float | None) -> float:
@@ -287,6 +434,8 @@ def _fvgs_for_tf(
     cfg: Config,
     tick_size: float | None,
     atr: Sequence[float],
+    atr_reliable: bool,
+    atr_fallback: Sequence[float] | None,
     bos_events: Sequence[Mapping[str, Any]],
     returns_sigma: Sequence[float] | None = None,
     stats: MutableMapping[str, int] | None = None,
@@ -317,7 +466,31 @@ def _fvgs_for_tf(
         direction = "up" if bullish_gap else "down"
         bot_raw = high_prev if bullish_gap else high_next
         top_raw = low_next if bullish_gap else low_prev
-        if top_raw - bot_raw <= 0:
+        gap_abs = top_raw - bot_raw
+        if gap_abs <= 0:
+            if stats is not None:
+                stats["fvg_reject_no_gap"] = stats.get("fvg_reject_no_gap", 0) + 1
+            continue
+
+        impulse_idx = i + 2
+        atr_value = _series_value(atr, impulse_idx)
+        atr_component = (
+            cfg.min_gap_atr_ratio * atr_value
+            if math.isfinite(atr_value) and atr_value > 0
+            else 0.0
+        )
+        tick_component = (
+            cfg.min_gap_tick_multiple * tick
+            if tick is not None and tick > 0
+            else 0.0
+        )
+        gap_thresholds = [value for value in (atr_component, tick_component) if value > 0]
+        gap_min = max(gap_thresholds) if gap_thresholds else 0.0
+        price_mid = (top_raw + bot_raw) / 2.0
+        price_mid_abs = abs(price_mid)
+        pct_ok = price_mid_abs <= 0 or (gap_abs / price_mid_abs) >= cfg.min_gap_pct
+        abs_ok = gap_min <= 0 or gap_abs >= gap_min
+        if not (abs_ok and pct_ok):
             if stats is not None:
                 stats["fvg_reject_no_gap"] = stats.get("fvg_reject_no_gap", 0) + 1
             continue
@@ -325,11 +498,17 @@ def _fvgs_for_tf(
         if stats is not None:
             stats["fvg_raw_count"] = stats.get("fvg_raw_count", 0) + 1
 
-        impulse_idx = i + 2
-        atr_value = atr[impulse_idx] if impulse_idx < len(atr) else math.nan
-        if not atr_value or math.isnan(atr_value) or atr_value <= 0:
+        atr_valid_value = math.isfinite(atr_value) and atr_value > 0
+        if not atr_valid_value and atr_fallback is not None:
+            fallback_value = _series_value(atr_fallback, impulse_idx)
+            if math.isfinite(fallback_value) and fallback_value > 0:
+                atr_value = fallback_value
+                atr_valid_value = True
+        if atr_reliable and not atr_valid_value:
             if stats is not None:
-                stats["fvg_reject_displacement"] = stats.get("fvg_reject_displacement", 0) + 1
+                stats["fvg_reject_displacement"] = stats.get(
+                    "fvg_reject_displacement", 0
+                ) + 1
             continue
 
         sigma_value = (
@@ -339,9 +518,10 @@ def _fvgs_for_tf(
         )
         k_body = cfg.displacement_body
         k_range = cfg.displacement_range
-        if sigma_value and math.isfinite(sigma_value) and sigma_value < 0.5 * atr_value:
-            k_body = max(0.7, k_body - 0.2)
-            k_range = max(1.1, k_range - 0.3)
+        if atr_reliable and atr_valid_value:
+            if sigma_value and math.isfinite(sigma_value) and sigma_value < 0.5 * atr_value:
+                k_body = max(cfg.displacement_body_floor, k_body - 0.2)
+                k_range = max(cfg.displacement_range_floor, k_range - 0.3)
 
         body1 = abs(float(c1["c"]) - float(c1["o"]))
         body2 = abs(float(c2["c"]) - float(c2["o"]))
@@ -349,10 +529,20 @@ def _fvgs_for_tf(
         range2 = float(c2["h"]) - float(c2["l"])
         impulse_body = max(body1, body2)
         impulse_range = max(range1, range2)
-        if impulse_body < k_body * atr_value and impulse_range < k_range * atr_value:
-            if stats is not None:
-                stats["fvg_reject_displacement"] = stats.get("fvg_reject_displacement", 0) + 1
-            continue
+        if atr_reliable and atr_valid_value:
+            meets_primary = (impulse_body >= k_body * atr_value) or (
+                impulse_range >= k_range * atr_value
+            )
+            meets_floor = (
+                impulse_body >= cfg.displacement_body_floor * atr_value
+                and impulse_range >= cfg.displacement_range_floor * atr_value
+            )
+            if not (meets_primary or meets_floor):
+                if stats is not None:
+                    stats["fvg_reject_displacement"] = stats.get(
+                        "fvg_reject_displacement", 0
+                    ) + 1
+                continue
 
         created_idx = i + 2
         status = "open"
@@ -417,6 +607,13 @@ def _fvgs_for_tf(
             bot_value = bot_raw
         mid_value = _round_tick((top_raw + bot_raw) / 2.0, tick)
 
+        raw_status = status
+        zone_status = raw_status
+        if raw_status == "inverted":
+            zone_status = "tapped" if fulfil_idx is not None else "open"
+        elif raw_status == "fulfilled":
+            zone_status = "tapped"
+
         zone = {
             "tf": tf,
             "direction": direction,
@@ -424,8 +621,10 @@ def _fvgs_for_tf(
             "bot": float(bot_value),
             "mid": float(mid_value),
             "created_utc": _ms_to_iso(int(c2["t"])),
-            "status": status,
+            "status": zone_status,
         }
+        if raw_status == "inverted":
+            zone["inverted"] = True
         zones.append(zone)
     return zones
 
@@ -437,6 +636,8 @@ def _evaluate_zone_status(
     zone_range: Tuple[float, float],
     zone_type: str,
     tick: float | None,
+    atr: Sequence[float] | None = None,
+    false_touch_atr_ratio: float = 0.1,
 ) -> Tuple[str, List[Tuple[float, float, int]], int | None, int | None]:
     status = "fresh"
     coverage: List[Tuple[float, float, int]] = []
@@ -444,6 +645,23 @@ def _evaluate_zone_status(
     invalidated_idx: int | None = None
     epsilon = tick or 0.0
     low, high = zone_range
+    false_touch_grace_used = False
+
+    def _atr_value(index: int) -> float:
+        if not atr:
+            return math.nan
+        if index < len(atr):
+            value = atr[index]
+        else:
+            value = atr[-1]
+        try:
+            value_f = float(value)
+        except (TypeError, ValueError):
+            return math.nan
+        if not math.isfinite(value_f) or value_f <= 0.0:
+            return math.nan
+        return value_f
+
     for idx in range(start_idx + 1, len(candles)):
         candle = candles[idx]
         body_low, body_high = _body_range(candle)
@@ -456,11 +674,37 @@ def _evaluate_zone_status(
                 first_touch = idx
             if body_low >= low and body_high <= high and status == "fresh":
                 status = "tapped"
+        atr_value = _atr_value(idx)
+        breach_allowance = (
+            false_touch_atr_ratio * atr_value
+            if atr_value and math.isfinite(atr_value)
+            else 0.0
+        )
         if zone_type == "demand" and close_price < low - epsilon:
+            breach = low - close_price
+            if (
+                not false_touch_grace_used
+                and breach_allowance > 0.0
+                and breach <= breach_allowance
+            ):
+                false_touch_grace_used = True
+                if status == "fresh":
+                    status = "tapped"
+                continue
             status = "invalidated"
             invalidated_idx = idx
             break
         if zone_type == "supply" and close_price > high + epsilon:
+            breach = close_price - high
+            if (
+                not false_touch_grace_used
+                and breach_allowance > 0.0
+                and breach <= breach_allowance
+            ):
+                false_touch_grace_used = True
+                if status == "fresh":
+                    status = "tapped"
+                continue
             status = "invalidated"
             invalidated_idx = idx
             break
@@ -508,6 +752,8 @@ def _ob_for_tf(
     cfg: Config,
     tick_size: float | None,
     atr: Sequence[float],
+    atr_reliable: bool,
+    atr_fallback: Sequence[float] | None,
     bos_events: Sequence[Mapping[str, Any]],
     choch_events: Sequence[Mapping[str, Any]],
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
@@ -568,8 +814,14 @@ def _ob_for_tf(
         impulse_idx = bos_idx - 1
         if impulse_idx <= 0:
             continue
-        atr_value = atr[impulse_idx] if impulse_idx < len(atr) else math.nan
-        if not atr_value or math.isnan(atr_value) or atr_value <= 0:
+        atr_value = _series_value(atr, impulse_idx)
+        atr_valid_value = math.isfinite(atr_value) and atr_value > 0
+        if not atr_valid_value and atr_fallback is not None:
+            fallback_value = _series_value(atr_fallback, impulse_idx)
+            if math.isfinite(fallback_value) and fallback_value > 0:
+                atr_value = fallback_value
+                atr_valid_value = True
+        if atr_reliable and not atr_valid_value:
             continue
         base_idx = None
         for idx in range(max(0, impulse_idx - pivot_span), impulse_idx + 1):
@@ -578,7 +830,7 @@ def _ob_for_tf(
             body_span = body_high - body_low
             if body_span <= 0:
                 continue
-            if body_span > cfg.ob_body_max_atr * atr_value:
+            if atr_reliable and atr_valid_value and body_span > cfg.ob_body_max_atr * atr_value:
                 continue
             base_idx = idx
         if base_idx is None:
@@ -591,7 +843,7 @@ def _ob_for_tf(
             continue
         bos_close = float(candles[bos_idx]["c"])
         distance = abs(bos_close - (zone_high if zone_type == "supply" else zone_low))
-        if distance < cfg.ob_distance_atr * atr_value:
+        if atr_reliable and atr_valid_value and distance < cfg.ob_distance_atr * atr_value:
             continue
         status, coverage, first_touch, invalidated_idx = _evaluate_zone_status(
             candles,
@@ -599,6 +851,7 @@ def _ob_for_tf(
             zone_range=(zone_low, zone_high),
             zone_type=zone_type,
             tick=tick,
+            atr=atr,
         )
         zone = {
             "tf": tf,
@@ -608,6 +861,8 @@ def _ob_for_tf(
             "mean": _round_tick((zone_low + zone_high) / 2.0, tick),
             "origin_utc": _ms_to_iso(int(candles[bos_idx]["t"])),
             "status": status,
+            "source": "bos",
+            "confirmed_by": "bos",
         }
         zones.append(zone)
         raw_metadata.append(
@@ -814,6 +1069,7 @@ def _pb_for_tf(
             zone_range=(block_low, block_high),
             zone_type=direction,
             tick=tick,
+            atr=atr,
         )
         blocks.append(
             {
@@ -989,7 +1245,7 @@ def detect_zones(
         raise TypeError("config must be an instance of Config or None")
 
     timeframes = _ensure_timeframes(frames, ["15m", "1h", "4h", "1d"])
-    tick = cfg.tick_size or _infer_tick_size(frames.get("1m", []))
+    tick = _resolve_tick_size(cfg, frames, timeframes)
     external_liquidity: Dict[str, List[Dict[str, Any]]] = {}
     if isinstance(liquidity_levels, Mapping):
         for key in ("eqh", "eql", "pdh", "pdl"):
@@ -1033,10 +1289,41 @@ def detect_zones(
             tf_diag["skipped"] = reason
             diagnostics_timeframes.append(tf_diag)
             continue
-        atr = compute_atr(candles, cfg.atr_period)
+        warmup_required = _WARMUP_REQUIREMENTS.get(tf, 0)
+        warmup_actual = min(len(candles), warmup_required)
+        warmup_ok = warmup_required == 0 or warmup_actual >= warmup_required
+        tf_diag["warmup"] = {
+            "required": warmup_required,
+            "actual": warmup_actual,
+            "ok": warmup_ok,
+        }
+        atr_primary = compute_atr(candles, cfg.atr_period)
         returns_sigma = _rolling_return_sigma(candles, window=20)
-        valid_atr = sum(1 for value in atr if isinstance(value, (int, float)) and math.isfinite(value) and value > 0)
-        tf_diag["atr"] = {"length": len(atr), "valid_values": valid_atr}
+        atr_proxy = _rolling_std_close(candles, window=20)
+        valid_atr = sum(
+            1
+            for value in atr_primary
+            if isinstance(value, (int, float)) and math.isfinite(value) and value > 0
+        )
+        potential_atr = max(0, len(candles) - cfg.atr_period)
+        coverage_ratio = (
+            valid_atr / potential_atr if potential_atr > 0 else 0.0
+        )
+        atr_reliable = potential_atr > 0 and coverage_ratio >= 0.8
+        atr_effective, atr_proxy_count = _combine_atr_series(
+            atr_primary,
+            atr_proxy,
+            len(candles),
+        )
+        tf_diag["atr"] = {
+            "length": len(atr_primary),
+            "valid_values": valid_atr,
+            "coverage_ratio": coverage_ratio,
+            "reliable": atr_reliable,
+            "fallback_replacements": atr_proxy_count,
+        }
+        if not atr_reliable:
+            tf_diag["atr"]["proxy"] = "stdev_close_20"
         pivots, bos_events, choch_events = _detect_structure(candles, tf=tf, tick_size=tick, cfg=cfg)
         tf_window_start = cfg.zones_window_start_ms
         tf_window_end = cfg.window_end_ms_prev_closed
@@ -1108,7 +1395,9 @@ def detect_zones(
             tf=tf,
             cfg=cfg,
             tick_size=tick,
-            atr=atr,
+            atr=atr_effective,
+            atr_reliable=atr_reliable,
+            atr_fallback=atr_proxy,
             bos_events=bos_events,
             returns_sigma=returns_sigma,
             stats=stats_entry,
@@ -1124,7 +1413,9 @@ def detect_zones(
             tf=tf,
             cfg=cfg,
             tick_size=tick,
-            atr=atr,
+            atr=atr_effective,
+            atr_reliable=atr_reliable,
+            atr_fallback=atr_proxy,
             bos_events=bos_events,
             choch_events=choch_events,
         )
@@ -1145,7 +1436,7 @@ def detect_zones(
             tf=tf,
             cfg=cfg,
             tick_size=tick,
-            atr=atr,
+            atr=atr_effective,
             returns_sigma=returns_sigma,
             smc_data=smc_payload,
         )
@@ -1202,7 +1493,7 @@ def detect_zones(
             tf=tf,
             cfg=cfg,
             tick_size=tick,
-            atr=atr,
+            atr=atr_effective,
             pivots=pivots,
         )
         tf_diag["pb"] = {"count": len(pb_tf)}
@@ -1277,4 +1568,16 @@ def detect_zones(
             "summary": diagnostics_summary,
         },
     }
+    warmup_overview: Dict[str, Any] = {}
+    for frame_diag in diagnostics_timeframes:
+        tf_key = frame_diag.get("tf")
+        warmup_entry = frame_diag.get("warmup")
+        if tf_key and isinstance(warmup_entry, Mapping):
+            warmup_overview[str(tf_key)] = {
+                "required": int(warmup_entry.get("required", 0)),
+                "actual": int(warmup_entry.get("actual", 0)),
+                "ok": bool(warmup_entry.get("ok")),
+            }
+    if warmup_overview:
+        payload["meta"]["diagnostics"]["warmup"] = warmup_overview
     return payload

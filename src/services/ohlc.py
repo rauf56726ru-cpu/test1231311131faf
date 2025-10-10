@@ -93,7 +93,7 @@ def _to_candle_mapping(row: Mapping[str, object] | Sequence[object]) -> Candle |
     if isinstance(row, Mapping):
         # Accepted keys: time/ts/ts_ms_utc or t; open/o; high/h; low/l; close/c; volume/v.
         time_value = None
-        for key in ("ts_ms_utc", "t", "time", "openTime", "open_time"):
+        for key in ("ts_ms_utc", "time", "t", "openTime", "open_time"):
             candidate = row.get(key)
             if candidate is not None:
                 time_value = candidate
