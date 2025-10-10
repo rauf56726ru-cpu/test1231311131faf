@@ -536,6 +536,8 @@ def _evaluate_zone_status(
     zone_range: Tuple[float, float],
     zone_type: str,
     tick: float | None,
+    atr: Sequence[float] | None = None,
+    false_touch_atr_ratio: float = 0.1,
 ) -> Tuple[str, List[Tuple[float, float, int]], int | None, int | None]:
     status = "fresh"
     coverage: List[Tuple[float, float, int]] = []
@@ -543,6 +545,23 @@ def _evaluate_zone_status(
     invalidated_idx: int | None = None
     epsilon = tick or 0.0
     low, high = zone_range
+    false_touch_grace_used = False
+
+    def _atr_value(index: int) -> float:
+        if not atr:
+            return math.nan
+        if index < len(atr):
+            value = atr[index]
+        else:
+            value = atr[-1]
+        try:
+            value_f = float(value)
+        except (TypeError, ValueError):
+            return math.nan
+        if not math.isfinite(value_f) or value_f <= 0.0:
+            return math.nan
+        return value_f
+
     for idx in range(start_idx + 1, len(candles)):
         candle = candles[idx]
         body_low, body_high = _body_range(candle)
@@ -555,11 +574,37 @@ def _evaluate_zone_status(
                 first_touch = idx
             if body_low >= low and body_high <= high and status == "fresh":
                 status = "tapped"
+        atr_value = _atr_value(idx)
+        breach_allowance = (
+            false_touch_atr_ratio * atr_value
+            if atr_value and math.isfinite(atr_value)
+            else 0.0
+        )
         if zone_type == "demand" and close_price < low - epsilon:
+            breach = low - close_price
+            if (
+                not false_touch_grace_used
+                and breach_allowance > 0.0
+                and breach <= breach_allowance
+            ):
+                false_touch_grace_used = True
+                if status == "fresh":
+                    status = "tapped"
+                continue
             status = "invalidated"
             invalidated_idx = idx
             break
         if zone_type == "supply" and close_price > high + epsilon:
+            breach = close_price - high
+            if (
+                not false_touch_grace_used
+                and breach_allowance > 0.0
+                and breach <= breach_allowance
+            ):
+                false_touch_grace_used = True
+                if status == "fresh":
+                    status = "tapped"
+                continue
             status = "invalidated"
             invalidated_idx = idx
             break
@@ -698,6 +743,7 @@ def _ob_for_tf(
             zone_range=(zone_low, zone_high),
             zone_type=zone_type,
             tick=tick,
+            atr=atr,
         )
         zone = {
             "tf": tf,
@@ -915,6 +961,7 @@ def _pb_for_tf(
             zone_range=(block_low, block_high),
             zone_type=direction,
             tick=tick,
+            atr=atr,
         )
         blocks.append(
             {

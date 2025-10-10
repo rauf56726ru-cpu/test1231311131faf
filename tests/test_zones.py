@@ -86,7 +86,7 @@ def test_detect_zones_identifies_fvg_and_order_blocks() -> None:
     fvg_zone = zones["fvg"][0]
     assert fvg_zone["tf"] == "15m"
     assert fvg_zone["direction"] in {"up", "down"}
-    assert fvg_zone["status"] in {"open", "fresh", "tapped"}
+    assert fvg_zone["status"] in {"open", "fresh", "tapped", "mitigated"}
     if fvg_zone.get("inverted"):
         assert fvg_zone["status"] in {"open", "tapped"}
     assert fvg_zone["bot"] < fvg_zone["top"]

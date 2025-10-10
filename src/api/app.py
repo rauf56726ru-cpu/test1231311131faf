@@ -669,7 +669,9 @@ def _filter_compact_zones(
     window_hours: int | None = None,
     config: ZonesConfig | None = None,
 ) -> tuple[list[Dict[str, Any]], Dict[str, int], Dict[str, Any]]:
-    formed_cutoff_base = max(72.0, float(window_hours) * 1.5) if window_hours else 72.0
+    formed_cutoff_base = (
+        max(240.0, float(window_hours) * 1.5) if window_hours else 240.0
+    )
     formed_cutoff_delta = timedelta(hours=formed_cutoff_base)
     diagnostics: Dict[str, Any] = {
         "raw_counts": {},
@@ -680,7 +682,7 @@ def _filter_compact_zones(
         "zones_before_filter": 0,
         "zones_after_filter": 0,
         "formed_cutoff_hours": formed_cutoff_base,
-        "allowed_statuses": ["open", "fresh", "tapped"],
+        "allowed_statuses": ["open", "fresh", "tapped", "mitigated"],
     }
     cfg = config or ZonesConfig()
     try:
@@ -724,7 +726,7 @@ def _filter_compact_zones(
     dropped_reasons: Dict[str, int] = defaultdict(int)
     dropped_details: list[Dict[str, Any]] = []
 
-    allowed_statuses = {"open", "fresh", "tapped"}
+    allowed_statuses = {"open", "fresh", "tapped", "mitigated"}
 
     def _mark_drop(
         reason: str,
@@ -771,7 +773,7 @@ def _filter_compact_zones(
             if formed is None:
                 _mark_drop("missing_formed_at", zone_type=zone_type, entry=entry)
                 continue
-            if formed < now_dt - formed_cutoff_delta and status not in {"open", "fresh", "tapped"}:
+            if formed < now_dt - formed_cutoff_delta and status not in allowed_statuses:
                 _mark_drop("stale_formed_at", zone_type=zone_type, entry=entry)
                 continue
             price_range = _zone_price_range(entry)
