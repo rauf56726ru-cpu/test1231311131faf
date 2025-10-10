@@ -86,7 +86,9 @@ def test_detect_zones_identifies_fvg_and_order_blocks() -> None:
     fvg_zone = zones["fvg"][0]
     assert fvg_zone["tf"] == "15m"
     assert fvg_zone["direction"] in {"up", "down"}
-    assert fvg_zone["status"] in {"open", "fulfilled", "inverted"}
+    assert fvg_zone["status"] in {"open", "fresh", "tapped"}
+    if fvg_zone.get("inverted"):
+        assert fvg_zone["status"] in {"open", "tapped"}
     assert fvg_zone["bot"] < fvg_zone["top"]
     assert fvg_zone["mid"] == pytest.approx((fvg_zone["bot"] + fvg_zone["top"]) / 2)
 
@@ -116,7 +118,13 @@ def test_fvg_preserves_raw_bounds_when_tick_collapses() -> None:
         make_candle(3, 100.5, 100.7, 99.8, 100.1),
         make_candle(4, 100.0, 100.4, 99.7, 99.9),
     ]
-    cfg = Config(tick_size=1.0, displacement_body=0.0, displacement_range=0.0, atr_period=1)
+    cfg = Config(
+        tick_size=1.0,
+        displacement_body=0.0,
+        displacement_range=0.0,
+        atr_period=1,
+        min_gap_tick_multiple=0.0,
+    )
     payload = detect_zones(frames={"15m": candles}, config=cfg)
 
     zones = payload["zones"]

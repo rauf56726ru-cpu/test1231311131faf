@@ -11,6 +11,7 @@ import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from collections import deque
+from decimal import Decimal
 from typing import Any, Deque, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple
 
 from .ohlc import TIMEFRAME_TO_MS, resample_ohlcv
@@ -26,8 +27,10 @@ class Config:
 
     tick_size: float | None = None
     atr_period: int = 14
-    displacement_body: float = 1.0
-    displacement_range: float = 1.5
+    displacement_body: float = 0.6
+    displacement_range: float = 1.1
+    displacement_body_floor: float = 0.25
+    displacement_range_floor: float = 0.5
     base_min_bars: int = 1
     base_max_bars: int = 4
     base_max_atr: float = 0.8
@@ -45,6 +48,10 @@ class Config:
     allow_base_fallback: bool = False
     base_fallback_max_age: int = 200
     base_fallback_max_distance_atr: float = 3.0
+    min_gap_atr_ratio: float = 0.1
+    min_gap_tick_multiple: float = 2.0
+    min_gap_pct: float = 0.0003
+    m_wick_atr: float = 3.0
 
 
 _PIVOT_WINDOWS: Dict[str, int] = {"15m": 2, "1h": 3, "4h": 4}
@@ -91,6 +98,60 @@ def _round_tick(value: float, tick_size: float | None) -> float:
     if tick_size is None or tick_size <= 0:
         return float(value)
     return round(value / tick_size) * tick_size
+
+
+def _tick_size_from_price(price: float) -> float | None:
+    if not math.isfinite(price) or price <= 0:
+        return None
+    decimal_price = Decimal(str(price)).normalize()
+    exponent = decimal_price.as_tuple().exponent
+    decimals = max(0, -exponent)
+    tick = 10 ** (-decimals)
+    return float(tick)
+
+
+def _last_price_from_frames(frames: Mapping[str, Sequence[Candle]]) -> float | None:
+    if not isinstance(frames, Mapping):
+        return None
+    ordered_frames = sorted(frames.keys(), key=lambda tf: TIMEFRAME_TO_MS.get(tf, math.inf))
+    for tf in ordered_frames:
+        candles = frames.get(tf)
+        if not candles:
+            continue
+        for candle in reversed(candles):
+            for key in ("c", "o", "h", "l"):
+                value = candle.get(key)
+                try:
+                    price = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(price) and price > 0:
+                    return price
+    return None
+
+
+def _resolve_tick_size(cfg: Config, frames: Mapping[str, Sequence[Candle]], timeframes: Mapping[str, Sequence[Candle]]) -> float | None:
+    tick = cfg.tick_size
+    if tick is not None and tick > 0:
+        return float(tick)
+
+    last_price = _last_price_from_frames(frames)
+    if last_price is None:
+        last_price = _last_price_from_frames(timeframes)
+
+    tick_from_price = _tick_size_from_price(last_price) if last_price is not None else None
+    if tick_from_price is not None and tick_from_price > 0:
+        cfg.tick_size = float(tick_from_price)
+        return float(tick_from_price)
+
+    inferred = _infer_tick_size(frames.get("1m", []))
+    if inferred is None or inferred <= 0:
+        inferred = _infer_tick_size(timeframes.get("15m", []))
+    if inferred is not None and inferred > 0:
+        cfg.tick_size = float(inferred)
+        return float(inferred)
+
+    return None
 
 
 def _rolling_return_sigma(
@@ -317,7 +378,31 @@ def _fvgs_for_tf(
         direction = "up" if bullish_gap else "down"
         bot_raw = high_prev if bullish_gap else high_next
         top_raw = low_next if bullish_gap else low_prev
-        if top_raw - bot_raw <= 0:
+        gap_abs = top_raw - bot_raw
+        if gap_abs <= 0:
+            if stats is not None:
+                stats["fvg_reject_no_gap"] = stats.get("fvg_reject_no_gap", 0) + 1
+            continue
+
+        impulse_idx = i + 2
+        atr_value = atr[impulse_idx] if impulse_idx < len(atr) else math.nan
+        atr_component = (
+            cfg.min_gap_atr_ratio * atr_value
+            if math.isfinite(atr_value) and atr_value > 0
+            else 0.0
+        )
+        tick_component = (
+            cfg.min_gap_tick_multiple * tick
+            if tick is not None and tick > 0
+            else 0.0
+        )
+        gap_thresholds = [value for value in (atr_component, tick_component) if value > 0]
+        gap_min = max(gap_thresholds) if gap_thresholds else 0.0
+        price_mid = (top_raw + bot_raw) / 2.0
+        price_mid_abs = abs(price_mid)
+        pct_ok = price_mid_abs <= 0 or (gap_abs / price_mid_abs) >= cfg.min_gap_pct
+        abs_ok = gap_min <= 0 or gap_abs >= gap_min
+        if not (abs_ok and pct_ok):
             if stats is not None:
                 stats["fvg_reject_no_gap"] = stats.get("fvg_reject_no_gap", 0) + 1
             continue
@@ -325,8 +410,6 @@ def _fvgs_for_tf(
         if stats is not None:
             stats["fvg_raw_count"] = stats.get("fvg_raw_count", 0) + 1
 
-        impulse_idx = i + 2
-        atr_value = atr[impulse_idx] if impulse_idx < len(atr) else math.nan
         if not atr_value or math.isnan(atr_value) or atr_value <= 0:
             if stats is not None:
                 stats["fvg_reject_displacement"] = stats.get("fvg_reject_displacement", 0) + 1
@@ -340,8 +423,8 @@ def _fvgs_for_tf(
         k_body = cfg.displacement_body
         k_range = cfg.displacement_range
         if sigma_value and math.isfinite(sigma_value) and sigma_value < 0.5 * atr_value:
-            k_body = max(0.7, k_body - 0.2)
-            k_range = max(1.1, k_range - 0.3)
+            k_body = max(cfg.displacement_body_floor, k_body - 0.2)
+            k_range = max(cfg.displacement_range_floor, k_range - 0.3)
 
         body1 = abs(float(c1["c"]) - float(c1["o"]))
         body2 = abs(float(c2["c"]) - float(c2["o"]))
@@ -349,7 +432,14 @@ def _fvgs_for_tf(
         range2 = float(c2["h"]) - float(c2["l"])
         impulse_body = max(body1, body2)
         impulse_range = max(range1, range2)
-        if impulse_body < k_body * atr_value and impulse_range < k_range * atr_value:
+        meets_primary = (impulse_body >= k_body * atr_value) or (
+            impulse_range >= k_range * atr_value
+        )
+        meets_floor = (
+            impulse_body >= cfg.displacement_body_floor * atr_value
+            and impulse_range >= cfg.displacement_range_floor * atr_value
+        )
+        if not (meets_primary or meets_floor):
             if stats is not None:
                 stats["fvg_reject_displacement"] = stats.get("fvg_reject_displacement", 0) + 1
             continue
@@ -417,6 +507,13 @@ def _fvgs_for_tf(
             bot_value = bot_raw
         mid_value = _round_tick((top_raw + bot_raw) / 2.0, tick)
 
+        raw_status = status
+        zone_status = raw_status
+        if raw_status == "inverted":
+            zone_status = "tapped" if fulfil_idx is not None else "open"
+        elif raw_status == "fulfilled":
+            zone_status = "tapped"
+
         zone = {
             "tf": tf,
             "direction": direction,
@@ -424,8 +521,10 @@ def _fvgs_for_tf(
             "bot": float(bot_value),
             "mid": float(mid_value),
             "created_utc": _ms_to_iso(int(c2["t"])),
-            "status": status,
+            "status": zone_status,
         }
+        if raw_status == "inverted":
+            zone["inverted"] = True
         zones.append(zone)
     return zones
 
@@ -989,7 +1088,7 @@ def detect_zones(
         raise TypeError("config must be an instance of Config or None")
 
     timeframes = _ensure_timeframes(frames, ["15m", "1h", "4h", "1d"])
-    tick = cfg.tick_size or _infer_tick_size(frames.get("1m", []))
+    tick = _resolve_tick_size(cfg, frames, timeframes)
     external_liquidity: Dict[str, List[Dict[str, Any]]] = {}
     if isinstance(liquidity_levels, Mapping):
         for key in ("eqh", "eql", "pdh", "pdl"):

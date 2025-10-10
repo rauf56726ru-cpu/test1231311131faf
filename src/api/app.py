@@ -860,6 +860,18 @@ def _prepare_summary_payload(
     meta_source = payload.get("meta") if isinstance(payload.get("meta"), Mapping) else {}
     data_source = payload.get("data") if isinstance(payload.get("data"), Mapping) else {}
     availability = payload.get("availability") if isinstance(payload.get("availability"), Mapping) else {}
+    orderflow_availability_timeframes: Dict[str, Mapping[str, Any]] = {}
+    orderflow_availability_block = (
+        availability.get("orderflow") if isinstance(availability.get("orderflow"), Mapping) else {}
+    )
+    if isinstance(orderflow_availability_block, Mapping):
+        tf_availability = orderflow_availability_block.get("timeframes")
+        if isinstance(tf_availability, Mapping):
+            orderflow_availability_timeframes = {
+                str(tf_key).lower(): info
+                for tf_key, info in tf_availability.items()
+                if isinstance(info, Mapping)
+            }
 
     ohlcv_source = data_source.get("ohlcv") if isinstance(data_source.get("ohlcv"), Mapping) else {}
     orderflow_source = (
@@ -1436,9 +1448,20 @@ def _prepare_summary_payload(
             if aggregates_missing_entirely:
                 partial = True
 
+        canonical_per_bar = ("1m", "3m", "5m", "15m")
+        if orderflow_availability_timeframes:
+            required_per_bar = {"1m"}
+            for tf_key, info in orderflow_availability_timeframes.items():
+                tf_norm = str(tf_key).lower()
+                if tf_norm not in canonical_per_bar:
+                    continue
+                if bool(info.get("has_data", True)):
+                    required_per_bar.add(tf_norm)
+        else:
+            required_per_bar = set(canonical_per_bar)
         per_bar_missing = [
             tf
-            for tf in ("1m", "3m", "5m", "15m")
+            for tf in sorted(required_per_bar, key=canonical_per_bar.index)
             if not orderflow_per_bar.get(tf)
         ]
         if per_bar_missing:
@@ -1764,13 +1787,14 @@ async def register_inspection_snapshot(payload: SnapshotIn) -> Dict[str, str]:
             normalised = dict(entry)
             ts_value = normalised.get("t")
             try:
-                ts_int = int(ts_value) if ts_value is not None else None
+                original_ts = int(ts_value) if ts_value is not None else None
             except (TypeError, ValueError):
-                ts_int = None
+                original_ts = None
+            ts_int = original_ts
             if ts_int is None or ts_int <= 0:
                 ts_int = index * 60_000 + 1
             normalised["t"] = ts_int
-            normalised["time"] = ts_int
+            normalised["time"] = original_ts if original_ts is not None else ts_int
             if "open" not in normalised and "o" in normalised:
                 normalised["open"] = normalised.get("o")
             if "high" not in normalised and "h" in normalised:
