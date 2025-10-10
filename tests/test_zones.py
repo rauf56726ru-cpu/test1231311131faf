@@ -86,7 +86,9 @@ def test_detect_zones_identifies_fvg_and_order_blocks() -> None:
     fvg_zone = zones["fvg"][0]
     assert fvg_zone["tf"] == "15m"
     assert fvg_zone["direction"] in {"up", "down"}
-    assert fvg_zone["status"] in {"open", "fulfilled", "inverted"}
+    assert fvg_zone["status"] in {"open", "fresh", "tapped", "mitigated"}
+    if fvg_zone.get("inverted"):
+        assert fvg_zone["status"] in {"open", "tapped"}
     assert fvg_zone["bot"] < fvg_zone["top"]
     assert fvg_zone["mid"] == pytest.approx((fvg_zone["bot"] + fvg_zone["top"]) / 2)
 
@@ -116,7 +118,13 @@ def test_fvg_preserves_raw_bounds_when_tick_collapses() -> None:
         make_candle(3, 100.5, 100.7, 99.8, 100.1),
         make_candle(4, 100.0, 100.4, 99.7, 99.9),
     ]
-    cfg = Config(tick_size=1.0, displacement_body=0.0, displacement_range=0.0, atr_period=1)
+    cfg = Config(
+        tick_size=1.0,
+        displacement_body=0.0,
+        displacement_range=0.0,
+        atr_period=1,
+        min_gap_tick_multiple=0.0,
+    )
     payload = detect_zones(frames={"15m": candles}, config=cfg)
 
     zones = payload["zones"]
@@ -142,6 +150,32 @@ def test_detect_zones_legacy_single_positional_argument() -> None:
 
     assert "zones" in payload
     assert isinstance(payload["zones"], dict)
+
+
+def test_fvg_survives_with_atr_fallback() -> None:
+    frames = {"15m": build_orderflow_sequence()}
+    cfg = Config(tick_size=0.2, atr_period=50)
+
+    payload = detect_zones(frames=frames, config=cfg)
+
+    fvg_zones = payload["zones"]["fvg"]
+    assert fvg_zones, "Expected FVG zones even when ATR coverage is insufficient"
+
+    stats = payload["meta"]["fvg_stats"]["15m"]
+    assert stats.get("fvg_reject_displacement", 0) == 0
+
+    diagnostics = payload["meta"]["diagnostics"]
+    warmup_diag = diagnostics.get("warmup", {}).get("15m", {})
+    assert warmup_diag.get("ok") is False
+
+    timeframe_diag = next(
+        entry
+        for entry in diagnostics.get("timeframes", [])
+        if entry.get("tf") == "15m"
+    )
+    atr_diag = timeframe_diag.get("atr", {})
+    assert atr_diag.get("reliable") is False
+    assert atr_diag.get("proxy") == "stdev_close_20"
 
 
 def test_detect_zones_diagnostics_include_reasons_for_empty_results() -> None:
@@ -190,3 +224,83 @@ def test_zones_endpoint_returns_structured_payload(client: TestClient) -> None:
     assert any(zones[key] for key in ("fvg", "ob", "mb", "bb", "rb", "pb", "sr")), (
         "Expected at least one populated zone list"
     )
+
+
+def test_zones_endpoint_uses_latest_snapshot_defaults(client: TestClient) -> None:
+    candles: List[Dict[str, float]] = []
+    for idx in range(18):
+        base = 100.0 + idx * 0.15
+        candles.append(make_candle(idx, base, base + 0.6, base - 0.6, base + 0.2))
+
+    gap_start = len(candles)
+    candles.append(make_candle(gap_start, 103.5, 103.8, 102.9, 103.6))
+    candles.append(make_candle(gap_start + 1, 104.1, 104.4, 103.8, 104.2))
+    candles.append(make_candle(gap_start + 2, 107.2, 107.8, 106.9, 107.5))
+
+    for tail in range(3):
+        idx = len(candles)
+        base = 106.8 - tail * 0.25
+        candles.append(make_candle(idx, base, base + 0.7, base - 0.7, base + 0.15))
+    snapshot_payload = {
+        "symbol": "SNAP",
+        "tf": "15m",
+        "candles": candles,
+    }
+    create_response = client.post("/inspection/snapshot", json=snapshot_payload)
+    assert create_response.status_code == 200
+
+    response = client.get("/zones")
+    assert response.status_code == 200
+    payload = response.json()
+    zones = payload.get("zones", {})
+    assert zones.get("fvg") or zones.get("ob"), "Expected FVG or OB zones from latest snapshot"
+
+
+def test_diag_report_includes_kpi_metrics(client: TestClient) -> None:
+    candles = build_orderflow_sequence()
+    snapshot_payload = {
+        "symbol": "DIAG",
+        "tf": "15m",
+        "candles": candles,
+    }
+    create_response = client.post("/inspection/snapshot", json=snapshot_payload)
+    assert create_response.status_code == 200
+
+    response = client.get("/diag")
+    assert response.status_code == 200
+    payload = response.json()
+
+    before_after = payload.get("before_after")
+    assert isinstance(before_after, dict)
+    assert "raw_counts" in before_after
+    assert "zones_before_filter" in before_after
+    assert "zones_after_filter" in before_after
+
+    metrics = payload.get("metrics")
+    assert isinstance(metrics, dict)
+    for key in (
+        "fvg_reject_no_gap",
+        "fvg_reject_displacement",
+        "zones_retained",
+        "fvg_ob_share",
+    ):
+        entry = metrics.get(key)
+        assert isinstance(entry, dict)
+        assert "ok" in entry
+        assert "target" in entry
+        if not entry["ok"]:
+            assert entry.get("reason"), f"Expected reason for failed metric {key}"
+
+    timeframe_targets = payload.get("timeframe_targets")
+    assert isinstance(timeframe_targets, dict)
+    for key in ("1h_fvg", "1h_ob", "15m_fvg"):
+        entry = timeframe_targets.get(key)
+        assert isinstance(entry, dict)
+        assert "ok" in entry
+        assert "required" in entry
+        assert "count" in entry
+        if not entry["ok"]:
+            assert entry.get("reason"), f"Expected reason for timeframe target {key}"
+
+    diagnostics = payload.get("diagnostics")
+    assert isinstance(diagnostics, dict)
