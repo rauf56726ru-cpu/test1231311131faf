@@ -39,8 +39,9 @@ def test_inspection_placeholder_has_default_symbol(client: TestClient) -> None:
     assert response.status_code == 200
     assert "value=\"BTCUSDT\"" in response.text
     assert 'id="chart-symbol"' in response.text
-    for tf in ("data-tf=\"1m\"", "data-tf=\"3m\"", "data-tf=\"30m\"", "data-tf=\"1w\""):
-        assert tf in response.text
+    expected_tfs = ("1m", "3m", "5m", "15m", "1h", "4h", "1d")
+    for tf in expected_tfs:
+        assert f'data-tf="{tf}"' in response.text
 
 
 def test_inspection_snapshot_roundtrip(client: TestClient) -> None:

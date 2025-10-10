@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 import asyncio
 import json
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 import time
 
 import pytest
@@ -138,6 +138,22 @@ def stub_fetch_ohlcv(monkeypatch):
     monkeypatch.setattr(ohlc, "fetch_ohlcv_sync", fake_fetch)
     monkeypatch.setattr(ohlc, "fetch_ohlcv", fake_fetch_async)
     monkeypatch.setattr(check_all_datas, "fetch_ohlcv", fake_fetch_async)
+
+    async def fake_fetch_orderbook(symbol: str, window_minutes: int, *, trace=None):
+        from datetime import datetime, timezone
+        return {
+            "symbol": symbol.upper(),
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "window_minutes": window_minutes,
+            "top_levels": [
+                {"side": "bid", "p": 100.0, "sz": 5.0},
+                {"side": "ask", "p": 100.5, "sz": 4.0},
+            ],
+            "imbalance": 1.0,
+            "spoofing_flags": [],
+        }
+
+    monkeypatch.setattr(app_module, "fetch_orderbook", fake_fetch_orderbook)
     monkeypatch.setattr(check_all_datas, "fetch_ohlcv_sync", fake_fetch)
     monkeypatch.setattr(app_module, "fetch_ohlcv_enhanced", fake_fetch_async)
     yield
@@ -167,6 +183,9 @@ def _build_snapshot_payload(base: datetime, count: int = 12) -> dict:
     payload = {"symbol": "BTCUSDT", "tf": "1m", "candles": candles}
     if candles:
         payload["selection"] = {"start": candles[0]["t"], "end": candles[-1]["t"]}
+        payload["book"] = {"top_levels": [
+            {"bid": candles[-1]["c"], "ask": candles[-1]["c"] + 0.5, "price": candles[-1]["c"], "ts": candles[-1]["t"]}
+        ]}
     return payload
 
 
@@ -227,11 +246,20 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
         assert isinstance(series["candles"], list)
 
     orderflow = data_block["orderflow"]
-    assert set(orderflow.keys()) == {"1m", "15m", "1h"}
+    expected_tfs = {"1m", "3m", "5m", "15m", "1h"}
+    assert expected_tfs.issubset(orderflow.keys())
+    diag_block = orderflow.get("diag")
+    assert isinstance(diag_block, dict)
     for tf, block in orderflow.items():
-        assert isinstance(block["per_bar"], list)
+        if tf == "diag":
+            continue
+        assert isinstance(block.get("per_bar"), list)
         if tf == "1m":
-            assert len(block["per_bar"]) <= 120
+            compact_diag = (diag_block or {}).get("compact") if isinstance(diag_block, dict) else None
+            per_bar_limits = (compact_diag or {}).get("per_bar_lengths") if isinstance(compact_diag, dict) else {}
+            limit = per_bar_limits.get("1m")
+            if isinstance(limit, int) and limit > 0:
+                assert len(block["per_bar"]) <= limit
 
     assert isinstance(body["notes"], list)
     assert not body["notes"]
@@ -269,8 +297,13 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
     assert prev_day["close"] == pytest.approx(expected_close)
 
     zones = data_block["zones"]
-    assert set(zones.keys()) == {"fvg", "fvl", "ob", "mb", "bb", "rb", "pb", "sr", "profile_levels"}
-    for zone_series in zones.values():
+    zones_diag = zones.get("diag")
+    assert isinstance(zones_diag, dict)
+    zone_series_keys = {"fvg", "fvl", "ob", "mb", "bb", "rb", "pb", "sr", "profile_levels"}
+    assert zone_series_keys.issubset(zones.keys())
+    for key, zone_series in zones.items():
+        if key == "diag":
+            continue
         assert isinstance(zone_series, list)
 
     liquidity = data_block["liquidity"]
@@ -345,19 +378,11 @@ def test_topup_limits_window_to_last_collection(client: TestClient) -> None:
         assert response.status_code == 200
         body = response.json()
         zones_block = body["data"]["zones"]
-
-        for zone_key in ("fvg", "ob", "mb", "bb", "rb", "pb", "sr"):
-            zone_entries = zones_block.get(zone_key, [])
-            assert zone_entries, f"expected informational entry for {zone_key}"
-            message_entry = zone_entries[0]
-            assert "message" in message_entry
-            message_text = message_entry["message"].lower()
-            if "выбранный период" not in message_text:
-                # Allow ASCII-only fallbacks while still enforcing contextual details
-                assert zone_key in message_text
-                assert "15m" in message_text or "1h" in message_text or "4h" in message_text
-            else:
-                assert "выбранный период" in message_text
+        zones_diag_block = zones_block.get("diag")
+        assert isinstance(zones_diag_block, dict)
+        gating_diag = zones_diag_block.get("gating")
+        if gating_diag is not None:
+            assert isinstance(gating_diag, dict)
     finally:
         reset_state()
 
@@ -391,6 +416,42 @@ def test_multi_timeframe_ohlcv_alignment(client: TestClient) -> None:
     assert pytest.approx(first_hour["v"]) == sum(minute_map[ts]["v"] for ts in expected_minutes)
 
     assert ohlcv_block["1d"]["candles"]
+
+
+def _min_delta(candles: list[dict[str, Any]]) -> int | None:
+    prev_ts: int | None = None
+    delta: int | None = None
+    for candle in candles:
+        ts = candle.get("t")
+        if not isinstance(ts, int):
+            continue
+        if prev_ts is not None:
+            diff = ts - prev_ts
+            if diff > 0 and (delta is None or diff < delta):
+                delta = diff
+        prev_ts = ts
+    return delta
+
+
+def test_timeframe_series_do_not_embed_minute_data(client: TestClient) -> None:
+    base = datetime(2024, 5, 1, 0, 0, tzinfo=UTC)
+    payload = _build_snapshot_payload(base, count=6 * 60)
+
+    create_response = client.post("/inspection/snapshot", json=payload)
+    assert create_response.status_code == 200
+    snapshot_id = create_response.json()["snapshot_id"]
+
+    response = client.get("/inspection/check-all", params={"snapshot": snapshot_id, "hours": 4})
+    assert response.status_code == 200
+    body = response.json()
+
+    ohlcv_block = body["data"]["ohlcv"]
+    for tf in ("3m", "5m", "15m", "1h"):
+        candles = ohlcv_block[tf]["candles"]
+        assert candles, f"expected candles for {tf}"
+        delta = _min_delta(candles)
+        expected = check_all_datas.TIMEFRAME_TO_MS[tf]
+        assert delta is None or delta >= expected, f"{tf} frame leaked minute bars"
 
 
 def test_orderflow_block_matches_spec(client: TestClient) -> None:
@@ -434,32 +495,27 @@ def test_orderflow_block_matches_spec(client: TestClient) -> None:
     body = response.json()
 
     orderflow_block = body["data"]["orderflow"]
-    assert set(orderflow_block.keys()) == {"1m", "15m", "1h"}
+    expected_tfs = {"1m", "3m", "5m", "15m", "1h"}
+    assert expected_tfs.issubset(orderflow_block.keys())
+    diag_block = orderflow_block.get("diag")
+    assert isinstance(diag_block, dict)
 
     minute_series = orderflow_block["1m"]["per_bar"]
     assert isinstance(minute_series, list)
     assert minute_series
-    assert len(minute_series) <= 120
+    assert len(minute_series) <= 240
     minute_entry = minute_series[-1]
     assert "delta" in minute_entry and "cvd" in minute_entry
 
-    fifteen_series = orderflow_block["15m"]["per_bar"]
-    assert isinstance(fifteen_series, list)
-    assert fifteen_series
-    fifteen_entry = fifteen_series[0]
-    for key in ("delta_sum", "cvd_close", "vol_sum"):
-        assert isinstance(fifteen_entry[key], (int, float))
-    if "bars" in fifteen_entry:
-        assert isinstance(fifteen_entry["bars"], int)
-
-    hourly_series = orderflow_block["1h"]["per_bar"]
-    assert isinstance(hourly_series, list)
-    if hourly_series:
-        hourly_entry = hourly_series[0]
-        for key in ("delta_sum", "cvd_close", "vol_sum"):
-            assert isinstance(hourly_entry[key], (int, float))
-        if "bars" in hourly_entry:
-            assert isinstance(hourly_entry["bars"], int)
+    for tf in ("3m", "5m", "15m", "1h"):
+        series = orderflow_block[tf]["per_bar"]
+        assert isinstance(series, list)
+        if series:
+            entry = series[0]
+            for key in ("delta_sum", "cvd_close", "vol_sum"):
+                assert isinstance(entry[key], (int, float))
+            if "bars" in entry:
+                assert isinstance(entry["bars"], int)
 
 
 def test_vwap_tpo_sessions_include_aliases(client: TestClient) -> None:

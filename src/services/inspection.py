@@ -40,6 +40,7 @@ from .ohlc import (
     normalise_ohlcv,
     resample_ohlcv,
 )
+from .ohlcv import SUPPORTED_TIMEFRAMES
 from .profile import build_profile_package
 from .ohlc_sanitizer import sanitize_candles
 from .timeutils import ensure_ms_epoch, safe_datetime_from_ms
@@ -62,8 +63,21 @@ SNAPSHOT_STORAGE_DIR = Path(
 _SNAPSHOT_ID_SANITISER = re.compile(r"[^A-Za-z0-9._-]")
 
 MS_IN_DAY = 86_400_000
-HTF_TIMEFRAMES: Tuple[str, ...] = ("15m", "1h", "4h", "1d")
+SUPPORTED_CHART_TIMEFRAMES: Tuple[str, ...] = tuple(
+    tf for tf in ("1m", "3m", "5m", "15m", "1h", "4h", "1d") if tf in SUPPORTED_TIMEFRAMES
+)
+HTF_TIMEFRAMES: Tuple[str, ...] = tuple(tf for tf in SUPPORTED_CHART_TIMEFRAMES if tf != "1m")
 MINUTE_INTERVAL_MS = TIMEFRAME_TO_MS.get("1m", 60_000)
+
+MIN_FRAME_BARS: Dict[str, int] = {
+    "1m": 40,
+    "3m": 30,
+    "5m": 24,
+    "15m": 16,
+    "1h": 12,
+    "4h": 6,
+    "1d": 4,
+}
 
 
 
@@ -176,9 +190,14 @@ def ensure_higher_timeframes(
 
     logger = logging.getLogger(__name__)
     minute_seed = candles_by_tf.get("1m")
-    minute_candles: List[Mapping[str, Any]] = (
-        list(minute_seed) if isinstance(minute_seed, Sequence) else []
-    )
+    minute_candles: List[Mapping[str, Any]] = []
+    if isinstance(minute_seed, Sequence):
+        for candle in minute_seed:
+            if not isinstance(candle, Mapping):
+                continue
+            if not _is_candle_closed(candle.get("closed")):
+                continue
+            minute_candles.append(candle)
     logger.debug(
         "Ensuring higher timeframes for liquidity",
         extra={"seed_tf": "1m", "seed_candles": len(minute_candles)},
@@ -188,7 +207,7 @@ def ensure_higher_timeframes(
     if not minute_candles:
         return generated
 
-    for target_tf in ("15m", "1h"):
+    for target_tf in HTF_TIMEFRAMES:
         existing = candles_by_tf.get(target_tf)
         existing_count = len(existing) if isinstance(existing, Sequence) else 0
         if existing_count:
@@ -211,6 +230,172 @@ def ensure_higher_timeframes(
             },
         )
     return generated
+
+
+def _clone_candle_series(series: Any) -> List[Dict[str, Any]]:
+    """Return a shallow copy of candle mappings with consistent dict payloads."""
+
+    if not isinstance(series, Sequence):
+        return []
+    cloned: List[Dict[str, Any]] = []
+    for candle in series:
+        if isinstance(candle, Mapping):
+            cloned.append(dict(candle))
+    return cloned
+
+
+def _is_candle_closed(flag: Any) -> bool:
+    """Determine whether a candle should be considered closed for analysis."""
+
+    if isinstance(flag, bool):
+        return flag
+    if flag is None:
+        return True
+    if isinstance(flag, (int, float)):
+        return bool(flag)
+    if isinstance(flag, str):
+        token = flag.strip().lower()
+        if not token:
+            return True
+        if token in {"false", "0", "no", "open", "pending"}:
+            return False
+        return True
+    return True
+
+
+def _normalise_zone_frames_from_snapshot(
+    frames: Mapping[str, Any]
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Extract candle sequences from snapshot frame payloads."""
+
+    normalised: Dict[str, List[Dict[str, Any]]] = {}
+    for tf_key, payload in frames.items():
+        if not isinstance(tf_key, str):
+            continue
+        if isinstance(payload, Mapping):
+            series = payload.get("candles")
+        else:
+            series = payload
+        candles = _clone_candle_series(series)
+        if candles:
+            normalised[tf_key] = candles
+    return normalised
+
+
+def _select_zone_base_from_frames(
+    frames: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    preferred: str | None = None,
+) -> Tuple[str | None, List[Dict[str, Any]]]:
+    """Pick the most suitable timeframe series for zone anchoring."""
+
+    order: List[str] = []
+    seen: set[str] = set()
+    if isinstance(preferred, str) and preferred:
+        order.append(preferred)
+        seen.add(preferred)
+    for candidate in ("1m", "3m", "5m", "15m", "1h", "4h", "1d"):
+        if candidate not in seen:
+            order.append(candidate)
+            seen.add(candidate)
+    for tf_key in frames.keys():
+        if isinstance(tf_key, str) and tf_key not in seen:
+            order.append(tf_key)
+            seen.add(tf_key)
+
+    for tf_key in order:
+        series = frames.get(tf_key)
+        candles = _clone_candle_series(series)
+        if candles:
+            return tf_key, candles
+    return None, []
+
+
+def _compute_zone_window(
+    series: Sequence[Mapping[str, Any]],
+    tf_key: str | None,
+) -> Tuple[int | None, int | None]:
+    """Compute analysis window bounds based on the provided candle series."""
+
+    if not isinstance(series, Sequence) or not series:
+        return None, None
+    closed_series = [
+        candle for candle in series if _is_candle_closed(candle.get("closed"))
+    ]
+    effective = closed_series or [
+        candle for candle in series if isinstance(candle, Mapping)
+    ]
+    timestamps: List[int] = []
+    for candle in effective:
+        ts_raw = candle.get("t") if isinstance(candle, Mapping) else None
+        try:
+            ts_value = int(ts_raw)
+        except (TypeError, ValueError):
+            continue
+        timestamps.append(ts_value)
+    if not timestamps:
+        return None, None
+    start_ms = min(timestamps)
+    interval_ms = TIMEFRAME_TO_MS.get(tf_key, MINUTE_INTERVAL_MS) if isinstance(tf_key, str) else MINUTE_INTERVAL_MS
+    if not isinstance(interval_ms, int) or interval_ms <= 0:
+        interval_ms = MINUTE_INTERVAL_MS
+    close_adjust = max(interval_ms - MINUTE_INTERVAL_MS, 0)
+    last_open = max(timestamps)
+    end_ms = last_open + close_adjust
+    start_aligned = max(0, _align_to_interval(start_ms, MINUTE_INTERVAL_MS))
+    end_aligned = max(start_aligned, _align_to_interval(end_ms, MINUTE_INTERVAL_MS))
+    return start_aligned, end_aligned
+
+
+def _build_zone_frames_for_detection(
+    frames: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    window_start_ms: int | None,
+    window_end_ms: int | None,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Filter multi-timeframe candles for zone detection."""
+
+    prepared: Dict[str, List[Dict[str, Any]]] = {}
+    for tf_key, series in frames.items():
+        if not isinstance(tf_key, str):
+            continue
+        candles = _clone_candle_series(series)
+        if not candles:
+            continue
+        interval_ms = TIMEFRAME_TO_MS.get(tf_key, MINUTE_INTERVAL_MS)
+        if not isinstance(interval_ms, int) or interval_ms <= 0:
+            interval_ms = MINUTE_INTERVAL_MS
+        filtered: List[Dict[str, Any]] = []
+        for candle in candles:
+            if not _is_candle_closed(candle.get("closed")):
+                continue
+            ts_raw = candle.get("t")
+            try:
+                open_ts = int(ts_raw)
+            except (TypeError, ValueError):
+                continue
+            close_ts = open_ts + max(interval_ms - MINUTE_INTERVAL_MS, 0)
+            if window_start_ms is not None and close_ts < window_start_ms:
+                continue
+            if window_end_ms is not None and close_ts > window_end_ms:
+                continue
+            filtered.append(candle)
+        if not filtered:
+            for candle in candles:
+                ts_raw = candle.get("t")
+                try:
+                    open_ts = int(ts_raw)
+                except (TypeError, ValueError):
+                    continue
+                close_ts = open_ts + max(interval_ms - MINUTE_INTERVAL_MS, 0)
+                if window_start_ms is not None and close_ts < window_start_ms:
+                    continue
+                if window_end_ms is not None and close_ts > window_end_ms:
+                    continue
+                filtered.append(candle)
+        if filtered:
+            prepared[tf_key] = filtered
+    return prepared
 
 
 def _expected_minute_sequence(start_ms: int, end_ms: int) -> List[int]:
@@ -248,6 +433,87 @@ def _summarise_missing_minutes(
     return gaps
 
 
+def _extract_ts_bounds(candles: Sequence[Mapping[str, Any]]) -> Tuple[int | None, int | None]:
+    timestamps: List[int] = []
+    for candle in candles:
+        if not isinstance(candle, Mapping):
+            continue
+        ts_raw = candle.get("t")
+        try:
+            ts_value = int(ts_raw)
+        except (TypeError, ValueError):
+            continue
+        timestamps.append(ts_value)
+    if not timestamps:
+        return None, None
+    return min(timestamps), max(timestamps)
+
+
+def _build_frame_status_entry(
+    tf: str,
+    candles: Sequence[Mapping[str, Any]],
+    *,
+    source: str | None,
+    dq_entry: Mapping[str, Any] | None,
+    minute_seed_count: int,
+    now_ms: int | None = None,
+) -> Dict[str, Any]:
+    interval_ms = TIMEFRAME_TO_MS.get(tf, MINUTE_INTERVAL_MS)
+    min_required = max(2, MIN_FRAME_BARS.get(tf, 4))
+    now_value = ensure_ms_epoch(now_ms) or ensure_ms_epoch(datetime.now(timezone.utc)) or 0
+
+    closed = [c for c in candles if _is_candle_closed(c.get("closed"))]
+    effective = closed or [c for c in candles if isinstance(c, Mapping)]
+    available = len(effective)
+
+    start_ts, end_ts = _extract_ts_bounds(effective)
+    close_ts = None
+    if end_ts is not None:
+        close_ts = end_ts + max(interval_ms - MINUTE_INTERVAL_MS, 0)
+    freshness_sec: int | None = None
+    if close_ts is not None:
+        freshness_ms = max(0, now_value - close_ts)
+        freshness_sec = freshness_ms // 1000
+
+    expected = dq_entry.get("expected") if isinstance(dq_entry, Mapping) else None
+    missing_after = dq_entry.get("missing_after") if isinstance(dq_entry, Mapping) else 0
+    missing_before = dq_entry.get("missing_before") if isinstance(dq_entry, Mapping) else 0
+
+    status = "ok"
+    reason: str | None = None
+
+    if available == 0:
+        status = "empty"
+        if tf != "1m" and minute_seed_count == 0:
+            reason = "missing_seed"
+        elif missing_after:
+            reason = "missing_candles"
+        else:
+            reason = "no_candles"
+    elif available < min_required:
+        status = "insufficient"
+        reason = "insufficient_candles"
+    elif missing_after:
+        status = "insufficient"
+        reason = "insufficient_candles"
+
+    entry: Dict[str, Any] = {
+        "status": status,
+        "reason": reason,
+        "available": available,
+        "required": min_required,
+        "source": source or "unknown",
+        "interval_ms": interval_ms,
+        "range": {"start": start_ts, "end": end_ts},
+        "close_ts": close_ts,
+        "freshness_sec": freshness_sec,
+        "expected": expected,
+        "missing_after": missing_after,
+        "missing_before": missing_before,
+    }
+    return entry
+
+
 def _fetch_binance_minutes(
     symbol: str,
     start_ms: int,
@@ -272,6 +538,11 @@ def _fetch_binance_minutes(
 
 MinuteFetcher = Callable[[str, int, int, int], Sequence[Mapping[str, object] | Sequence[object]]]
 _DEFAULT_MINUTE_FETCHER: MinuteFetcher = _fetch_binance_minutes
+
+
+
+def _noop_fetcher(symbol: str, start_ms: int, end_ms: int, limit: int) -> Sequence[Mapping[str, object]]:
+    return []
 
 
 def _download_missing_minutes(
@@ -367,6 +638,7 @@ def build_htf_section(
     selection: Mapping[str, Any] | None,
     *,
     fetcher: MinuteFetcher | None = None,
+    allow_network: bool = True,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Collect high timeframe candles aggregated from 1m data."""
 
@@ -406,7 +678,10 @@ def build_htf_section(
     days = max(1, math.ceil(span_ms / MS_IN_DAY)) if span_ms else 1
     total_span_ms = max(days * MS_IN_DAY, MINUTE_INTERVAL_MS)
 
-    fetcher_fn = fetcher or _DEFAULT_MINUTE_FETCHER
+    if allow_network:
+        fetcher_fn = fetcher or _DEFAULT_MINUTE_FETCHER
+    else:
+        fetcher_fn = fetcher or _noop_fetcher
 
     timeframe_ranges: Dict[str, Dict[str, int]] = {}
     minute_window_start = minute_end
@@ -589,6 +864,175 @@ def _persist_snapshot(snapshot: Snapshot) -> None:
             pass
 
 
+def _normalise_candle_entry(entry: Any) -> tuple[Any, bool]:
+    """Return a copy of the candle with normalised timestamp."""
+
+    changed = False
+
+    if isinstance(entry, Mapping):
+        candle = dict(entry)
+        timestamp_keys = ("t", "time", "openTime", "open_time")
+        normalised_ts: int | None = None
+        for key in timestamp_keys:
+            if key not in candle:
+                continue
+            normalised_ts = ensure_ms_epoch(candle.get(key))
+            if normalised_ts is not None:
+                break
+        if normalised_ts is not None:
+            if candle.get("t") != normalised_ts:
+                changed = True
+            candle["t"] = normalised_ts
+        return candle, changed
+
+    if isinstance(entry, Sequence) and not isinstance(entry, (str, bytes, bytearray)):
+        row = list(entry)
+        if row:
+            normalised_ts = ensure_ms_epoch(row[0])
+            if normalised_ts is not None and normalised_ts != row[0]:
+                row[0] = normalised_ts
+                changed = True
+        return row, changed
+
+    return entry, changed
+
+
+
+def _normalise_frame_candles(candles: Sequence[Any]) -> tuple[list[Any], bool]:
+    """Normalise timestamps for candle collections."""
+
+    normalised: list[Any] = []
+    changed = False
+    for candle in candles:
+        converted, mutated = _normalise_candle_entry(candle)
+        normalised.append(converted)
+        changed = changed or mutated
+    return normalised, changed
+
+
+
+def _normalise_snapshot_structure(snapshot: MutableMapping[str, Any]) -> bool:
+    """Normalise timestamps within stored snapshot structures."""
+
+    changed = False
+
+    frames = snapshot.get("frames")
+    if isinstance(frames, MutableMapping):
+        for key in list(frames.keys()):
+            frame = frames[key]
+            if isinstance(frame, Mapping):
+                frame_dict = dict(frame)
+                candles = frame_dict.get("candles")
+                if isinstance(candles, Sequence) and not isinstance(candles, (str, bytes, bytearray)):
+                    normalised_candles, mutated = _normalise_frame_candles(candles)
+                    if mutated:
+                        frame_dict["candles"] = normalised_candles
+                        frames[key] = frame_dict
+                        changed = True
+                    else:
+                        frame_dict["candles"] = list(candles) if isinstance(candles, tuple) else candles
+                        frames[key] = frame_dict
+            elif isinstance(frame, Sequence) and not isinstance(frame, (str, bytes, bytearray)):
+                normalised_candles, mutated = _normalise_frame_candles(frame)
+                if mutated or not isinstance(frame, list):
+                    frames[key] = normalised_candles
+                    changed = True
+
+
+
+    orderflow_block = snapshot.get("orderflow")
+    if isinstance(orderflow_block, MutableMapping):
+        of_copy = dict(orderflow_block)
+        block_changed = False
+
+        def _normalise_orderflow_series(series: Sequence[Any]) -> tuple[list[Any], bool]:
+            rows: list[Any] = []
+            mutated = False
+            for item in series:
+                if not isinstance(item, Mapping):
+                    rows.append(item)
+                    continue
+                row = dict(item)
+                ts_value = row.get("ts") or row.get("t")
+                ts_int = ensure_ms_epoch(ts_value)
+                if ts_int is not None:
+                    if row.get("ts") != ts_int:
+                        row["ts"] = ts_int
+                        mutated = True
+                    if row.get("t") != ts_int:
+                        row["t"] = ts_int
+                        mutated = True
+                rows.append(row)
+            return rows, mutated
+
+        footprint = of_copy.get("footprint")
+        if isinstance(footprint, Sequence) and not isinstance(footprint, (str, bytes, bytearray)):
+            normalised_rows, mutated = _normalise_orderflow_series(footprint)
+            if mutated:
+                of_copy["footprint"] = normalised_rows
+                block_changed = True
+
+        per_bar_rows = of_copy.get("per_bar")
+        if isinstance(per_bar_rows, Sequence) and not isinstance(per_bar_rows, (str, bytes, bytearray)):
+            normalised_rows, mutated = _normalise_orderflow_series(per_bar_rows)
+            if mutated:
+                of_copy["per_bar"] = normalised_rows
+                block_changed = True
+
+        for agg_key in ("aggregates", "footprint_aggregates", "cvd_aggregates"):
+            payload = of_copy.get(agg_key)
+            if not isinstance(payload, Mapping):
+                continue
+            agg_mutated = False
+            agg_copy: dict[str, Any] = {}
+            for tf_key, series in payload.items():
+                if isinstance(series, Sequence) and not isinstance(series, (str, bytes, bytearray)):
+                    normalised_rows, mutated = _normalise_orderflow_series(series)
+                    if mutated:
+                        agg_mutated = True
+                    agg_copy[tf_key] = normalised_rows
+                else:
+                    agg_copy[tf_key] = series
+            if agg_mutated:
+                of_copy[agg_key] = agg_copy
+                block_changed = True
+
+        if block_changed:
+            snapshot["orderflow"] = of_copy
+            changed = True
+
+    agg_block = snapshot.get("agg_trades")
+    if isinstance(agg_block, MutableMapping):
+        agg_copy = dict(agg_block)
+        trades = agg_copy.get("agg")
+        if isinstance(trades, Sequence) and not isinstance(trades, (str, bytes, bytearray)):
+            normalised_trades = []
+            mutated = False
+            for trade in trades:
+                if not isinstance(trade, Mapping):
+                    normalised_trades.append(trade)
+                    continue
+                item = dict(trade)
+                ts_int = ensure_ms_epoch(item.get("t"))
+                if ts_int is not None and item.get("t") != ts_int:
+                    item["t"] = ts_int
+                    mutated = True
+                normalised_trades.append(item)
+            if mutated:
+                agg_copy["agg"] = normalised_trades
+                snapshot["agg_trades"] = agg_copy
+                changed = True
+
+    top_level_candles = snapshot.get("candles")
+    if isinstance(top_level_candles, Sequence) and not isinstance(top_level_candles, (str, bytes, bytearray)):
+        normalised_candles, mutated = _normalise_frame_candles(top_level_candles)
+        if mutated:
+            snapshot["candles"] = normalised_candles
+            changed = True
+
+    return changed
+
+
 def _remove_snapshot_file(snapshot_id: str) -> None:
     path = _snapshot_path(snapshot_id)
     try:
@@ -624,14 +1068,35 @@ def _load_existing_snapshots() -> None:
     for path in files:
         try:
             raw = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            LOGGER.warning(
+                "Failed to read persisted snapshot; skipping",
+                extra={"path": str(path)},
+                exc_info=exc,
+            )
+            continue
+        try:
             data = json.loads(raw)
-        except (OSError, json.JSONDecodeError):
+        except json.JSONDecodeError as exc:
+            LOGGER.warning(
+                "Invalid JSON in persisted snapshot; skipping",
+                extra={"path": str(path)},
+                exc_info=exc,
+            )
             continue
         if not isinstance(data, Mapping):
             continue
         snapshot_id = str(data.get("id") or path.stem)
         snapshot = dict(data)
         snapshot["id"] = snapshot_id
+        normalised = False
+        if isinstance(snapshot, MutableMapping):
+            normalised = _normalise_snapshot_structure(snapshot)
+        if normalised:
+            try:
+                _persist_snapshot(snapshot)
+            except Exception:
+                LOGGER.warning("Failed to persist normalised snapshot", extra={"id": snapshot_id})
         _SNAPSHOT_STORE[snapshot_id] = snapshot
         _SNAPSHOT_STORE.move_to_end(snapshot_id)
 
@@ -942,7 +1407,7 @@ def compute_session_vwaps(symbol: str, candles: Sequence[Mapping[str, Any]]) -> 
         "meta": meta,
     }
 def _coerce_frame(tf_key: str, frame: Mapping[str, Any] | Sequence[Any]) -> Dict[str, Any]:
-    if tf_key not in TIMEFRAME_WINDOWS:
+    if tf_key not in SUPPORTED_CHART_TIMEFRAMES:
         raise ValueError(f"Unsupported timeframe: {tf_key}")
 
     if isinstance(frame, Mapping):
@@ -955,7 +1420,9 @@ def _coerce_frame(tf_key: str, frame: Mapping[str, Any] | Sequence[Any]) -> Dict
     except TypeError as exc:  # pragma: no cover - defensive guard
         raise ValueError("Frame candles must be iterable") from exc
 
-    return {"tf": tf_key, "candles": candles}
+    normalised_candles, _ = _normalise_frame_candles(candles)
+
+    return {"tf": tf_key, "candles": normalised_candles}
 
 
 def _extract_frames(snapshot: Mapping[str, Any], primary_tf: str) -> Dict[str, Dict[str, Any]]:
@@ -963,10 +1430,44 @@ def _extract_frames(snapshot: Mapping[str, Any], primary_tf: str) -> Dict[str, D
     raw_frames = snapshot.get("frames")
     if isinstance(raw_frames, Mapping):
         for key, frame in raw_frames.items():
-            tf_value = None
+            key_tf = str(key or "").strip().lower()
+            declared_tf: str | None = None
             if isinstance(frame, Mapping):
-                tf_value = frame.get("tf")
-            tf_key = str(tf_value or key or primary_tf).lower()
+                declared_raw = frame.get("tf")
+                if isinstance(declared_raw, str):
+                    declared_tf = declared_raw.strip().lower()
+
+            tf_candidates: List[str] = []
+            if key_tf:
+                tf_candidates.append(key_tf)
+            if declared_tf and declared_tf not in tf_candidates:
+                tf_candidates.append(declared_tf)
+            primary_clean = primary_tf.strip().lower()
+            if primary_clean and primary_clean not in tf_candidates:
+                tf_candidates.append(primary_clean)
+
+            tf_key: str | None = None
+            for candidate in tf_candidates:
+                if candidate in SUPPORTED_CHART_TIMEFRAMES:
+                    tf_key = candidate
+                    break
+
+            if tf_key is None:
+                raise ValueError(
+                    f"Snapshot includes unsupported timeframe key '{key}'"
+                )
+
+            if declared_tf and declared_tf != tf_key:
+                LOGGER.warning(
+                    "Frame timeframe mismatch, normalising to key",
+                    extra={
+                        "snapshot_id": snapshot.get("id"),
+                        "frame_key": key,
+                        "declared_tf": declared_tf,
+                        "normalised_tf": tf_key,
+                    },
+                )
+
             frames[tf_key] = _coerce_frame(tf_key, frame)  # type: ignore[arg-type]
     elif "candles" in snapshot:
         try:
@@ -1054,10 +1555,12 @@ def register_snapshot(snapshot: Mapping[str, Any]) -> str:
         "meta": meta,
     }
 
+    _normalise_snapshot_structure(stored)
+
     if selection_data:
         stored["selection"] = selection_data
 
-    for key in ("delta", "vwap", "zones", "smt", "agg_trades"):
+    for key in ("delta", "vwap", "zones", "smt", "agg_trades", "orderflow"):
         if key in snapshot:
             stored[key] = snapshot[key]
 
@@ -1159,7 +1662,12 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
     start = int(selection.get("start")) if selection and selection.get("start") else None
     end = int(selection.get("end")) if selection and selection.get("end") else None
 
-    htf_section, htf_quality = build_htf_section(symbol, frames, selection)
+    htf_section, htf_quality = build_htf_section(
+        symbol,
+        frames,
+        selection,
+        allow_network=False,
+    )
 
     normalised_frames: Dict[str, Dict[str, Any]] = {}
     diagnostics_frames: Dict[str, Any] = {}
@@ -1167,6 +1675,7 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
     vwap_frames: Dict[str, Dict[str, Any]] = {}
     full_candles_by_tf: Dict[str, List[Mapping[str, Any]]] = {}
     liquidity_sources: Dict[str, str] = {}
+    timeframe_meta: Dict[str, Dict[str, Any]] = {}
 
     for tf_key, frame in frames.items():
         candles = frame.get("candles", []) if isinstance(frame, Mapping) else []
@@ -1181,7 +1690,7 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
             tf_key,
             candles,
             include_diagnostics=True,
-            use_full_span=(tf_key == "1m"),
+            use_full_span=False,
         )
         diagnostics = result.pop("diagnostics", {})
 
@@ -1194,8 +1703,8 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
         full_candles_by_tf[tf_key] = raw_candles
         if tf_key == "1m":
             liquidity_sources[tf_key] = "minute"
-        elif tf_key == "1d":
-            liquidity_sources.setdefault(tf_key, "frame")
+        else:
+            liquidity_sources.setdefault(tf_key, "snapshot")
 
         filtered_candles = _filter_by_selection(raw_candles, start=start, end=end)
         result["candles"] = filtered_candles
@@ -1217,79 +1726,104 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
             "value": _compute_vwap(filtered_candles),
         }
 
-    htf_candles_map = (
-        htf_section.get("candles")
-        if isinstance(htf_section, Mapping) and isinstance(htf_section.get("candles"), Mapping)
-        else {}
-    )
-    if isinstance(htf_candles_map, Mapping):
-        for tf_key in ("15m", "1h", "1d"):
-            series = htf_candles_map.get(tf_key)
-            if not isinstance(series, Sequence):
-                continue
-            cleaned = [c for c in series if isinstance(c, Mapping)]
-            if not cleaned:
-                continue
-            full_candles_by_tf[tf_key] = cleaned
-            liquidity_sources[tf_key] = "htf"
-
-    generated_frames = ensure_higher_timeframes(full_candles_by_tf)
-    for tf_key, candles in generated_frames.items():
-        filtered_candles = _filter_by_selection(candles, start=start, end=end)
-        frame_payload: Dict[str, Any] = {
-            "symbol": symbol,
-            "tf": tf_key,
-            "candles": filtered_candles,
-        }
-        if candles:
-            last_candle = candles[-1]
-            frame_payload["last_price"] = _coerce_float(last_candle.get("c"))
-            frame_payload["last_ts"] = last_candle.get("t")
-        normalised_frames[tf_key] = frame_payload
-        diagnostics_frames.setdefault(tf_key, {})
-        delta_frames[tf_key] = _compute_delta_series(filtered_candles)
-        vwap_frames[tf_key] = {
-            "selection": {"start": start, "end": end},
-            "value": _compute_vwap(filtered_candles),
-        }
-        full_candles_by_tf[tf_key] = candles
-        if liquidity_sources.get(tf_key) != "htf":
-            liquidity_sources[tf_key] = "aggregated"
-
-    for tf_key in ("15m", "1h"):
-        candles = full_candles_by_tf.get(tf_key)
-        if not candles:
-            continue
-        filtered_candles = _filter_by_selection(candles, start=start, end=end)
-        frame_payload: Dict[str, Any] = {
-            "symbol": symbol,
-            "tf": tf_key,
-            "candles": filtered_candles,
-        }
-        last_candle = candles[-1]
-        frame_payload["last_price"] = _coerce_float(last_candle.get("c")) if isinstance(last_candle, Mapping) else None
-        frame_payload["last_ts"] = last_candle.get("t") if isinstance(last_candle, Mapping) else None
-        normalised_frames[tf_key] = frame_payload
-        diagnostics_frames.setdefault(tf_key, {})
-        delta_frames[tf_key] = _compute_delta_series(filtered_candles)
-        vwap_frames[tf_key] = {
-            "selection": {"start": start, "end": end},
-            "value": _compute_vwap(filtered_candles),
-        }
-
     profile_config = resolve_profile_config(symbol, snapshot.get("meta"))
     preset = profile_config["preset"]
     raw_profile_defaults = profile_config.get("raw_defaults")
     preset_payload = profile_config.get("preset_payload")
     preset_required = profile_config.get("preset_required", False)
-    target_tf_key = profile_config.get("target_tf_key", "1m")
+    target_tf_preference = str(profile_config.get("target_tf_key") or "1m")
 
-    base_candles = normalised_frames.get(target_tf_key, {}).get("candles", [])
+    normalised_candles_by_tf: Dict[str, List[Dict[str, Any]]] = {}
+    for tf_key, payload in normalised_frames.items():
+        series = payload.get("candles") if isinstance(payload, Mapping) else None
+        candles = _clone_candle_series(series)
+        if candles:
+            normalised_candles_by_tf[tf_key] = candles
+
+    zone_source_frames: Dict[str, List[Dict[str, Any]]] = {}
+    for tf_key, series in full_candles_by_tf.items():
+        candles = _clone_candle_series(series)
+        if candles:
+            zone_source_frames[tf_key] = candles
+    for tf_key, series in normalised_candles_by_tf.items():
+        zone_source_frames.setdefault(tf_key, list(series))
+
+    dq_timeframes = (
+        htf_quality.get("timeframes")
+        if isinstance(htf_quality.get("timeframes"), Mapping)
+        else {}
+    )
+    minute_seed_count = len(full_candles_by_tf.get("1m", []))
+    now_ms = ensure_ms_epoch(datetime.now(timezone.utc))
+    for tf in SUPPORTED_CHART_TIMEFRAMES:
+        candles = normalised_candles_by_tf.get(tf, [])
+        entry = _build_frame_status_entry(
+            tf,
+            candles,
+            source=liquidity_sources.get(tf),
+            dq_entry=dq_timeframes.get(tf) if isinstance(dq_timeframes, Mapping) else None,
+            minute_seed_count=minute_seed_count,
+            now_ms=now_ms,
+        )
+        timeframe_meta[tf] = entry
+        frame_payload = normalised_frames.get(tf)
+        if frame_payload is None:
+            frame_payload = {"symbol": symbol, "tf": tf, "candles": []}
+            normalised_frames[tf] = frame_payload
+        frame_payload.setdefault("tf", tf)
+        frame_payload.setdefault("candles", [])
+        frame_payload["status"] = entry["status"]
+        frame_payload["reason"] = entry.get("reason")
+        frame_payload["available"] = entry["available"]
+        frame_payload["required"] = entry["required"]
+        frame_payload["expected"] = entry.get("expected")
+        frame_payload["missing_after"] = entry.get("missing_after")
+        frame_payload["missing_before"] = entry.get("missing_before")
+        frame_payload["source"] = entry.get("source")
+        frame_payload["interval_ms"] = entry.get("interval_ms")
+        frame_payload["range"] = entry.get("range")
+        frame_payload["freshness_sec"] = entry.get("freshness_sec")
+        frame_payload["last_close_ts"] = entry.get("close_ts")
+        frame_payload.setdefault("symbol", symbol)
+        if frame_payload.get("last_ts") is None and isinstance(entry.get("range"), Mapping):
+            frame_payload["last_ts"] = entry["range"].get("end")
+        normalised_candles_by_tf.setdefault(tf, frame_payload.get("candles", []))
+
+    for tf, meta_entry in timeframe_meta.items():
+        LOGGER.info(
+            "inspection.frame_status",
+            extra={
+                "symbol": symbol,
+                "tf": tf,
+                "status": meta_entry.get("status"),
+                "reason": meta_entry.get("reason"),
+                "available": meta_entry.get("available"),
+                "required": meta_entry.get("required"),
+                "range_start": meta_entry.get("range", {}).get("start")
+                if isinstance(meta_entry.get("range"), Mapping)
+                else None,
+                "range_end": meta_entry.get("range", {}).get("end")
+                if isinstance(meta_entry.get("range"), Mapping)
+                else None,
+                "source": meta_entry.get("source"),
+            },
+        )
+
+    profile_tf_key, base_candles = _select_zone_base_from_frames(
+        normalised_candles_by_tf,
+        preferred=target_tf_preference,
+    )
     if not base_candles:
-        base_candles = normalised_frames.get("1m", {}).get("candles", [])
-    if not base_candles and normalised_frames:
-        first_key = next(iter(normalised_frames))
-        base_candles = normalised_frames[first_key].get("candles", [])
+        profile_tf_key, base_candles = _select_zone_base_from_frames(
+            zone_source_frames,
+            preferred=target_tf_preference,
+        )
+    if not profile_tf_key:
+        profile_tf_key = target_tf_preference
+    target_tf_key = profile_tf_key
+    if base_candles and profile_tf_key in normalised_candles_by_tf:
+        base_candles = normalised_candles_by_tf[profile_tf_key]
+
 
     session_vwap = compute_session_vwaps(symbol, base_candles)
 
@@ -1325,11 +1859,19 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
         closed_candles = [
             candle
             for candle in base_candles
-            if bool(candle.get("closed", True))
+            if _is_candle_closed(candle.get("closed"))
         ]
         profile_candles = closed_candles or list(base_candles)
 
     profile_ready = bool(profile_candles)
+
+    base_series_for_window: Sequence[Mapping[str, Any]] = zone_source_frames.get(target_tf_key, [])
+    if not base_series_for_window and base_candles:
+        base_series_for_window = base_candles
+    zones_window_start_ms, window_end_ms_prev_closed = _compute_zone_window(
+        list(base_series_for_window),
+        target_tf_key,
+    )
 
     if preset and profile_candles and sessions:
         cache_token = (
@@ -1380,12 +1922,26 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
             }
             profile_ready = False
 
-    if profile_ready and profile_candles:
+    zone_cfg = ZonesConfig(tick_size=tick_size_value)
+    zone_cfg.zones_window_start_ms = zones_window_start_ms
+    zone_cfg.window_end_ms_prev_closed = window_end_ms_prev_closed
+
+    zone_frames = _build_zone_frames_for_detection(
+        zone_source_frames,
+        window_start_ms=zones_window_start_ms,
+        window_end_ms=window_end_ms_prev_closed,
+    )
+    if target_tf_key not in zone_frames and base_candles:
+        fallback_frames = _build_zone_frames_for_detection(
+            {target_tf_key: base_candles},
+            window_start_ms=zones_window_start_ms,
+            window_end_ms=window_end_ms_prev_closed,
+        )
+        if fallback_frames.get(target_tf_key):
+            zone_frames[target_tf_key] = fallback_frames[target_tf_key]
+
+    if zone_frames:
         try:
-            zone_cfg = ZonesConfig(tick_size=tick_size_value)
-            zone_frames: Dict[str, Sequence[Mapping[str, Any]]] = {
-                target_tf_key: profile_candles
-            }
             detected_zones = detect_zones(
                 frames=zone_frames,
                 config=zone_cfg,
@@ -1412,6 +1968,7 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
                 },
                 "meta": {},
             }
+            profile_ready = False
 
     raw_meta = snapshot.get("meta") if isinstance(snapshot.get("meta"), Mapping) else {}
     liquidity_config = raw_meta.get("liquidity") if isinstance(raw_meta, Mapping) else None
@@ -1515,6 +2072,7 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
             },
             "source": snapshot.get("meta", {}),
             "data_quality_htf": htf_quality,
+            "timeframes": timeframe_meta,
         },
     }
 
@@ -1809,10 +2367,55 @@ def render_inspection_page(
       border: none;
       font-weight: 600;
     }
+    .tf-toggle button[data-state="empty"] {
+      color: var(--muted);
+      opacity: 0.7;
+    }
+    .tf-toggle button[data-state="insufficient"] {
+      color: #fbbf24;
+    }
+    .tf-toggle button[data-state="rate_limited"] {
+      color: #f87171;
+    }
     .tf-toggle button.active {
       background: var(--accent);
       color: #0f172a;
       box-shadow: 0 12px 26px rgba(14, 165, 233, 0.25);
+    }
+    .tf-status {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.35rem;
+      font-size: 0.75rem;
+      color: var(--muted);
+    }
+    .tf-status__item {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      padding: 0.25rem 0.6rem;
+      border-radius: 999px;
+      border: 1px solid rgba(148, 163, 184, 0.24);
+      background: rgba(15, 23, 42, 0.55);
+    }
+    .tf-status__item[data-status="ok"] {
+      color: #34d399;
+      border-color: rgba(52, 211, 153, 0.4);
+    }
+    .tf-status__item[data-status="insufficient"] {
+      color: #fbbf24;
+      border-color: rgba(251, 191, 36, 0.45);
+    }
+    .tf-status__item[data-status="empty"] {
+      color: var(--muted);
+    }
+    .tf-status__item[data-status="rate_limited"] {
+      color: #f87171;
+      border-color: rgba(248, 113, 113, 0.45);
+    }
+    .tf-status__reason {
+      font-style: italic;
+      color: var(--muted);
     }
     .badge {
       display: inline-flex;
@@ -2538,6 +3141,7 @@ def render_inspection_page(
     const clearSelection = document.getElementById("clear-selection");
     const timeframeCheckboxes = Array.from(document.querySelectorAll("[data-tf-checkbox]"));
     const timeframeToggle = document.getElementById("chart-tf-toggle");
+    const timeframeStatus = document.getElementById("tf-status");
     const statusEl = document.getElementById("inspection-status");
     const symbolInput = document.getElementById("symbol-input");
     const presetChip = document.getElementById("preset-chip");
@@ -2580,7 +3184,20 @@ def render_inspection_page(
       return Math.min(4, Math.max(1, Math.floor(parsed)));
     };
 
-    const PREFERRED_CHART_FRAMES = ["1m", "3m", "15m", "30m", "1h", "4h", "1d", "1w"];
+    const TIMEFRAME_ORDER = ["1m", "3m", "5m", "15m", "1h", "4h", "1d"];
+    const PREFERRED_CHART_FRAMES = TIMEFRAME_ORDER.slice();
+    const STATUS_LABELS = {
+      ok: "OK",
+      insufficient: "Мало данных",
+      empty: "Нет данных",
+      rate_limited: "Rate limited",
+    };
+    const REASON_LABELS = {
+      insufficient_candles: "недостаточно закрытых свечей",
+      missing_seed: "нет 1m базы",
+      missing_candles: "есть пропуски",
+      no_candles: "данные отсутствуют",
+    };
 
     let state = null;
 
@@ -2595,6 +3212,13 @@ def render_inspection_page(
       if (!entry || typeof entry !== "object") return false;
       const candles = Array.isArray(entry.candles) ? entry.candles : [];
       return candles.length > 0;
+    }
+
+    function translateReason(code) {
+      if (!code || typeof code !== "string") return "";
+      const mapped = REASON_LABELS[code];
+      if (mapped) return mapped;
+      return code.replace(/_/g, " ");
     }
 
     function selectPreferredFrame(frames, desired) {
@@ -2644,6 +3268,10 @@ def render_inspection_page(
       liveMeta: null,
       liveMismatch: false,
       progressEvents: [],
+      frameMeta: (() => {
+        const meta = initial.payload?.DATA?.meta?.timeframes;
+        return meta && typeof meta === "object" ? { ...meta } : {};
+      })(),
     };
 
     const AUTO_PRESET_SYMBOLS = new Set(["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
@@ -3194,6 +3822,12 @@ def render_inspection_page(
 
     function populateFrames(payload) {
       const frames = payload?.DATA?.frames || {};
+      const meta = payload?.DATA?.meta?.timeframes;
+      if (meta && typeof meta === "object") {
+        state.frameMeta = { ...meta };
+      } else {
+        state.frameMeta = {};
+      }
       const combined = { ...frames };
       if (state.liveFrames) {
         Object.entries(state.liveFrames).forEach(([tf, entry]) => {
@@ -3213,10 +3847,66 @@ def render_inspection_page(
       const buttons = Array.from(timeframeToggle.querySelectorAll("[data-tf]"));
       for (const button of buttons) {
         const tf = button.dataset.tf;
-        const enabled = frameHasCandles(frames, tf);
-        button.disabled = !enabled;
-        button.classList.toggle("active", enabled && state.frame === tf);
+        if (!tf) continue;
+        const meta = (state.frameMeta && typeof state.frameMeta === "object" && state.frameMeta[tf]) || {};
+        const status = meta.status || (frameHasCandles(frames, tf) ? "ok" : "empty");
+        button.disabled = false;
+        button.dataset.state = status;
+        button.classList.toggle("active", state.frame === tf);
+        button.textContent = tf;
+        const reasonText = meta.reason ? translateReason(meta.reason) : "";
+        if (reasonText) {
+          button.title = `${tf.toUpperCase()}: ${reasonText}`;
+        } else if (typeof meta.available === "number" && typeof meta.required === "number") {
+          button.title = `${tf.toUpperCase()}: ${meta.available}/${meta.required}`;
+        } else {
+          button.removeAttribute("title");
+        }
       }
+      renderTimeframeStatus();
+    }
+
+    function renderTimeframeStatus() {
+      if (!timeframeStatus) return;
+      const frames = state.availableFrames || state.payload?.DATA?.frames || {};
+      const meta = state.frameMeta && typeof state.frameMeta === "object" ? state.frameMeta : {};
+      timeframeStatus.innerHTML = "";
+      const fragment = document.createDocumentFragment();
+      let needsAttention = false;
+      TIMEFRAME_ORDER.forEach((tf) => {
+        const metaEntry = meta[tf] || {};
+        const status = metaEntry.status || (frameHasCandles(frames, tf) ? "ok" : "empty");
+        const item = document.createElement("div");
+        item.className = "tf-status__item";
+        item.dataset.status = status;
+        const label = document.createElement("span");
+        label.textContent = tf;
+        item.append(label);
+        if (typeof metaEntry.available === "number") {
+          const available = document.createElement("span");
+          const required = typeof metaEntry.required === "number" ? metaEntry.required : null;
+          available.textContent = required !== null ? `${metaEntry.available}/${required}` : `${metaEntry.available}`;
+          item.append(available);
+        }
+        const statusSpan = document.createElement("span");
+        statusSpan.textContent = STATUS_LABELS[status] || status || "—";
+        item.append(statusSpan);
+        if (metaEntry.reason) {
+          const reasonText = translateReason(metaEntry.reason);
+          if (reasonText) {
+            const reasonSpan = document.createElement("span");
+            reasonSpan.className = "tf-status__reason";
+            reasonSpan.textContent = reasonText;
+            item.append(reasonSpan);
+          }
+        }
+        if (status !== "ok") {
+          needsAttention = true;
+        }
+        fragment.append(item);
+      });
+      timeframeStatus.append(fragment);
+      timeframeStatus.dataset.state = needsAttention ? "attention" : "ok";
     }
 
     function renderMeta(payload) {
@@ -4390,7 +5080,7 @@ def render_inspection_page(
         return;
       }
       ensureChart();
-      const fitContent = options.fitContent !== false;
+      const fitContent = options.fitContent === true;
       ensureFrameData({ resetRequestedKeys: options.resetRequestedKeys, fitContent })
         .then(() => {
           updateSelectionLabel();
@@ -4464,6 +5154,17 @@ def render_inspection_page(
         state.frame = tf;
         renderChart({ resetRequestedKeys: true });
         updateTimeframeToggle();
+        const metaEntry =
+          state.frameMeta && typeof state.frameMeta === "object" ? state.frameMeta[tf] : null;
+        if (metaEntry && metaEntry.status && metaEntry.status !== "ok") {
+          const statusLabel = STATUS_LABELS[metaEntry.status] || metaEntry.status;
+          const reasonText = metaEntry.reason ? translateReason(metaEntry.reason) : "";
+          const suffix = reasonText ? ` (${reasonText})` : "";
+          updateStatus(
+            `Слой ${tf} — ${statusLabel}${suffix}. Используйте «Дособрать данные», чтобы обновить слой.`,
+            "warning",
+          );
+        }
         syncLiveStores({ force: true });
       });
     }
@@ -4669,7 +5370,7 @@ def render_inspection_page(
     populateFrames(state.payload);
     populateSnapshots(initial.snapshots || []);
     renderMeta(state.payload);
-    renderChart();
+    renderChart({ fitContent: true });
     await refreshSnapshots();
     if (state.snapshotId && snapshotSelect) {
       snapshotSelect.value = state.snapshotId;
@@ -4766,13 +5467,13 @@ def render_inspection_page(
                 <div class="tf-toggle" id="chart-tf-toggle">
                   <button type="button" data-tf="1m">1m</button>
                   <button type="button" data-tf="3m">3m</button>
+                  <button type="button" data-tf="5m">5m</button>
                   <button type="button" data-tf="15m">15m</button>
-                  <button type="button" data-tf="30m">30m</button>
                   <button type="button" data-tf="1h">1h</button>
                   <button type="button" data-tf="4h">4h</button>
                   <button type="button" data-tf="1d">1d</button>
-                  <button type="button" data-tf="1w">1w</button>
                 </div>
+                <div class="tf-status" id="tf-status"></div>
               </div>
             </div>
             <div id=\"inspection-chart\" class=\"chart-shell\" data-selection-label=\"—\"></div>

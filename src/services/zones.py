@@ -844,23 +844,32 @@ def _sr_levels(
         price = float(pivot["price"])
         level_type = "resistance" if pivot["type"] == "ph" else "support"
         ts_iso = _ms_to_iso(int(candles_4h[pivot["idx"]]["t"]))
-        levels.append({"type": level_type, "price": price, "ts": ts_iso, "valid": True})
+        levels.append({"type": level_type, "price": price, "ts": ts_iso, "valid": True, "formed_at_utc": ts_iso, "created_utc": ts_iso, "origin_utc": ts_iso, "last_touched_utc": ts_iso})
     if candles_1d:
         previous = candles_1d[-1]
+        ts_iso = _ms_to_iso(int(previous["t"]))
         levels.append(
             {
                 "type": "resistance",
                 "price": float(previous["h"]),
-                "ts": _ms_to_iso(int(previous["t"])),
+                "ts": ts_iso,
                 "valid": True,
+                "formed_at_utc": ts_iso,
+                "created_utc": ts_iso,
+                "origin_utc": ts_iso,
+                "last_touched_utc": ts_iso,
             }
         )
         levels.append(
             {
                 "type": "support",
                 "price": float(previous["l"]),
-                "ts": _ms_to_iso(int(previous["t"])),
+                "ts": ts_iso,
                 "valid": True,
+                "formed_at_utc": ts_iso,
+                "created_utc": ts_iso,
+                "origin_utc": ts_iso,
+                "last_touched_utc": ts_iso,
             }
         )
     merged: List[Dict[str, Any]] = []
@@ -873,6 +882,7 @@ def _sr_levels(
         if pct_diff <= epsilon_pct and level["type"] == prev["type"]:
             prev["price"] = (prev["price"] + level["price"]) / 2.0
             prev["ts"] = max(prev["ts"], level["ts"])
+            prev["last_touched_utc"] = max(prev["last_touched_utc"], level["last_touched_utc"])
         else:
             merged.append(level)
     return merged
@@ -880,6 +890,8 @@ def _sr_levels(
 
 def _profile_levels(
     profile_refs: Mapping[str, Mapping[str, float]] | None,
+    *,
+    fallback_iso: str | None = None,
 ) -> List[Dict[str, Any]]:
     if not isinstance(profile_refs, Mapping):
         return []
@@ -894,7 +906,13 @@ def _profile_levels(
                 price = float(values[key])
             except (TypeError, ValueError):
                 continue
-            levels.append({"type": key, "price": price, "session": session})
+            entry: Dict[str, Any] = {"type": key, "price": price, "session": session}
+            if fallback_iso:
+                entry.setdefault("formed_at_utc", fallback_iso)
+                entry.setdefault("created_utc", fallback_iso)
+                entry.setdefault("origin_utc", fallback_iso)
+                entry.setdefault("last_touched_utc", fallback_iso)
+            levels.append(entry)
     return levels
 
 
@@ -1210,6 +1228,16 @@ def detect_zones(
                 reasons.append({"tf": frame_diag.get("tf"), "reason": reason_value})
         return reasons
 
+    profile_level_fallback: str | None = None
+    if cfg.window_end_ms_prev_closed is not None:
+        profile_level_fallback = _ms_to_iso(int(cfg.window_end_ms_prev_closed))
+    else:
+        for tf_candidate in ("1h", "4h", "15m", "1d"):
+            candidate = timeframes.get(tf_candidate)
+            if candidate:
+                profile_level_fallback = _ms_to_iso(int(candidate[-1]["t"]))
+                break
+
     diagnostics_summary: Dict[str, Any] = {}
     zone_collections = {
         "fvg": fvg_all,
@@ -1239,7 +1267,7 @@ def detect_zones(
             "rb": rb_all,
             "pb": pb_all,
             "sr": sr_levels,
-            "profile_levels": _profile_levels(profile_levels),
+            "profile_levels": _profile_levels(profile_levels, fallback_iso=profile_level_fallback),
         }
     }
     payload["meta"] = {
