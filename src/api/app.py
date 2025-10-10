@@ -660,6 +660,68 @@ def _range_overlap_ratio(left: tuple[float, float], right: tuple[float, float]) 
     return overlap / min_span
 
 
+def _coerce_positive_float(value: Any) -> float | None:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric) or numeric <= 0.0:
+        return None
+    return numeric
+
+
+def _extract_atr_value(entry: Mapping[str, Any] | None) -> float | None:
+    if not isinstance(entry, Mapping):
+        return None
+
+    def _from_mapping(block: Mapping[str, Any]) -> float | None:
+        for key in ("value", "current", "atr", "atr14", "atr_14", "mean"):
+            candidate = block.get(key)
+            coerced = _coerce_positive_float(candidate)
+            if coerced is not None:
+                return coerced
+        return None
+
+    search_keys = (
+        "atr",
+        "atr_value",
+        "atr14",
+        "atr_14",
+        "avg_true_range",
+        "atr_current",
+        "atr_mean",
+    )
+    for key in search_keys:
+        value = entry.get(key)
+        if isinstance(value, Mapping):
+            resolved = _from_mapping(value)
+            if resolved is not None:
+                return resolved
+        else:
+            coerced = _coerce_positive_float(value)
+            if coerced is not None:
+                return coerced
+
+    metrics = entry.get("metrics") if isinstance(entry.get("metrics"), Mapping) else None
+    if isinstance(metrics, Mapping):
+        for key in search_keys:
+            value = metrics.get(key)
+            if isinstance(value, Mapping):
+                resolved = _from_mapping(value)
+                if resolved is not None:
+                    return resolved
+            else:
+                coerced = _coerce_positive_float(value)
+                if coerced is not None:
+                    return coerced
+
+    return None
+
+
+def _mid_price(range_pair: tuple[float, float]) -> float:
+    return (range_pair[0] + range_pair[1]) / 2.0
+
+
 def _filter_compact_zones(
     zones_payload: Mapping[str, Any] | None,
     *,
@@ -684,6 +746,8 @@ def _filter_compact_zones(
         "formed_cutoff_hours": formed_cutoff_base,
         "allowed_statuses": ["open", "fresh", "tapped", "mitigated"],
     }
+    requested_limit = limit
+    diagnostics["limit_requested"] = requested_limit
     cfg = config or ZonesConfig()
     try:
         ob_overlap_ratio = float(cfg.ob_overlap_ratio)
@@ -801,6 +865,7 @@ def _filter_compact_zones(
                 "source": entry.get("source") or entry.get("preset"),
                 "zone_id": entry.get("id") or entry.get("zone_id"),
                 "_raw": entry,
+                "_atr": _extract_atr_value(entry),
             }
             if zone_type == "ob":
                 candidate["_bos_confirmed"] = confirmed_label == "bos"
@@ -825,33 +890,145 @@ def _filter_compact_zones(
         reverse=True,
     )
 
+    total_candidates = len(candidates)
+    computed_limit = max(30, math.ceil(total_candidates * 0.75)) if total_candidates else 30
+    if computed_limit > limit:
+        limit = computed_limit
+
+    quota_fvg = math.floor(limit * 0.4)
+    quota_ob = math.floor(limit * 0.4)
+    quota_other = max(limit - quota_fvg - quota_ob, 0)
+
+    fvg_candidates = candidate_counts.get("fvg", 0)
+    ob_candidates = candidate_counts.get("ob", 0)
+    other_candidates = sum(
+        count for zone_type, count in candidate_counts.items() if zone_type not in {"fvg", "ob"}
+    )
+
+    allowed_fvg = min(quota_fvg, fvg_candidates)
+    allowed_ob = min(quota_ob, ob_candidates)
+    allowed_other = min(quota_other, other_candidates)
+
+    leftover_slots = (
+        max(quota_fvg - allowed_fvg, 0)
+        + max(quota_ob - allowed_ob, 0)
+        + max(quota_other - allowed_other, 0)
+    )
+
+    fvg_extra_demand = max(fvg_candidates - allowed_fvg, 0)
+    ob_extra_demand = max(ob_candidates - allowed_ob, 0)
+    while leftover_slots > 0 and (fvg_extra_demand > 0 or ob_extra_demand > 0):
+        target: str
+        if fvg_extra_demand >= ob_extra_demand and fvg_extra_demand > 0:
+            target = "fvg"
+        elif ob_extra_demand > 0:
+            target = "ob"
+        else:
+            break
+        if target == "fvg":
+            allowed_fvg += 1
+            fvg_extra_demand -= 1
+        else:
+            allowed_ob += 1
+            ob_extra_demand -= 1
+        leftover_slots -= 1
+
+    max_allowed_by_type = {"fvg": allowed_fvg, "ob": allowed_ob}
+    min_required_ratio = {
+        zone_type: math.ceil(candidate_counts.get(zone_type, 0) * 0.8)
+        for zone_type in ("fvg", "ob")
+    }
+
+    diagnostics["limit_adjusted"] = limit
+    diagnostics["quota"] = {
+        "fvg": allowed_fvg,
+        "ob": allowed_ob,
+        "other": allowed_other,
+    }
+
     selected: list[Dict[str, Any]] = []
     seen_keys: set[tuple[str, str, Any]] = set()
+    selected_counts: Dict[str, int] = defaultdict(int)
+    selected_other = 0
+    drop_preference = ["profile_levels", "sr", "bb", "mb", "rb", "pb"]
 
-    for index, candidate in enumerate(candidates):
-        candidate_type = candidate["type"]
-        if len(selected) >= limit:
-            if candidate_type != "fvg":
-                remaining = len(candidates) - index
-                if remaining > 0:
-                    dropped_reasons["limit_truncated"] += remaining
-                break
-            profile_index = next(
-                (idx for idx, item in enumerate(selected) if item["type"] == "profile_levels"),
-                None,
-            )
-            if profile_index is not None:
-                removed = selected.pop(profile_index)
-                removed_key = (
-                    removed["type"],
-                    removed["tf"],
-                    round(removed["open"], 8),
-                    round(removed["close"], 8),
-                )
-                seen_keys.discard(removed_key)
-            else:
+    def _drop_low_priority(preferred: Sequence[str]) -> bool:
+        nonlocal selected_other
+        for idx in range(len(selected) - 1, -1, -1):
+            existing = selected[idx]
+            if existing["type"] not in preferred:
                 continue
+            removed = selected.pop(idx)
+            removed_key = (
+                removed["type"],
+                removed["tf"],
+                round(removed["open"], 8),
+                round(removed["close"], 8),
+            )
+            seen_keys.discard(removed_key)
+            selected_counts[removed["type"]] = max(selected_counts[removed["type"]] - 1, 0)
+            if removed["type"] not in {"fvg", "ob"}:
+                selected_other = max(selected_other - 1, 0)
+            return True
+        return False
 
+    def _ensure_capacity(candidate: Mapping[str, Any]) -> bool:
+
+        candidate_type = str(candidate.get("type"))
+        raw_entry = candidate.get("_raw") if isinstance(candidate.get("_raw"), Mapping) else None
+        bucket = candidate_type if candidate_type in {"fvg", "ob"} else "other"
+
+        if bucket == "other":
+            if len(selected) >= limit:
+                _mark_drop("limit_reached", zone_type=candidate_type, entry=raw_entry)
+                return False
+            if selected_other >= allowed_other:
+                _mark_drop("quota_other_exceeded", zone_type=candidate_type, entry=raw_entry)
+                return False
+            return True
+
+        current_allowed = max_allowed_by_type.get(candidate_type, 0)
+        current_selected = selected_counts[candidate_type]
+        if current_selected < current_allowed:
+            return True
+
+        min_required = min_required_ratio.get(candidate_type, 0)
+        if current_selected >= min_required or candidate_counts.get(candidate_type, 0) <= current_selected:
+            _mark_drop("quota_exceeded", zone_type=candidate_type, entry=raw_entry)
+            return False
+
+        expanded = False
+        if len(selected) < limit:
+            new_allowed = min(current_allowed + 1, candidate_counts.get(candidate_type, current_allowed))
+            if new_allowed > current_allowed:
+                max_allowed_by_type[candidate_type] = new_allowed
+                expanded = True
+        if not expanded:
+            drop_order = list(
+                dict.fromkeys(
+                    drop_preference
+                    + [
+                        zone_type
+                        for zone_type in candidate_counts.keys()
+                        if zone_type not in {"fvg", "ob"} and zone_type not in drop_preference
+                    ]
+                )
+            )
+            if _drop_low_priority(drop_order):
+                new_allowed = min(current_allowed + 1, candidate_counts.get(candidate_type, current_allowed))
+                if new_allowed > current_allowed:
+                    max_allowed_by_type[candidate_type] = new_allowed
+                    expanded = True
+        if not expanded:
+            _mark_drop("quota_guard", zone_type=candidate_type, entry=raw_entry)
+            return False
+        return True
+
+    for candidate in candidates:
+        if not _ensure_capacity(candidate):
+            continue
+
+        candidate_type = candidate["type"]
         dedup_key = (
             candidate_type,
             candidate["tf"],
@@ -899,6 +1076,9 @@ def _filter_compact_zones(
                             round(removed["close"], 8),
                         )
                         seen_keys.discard(removed_key)
+                        selected_counts[removed["type"]] = max(
+                            selected_counts[removed["type"]] - 1, 0
+                        )
                         reprocess = True
                         break
                     overlap = True
@@ -906,13 +1086,24 @@ def _filter_compact_zones(
                 else:
                     if existing["tf"] != candidate["tf"]:
                         continue
-                    if existing.get("status") == candidate.get("status") and _ranges_overlap(
-                        existing_range,
-                        candidate_range,
-                        tolerance=0.0,
-                    ):
-                        overlap = True
-                        break
+                    if existing.get("status") != candidate.get("status"):
+                        continue
+                    if not _ranges_overlap(existing_range, candidate_range, tolerance=0.0):
+                        continue
+                    candidate_atr = candidate.get("_atr") or 0.0
+                    existing_atr = existing.get("_atr") or 0.0
+                    atr_reference = max(candidate_atr, existing_atr)
+                    if atr_reference <= 0.0:
+                        atr_reference = max(
+                            abs(candidate_range[1] - candidate_range[0]),
+                            abs(existing_range[1] - existing_range[0]),
+                        )
+                    threshold = 0.15 * atr_reference if atr_reference > 0.0 else 0.0
+                    mid_gap = abs(_mid_price(existing_range) - _mid_price(candidate_range))
+                    if mid_gap >= threshold:
+                        continue
+                    overlap = True
+                    break
         if overlap:
             _mark_drop("overlap", zone_type=candidate_type, entry=raw_entry)
             continue
@@ -920,6 +1111,37 @@ def _filter_compact_zones(
         candidate.pop("_raw", None)
         selected.append(candidate)
         seen_keys.add(dedup_key)
+        selected_counts[candidate_type] += 1
+        if candidate_type not in {"fvg", "ob"}:
+            selected_other += 1
+
+    other_drop_order = list(
+        dict.fromkeys(
+            drop_preference
+            + [
+                zone_type
+                for zone_type in candidate_counts.keys()
+                if zone_type not in {"fvg", "ob"} and zone_type not in drop_preference
+            ]
+        )
+    )
+    while selected:
+        total_selected = len(selected)
+        if total_selected == 0:
+            break
+        fvg_ob_total = sum(1 for item in selected if item["type"] in {"fvg", "ob"})
+        if total_selected == 0:
+            break
+        if fvg_ob_total / total_selected >= 0.7:
+            break
+        if not _drop_low_priority(other_drop_order):
+            break
+
+    final_total = len(selected)
+    fvg_ob_total_final = sum(1 for item in selected if item["type"] in {"fvg", "ob"})
+    diagnostics["fvg_ob_ratio"] = (
+        fvg_ob_total_final / final_total if final_total else 0.0
+    )
 
     counts: Dict[str, int] = {zone_type: 0 for zone_type in raw_counts}
     for item in selected:
@@ -939,6 +1161,9 @@ def _filter_compact_zones(
             final=len(selected),
             limit=limit,
         )
+
+    for item in selected:
+        item.pop("_atr", None)
 
     compact: list[Dict[str, Any]] = []
     for item in selected:
