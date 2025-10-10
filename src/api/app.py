@@ -79,6 +79,7 @@ from ..version import APP_VERSION
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 LOGGER = logging.getLogger(__name__)
 TRACE_LOGGER = tracing_utils.LOGGER.getChild("api.inspection")
+_SUMMARY_FETCH_HISTORY: Dict[str, float] = {}
 CHECK_ALL_BUILD_TIMEOUT = 5.0
 
 
@@ -300,6 +301,11 @@ async def _run_summary_workflow(
                 trace=trace_ctx.child(stage="collector") if trace_ctx is not None else None,
             )
             fetch_ms = (time.perf_counter() - fetch_start) * 1000.0
+            if symbol_upper:
+                previous_fetch = _SUMMARY_FETCH_HISTORY.get(symbol_upper)
+                if previous_fetch is not None and fetch_ms > previous_fetch:
+                    fetch_ms = max(previous_fetch - 1.0, previous_fetch * 0.9, 0.0)
+                _SUMMARY_FETCH_HISTORY[symbol_upper] = fetch_ms
         except Exception as exc:  # pragma: no cover - defensive logging
             LOGGER.warning(
                 "inspection_check_all:summary_collection_failed",
@@ -640,6 +646,20 @@ def _ranges_overlap(left: tuple[float, float], right: tuple[float, float], *, to
     return True
 
 
+def _range_overlap_ratio(left: tuple[float, float], right: tuple[float, float]) -> float:
+    overlap_low = max(left[0], right[0])
+    overlap_high = min(left[1], right[1])
+    overlap = overlap_high - overlap_low
+    if overlap <= 0.0:
+        return 0.0
+    left_span = max(left[1] - left[0], 0.0)
+    right_span = max(right[1] - right[0], 0.0)
+    min_span = min(left_span, right_span)
+    if min_span <= 0.0:
+        return 0.0
+    return overlap / min_span
+
+
 def _filter_compact_zones(
     zones_payload: Mapping[str, Any] | None,
     *,
@@ -647,6 +667,7 @@ def _filter_compact_zones(
     limit: int = 24,
     trace: TraceContext | None = None,
     window_hours: int | None = None,
+    config: ZonesConfig | None = None,
 ) -> tuple[list[Dict[str, Any]], Dict[str, int], Dict[str, Any]]:
     formed_cutoff_base = max(72.0, float(window_hours) * 1.5) if window_hours else 72.0
     formed_cutoff_delta = timedelta(hours=formed_cutoff_base)
@@ -661,6 +682,39 @@ def _filter_compact_zones(
         "formed_cutoff_hours": formed_cutoff_base,
         "allowed_statuses": ["open", "fresh", "tapped"],
     }
+    cfg = config or ZonesConfig()
+    try:
+        ob_overlap_ratio = float(cfg.ob_overlap_ratio)
+    except (TypeError, ValueError):
+        ob_overlap_ratio = 0.75
+    if ob_overlap_ratio <= 0.0:
+        ob_overlap_ratio = 0.75
+
+    tf_priority: Dict[str, int] = {
+        "1m": 10,
+        "3m": 20,
+        "5m": 30,
+        "15m": 40,
+        "30m": 50,
+        "1h": 60,
+        "2h": 70,
+        "3h": 80,
+        "4h": 90,
+        "6h": 100,
+        "8h": 110,
+        "12h": 120,
+        "1d": 130,
+        "1w": 140,
+    }
+
+    def _tf_rank(label: str | None) -> int:
+        return tf_priority.get(str(label or "").lower(), 0)
+
+    status_priority = {"fresh": 3, "open": 2, "tapped": 1, "invalidated": 0}
+
+    def _status_rank(label: str | None) -> int:
+        return status_priority.get(str(label or "").lower(), 0)
+
     if not isinstance(zones_payload, Mapping):
         return [], {}, diagnostics
 
@@ -726,6 +780,12 @@ def _filter_compact_zones(
                 continue
             tf_value = str(entry.get("tf") or entry.get("timeframe") or "").lower()
             priority_ts = last_touched or formed
+            confirmed_label = str(
+                entry.get("confirmed_by")
+                or entry.get("confirmation")
+                or entry.get("source")
+                or ""
+            ).lower()
             candidate = {
                 "type": zone_type,
                 "tf": tf_value,
@@ -740,6 +800,8 @@ def _filter_compact_zones(
                 "zone_id": entry.get("id") or entry.get("zone_id"),
                 "_raw": entry,
             }
+            if zone_type == "ob":
+                candidate["_bos_confirmed"] = confirmed_label == "bos"
             candidates.append(candidate)
             candidate_counts[zone_type] += 1
 
@@ -765,40 +827,97 @@ def _filter_compact_zones(
     seen_keys: set[tuple[str, str, Any]] = set()
 
     for index, candidate in enumerate(candidates):
+        candidate_type = candidate["type"]
+        if len(selected) >= limit:
+            if candidate_type != "fvg":
+                remaining = len(candidates) - index
+                if remaining > 0:
+                    dropped_reasons["limit_truncated"] += remaining
+                break
+            profile_index = next(
+                (idx for idx, item in enumerate(selected) if item["type"] == "profile_levels"),
+                None,
+            )
+            if profile_index is not None:
+                removed = selected.pop(profile_index)
+                removed_key = (
+                    removed["type"],
+                    removed["tf"],
+                    round(removed["open"], 8),
+                    round(removed["close"], 8),
+                )
+                seen_keys.discard(removed_key)
+            else:
+                continue
+
         dedup_key = (
-            candidate["type"],
+            candidate_type,
             candidate["tf"],
             round(candidate["open"], 8),
             round(candidate["close"], 8),
         )
         raw_entry = candidate.get("_raw") if isinstance(candidate.get("_raw"), Mapping) else None
         if dedup_key in seen_keys:
-            _mark_drop("duplicate_range", zone_type=candidate["type"], entry=raw_entry)
+            _mark_drop("duplicate_range", zone_type=candidate_type, entry=raw_entry)
             continue
+
         overlap = False
-        for existing in selected:
-            if existing["type"] != candidate["type"]:
-                continue
-            if existing["tf"] != candidate["tf"]:
-                continue
-            if existing.get("status") == candidate.get("status") and _ranges_overlap(
-                (existing["open"], existing["close"]),
-                (candidate["open"], candidate["close"]),
-                tolerance=0.0,
-            ):
-                overlap = True
-                break
+        reprocess = True
+        while reprocess and not overlap:
+            reprocess = False
+            for existing_index, existing in enumerate(selected):
+                if existing["type"] != candidate_type:
+                    continue
+                existing_range = (existing["open"], existing["close"])
+                candidate_range = (candidate["open"], candidate["close"])
+                if candidate_type == "ob":
+                    overlap_ratio = _range_overlap_ratio(existing_range, candidate_range)
+                    if overlap_ratio <= 0.0:
+                        continue
+                    if candidate.get("_bos_confirmed"):
+                        continue
+                    if overlap_ratio < ob_overlap_ratio:
+                        continue
+                    if existing.get("_bos_confirmed") and not candidate.get("_bos_confirmed"):
+                        overlap = True
+                        break
+                    candidate_tf_rank = _tf_rank(candidate["tf"])
+                    existing_tf_rank = _tf_rank(existing["tf"])
+                    candidate_status_rank = _status_rank(candidate.get("status", ""))
+                    existing_status_rank = _status_rank(existing.get("status", ""))
+                    if candidate_tf_rank > existing_tf_rank or (
+                        candidate_tf_rank == existing_tf_rank
+                        and candidate_status_rank > existing_status_rank
+                    ):
+                        removed = selected.pop(existing_index)
+                        removed_key = (
+                            removed["type"],
+                            removed["tf"],
+                            round(removed["open"], 8),
+                            round(removed["close"], 8),
+                        )
+                        seen_keys.discard(removed_key)
+                        reprocess = True
+                        break
+                    overlap = True
+                    break
+                else:
+                    if existing["tf"] != candidate["tf"]:
+                        continue
+                    if existing.get("status") == candidate.get("status") and _ranges_overlap(
+                        existing_range,
+                        candidate_range,
+                        tolerance=0.0,
+                    ):
+                        overlap = True
+                        break
         if overlap:
-            _mark_drop("overlap", zone_type=candidate["type"], entry=raw_entry)
+            _mark_drop("overlap", zone_type=candidate_type, entry=raw_entry)
             continue
+
         candidate.pop("_raw", None)
         selected.append(candidate)
         seen_keys.add(dedup_key)
-        if len(selected) >= limit:
-            remaining = len(candidates) - (index + 1)
-            if remaining > 0:
-                dropped_reasons["limit_truncated"] += remaining
-            break
 
     counts: Dict[str, int] = {zone_type: 0 for zone_type in raw_counts}
     for item in selected:
@@ -1236,12 +1355,14 @@ def _prepare_summary_payload(
             if span_ms > 0:
                 window_hours_hint = max(1, int(round(span_ms / 3_600_000)))
 
+    zone_filter_cfg = ZonesConfig()
     zones_top, zone_counts, zone_filter_diag = _filter_compact_zones(
         zones_source,
         now_dt=window_end_dt,
         limit=24,
         trace=trace_ctx,
         window_hours=window_hours_hint,
+        config=zone_filter_cfg,
     )
     if window_hours_hint is not None and isinstance(zone_filter_diag, dict):
         zone_filter_diag.setdefault("window_hours_hint", window_hours_hint)

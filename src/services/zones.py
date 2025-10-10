@@ -36,16 +36,16 @@ class Config:
     base_max_atr: float = 0.8
     base_min_overlap: float = 0.5
     impulse_min_cover: float = 0.6
-    ob_body_max_atr: float = 0.7
-    ob_overlap_ratio: float = 0.6
-    ob_distance_atr: float = 0.5
+    ob_body_max_atr: float = 1.0
+    ob_overlap_ratio: float = 0.75
+    ob_distance_atr: float = 0.25
     min_block_ratio: float = 0.2
     epsilon_ticks: float = 1.0
     liquidity_window: int = 3
     sr_merge_pct: float = 0.0002
     zones_window_start_ms: int | None = None
     window_end_ms_prev_closed: int | None = None
-    allow_base_fallback: bool = False
+    allow_base_fallback: bool = True
     base_fallback_max_age: int = 200
     base_fallback_max_distance_atr: float = 3.0
     min_gap_atr_ratio: float = 0.1
@@ -707,6 +707,8 @@ def _ob_for_tf(
             "mean": _round_tick((zone_low + zone_high) / 2.0, tick),
             "origin_utc": _ms_to_iso(int(candles[bos_idx]["t"])),
             "status": status,
+            "source": "bos",
+            "confirmed_by": "bos",
         }
         zones.append(zone)
         raw_metadata.append(
