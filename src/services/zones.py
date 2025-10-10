@@ -51,7 +51,7 @@ class Config:
     allow_base_fallback: bool = True
     base_fallback_max_age: int = 200
     base_fallback_max_distance_atr: float = 3.0
-    min_gap_atr_ratio: float = 0.1
+    min_gap_atr_ratio: float = 0.08
     min_gap_tick_multiple: float = 2.0
     min_gap_pct: float = 0.0003
     m_wick_atr: float = 3.0
@@ -298,6 +298,105 @@ def _candle_range(candle: Candle) -> Tuple[float, float]:
     return (low, high) if low <= high else (high, low)
 
 
+def _candle_wicks(candle: Candle) -> Tuple[float, float]:
+    """Return the lower and upper wick lengths for a candle."""
+
+    open_price = float(candle.get("o", 0.0))
+    close_price = float(candle.get("c", 0.0))
+    low = float(candle.get("l", 0.0))
+    high = float(candle.get("h", 0.0))
+    body_low, body_high = (open_price, close_price)
+    if open_price > close_price:
+        body_low, body_high = close_price, open_price
+    lower_wick = max(0.0, body_low - low)
+    upper_wick = max(0.0, high - body_high)
+    return lower_wick, upper_wick
+
+
+def _resolve_fvg_gap(
+    prev_candle: Candle,
+    next_candle: Candle,
+    *,
+    cfg: Config,
+    atr_value: float,
+) -> tuple[str, float, float, str] | None:
+    """Determine the dominant gap between the outer candles of a triplet."""
+
+    prev_low_wick, prev_high_wick = _candle_range(prev_candle)
+    prev_body_low, prev_body_high = _body_range(prev_candle)
+    next_low_wick, next_high_wick = _candle_range(next_candle)
+    next_body_low, next_body_high = _body_range(next_candle)
+
+    atr_ok = math.isfinite(atr_value) and atr_value > 0
+    wick_limit = None
+    if atr_ok and cfg.m_wick_atr and cfg.m_wick_atr > 0:
+        wick_limit = cfg.m_wick_atr * float(atr_value)
+
+    if wick_limit is not None:
+        prev_lower_wick, prev_upper_wick = _candle_wicks(prev_candle)
+        next_lower_wick, next_upper_wick = _candle_wicks(next_candle)
+        if prev_upper_wick > wick_limit:
+            prev_high_wick = prev_body_high
+        if prev_lower_wick > wick_limit:
+            prev_low_wick = prev_body_low
+        if next_upper_wick > wick_limit:
+            next_high_wick = next_body_high
+        if next_lower_wick > wick_limit:
+            next_low_wick = next_body_low
+
+    bullish_candidates = [
+        ("wick_wick", prev_high_wick, next_low_wick),
+        ("wick_body", prev_high_wick, next_body_low),
+        ("body_wick", prev_body_high, next_low_wick),
+        ("body_body", prev_body_high, next_body_low),
+    ]
+    bearish_candidates = [
+        ("wick_wick", next_high_wick, prev_low_wick),
+        ("wick_body", next_body_high, prev_low_wick),
+        ("body_wick", next_high_wick, prev_body_low),
+        ("body_body", next_body_high, prev_body_low),
+    ]
+
+    combo_priority = {
+        "wick_body": 0,
+        "wick_wick": 1,
+        "body_wick": 2,
+        "body_body": 3,
+    }
+
+    def _select_candidate(candidates: list[tuple[str, float, float]]) -> tuple[float, float, str, float] | None:
+        best: tuple[float, float, str, float] | None = None
+        for label, bottom, top in candidates:
+            gap = top - bottom
+            if gap <= 0:
+                continue
+            if best is None:
+                best = (bottom, top, label, gap)
+                continue
+            _, _, best_label, best_gap = best
+            if gap < best_gap - 1e-9:
+                best = (bottom, top, label, gap)
+                continue
+            if abs(gap - best_gap) <= 1e-9:
+                priority_new = combo_priority.get(label, 99)
+                priority_best = combo_priority.get(best_label, 99)
+                if priority_new < priority_best:
+                    best = (bottom, top, label, gap)
+        return best
+
+    bullish_best = _select_candidate(bullish_candidates)
+    if bullish_best is not None:
+        bottom, top, label, _ = bullish_best
+        return "up", bottom, top, label
+
+    bearish_best = _select_candidate(bearish_candidates)
+    if bearish_best is not None:
+        bottom, top, label, _ = bearish_best
+        return "down", bottom, top, label
+
+    return None
+
+
 def _pivot_span(tf: str) -> int:
     return _PIVOT_WINDOWS.get(tf, 2)
 
@@ -451,29 +550,24 @@ def _fvgs_for_tf(
         if stats is not None:
             stats["fvg_triplets"] = stats.get("fvg_triplets", 0) + 1
         c0, c1, c2 = candles[i], candles[i + 1], candles[i + 2]
-        high_prev = float(c0["h"])
-        low_prev = float(c0["l"])
-        high_next = float(c2["h"])
-        low_next = float(c2["l"])
-
-        bullish_gap = high_prev < low_next
-        bearish_gap = low_prev > high_next
-        if not bullish_gap and not bearish_gap:
+        impulse_idx = i + 2
+        atr_value = _series_value(atr, impulse_idx)
+        gap_info = _resolve_fvg_gap(c0, c2, cfg=cfg, atr_value=atr_value)
+        if gap_info is None:
             if stats is not None:
                 stats["fvg_reject_no_gap"] = stats.get("fvg_reject_no_gap", 0) + 1
             continue
 
-        direction = "up" if bullish_gap else "down"
-        bot_raw = high_prev if bullish_gap else high_next
-        top_raw = low_next if bullish_gap else low_prev
+        direction, bot_raw, top_raw, gap_mode = gap_info
         gap_abs = top_raw - bot_raw
         if gap_abs <= 0:
             if stats is not None:
                 stats["fvg_reject_no_gap"] = stats.get("fvg_reject_no_gap", 0) + 1
             continue
 
-        impulse_idx = i + 2
-        atr_value = _series_value(atr, impulse_idx)
+        if stats is not None:
+            mode_key = f"fvg_gap_mode_{gap_mode}"
+            stats[mode_key] = stats.get(mode_key, 0) + 1
         atr_component = (
             cfg.min_gap_atr_ratio * atr_value
             if math.isfinite(atr_value) and atr_value > 0
@@ -605,7 +699,8 @@ def _fvgs_for_tf(
                 ) + 1
             top_value = top_raw
             bot_value = bot_raw
-        mid_value = _round_tick((top_raw + bot_raw) / 2.0, tick)
+        mid_seed = (top_value + bot_value) / 2.0
+        mid_value = _round_tick(mid_seed, tick) if tick else mid_seed
 
         raw_status = status
         zone_status = raw_status

@@ -270,13 +270,24 @@ def test_diag_report_includes_kpi_metrics(client: TestClient) -> None:
     assert response.status_code == 200
     payload = response.json()
 
-    before_after = payload.get("before_after")
-    assert isinstance(before_after, dict)
-    assert "raw_counts" in before_after
-    assert "zones_before_filter" in before_after
-    assert "zones_after_filter" in before_after
+    assert payload.get("schema") == "compact.v1"
 
-    metrics = payload.get("metrics")
+    meta = payload.get("meta")
+    assert isinstance(meta, dict)
+    assert meta.get("symbol") == "DIAG"
+    assert "tz" in meta
+    assert "coverage" in meta and isinstance(meta["coverage"], dict)
+
+    summary = payload.get("summary")
+    assert isinstance(summary, dict)
+
+    zones_summary = summary.get("zones")
+    assert isinstance(zones_summary, dict)
+    assert "raw_counts" in zones_summary
+    assert "retention" in zones_summary
+    assert "fvg_ob_share" in zones_summary
+
+    metrics = summary.get("metrics")
     assert isinstance(metrics, dict)
     for key in (
         "fvg_reject_no_gap",
@@ -291,7 +302,7 @@ def test_diag_report_includes_kpi_metrics(client: TestClient) -> None:
         if not entry["ok"]:
             assert entry.get("reason"), f"Expected reason for failed metric {key}"
 
-    timeframe_targets = payload.get("timeframe_targets")
+    timeframe_targets = summary.get("timeframe_targets")
     assert isinstance(timeframe_targets, dict)
     for key in ("1h_fvg", "1h_ob", "15m_fvg"):
         entry = timeframe_targets.get(key)
@@ -304,3 +315,10 @@ def test_diag_report_includes_kpi_metrics(client: TestClient) -> None:
 
     diagnostics = payload.get("diagnostics")
     assert isinstance(diagnostics, dict)
+    assert "filter" in diagnostics
+    assert "fvg_stats" in diagnostics
+
+    zones_block = payload.get("zones")
+    assert isinstance(zones_block, dict)
+    for key in ("fvg", "ob", "other"):
+        assert key in zones_block

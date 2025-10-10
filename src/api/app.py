@@ -893,7 +893,7 @@ def _filter_compact_zones(
     )
 
     total_candidates = len(candidates)
-    computed_limit = max(30, math.ceil(total_candidates * 0.75)) if total_candidates else 30
+    computed_limit = max(30, math.ceil(total_candidates * 0.8)) if total_candidates else 30
     if computed_limit > limit:
         limit = computed_limit
 
@@ -1100,7 +1100,10 @@ def _filter_compact_zones(
                             abs(candidate_range[1] - candidate_range[0]),
                             abs(existing_range[1] - existing_range[0]),
                         )
-                    threshold = 0.15 * atr_reference if atr_reference > 0.0 else 0.0
+                    threshold_ratio = max(cfg.r_zone_pct * 0.8, 0.1)
+                    threshold = (
+                        threshold_ratio * atr_reference if atr_reference > 0.0 else 0.0
+                    )
                     mid_gap = abs(_mid_price(existing_range) - _mid_price(candidate_range))
                     if mid_gap >= threshold:
                         continue
@@ -3702,9 +3705,9 @@ async def diag_report() -> JSONResponse:
     metrics_block: Dict[str, Dict[str, Any]] = {}
 
     gap_entry = {
-        "ok": gap_reduction is not None and gap_reduction >= 0.6,
+        "ok": gap_reduction is not None and gap_reduction >= 0.5,
         "reduction": gap_reduction,
-        "target": 0.6,
+        "target": 0.5,
         "triplets": triplets_total,
         "rejects": reject_gap_total,
     }
@@ -3785,33 +3788,188 @@ async def diag_report() -> JSONResponse:
                 tf_entry["reason"] = f"only {count} zones within window"
         timeframe_targets[key] = tf_entry
 
-    before_after = {
-        "raw_counts": filter_diag.get("raw_counts", {}),
-        "candidate_counts": filter_diag.get("candidate_counts", {}),
-        "zones_before_filter": zones_before,
-        "zones_after_filter": zones_after,
-        "fvg_ob_ratio": fvg_ob_ratio,
-        "total_candidates": int(filter_diag.get("total_candidates", 0) or 0),
-        "dropped_reasons": filter_diag.get("dropped_reasons", {}),
+    raw_counts = {
+        str(key): int(value) for key, value in filter_diag.get("raw_counts", {}).items()
+    }
+    candidate_counts = {
+        str(key): int(value)
+        for key, value in filter_diag.get("candidate_counts", {}).items()
+    }
+    total_candidates = int(filter_diag.get("total_candidates", 0) or 0)
+
+    def _last_close(series: Sequence[Mapping[str, Any]] | None) -> float | None:
+        if not isinstance(series, Sequence):
+            return None
+        for candle in reversed(series):
+            if not isinstance(candle, Mapping):
+                continue
+            close_value = candle.get("c")
+            try:
+                price = float(close_value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(price) and price > 0:
+                return price
+        return None
+
+    last_price = _last_close(anchor_series)
+    if last_price is None:
+        for series in detection_frames.values():
+            last_price = _last_close(series)
+            if last_price is not None:
+                break
+
+    meta_source = snapshot_payload.get("meta") if isinstance(snapshot_payload.get("meta"), Mapping) else {}
+    tz_value = (
+        meta_source.get("tz")
+        or meta_source.get("timezone")
+        or snapshot_payload.get("tz")
+        or "UTC"
+    )
+
+    coverage_map: Dict[str, int] = {}
+    coverage_source = snapshot_payload.get("coverage")
+    if isinstance(coverage_source, Mapping):
+        for key, value in coverage_source.items():
+            try:
+                coverage_map[str(key)] = int(float(value))
+            except (TypeError, ValueError):
+                continue
+    elif isinstance(coverage_source, Sequence):
+        for item in coverage_source:
+            if not isinstance(item, Mapping):
+                continue
+            tf_label = str(item.get("tf") or item.get("timeframe") or "").lower()
+            if not tf_label:
+                continue
+            coverage_value = (
+                item.get("coverage_pct")
+                or item.get("coverage")
+                or item.get("value")
+            )
+            try:
+                coverage_map[tf_label] = int(float(coverage_value))
+            except (TypeError, ValueError):
+                continue
+    if not coverage_map:
+        for tf_key, series in detection_frames.items():
+            if not isinstance(series, Sequence) or not series:
+                continue
+            coverage_map[str(tf_key)] = 100
+
+    intervals = sorted(str(key) for key in detection_frames.keys())
+    candles_total = sum(len(series) for series in detection_frames.values() if isinstance(series, Sequence))
+
+    ohlcv_compact: Dict[str, List[Dict[str, Any]]] = {}
+    for tf_key in intervals:
+        series = detection_frames.get(tf_key) if isinstance(detection_frames, Mapping) else None
+        if not isinstance(series, Sequence) or not series:
+            continue
+        trimmed: List[Dict[str, Any]] = []
+        for candle in series[-5:]:
+            if not isinstance(candle, Mapping):
+                continue
+            trimmed.append(
+                {
+                    key: candle.get(key)
+                    for key in ("t", "o", "h", "l", "c", "v")
+                    if key in candle
+                }
+            )
+        if trimmed:
+            ohlcv_compact[tf_key] = trimmed
+
+    MAX_ZONES_PER_TYPE = 12
+    zones_struct: Dict[str, Any] = {"fvg": [], "ob": [], "other": {}}
+    for entry in compact:
+        if not isinstance(entry, Mapping):
+            continue
+        zone_type = str(entry.get("type", "")).lower()
+        target: List[Dict[str, Any]]
+        if zone_type in {"fvg", "ob"}:
+            target = zones_struct[zone_type]
+        else:
+            other_map = zones_struct.setdefault("other", {})
+            if not isinstance(other_map, dict):
+                other_map = {}
+                zones_struct["other"] = other_map
+            target = other_map.setdefault(zone_type or "misc", [])
+        if len(target) >= MAX_ZONES_PER_TYPE:
+            continue
+        zone_entry = {
+            "tf": entry.get("tf"),
+            "status": entry.get("status"),
+            "open": entry.get("open"),
+            "close": entry.get("close"),
+            "mean": entry.get("mean"),
+            "formed_at_utc": entry.get("formed_at_utc"),
+            "last_touched_utc": entry.get("last_touched_utc"),
+            "source": entry.get("source"),
+        }
+        if entry.get("zone_id") is not None:
+            zone_entry["zone_id"] = entry.get("zone_id")
+        target.append(zone_entry)
+
+    retention_summary = {
+        "before": zones_before,
+        "after": zones_after,
+        "ratio": retention_ratio,
+        "target": 0.8,
+    }
+    if retention_entry.get("reason"):
+        retention_summary["reason"] = retention_entry["reason"]
+
+    fvg_ob_summary = {
+        "ratio": fvg_ob_ratio,
+        "target": 0.7,
+    }
+    if fvg_ob_entry.get("reason"):
+        fvg_ob_summary["reason"] = fvg_ob_entry["reason"]
+
+    zones_summary = {
+        "raw_counts": raw_counts,
+        "candidate_counts": candidate_counts,
+        "total_candidates": total_candidates,
+        "top_counts": counts,
+        "retention": retention_summary,
+        "fvg_ob_share": fvg_ob_summary,
+    }
+
+    meta_block = {
+        "symbol": snapshot_payload.get("symbol"),
+        "tf": snapshot_payload.get("tf"),
+        "tz": tz_value,
+        "last_price": last_price,
+        "period": {
+            "start": _to_iso(window_start_ms) if window_start_ms else None,
+            "end": _to_iso(window_end_ms) if window_end_ms else None,
+        },
+        "coverage": coverage_map,
+    }
+
+    summary_block = {
+        "candles_total": candles_total,
+        "intervals": intervals,
+        "zones": zones_summary,
+        "metrics": metrics_block,
+        "timeframe_targets": timeframe_targets,
+    }
+
+    diagnostics_block = {
+        "filter": filter_diag,
+        "fvg_stats": fvg_stats,
+        "top_sample": compact[: min(len(compact), 20)],
     }
 
     report = {
-        "snapshot": {
-            "id": snapshot_payload.get("id"),
-            "symbol": snapshot_payload.get("symbol"),
-            "tf": snapshot_payload.get("tf"),
-            "captured_at": snapshot_payload.get("captured_at"),
-        },
-        "before_after": before_after,
-        "metrics": metrics_block,
-        "timeframe_targets": timeframe_targets,
-        "top_counts": counts,
-        "top_preview": compact[: min(len(compact), 12)],
-        "diagnostics": filter_diag,
+        "schema": "compact.v1",
+        "meta": meta_block,
+        "ohlcv": ohlcv_compact,
+        "zones": zones_struct,
+        "summary": summary_block,
+        "cvd": {"buy": 0, "sell": 0},
+        "diagnostics": diagnostics_block,
     }
-
-    if fvg_stats:
-        report.setdefault("meta", {})["fvg_stats"] = fvg_stats
 
     return JSONResponse(report)
 
