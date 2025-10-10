@@ -46,6 +46,23 @@ def test_snapshot_loader_normalises_microsecond_timestamps(tmp_path, monkeypatch
                 ],
             }
         },
+        "orderflow": {
+            "footprint": [
+                {"ts": micro_ts, "bid": 5.0, "ask": 6.0, "delta": 1.0},
+                {"ts": micro_ts + 60_000_000, "bid": 4.0, "ask": 4.5, "delta": 0.5},
+            ],
+            "cvd": [
+                {"ts": micro_ts, "cvd_buy": 6.0, "cvd_sell": 5.0, "cvd_net": 1.0},
+                {"ts": micro_ts + 60_000_000, "cvd_buy": 10.5, "cvd_sell": 9.0, "cvd_net": 1.5},
+            ],
+        },
+        "agg_trades": {
+            "symbol": "BTCUSDT",
+            "agg": [
+                {"t": micro_ts, "p": 1.05, "q": 2.0, "side": "buy"},
+                {"t": micro_ts + 60_000_000, "p": 1.1, "q": 1.5, "side": "sell"},
+            ],
+        },
     }
     (storage_dir / "micro.json").write_text(json.dumps(snapshot_payload), encoding="utf-8")
 
@@ -58,6 +75,16 @@ def test_snapshot_loader_normalises_microsecond_timestamps(tmp_path, monkeypatch
     assert snapshot is not None
     candles = snapshot["frames"]["1m"]["candles"]
     assert candles[0]["t"] == 1_759_394_400_000
+    orderflow_block = snapshot.get("orderflow")
+    assert isinstance(orderflow_block, dict)
+    footprint_rows = orderflow_block.get("footprint")
+    assert isinstance(footprint_rows, list) and footprint_rows
+    assert footprint_rows[0]["ts"] == 1_759_394_400_000
+    agg_payload = snapshot.get("agg_trades")
+    assert isinstance(agg_payload, dict)
+    agg_rows = agg_payload.get("agg")
+    assert isinstance(agg_rows, list) and agg_rows
+    assert agg_rows[0]["t"] == 1_759_394_400_000
     payload = inspection.build_inspection_payload(snapshot)
     frame_candles = payload["DATA"]["frames"]["1m"]["candles"]
     assert frame_candles

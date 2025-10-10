@@ -540,6 +540,11 @@ MinuteFetcher = Callable[[str, int, int, int], Sequence[Mapping[str, object] | S
 _DEFAULT_MINUTE_FETCHER: MinuteFetcher = _fetch_binance_minutes
 
 
+
+def _noop_fetcher(symbol: str, start_ms: int, end_ms: int, limit: int) -> Sequence[Mapping[str, object]]:
+    return []
+
+
 def _download_missing_minutes(
     symbol: str,
     gaps: Sequence[Mapping[str, int]],
@@ -633,6 +638,7 @@ def build_htf_section(
     selection: Mapping[str, Any] | None,
     *,
     fetcher: MinuteFetcher | None = None,
+    allow_network: bool = True,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Collect high timeframe candles aggregated from 1m data."""
 
@@ -672,7 +678,10 @@ def build_htf_section(
     days = max(1, math.ceil(span_ms / MS_IN_DAY)) if span_ms else 1
     total_span_ms = max(days * MS_IN_DAY, MINUTE_INTERVAL_MS)
 
-    fetcher_fn = fetcher or _DEFAULT_MINUTE_FETCHER
+    if allow_network:
+        fetcher_fn = fetcher or _DEFAULT_MINUTE_FETCHER
+    else:
+        fetcher_fn = fetcher or _noop_fetcher
 
     timeframe_ranges: Dict[str, Dict[str, int]] = {}
     minute_window_start = minute_end
@@ -928,6 +937,91 @@ def _normalise_snapshot_structure(snapshot: MutableMapping[str, Any]) -> bool:
                 if mutated or not isinstance(frame, list):
                     frames[key] = normalised_candles
                     changed = True
+
+
+
+    orderflow_block = snapshot.get("orderflow")
+    if isinstance(orderflow_block, MutableMapping):
+        of_copy = dict(orderflow_block)
+        block_changed = False
+
+        def _normalise_orderflow_series(series: Sequence[Any]) -> tuple[list[Any], bool]:
+            rows: list[Any] = []
+            mutated = False
+            for item in series:
+                if not isinstance(item, Mapping):
+                    rows.append(item)
+                    continue
+                row = dict(item)
+                ts_value = row.get("ts") or row.get("t")
+                ts_int = ensure_ms_epoch(ts_value)
+                if ts_int is not None:
+                    if row.get("ts") != ts_int:
+                        row["ts"] = ts_int
+                        mutated = True
+                    if row.get("t") != ts_int:
+                        row["t"] = ts_int
+                        mutated = True
+                rows.append(row)
+            return rows, mutated
+
+        footprint = of_copy.get("footprint")
+        if isinstance(footprint, Sequence) and not isinstance(footprint, (str, bytes, bytearray)):
+            normalised_rows, mutated = _normalise_orderflow_series(footprint)
+            if mutated:
+                of_copy["footprint"] = normalised_rows
+                block_changed = True
+
+        per_bar_rows = of_copy.get("per_bar")
+        if isinstance(per_bar_rows, Sequence) and not isinstance(per_bar_rows, (str, bytes, bytearray)):
+            normalised_rows, mutated = _normalise_orderflow_series(per_bar_rows)
+            if mutated:
+                of_copy["per_bar"] = normalised_rows
+                block_changed = True
+
+        for agg_key in ("aggregates", "footprint_aggregates", "cvd_aggregates"):
+            payload = of_copy.get(agg_key)
+            if not isinstance(payload, Mapping):
+                continue
+            agg_mutated = False
+            agg_copy: dict[str, Any] = {}
+            for tf_key, series in payload.items():
+                if isinstance(series, Sequence) and not isinstance(series, (str, bytes, bytearray)):
+                    normalised_rows, mutated = _normalise_orderflow_series(series)
+                    if mutated:
+                        agg_mutated = True
+                    agg_copy[tf_key] = normalised_rows
+                else:
+                    agg_copy[tf_key] = series
+            if agg_mutated:
+                of_copy[agg_key] = agg_copy
+                block_changed = True
+
+        if block_changed:
+            snapshot["orderflow"] = of_copy
+            changed = True
+
+    agg_block = snapshot.get("agg_trades")
+    if isinstance(agg_block, MutableMapping):
+        agg_copy = dict(agg_block)
+        trades = agg_copy.get("agg")
+        if isinstance(trades, Sequence) and not isinstance(trades, (str, bytes, bytearray)):
+            normalised_trades = []
+            mutated = False
+            for trade in trades:
+                if not isinstance(trade, Mapping):
+                    normalised_trades.append(trade)
+                    continue
+                item = dict(trade)
+                ts_int = ensure_ms_epoch(item.get("t"))
+                if ts_int is not None and item.get("t") != ts_int:
+                    item["t"] = ts_int
+                    mutated = True
+                normalised_trades.append(item)
+            if mutated:
+                agg_copy["agg"] = normalised_trades
+                snapshot["agg_trades"] = agg_copy
+                changed = True
 
     top_level_candles = snapshot.get("candles")
     if isinstance(top_level_candles, Sequence) and not isinstance(top_level_candles, (str, bytes, bytearray)):
@@ -1466,7 +1560,7 @@ def register_snapshot(snapshot: Mapping[str, Any]) -> str:
     if selection_data:
         stored["selection"] = selection_data
 
-    for key in ("delta", "vwap", "zones", "smt", "agg_trades"):
+    for key in ("delta", "vwap", "zones", "smt", "agg_trades", "orderflow"):
         if key in snapshot:
             stored[key] = snapshot[key]
 
@@ -1568,7 +1662,12 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
     start = int(selection.get("start")) if selection and selection.get("start") else None
     end = int(selection.get("end")) if selection and selection.get("end") else None
 
-    htf_section, htf_quality = build_htf_section(symbol, frames, selection)
+    htf_section, htf_quality = build_htf_section(
+        symbol,
+        frames,
+        selection,
+        allow_network=False,
+    )
 
     normalised_frames: Dict[str, Dict[str, Any]] = {}
     diagnostics_frames: Dict[str, Any] = {}
@@ -1591,7 +1690,7 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
             tf_key,
             candles,
             include_diagnostics=True,
-            use_full_span=(tf_key == "1m"),
+            use_full_span=False,
         )
         diagnostics = result.pop("diagnostics", {})
 
@@ -1621,66 +1720,6 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
 
         normalised_frames[tf_key] = result
         diagnostics_frames[tf_key] = diagnostics
-        delta_frames[tf_key] = _compute_delta_series(filtered_candles)
-        vwap_frames[tf_key] = {
-            "selection": {"start": start, "end": end},
-            "value": _compute_vwap(filtered_candles),
-        }
-
-    htf_candles_map = (
-        htf_section.get("candles")
-        if isinstance(htf_section, Mapping) and isinstance(htf_section.get("candles"), Mapping)
-        else {}
-    )
-    if isinstance(htf_candles_map, Mapping):
-        for tf_key in ("15m", "1h", "1d"):
-            series = htf_candles_map.get(tf_key)
-            if not isinstance(series, Sequence):
-                continue
-            cleaned = [c for c in series if isinstance(c, Mapping)]
-            if not cleaned:
-                continue
-            full_candles_by_tf[tf_key] = cleaned
-            liquidity_sources[tf_key] = "htf"
-
-    generated_frames = ensure_higher_timeframes(full_candles_by_tf)
-    for tf_key, candles in generated_frames.items():
-        filtered_candles = _filter_by_selection(candles, start=start, end=end)
-        frame_payload: Dict[str, Any] = {
-            "symbol": symbol,
-            "tf": tf_key,
-            "candles": filtered_candles,
-        }
-        if candles:
-            last_candle = candles[-1]
-            frame_payload["last_price"] = _coerce_float(last_candle.get("c"))
-            frame_payload["last_ts"] = last_candle.get("t")
-        normalised_frames[tf_key] = frame_payload
-        diagnostics_frames.setdefault(tf_key, {})
-        delta_frames[tf_key] = _compute_delta_series(filtered_candles)
-        vwap_frames[tf_key] = {
-            "selection": {"start": start, "end": end},
-            "value": _compute_vwap(filtered_candles),
-        }
-        full_candles_by_tf[tf_key] = candles
-        if liquidity_sources.get(tf_key) != "htf":
-            liquidity_sources[tf_key] = "aggregated"
-
-    for tf_key in ("15m", "1h"):
-        candles = full_candles_by_tf.get(tf_key)
-        if not candles:
-            continue
-        filtered_candles = _filter_by_selection(candles, start=start, end=end)
-        frame_payload: Dict[str, Any] = {
-            "symbol": symbol,
-            "tf": tf_key,
-            "candles": filtered_candles,
-        }
-        last_candle = candles[-1]
-        frame_payload["last_price"] = _coerce_float(last_candle.get("c")) if isinstance(last_candle, Mapping) else None
-        frame_payload["last_ts"] = last_candle.get("t") if isinstance(last_candle, Mapping) else None
-        normalised_frames[tf_key] = frame_payload
-        diagnostics_frames.setdefault(tf_key, {})
         delta_frames[tf_key] = _compute_delta_series(filtered_candles)
         vwap_frames[tf_key] = {
             "selection": {"start": start, "end": end},
@@ -1784,6 +1823,7 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
     target_tf_key = profile_tf_key
     if base_candles and profile_tf_key in normalised_candles_by_tf:
         base_candles = normalised_candles_by_tf[profile_tf_key]
+
 
     session_vwap = compute_session_vwaps(symbol, base_candles)
 

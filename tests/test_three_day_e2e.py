@@ -335,12 +335,25 @@ async def test_three_day_pipeline_runs_offline(monkeypatch, caplog):
     assert set(compact_one["ohlcv"]) >= {"15m", "1h"}
 
     per_bar = compact_one["orderflow"]["per_bar"]
-    assert set(per_bar) <= {"1m"}
-    for series in per_bar.values():
-        assert len(series) <= 120
-        for row in series:
-            assert row["t"] >= minute_candles[-1]["t"] - 120 * 60_000
-            assert "delta" in row and "cvd" in row
+    assert set(per_bar.keys()) == {"1m", "3m", "5m", "15m"}
+    assert per_bar["1m"], "Expected 1m orderflow rows"
+    length_expectations = {"1m": 120, "3m": 80, "5m": 60, "15m": 40}
+    tf_interval_ms = {"1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000}
+    start_ts = minute_candles[0]["t"]
+    end_ts = minute_candles[-1]["t"]
+    for tf, series in per_bar.items():
+        assert len(series) >= length_expectations[tf]
+        first_ts = series[0].get("ts") or series[0].get("t")
+        last_ts = series[-1].get("ts") or series[-1].get("t")
+        assert first_ts is not None and last_ts is not None
+        tolerance = tf_interval_ms[tf] * 2
+        assert end_ts - tolerance <= last_ts <= end_ts + tolerance
+        if tf == "1m":
+            for row in series:
+                assert "delta" in row and "cvd" in row
+        else:
+            for row in series:
+                assert "delta_sum" in row and "cvd_close" in row
 
     delta_metrics = compact_one["orderflow"]["delta_cvd_compact"]
     assert {"15m", "1h"}.issubset(delta_metrics)
@@ -357,6 +370,10 @@ async def test_three_day_pipeline_runs_offline(monkeypatch, caplog):
     assert compact_one["zones"]["top"], "Zones should not be empty in acceptance run"
     assert len(compact_one["zones"]["top"]) <= 12
     assert compact_one["zones"]["counts"], "Zone counts should be reported"
+    zone_diag_filter = compact_one["zones"].get("diag", {}).get("filter", {})
+    assert zone_diag_filter.get("allowed_statuses") == ["open", "fresh", "tapped"]
+    assert "zones_before_filter" in zone_diag_filter
+    assert "zones_after_filter" in zone_diag_filter
 
     timing_block = compact_one["timing"]
     for key in ("json_bytes", "serialize_ms"):

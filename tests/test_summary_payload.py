@@ -72,9 +72,13 @@ def test_prepare_summary_payload_uses_data_window_for_orderflow_and_zones() -> N
     compact = _prepare_summary_payload(payload)
 
     per_bar = compact["orderflow"]["per_bar"]
-    assert set(per_bar.keys()) == {"1m"}
+    assert set(per_bar.keys()) == {"1m", "3m", "5m", "15m"}
     assert per_bar["1m"], "Expected recent 1m orderflow entries"
     assert per_bar["1m"][-1]["cvd"] == 3.0
+    assert per_bar["3m"] == []
+    assert per_bar["5m"] == []
+    assert per_bar["15m"]
+    assert per_bar["15m"][-1]["cvd_close"] == 54.0
 
     meta = compact["orderflow"]["meta"]
     assert meta["partial"] is True
@@ -92,6 +96,9 @@ def test_prepare_summary_payload_uses_data_window_for_orderflow_and_zones() -> N
     assert zones_top[0]["formed_at_utc"].startswith(expected_date)
     counts = compact["zones"]["counts"]
     assert counts.get("ob") == 1
+    filter_diag = compact["zones"].get("diag", {}).get("filter")
+    assert filter_diag
+    assert filter_diag.get("allowed_statuses") == ["open", "fresh", "tapped"]
 
 
 def test_prepare_summary_payload_filters_zones_by_status_and_counts() -> None:
@@ -208,7 +215,7 @@ def test_prepare_summary_payload_filters_zones_by_status_and_counts() -> None:
     zones_top = compact["zones"]["top"]
     assert len(zones_top) == 2
     statuses = {item["status"] for item in zones_top}
-    assert statuses == {"fresh", "invalidated"}
+    assert statuses == {"fresh", "tapped"}
     counts = compact["zones"]["counts"]
     assert counts.get("ob") == 2
     assert counts.get("mb") == 0

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections import Counter
+from collections import Counter, defaultdict
 import json
 import logging
 import math
@@ -112,7 +112,7 @@ _BUILD_TIMEOUT_SECONDS = 12.0
 _ASYNC_BUILD_TIMEOUT_SECONDS = 5.0
 
 _EXPECTED_OHLCV_TFS: Tuple[str, ...] = ("1m", "3m", "5m", "15m", "1h", "4h", "1d")
-_EXPECTED_ORDERFLOW_TFS: Tuple[str, ...] = ("15m", "1h")
+_EXPECTED_ORDERFLOW_TFS: Tuple[str, ...] = ("1m", "3m", "5m", "15m", "1h")
 _EXPECTED_ORDERFLOW_METRICS: Tuple[str, ...] = ("footprint", "delta", "cvd")
 _EXPECTED_ZONE_KEYS: Tuple[str, ...] = (
     "fvg",
@@ -126,6 +126,17 @@ _EXPECTED_ZONE_KEYS: Tuple[str, ...] = (
     "profile_levels",
 )
 
+_PER_BAR_MIN_LENGTH = 240
+_PER_BAR_HARD_CAP = 7200
+
+
+
+def _per_bar_target_length(window_minutes: int | None) -> int:
+    if window_minutes is None or window_minutes <= 0:
+        return _PER_BAR_MIN_LENGTH
+    return max(_PER_BAR_MIN_LENGTH, min(int(window_minutes), _PER_BAR_HARD_CAP))
+
+_AGGREGATED_ORDERFLOW_TFS: Tuple[str, ...] = ("3m", "5m", "15m", "1h")
 _COLD_BACKFILL_MIN_REQUIRED: Dict[str, int] = {
     tf: 1 for tf in _EXPECTED_OHLCV_TFS
 }
@@ -1982,30 +1993,34 @@ def _aggregate_orderflow_series(
     if not series:
         return []
 
-    per_minute = {int(item["ts"]): item for item in series if isinstance(item, Mapping) and "ts" in item}
-    bucket_times = sorted({_align_to_interval(ts, interval_ms) for ts in per_minute})
-    expected = max(1, interval_ms // minute_interval)
+    buckets: Dict[int, List[Mapping[str, Any]]] = defaultdict(list)
+    for item in series:
+        if not isinstance(item, Mapping):
+            continue
+        ts_value = item.get("ts")
+        try:
+            ts_int = int(ts_value)
+        except (TypeError, ValueError):
+            continue
+        bucket_start = _align_to_interval(ts_int, interval_ms)
+        buckets[bucket_start].append(item)
 
     aggregated: List[Dict[str, Any]] = []
     running_cvd = 0.0
 
-    for bucket_start in bucket_times:
-        bucket_entries: List[Mapping[str, Any]] = []
-        for index in range(expected):
-            minute_ts = bucket_start + index * minute_interval
-            entry = per_minute.get(minute_ts)
-            if entry is None:
-                bucket_entries = []
-                break
-            bucket_entries.append(entry)
+    for bucket_start in sorted(buckets):
+        bucket_entries = sorted(
+            buckets[bucket_start],
+            key=lambda entry: int(entry.get("ts") or 0),
+        )
         if not bucket_entries:
             continue
-
         ask_volume = sum(float(entry.get("ask_vol", 0.0)) for entry in bucket_entries)
         bid_volume = sum(float(entry.get("bid_vol", 0.0)) for entry in bucket_entries)
-        delta = ask_volume - bid_volume
+        delta = sum(float(entry.get("delta", 0.0)) for entry in bucket_entries)
+        if delta == 0.0:
+            delta = ask_volume - bid_volume
         running_cvd += delta
-
         aggregated.append(
             {
                 "ts": bucket_start,
@@ -2020,7 +2035,156 @@ def _aggregate_orderflow_series(
     return aggregated
 
 
-_PER_BAR_WINDOW_MINUTES = 120
+def _coerce_orderflow_per_bar(
+    orderflow_source: Mapping[str, Any] | None,
+    *,
+    minute_interval: int,
+    target_length: int,
+) -> List[Dict[str, Any]]:
+    if not isinstance(orderflow_source, Mapping):
+        return []
+
+    footprint = orderflow_source.get("footprint")
+    rows: List[Dict[str, Any]] = []
+    if isinstance(footprint, Sequence) and not isinstance(footprint, (str, bytes, bytearray)):
+        running_cvd = 0.0
+        for item in footprint:
+            if not isinstance(item, Mapping):
+                continue
+            row = dict(item)
+            ts_value = row.get("ts") or row.get("t")
+            ts_int = _safe_int(ts_value)
+            if ts_int is None:
+                continue
+            aligned_ts = (ts_int // minute_interval) * minute_interval
+            bid = _coerce_float(row.get("bid") if row.get("bid") is not None else row.get("bid_vol"))
+            ask = _coerce_float(row.get("ask") if row.get("ask") is not None else row.get("ask_vol"))
+            delta = _coerce_float(row.get("delta"))
+            if delta is None and bid is not None and ask is not None:
+                delta = ask - bid
+            if delta is None:
+                delta = 0.0
+            running_cvd += delta
+            rows.append(
+                {
+                    "ts": aligned_ts,
+                    "delta": delta,
+                    "cvd": running_cvd,
+                    "bid_vol": bid if bid is not None else 0.0,
+                    "ask_vol": ask if ask is not None else 0.0,
+                    "imbalance": _coerce_float(row.get("imbalance")),
+                    "absorption_high": bool(row.get("absorption_high")),
+                    "absorption_low": bool(row.get("absorption_low")),
+                    "large_trades_count": int(row.get("large_trades_count", 0))
+                    if isinstance(row.get("large_trades_count"), (int, float))
+                    else 0,
+                }
+            )
+
+    if not rows:
+        per_bar_series = orderflow_source.get("per_bar")
+        if isinstance(per_bar_series, Sequence) and not isinstance(per_bar_series, (str, bytes, bytearray)):
+            running_cvd = 0.0
+            for entry in per_bar_series:
+                if not isinstance(entry, Mapping):
+                    continue
+                ts_value = entry.get("ts") or entry.get("t")
+                ts_int = _safe_int(ts_value)
+                if ts_int is None:
+                    continue
+                aligned_ts = (ts_int // minute_interval) * minute_interval
+                delta = _coerce_float(entry.get("delta")) or 0.0
+                running_cvd += delta
+                rows.append(
+                    {
+                        "ts": aligned_ts,
+                        "delta": delta,
+                        "cvd": _coerce_float(entry.get("cvd")) or running_cvd,
+                        "bid_vol": _coerce_float(entry.get("bid_vol")) or 0.0,
+                        "ask_vol": _coerce_float(entry.get("ask_vol")) or 0.0,
+                        "imbalance": _coerce_float(entry.get("imbalance")),
+                        "absorption_high": bool(entry.get("absorption_high")),
+                        "absorption_low": bool(entry.get("absorption_low")),
+                        "large_trades_count": int(entry.get("large_trades_count", 0))
+                        if isinstance(entry.get("large_trades_count"), (int, float))
+                        else 0,
+                    }
+                )
+
+    if not rows:
+        return []
+
+    dedup: Dict[int, Dict[str, Any]] = {}
+    for entry in rows:
+        ts_int = int(entry.get("ts", 0))
+        dedup[ts_int] = entry
+
+    ordered_rows = [dedup[key] for key in sorted(dedup)]
+    if len(ordered_rows) > target_length:
+        ordered_rows = ordered_rows[-target_length:]
+
+    running_cvd = 0.0
+    for entry in ordered_rows:
+        running_cvd += float(entry.get("delta", 0.0))
+        entry.setdefault("cvd", running_cvd)
+        entry.setdefault("bid_vol", 0.0)
+        entry.setdefault("ask_vol", 0.0)
+
+    return ordered_rows
+
+
+
+
+
+
+def _build_proxy_orderflow_from_minutes(
+    minute_candles: Sequence[Mapping[str, Any]],
+    *,
+    minute_interval: int,
+    target_length: int,
+) -> List[Dict[str, Any]]:
+    if not minute_candles or minute_interval <= 0:
+        return []
+    proxy_series: List[Dict[str, Any]] = []
+    running_cvd = 0.0
+    sorted_minutes = sorted(
+        (candle for candle in minute_candles if isinstance(candle, Mapping)),
+        key=lambda candle: _safe_int(candle.get("t")) or 0,
+    )
+    for candle in sorted_minutes:
+        ts = _safe_int(candle.get("t"))
+        if ts is None:
+            continue
+        volume = float(candle.get("v", 0.0))
+        if volume < 0.0:
+            volume = 0.0
+        open_price = _coerce_float(candle.get("o")) or 0.0
+        close_price = _coerce_float(candle.get("c")) or 0.0
+        delta_sign = 0
+        if close_price > open_price:
+            delta_sign = 1
+        elif close_price < open_price:
+            delta_sign = -1
+        delta = volume * delta_sign
+        ask_volume = max(0.0, (volume + delta) / 2.0)
+        bid_volume = max(0.0, volume - ask_volume)
+        running_cvd += delta
+        proxy_series.append(
+            {
+                "ts": ts,
+                "delta": delta,
+                "cvd": running_cvd,
+                "bid_vol": bid_volume,
+                "ask_vol": ask_volume,
+                "imbalance": None,
+                "absorption_high": False,
+                "absorption_low": False,
+                "large_trades_count": 0,
+            }
+        )
+    if len(proxy_series) > target_length:
+        proxy_series = proxy_series[-target_length:]
+    return proxy_series
 
 
 def _build_orderflow_block(
@@ -2028,10 +2192,26 @@ def _build_orderflow_block(
     trades_payload: Any,
     *,
     config: OrderflowConfig,
-) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
+    orderflow_source: Mapping[str, Any] | None = None,
+    window_minutes: int | None = None,
+) -> Tuple[Dict[str, Dict[str, List[Dict[str, Any]]]], Dict[str, Any]]:
     minute_interval = MINUTE_INTERVAL_MS
+    target_length = _per_bar_target_length(window_minutes)
+    result: Dict[str, Dict[str, List[Dict[str, Any]]]] = {
+        tf: {"per_bar": []} for tf in ("1m", "3m", "5m", "15m", "1h")
+    }
+    diag: Dict[str, Any] = {
+        "source": None,
+        "delta_source": None,
+        "series_lengths": {},
+        "trimmed": {},
+        "target_length": target_length,
+        "window_minutes": int(window_minutes) if window_minutes is not None else None,
+    }
     if not minute_candles or minute_interval <= 0:
-        return {tf: {"per_bar": []} for tf in ("1m", "3m", "5m", "15m")}
+        diag["source"] = "empty_minutes"
+        diag["delta_source"] = "none"
+        return result, diag
 
     trades = _extract_trades(trades_payload)
     minute_ts: List[int] = []
@@ -2066,34 +2246,60 @@ def _build_orderflow_block(
         config=config,
         large_trade_threshold=threshold,
     )
+    source_tag = "trades" if minute_series else None
 
-    result: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+    if not minute_series and orderflow_source is not None:
+        minute_series = _coerce_orderflow_per_bar(
+            orderflow_source, minute_interval=minute_interval, target_length=target_length
+        )
+        if minute_series:
+            source_tag = "orderflow_source"
 
-    if minute_series:
-        last_ts = max(_safe_int(entry.get("ts")) or 0 for entry in minute_series)
-        cutoff = last_ts - (_PER_BAR_WINDOW_MINUTES - 1) * minute_interval
-        trimmed = [
-            entry
-            for entry in minute_series
-            if (_safe_int(entry.get("ts")) or 0) >= cutoff
-        ]
-        result["1m"] = {"per_bar": trimmed[-_PER_BAR_WINDOW_MINUTES:]}
+    if not minute_series:
+        minute_series = _build_proxy_orderflow_from_minutes(
+            minute_candles, minute_interval=minute_interval, target_length=target_length
+        )
+        if minute_series:
+            source_tag = "proxy"
+
+    if not minute_series:
+        diag["source"] = source_tag or "none"
+        diag["delta_source"] = "none"
+        return result, diag
+
+    if source_tag == "proxy":
+        diag["delta_source"] = "proxy"
+    elif source_tag == "orderflow_source":
+        diag["delta_source"] = "external"
     else:
-        result["1m"] = {"per_bar": []}
+        diag["delta_source"] = "trades"
+    diag["source"] = source_tag or "trades"
 
-    for tf in ("15m", "1h"):
+    minute_series.sort(key=lambda entry: _safe_int(entry.get("ts")) or 0)
+    raw_len = len(minute_series)
+    diag["series_lengths"]["1m_raw"] = raw_len
+
+    if raw_len > target_length:
+        trimmed_series = minute_series[-target_length:]
+    else:
+        trimmed_series = minute_series[:]
+    diag["trimmed"]["1m"] = max(0, raw_len - len(trimmed_series))
+    diag["series_lengths"]["1m"] = len(trimmed_series)
+    result["1m"] = {"per_bar": trimmed_series}
+
+    for tf in _AGGREGATED_ORDERFLOW_TFS:
         interval_ms = TIMEFRAME_TO_MS.get(tf)
         if not interval_ms or interval_ms <= minute_interval:
-            result[tf] = {"per_bar": minute_series[:] if interval_ms == minute_interval else []}
             continue
         aggregated = _aggregate_orderflow_series(
-            minute_series,
+            trimmed_series,
             interval_ms=interval_ms,
             minute_interval=minute_interval,
         )
+        diag["series_lengths"][tf] = len(aggregated)
         result[tf] = {"per_bar": aggregated}
 
-    return result
+    return result, diag
 
 
 def _compute_vwap(candles: Sequence[Mapping[str, Any]]) -> float:
@@ -3463,26 +3669,36 @@ async def build_check_all_datas(
         if fifteen_min_ms:
             raw_zone_start = max(0, _align_to_interval(raw_zone_start, fifteen_min_ms))
         zones_window_start_ms = raw_zone_start
-    warmup_bars_base = zone_cfg.atr_period + 10
-    min_bars_per_tf = {"15m": 200, "1h": 60, "4h": 24}
+
+    warmup_bars_base = max(0, int(zone_cfg.atr_period + 10))
+    if strict_three_day:
+        min_bars_per_tf = {"15m": 120, "1h": 50, "4h": 18}
+    else:
+        min_bars_per_tf = {"15m": 200, "1h": 60, "4h": 24}
     required_bars_per_tf: Dict[str, int] = {}
-    history_candidate = zones_window_start_ms
+    warmup_required_per_tf: Dict[str, int] = {}
+    max_history_span_ms = 0
+    max_warmup_span_ms = 0
     for tf_key, baseline in min_bars_per_tf.items():
-        required = max(baseline, warmup_bars_base)
-        required_bars_per_tf[tf_key] = required
-        if strict_window:
-            continue
+        baseline_required = max(1, int(baseline))
+        required_bars_per_tf[tf_key] = baseline_required
+        warmup_required = warmup_bars_base
+        warmup_required_per_tf[tf_key] = warmup_required
         interval_ms_tf = TIMEFRAME_TO_MS.get(tf_key)
         if not interval_ms_tf:
             continue
-        candidate = zones_window_start_ms - required * interval_ms_tf
-        if candidate < history_candidate:
-            history_candidate = candidate
+        span_required = max(baseline_required, warmup_required) * interval_ms_tf
+        warmup_span = warmup_required * interval_ms_tf
+        if span_required > max_history_span_ms:
+            max_history_span_ms = span_required
+        if warmup_span > max_warmup_span_ms:
+            max_warmup_span_ms = warmup_span
     if strict_window:
-        zones_history_start_ms = zones_window_start_ms
+        zones_history_start_ms = zones_window_start_ms - max_warmup_span_ms
     else:
+        history_candidate = zones_window_start_ms - max_history_span_ms
         history_candidate = min(history_candidate, zones_window_start_ms - MS_IN_DAY)
-        zones_history_start_ms = max(0, history_candidate)
+        zones_history_start_ms = history_candidate
     zones_history_start_ms = max(0, _align_to_interval(zones_history_start_ms, MINUTE_INTERVAL_MS))
 
     zone_expected_minutes = _build_expected_times(
@@ -3498,103 +3714,128 @@ async def build_check_all_datas(
             window_start=zones_history_start_ms,
             window_end=window_end_ms,
         )
+    warmup_missing_minutes = 0
+    warmup_gap_only: List[Dict[str, Any]] = []
+    blocking_gaps: List[Dict[str, Any]] = []
     if zone_history_gaps:
-        gap_missing = sum(gap["count"] for gap in zone_history_gaps)
-        zone_expected_minutes = _build_expected_times(
-            zones_history_start_ms,
-            window_end_ms,
-            MINUTE_INTERVAL_MS,
-        )
-        zone_expected_count = len(zone_expected_minutes)
-        if strict_three_day:
-            coverage_pct = (
-                ((zone_expected_count - gap_missing) / zone_expected_count) * 100.0
-                if zone_expected_count
-                else 100.0
-            )
-            missing = MinuteDataUnavailable(
-                symbol=symbol,
-                start_ms=zones_history_start_ms,
-                end_ms=window_end_ms,
-                missing_count=gap_missing,
-                expected_count=zone_expected_count,
-                coverage_pct=round(coverage_pct, 3),
-                gaps=[(int(gap.get("from", zones_history_start_ms)), int(gap.get("to", zones_history_start_ms))) for gap in zone_history_gaps],
-            )
-            if trace_ctx is not None:
-                trace_ctx.warn(
-                    "availability.checked",
-                    scope="ohlcv.1m.zones",
-                    missing_minutes=gap_missing,
-                    window={"from": zones_history_start_ms, "to": window_end_ms},
-                )
-            minute_payload = _build_minute_missing_payload(
-                context,
-                now=now_dt,
-                missing=missing,
-            )
-            if trace_ctx is not None:
-                trace_ctx.info(
-                    "output.prepare_payload",
-                    scope="output",
-                    status="minute_missing",
-                    missing_fields=0,
-                )
-            return _finalise_payload(
-                minute_payload,
-                status="minute_missing",
-                pipeline_start=pipeline_start,
-                fetch_ms=fetch_ms,
-                db_ms=db_ms,
-                trace_ctx=trace_ctx,
-            )
-        if not network_backfill:
-            detail = {
-                "tf": target_tf_key,
-                "window": {"start_ms": zones_history_start_ms, "end_ms": window_end_ms},
-                "stage": "zones_history",
-                "minute_missing_before": gap_missing,
-                "fetched_1m_count": 0,
-                "time_gaps": zone_history_gaps,
-            }
-            raise DataQualityError(detail)
-        try:
-            budget.raise_if_exceeded("zones_history_backfill_start")
-            zone_downloaded_minutes = await _call_download_missing_minutes_async(
-                symbol,
+        for gap in zone_history_gaps:
+            gap_from = int(gap.get("from", zones_history_start_ms))
+            gap_to = int(gap.get("to", gap_from))
+            if gap_to >= zones_window_start_ms:
+                blocking_gaps.append(gap)
+            else:
+                warmup_gap_only.append(gap)
+        warmup_missing_minutes = sum(int(gap.get("count", 0)) for gap in warmup_gap_only)
+        blocking_missing = sum(int(gap.get("count", 0)) for gap in blocking_gaps)
+        if blocking_gaps:
+            zone_expected_minutes = _build_expected_times(
                 zones_history_start_ms,
                 window_end_ms,
-                zone_history_gaps,
-                budget=budget,
-                allow_network=network_backfill,
+                MINUTE_INTERVAL_MS,
             )
-        except BinanceDownloadError as exc:
-            detail = {
-                "tf": target_tf_key,
-                "window": {"start_ms": zones_history_start_ms, "end_ms": window_end_ms},
-                "stage": "zones_history",
-                "minute_missing_before": gap_missing,
-                "fetched_1m_count": exc.downloaded,
-                "time_gaps": zone_history_gaps,
-            }
-            raise DataQualityError(detail) from exc
-        except _TimeBudgetExceeded as exc:
-            LOGGER.warning(
-                "Time budget exceeded while seeding zone history",
-                extra={
-                    "stage": exc.stage,
-                    "symbol": symbol,
-                    "zones_history_start_ms": zones_history_start_ms,
-                    "window_end_ms": window_end_ms,
-                    "time_gaps": zone_history_gaps,
-                },
+            zone_expected_count = len(zone_expected_minutes)
+            if strict_three_day:
+                coverage_pct = (
+                    ((zone_expected_count - blocking_missing) / zone_expected_count) * 100.0
+                    if zone_expected_count
+                    else 100.0
+                )
+                missing = MinuteDataUnavailable(
+                    symbol=symbol,
+                    start_ms=zones_history_start_ms,
+                    end_ms=window_end_ms,
+                    missing_count=blocking_missing,
+                    expected_count=zone_expected_count,
+                    coverage_pct=round(coverage_pct, 3),
+                    gaps=[
+                        (
+                            int(gap.get("from", zones_history_start_ms)),
+                            int(gap.get("to", zones_history_start_ms)),
+                        )
+                        for gap in blocking_gaps
+                    ],
+                )
+                if trace_ctx is not None:
+                    trace_ctx.warn(
+                        "availability.checked",
+                        scope="ohlcv.1m.zones",
+                        missing_minutes=blocking_missing,
+                        window={"from": zones_history_start_ms, "to": window_end_ms},
+                    )
+                minute_payload = _build_minute_missing_payload(
+                    context,
+                    now=now_dt,
+                    missing=missing,
+                )
+                if trace_ctx is not None:
+                    trace_ctx.info(
+                        "output.prepare_payload",
+                        scope="output",
+                        status="minute_missing",
+                        missing_fields=0,
+                    )
+                return _finalise_payload(
+                    minute_payload,
+                    status="minute_missing",
+                    pipeline_start=pipeline_start,
+                    fetch_ms=fetch_ms,
+                    db_ms=db_ms,
+                    trace_ctx=trace_ctx,
+                )
+            if not network_backfill:
+                detail = {
+                    "tf": target_tf_key,
+                    "window": {"start_ms": zones_history_start_ms, "end_ms": window_end_ms},
+                    "stage": "zones_history",
+                    "minute_missing_before": blocking_missing,
+                    "fetched_1m_count": 0,
+                    "time_gaps": blocking_gaps,
+                }
+                raise DataQualityError(detail)
+            try:
+                budget.raise_if_exceeded("zones_history_backfill_start")
+                zone_downloaded_minutes = await _call_download_missing_minutes_async(
+                    symbol,
+                    zones_history_start_ms,
+                    window_end_ms,
+                    blocking_gaps,
+                    budget=budget,
+                    allow_network=network_backfill,
+                )
+            except BinanceDownloadError as exc:
+                detail = {
+                    "tf": target_tf_key,
+                    "window": {"start_ms": zones_history_start_ms, "end_ms": window_end_ms},
+                    "stage": "zones_history",
+                    "minute_missing_before": blocking_missing,
+                    "fetched_1m_count": exc.downloaded,
+                    "time_gaps": blocking_gaps,
+                }
+                raise DataQualityError(detail) from exc
+            except _TimeBudgetExceeded as exc:
+                LOGGER.warning(
+                    "Time budget exceeded while seeding zone history",
+                    extra={
+                        "stage": exc.stage,
+                        "symbol": symbol,
+                        "zones_history_start_ms": zones_history_start_ms,
+                        "window_end_ms": window_end_ms,
+                        "time_gaps": blocking_gaps,
+                    },
+                )
+                return _insufficient_from_context(context, now_override=now_dt)
+            for candle in zone_downloaded_minutes:
+                ts = candle["t"]
+                if ts < zones_history_start_ms or ts > window_end_ms:
+                    continue
+                minute_index_all[ts] = candle
+        if warmup_gap_only and trace_ctx is not None:
+            trace_ctx.info(
+                "availability.warmup_partial",
+                scope="ohlcv.1m.zones",
+                missing_minutes=warmup_missing_minutes,
+                window={"from": zones_history_start_ms, "to": zones_window_start_ms},
             )
-            return _insufficient_from_context(context, now_override=now_dt)
-        for candle in zone_downloaded_minutes:
-            ts = candle["t"]
-            if ts < zones_history_start_ms or ts > window_end_ms:
-                continue
-            minute_index_all[ts] = candle
 
     frames["1m"] = [minute_index_all[ts] for ts in sorted(minute_index_all)]
     minute_candles = frames["1m"]
@@ -3648,28 +3889,53 @@ async def build_check_all_datas(
         tf: len(zone_frames_full.get(tf, [])) for tf in ("15m", "1h", "4h", "1d")
     }
     warmup_bars_per_tf: Dict[str, int] = {}
+    warmup_diag: Dict[str, Dict[str, Any]] = {}
     for tf in ("15m", "1h", "4h", "1d"):
         total = len(zone_frames_full.get(tf, []))
         window_count = len(zone_frames_window.get(tf, []))
-        warmup_bars_per_tf[tf] = max(0, total - window_count)
-    zone_availability: Dict[str, Dict[str, int | bool]] = {}
+        warmup_actual = max(0, total - window_count)
+        warmup_bars_per_tf[tf] = warmup_actual
+        warmup_required = int(warmup_required_per_tf.get(tf, warmup_bars_base))
+        warmup_diag[tf] = {
+            "required": warmup_required,
+            "actual": warmup_actual,
+            "partial": bool(warmup_required and warmup_actual < warmup_required),
+        }
+    zone_availability: Dict[str, Dict[str, Any]] = {}
     if strict_window:
         for tf_key, required in required_bars_per_tf.items():
+            baseline_required = max(1, int(required))
             available = len(zone_frames_window.get(tf_key, []))
+            total_history = len(zone_frames_full.get(tf_key, []))
+            adjusted_required = baseline_required
+            if available > 0:
+                adjusted_required = min(baseline_required, available)
+            ok = available >= max(1, adjusted_required)
             zone_availability[tf_key] = {
-                "required": int(required),
+                "required": baseline_required,
+                "adjusted_required": int(adjusted_required),
                 "available": int(available),
-                "ok": bool(available >= required),
+                "total": int(total_history),
+                "ok": bool(ok),
             }
     zones_diag = {
         "tf_lengths": zone_tf_lengths,
         "atr_period": zone_cfg.atr_period,
         "warmup_bars_per_tf": warmup_bars_per_tf,
+        "warmup_required_per_tf": {tf: int(val) for tf, val in warmup_required_per_tf.items()},
+        "warmup_diag": warmup_diag,
+        "warmup_missing_minutes": int(warmup_missing_minutes),
+        "warmup_partial": bool(any(entry.get("partial") for entry in warmup_diag.values()) or warmup_missing_minutes),
         "window_hours": zones_window_hours,
         "tick_size": zone_cfg.tick_size,
     }
     if zone_availability:
         zones_diag["availability"] = zone_availability
+        zones_diag["available_tfs"] = [tf for tf, info in zone_availability.items() if int(info.get("available", 0)) > 0]
+        zones_diag["ok_tfs"] = [tf for tf, info in zone_availability.items() if bool(info.get("ok"))]
+    else:
+        zones_diag.setdefault("available_tfs", [])
+        zones_diag.setdefault("ok_tfs", [])
     zone_cfg.zones_window_start_ms = zones_window_start_ms
     zone_cfg.window_end_ms_prev_closed = window_end_ms
     zone_cfg.allow_base_fallback = True
@@ -3718,7 +3984,12 @@ async def build_check_all_datas(
         "start": selection_start,
         "end": selection_end,
     }
-    htf_section, htf_quality = build_htf_section(symbol, frames, selection_payload)
+    htf_section, htf_quality = build_htf_section(
+        symbol,
+        frames,
+        selection_payload,
+        allow_network=bool(network_backfill),
+    )
 
     liquidity_config = raw_meta.get("liquidity") if isinstance(raw_meta, Mapping) else None
 
@@ -4129,12 +4400,36 @@ async def build_check_all_datas(
                 },
             )
 
+    gating_diag: Dict[str, Dict[str, Any]] = {}
+    zone_min_required_map = {
+        "fvg": 1,
+        "fvl": 1,
+        "ob": 1,
+        "rb": 1,
+        "pb": 1,
+        "mb": 1,
+        "bb": 1,
+    }
     if strict_window and zone_availability and isinstance(zones_container, MutableMapping):
         for zone_key, tf_candidates in zone_type_timeframes.items():
-            if not tf_candidates or zone_key not in zones_container:
+            if zone_key not in zones_container:
                 continue
-            if any(not zone_availability.get(tf, {}).get("ok", False) for tf in tf_candidates):
+            requested = [tf for tf in tf_candidates if tf in zone_availability]
+            if not requested:
+                continue
+            ok_list = [tf for tf in requested if zone_availability.get(tf, {}).get("ok", False)]
+            missing_list = [tf for tf in requested if not zone_availability.get(tf, {}).get("ok", False)]
+            min_required = zone_min_required_map.get(zone_key, len(requested)) or 0
+            gating_diag[zone_key] = {
+                "requested_tfs": requested,
+                "ok_tfs": ok_list,
+                "missing_tfs": missing_list,
+                "min_required": int(min_required),
+            }
+            if len(ok_list) < max(1, min_required):
                 zones_container[zone_key] = []
+        if gating_diag:
+            zones_diag["gating"] = gating_diag
 
     liquidity_payload = await asyncio.to_thread(
         build_liquidity_snapshot,
@@ -4169,10 +4464,13 @@ async def build_check_all_datas(
         ]
 
     orderflow_config = _resolve_orderflow_config(raw_meta)
-    orderflow_block = _build_orderflow_block(
+    orderflow_window_minutes = len(minute_htf_source) if minute_htf_source else None
+    orderflow_block, orderflow_diag = _build_orderflow_block(
         minute_htf_source,
         snapshot.get("agg_trades"),
         config=orderflow_config,
+        orderflow_source=snapshot.get("orderflow"),
+        window_minutes=orderflow_window_minutes,
     )
     if rollup_payload:
         ohlcv_block = rollup_payload
@@ -4556,7 +4854,7 @@ async def build_check_all_datas(
         ohlcv_public[tf] = {"candles": candles}
 
     orderflow_public: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
-    for tf in ("1m", "15m", "1h"):
+    for tf in ("1m", "3m", "5m", "15m", "1h"):
         tf_payload = orderflow_block.get(tf) if isinstance(orderflow_block, Mapping) else None
         per_bar: List[Dict[str, Any]] = []
         if isinstance(tf_payload, Mapping):
@@ -4564,6 +4862,8 @@ async def build_check_all_datas(
             if isinstance(raw_series, Sequence):
                 per_bar = [dict(entry) for entry in raw_series if isinstance(entry, Mapping)]
         orderflow_public[tf] = {"per_bar": per_bar}
+
+    orderflow_public["diag"] = orderflow_diag
 
     zones_container = detected_zones.get("zones") if isinstance(detected_zones, Mapping) else None
     zone_keys = ("fvg", "fvl", "ob", "mb", "bb", "rb", "pb", "sr", "profile_levels")
@@ -4576,34 +4876,48 @@ async def build_check_all_datas(
                     dict(item) for item in raw_zone if isinstance(item, Mapping)
                 ]
 
+    allowed_zone_statuses = {"open", "fresh", "tapped"}
+    for key in zone_keys:
+        series = zones_public.get(key)
+        if not isinstance(series, list):
+            continue
+        filtered_series = []
+        for entry in series:
+            if not isinstance(entry, Mapping):
+                continue
+            status_value = str(entry.get("status") or "").lower()
+            if status_value and status_value not in allowed_zone_statuses:
+                continue
+            filtered_series.append(entry)
+        zones_public[key] = filtered_series
+
+    gating_public = zones_diag.get("gating") if isinstance(zones_diag.get("gating"), Mapping) else {}
+    zones_public["diag"] = zones_diag
     if strict_window and zone_availability:
         for zone_key, tf_candidates in zone_type_timeframes.items():
             if zones_public.get(zone_key):
                 continue
             if not tf_candidates:
                 continue
-            insufficient: List[str] = []
-            tracked = 0
-            for tf_name in tf_candidates:
-                tracked += 1
-                info = zone_availability.get(tf_name)
-                required = required_bars_per_tf.get(tf_name, 0)
-                available = len(zone_frames_window.get(tf_name, []))
-                ok = available >= required if required else False
-                if info is not None:
-                    required = int(info.get("required", required))
-                    available = int(info.get("available", available))
-                    ok = bool(info.get("ok", available >= required if required else False))
-                if not required:
-                    continue
-                if not ok:
-                    insufficient.append(f"{tf_name}: {available}/{required}")
-            if tracked and insufficient and len(insufficient) == tracked:
-                message = (
-                    f"?? ?????????????????? ???????????? ???????????? ?????? {zone_key.upper()} ?????? "
-                    f"(???????????????? {', '.join(insufficient)})."
-                )
-                zones_public[zone_key] = [{"message": message, "period": "topup"}]
+            gating_info = gating_public.get(zone_key) if isinstance(gating_public, Mapping) else None
+            requested = gating_info.get("requested_tfs") if isinstance(gating_info, Mapping) else []
+            ok_list = gating_info.get("ok_tfs") if isinstance(gating_info, Mapping) else []
+            missing_list = gating_info.get("missing_tfs") if isinstance(gating_info, Mapping) else []
+            if requested and ok_list:
+                continue
+            if not requested:
+                continue
+            details = []
+            for tf_name in requested:
+                info = zone_availability.get(tf_name, {})
+                available = int(info.get("available", len(zone_frames_window.get(tf_name, []))))
+                required = int(info.get("adjusted_required", info.get("required", 0)))
+                details.append(f"{tf_name}: {available}/{required}")
+            message = (
+                f"?? ?????????????????? ???????????? ???????????? ?????? {zone_key.upper()} ?????? "
+                f"(???????????????? {', '.join(details)})."
+            )
+            zones_public[zone_key] = [{"message": message, "period": "topup"}]
 
     if trace_ctx is not None:
         trace_ctx.info(
@@ -4651,6 +4965,7 @@ async def build_check_all_datas(
         "tpo": {"composite_day": composite_day_public},
         "prev_day": prev_day_block,
         "zones": zones_public,
+        "zones_confirmed": [],
         "liquidity": liquidity_public,
         "risk_prefs": risk_prefs_public,
         "context": context_public,
@@ -4698,6 +5013,8 @@ async def build_check_all_datas(
         }
 
     for zone_key, series in zones_public.items():
+        if zone_key == "diag":
+            continue
         count = len(series) if isinstance(series, Sequence) else 0
         availability["zones"][zone_key] = {"count": count}
         if count == 0:
@@ -4711,6 +5028,8 @@ async def build_check_all_datas(
             orderflow_metrics["footprint"] = True
 
     for tf, payload in orderflow_public.items():
+        if tf == "diag":
+            continue
         per_bar = payload.get("per_bar") if isinstance(payload, Mapping) else []
         series = per_bar if isinstance(per_bar, Sequence) else []
         series_list = [entry for entry in series if isinstance(entry, Mapping)]
@@ -4743,6 +5062,9 @@ async def build_check_all_datas(
         "last_tf": last_tf,
         "last_price_source": last_price_source,
     }
+    meta_block["window_hours"] = int(base_window_hours)
+    meta_block["strict_window"] = bool(strict_window)
+    meta_block["strict_three_day"] = bool(strict_three_day)
     if snapshot_age_sec is not None:
         meta_block["snapshot_age_sec"] = snapshot_age_sec
     if insufficient_reason:
