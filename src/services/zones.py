@@ -40,6 +40,7 @@ class Config:
     base_min_overlap: float = 0.5
     impulse_min_cover: float = 0.6
     ob_body_max_atr: float = 1.0
+    ob_min_body_atr: float = 0.2
     ob_overlap_ratio: float = 0.8
     ob_distance_atr: float = 0.25
     min_block_ratio: float = 0.15
@@ -51,14 +52,22 @@ class Config:
     allow_base_fallback: bool = True
     base_fallback_max_age: int = 200
     base_fallback_max_distance_atr: float = 3.0
-    min_gap_atr_ratio: float = 0.1
+    min_gap_atr_ratio: float = 0.5
     min_gap_tick_multiple: float = 2.0
     min_gap_pct: float = 0.00007
+    max_gap_age_bars: int = 300
     m_wick_atr: float = 3.0
 
 
 _PIVOT_WINDOWS: Dict[str, int] = {"15m": 2, "1h": 3, "4h": 4}
 _WARMUP_REQUIREMENTS: Dict[str, int] = {"15m": 24, "1h": 48, "4h": 12}
+_HTF_CONFIRMATION_MAP: Dict[str, Tuple[str, ...]] = {
+    "1m": ("5m", "15m", "1h", "4h"),
+    "5m": ("15m", "1h", "4h"),
+    "15m": ("1h", "4h"),
+    "1h": ("4h", "1d"),
+    "4h": ("1d",),
+}
 
 
 def _ms_to_iso(timestamp_ms: int) -> str:
@@ -410,6 +419,68 @@ def _epsilon(cfg: Config, tick_size: float | None) -> float:
     return cfg.epsilon_ticks * tick_size
 
 
+def _apply_htf_confirmations(
+    zones_by_tf: Mapping[str, List[Dict[str, Any]]],
+    *,
+    top_field: str,
+    bottom_field: str,
+    threshold: float = 0.5,
+) -> Dict[str, List[Dict[str, Any]]]:
+    confirmations: Dict[str, List[Dict[str, Any]]] = {}
+
+    def _range(zone: Mapping[str, Any]) -> tuple[float, float]:
+        high = float(zone.get(top_field, 0.0))
+        low = float(zone.get(bottom_field, 0.0))
+        if low > high:
+            low, high = high, low
+        return low, high
+
+    for tf, zone_list in zones_by_tf.items():
+        for zone in zone_list:
+            if "confirmed" not in zone:
+                zone["confirmed"] = False
+            zone.pop("confirmed_with", None)
+
+    for lower_tf, zone_list in zones_by_tf.items():
+        higher_candidates = _HTF_CONFIRMATION_MAP.get(lower_tf, ())
+        if not higher_candidates:
+            continue
+        lower_entries: List[Dict[str, Any]] = []
+        for zone in zone_list:
+            low, high = _range(zone)
+            width = max(high - low, 1e-9)
+            confirmed_entry: Dict[str, Any] | None = None
+            for higher_tf in higher_candidates:
+                higher_zones = zones_by_tf.get(higher_tf, [])
+                if not higher_zones:
+                    continue
+                for higher_zone in higher_zones:
+                    h_low, h_high = _range(higher_zone)
+                    overlap_low = max(low, h_low)
+                    overlap_high = min(high, h_high)
+                    overlap = overlap_high - overlap_low
+                    if overlap <= 0:
+                        continue
+                    ratio = overlap / width
+                    if ratio >= threshold:
+                        zone["confirmed"] = True
+                        zone["confirmed_with"] = higher_tf
+                        confirmed_entry = {
+                            "with": higher_tf,
+                            "ratio": ratio,
+                            "origin": zone.get("origin_utc") or zone.get("created_utc"),
+                        }
+                        break
+                if confirmed_entry is not None:
+                    break
+            if confirmed_entry is not None:
+                lower_entries.append(confirmed_entry)
+        if lower_entries:
+            confirmations[lower_tf] = lower_entries
+
+    return confirmations
+
+
 def _detect_pivots(candles: Sequence[Candle], span: int) -> List[Dict[str, Any]]:
     if span <= 0 or len(candles) < 2 * span + 1:
         return []
@@ -608,6 +679,11 @@ def _fvgs_for_tf(
                 continue
 
         created_idx = i + 2
+        age_bars = len(candles) - created_idx - 1
+        if cfg.max_gap_age_bars and cfg.max_gap_age_bars > 0 and age_bars > cfg.max_gap_age_bars:
+            if stats is not None:
+                stats["fvg_reject_age"] = stats.get("fvg_reject_age", 0) + 1
+            continue
         status = "open"
         fulfil_idx: int | None = None
         for j in range(created_idx + 1, len(candles)):
@@ -686,6 +762,9 @@ def _fvgs_for_tf(
             "mid": float(mid_value),
             "created_utc": _ms_to_iso(int(c2["t"])),
             "status": zone_status,
+            "gap": float(gap_abs),
+            "age_bars": int(age_bars),
+            "confirmed": False,
         }
         if raw_status == "inverted":
             zone["inverted"] = True
@@ -894,6 +973,8 @@ def _ob_for_tf(
             body_span = body_high - body_low
             if body_span <= 0:
                 continue
+            if atr_reliable and atr_valid_value and body_span < cfg.ob_min_body_atr * atr_value:
+                continue
             if atr_reliable and atr_valid_value and body_span > cfg.ob_body_max_atr * atr_value:
                 continue
             base_idx = idx
@@ -917,6 +998,11 @@ def _ob_for_tf(
             tick=tick,
             atr=atr,
         )
+        fill_ratio = 0.0
+        if coverage:
+            zone_width = max(zone_high - zone_low, tick or 1e-9)
+            covered = sum(max(high - low, 0.0) for low, high, _ in coverage)
+            fill_ratio = min(1.0, max(0.0, covered / zone_width))
         zone = {
             "tf": tf,
             "type": zone_type,
@@ -927,7 +1013,11 @@ def _ob_for_tf(
             "status": status,
             "source": "bos",
             "confirmed_by": "bos",
+            "confirmed": False,
+            "fill_ratio": fill_ratio,
         }
+        if fill_ratio >= 0.6:
+            zone["mitigation"] = "mitigated"
         zones.append(zone)
         raw_metadata.append(
             {
@@ -1333,7 +1423,9 @@ def detect_zones(
             if cleaned:
                 external_liquidity[key] = cleaned
     fvg_all: List[Dict[str, Any]] = []
+    fvg_by_tf: Dict[str, List[Dict[str, Any]]] = {}
     ob_all: List[Dict[str, Any]] = []
+    ob_by_tf: Dict[str, List[Dict[str, Any]]] = {}
     mb_all: List[Dict[str, Any]] = []
     bb_all: List[Dict[str, Any]] = []
     rb_all: List[Dict[str, Any]] = []
@@ -1448,6 +1540,7 @@ def detect_zones(
             "fvg_triplets",
             "fvg_raw_count",
             "fvg_reject_no_gap",
+            "fvg_reject_age",
             "fvg_reject_displacement",
             "fvg_reject_fulfilled_same_leg",
             "fvg_reject_tick_collapse",
@@ -1472,6 +1565,7 @@ def detect_zones(
             fvg_entry["reason"] = _derive_fvg_reason(stats_entry)
         tf_diag["fvg"] = fvg_entry
         fvg_all.extend(fvgs_tf)
+        fvg_by_tf[tf] = fvgs_tf
         ob_zones, metadata, smc_payload = _ob_for_tf(
             candles,
             tf=tf,
@@ -1488,6 +1582,7 @@ def detect_zones(
             ob_entry["reason"] = "no_bos_events" if not bos_events else "no_order_blocks"
         tf_diag["ob"] = ob_entry
         ob_all.extend(ob_zones)
+        ob_by_tf[tf] = ob_zones
         if external_liquidity:
             combined = dict(smc_payload.get("liquidity", {}))
             for key, items in external_liquidity.items():
@@ -1594,6 +1689,9 @@ def detect_zones(
                 break
 
     diagnostics_summary: Dict[str, Any] = {}
+    fvg_confirmations = _apply_htf_confirmations(fvg_by_tf, top_field="top", bottom_field="bot")
+    ob_confirmations = _apply_htf_confirmations(ob_by_tf, top_field="close", bottom_field="open")
+
     zone_collections = {
         "fvg": fvg_all,
         "ob": ob_all,
@@ -1608,6 +1706,13 @@ def detect_zones(
         if not series and reasons:
             entry["reasons"] = reasons
         diagnostics_summary[zone_key] = entry
+    if fvg_confirmations or ob_confirmations:
+        confirmations_diag: Dict[str, Any] = {}
+        if fvg_confirmations:
+            confirmations_diag["fvg"] = fvg_confirmations
+        if ob_confirmations:
+            confirmations_diag["ob"] = ob_confirmations
+        diagnostics_summary["confirmations"] = confirmations_diag
     sr_entry: Dict[str, Any] = {"count": len(sr_levels)}
     if not sr_levels and sr_reason:
         sr_entry["reasons"] = [{"tf": "sr", "reason": sr_reason}]

@@ -35,6 +35,12 @@ class LiquidityConfig:
     r_ticks: int = 5
     atr_period: int = 14
     sweep_atr_multiplier: float = 0.3
+    tolerance_mode: str = "ticks"
+    tolerance_percent: float = 0.0
+    sweep_min_move_atr: float = 0.3
+    sweep_epsilon_pct: float = 0.05
+    sweep_lookback_bars: int = 200
+    sweep_confirm_window: int = 10
     tolerance_eqh_ticks: float | None = None
     tolerance_eql_ticks: float | None = None
     min_points_dynamic: bool = True
@@ -45,6 +51,9 @@ class LiquidityConfig:
     merge_overlap_ratio: float = 0.6
     enable_resample_when_sparse: bool = True
     degraded_window_floor: int = 1
+    cluster_price_window_pct: float = 0.0002
+    cluster_time_window_bars: int = 10
+    min_distance_bars: int = 3
     feature_strict_legacy_mode: bool = False
     feature_relaxed_clustering: bool = True
     feature_extended_resample: bool = True
@@ -77,6 +86,8 @@ def _count_pairs_within_tolerance(
     *,
     tolerance: float,
     tick_size: float | None,
+    tolerance_mode: str = "ticks",
+    tolerance_percent: float = 0.0,
 ) -> int:
     if tolerance <= 0 or not swings:
         return 0
@@ -90,7 +101,11 @@ def _count_pairs_within_tolerance(
     for left in range(len(quantised)):
         base = quantised[left]
         for right in range(left + 1, len(quantised)):
-            if abs(base - quantised[right]) <= tolerance + 1e-9:
+            threshold = tolerance
+            if tolerance_mode == "percent" and tolerance_percent > 0:
+                dynamic = max(abs(base) * tolerance_percent, tick_size or 0.0)
+                threshold = max(threshold, dynamic)
+            if abs(base - quantised[right]) <= threshold + 1e-9:
                 count += 1
     return count
 
@@ -481,6 +496,12 @@ def _resolve_config(raw: Mapping[str, Any] | None) -> LiquidityConfig:
 
     tolerance_section = raw.get("tolerance")
     if isinstance(tolerance_section, Mapping):
+        mode_value = tolerance_section.get("mode") or tolerance_section.get("type")
+        if isinstance(mode_value, str):
+            config.tolerance_mode = mode_value.lower()
+        percent_value = tolerance_section.get("percent") or tolerance_section.get("pct")
+        if percent_value is not None:
+            config.tolerance_percent = _positive_float(percent_value, config.tolerance_percent, lower=0.0, upper=0.2)
         eqh = tolerance_section.get("eqh")
         eql = tolerance_section.get("eql")
         if eqh is not None:
@@ -499,6 +520,14 @@ def _resolve_config(raw: Mapping[str, Any] | None) -> LiquidityConfig:
         if "tolerance_eql_ticks" in raw:
             config.tolerance_eql_ticks = _positive_float(
                 raw.get("tolerance_eql_ticks"), float(config.r_ticks), lower=0.0, upper=100.0
+            )
+        if "tolerance_mode" in raw:
+            mode_value = raw.get("tolerance_mode")
+            if isinstance(mode_value, str):
+                config.tolerance_mode = mode_value.lower()
+        if "tolerance_percent" in raw:
+            config.tolerance_percent = _positive_float(
+                raw.get("tolerance_percent"), config.tolerance_percent, lower=0.0, upper=0.2
             )
 
     min_points_section = raw.get("min_points")
@@ -561,6 +590,69 @@ def _resolve_config(raw: Mapping[str, Any] | None) -> LiquidityConfig:
             raw.get("degraded_window_floor"), config.degraded_window_floor, lower=1, upper=5
         )
 
+    cluster_section = raw.get("cluster")
+    if isinstance(cluster_section, Mapping):
+        price_pct = cluster_section.get("price_window_pct") or cluster_section.get("price_pct")
+        if price_pct is not None:
+            config.cluster_price_window_pct = _positive_float(
+                price_pct, config.cluster_price_window_pct, lower=0.0, upper=0.01
+            )
+        time_bars = cluster_section.get("time_window_bars") or cluster_section.get("bars")
+        if time_bars is not None:
+            config.cluster_time_window_bars = _positive_int(
+                time_bars, config.cluster_time_window_bars, lower=1, upper=50
+            )
+    if "cluster_price_window_pct" in raw:
+        config.cluster_price_window_pct = _positive_float(
+            raw.get("cluster_price_window_pct"), config.cluster_price_window_pct, lower=0.0, upper=0.01
+        )
+    if "cluster_time_window_bars" in raw:
+        config.cluster_time_window_bars = _positive_int(
+            raw.get("cluster_time_window_bars"), config.cluster_time_window_bars, lower=1, upper=50
+        )
+    if "min_distance_bars" in raw:
+        config.min_distance_bars = _positive_int(
+            raw.get("min_distance_bars"), config.min_distance_bars, lower=1, upper=50
+        )
+
+    sweep_section = raw.get("sweep") or raw.get("sweeps")
+    if isinstance(sweep_section, Mapping):
+        if "atr_min_move" in sweep_section or "min_move_atr" in sweep_section:
+            config.sweep_min_move_atr = _positive_float(
+                sweep_section.get("atr_min_move") or sweep_section.get("min_move_atr"),
+                config.sweep_min_move_atr,
+                lower=0.0,
+                upper=5.0,
+            )
+        if "epsilon_pct" in sweep_section:
+            config.sweep_epsilon_pct = _positive_float(
+                sweep_section.get("epsilon_pct"), config.sweep_epsilon_pct, lower=0.0, upper=0.5
+            )
+        if "lookback_bars" in sweep_section:
+            config.sweep_lookback_bars = _positive_int(
+                sweep_section.get("lookback_bars"), config.sweep_lookback_bars, lower=10, upper=1000
+            )
+        if "confirm_window" in sweep_section:
+            config.sweep_confirm_window = _positive_int(
+                sweep_section.get("confirm_window"), config.sweep_confirm_window, lower=1, upper=100
+            )
+    if "sweep_min_move_atr" in raw:
+        config.sweep_min_move_atr = _positive_float(
+            raw.get("sweep_min_move_atr"), config.sweep_min_move_atr, lower=0.0, upper=5.0
+        )
+    if "sweep_epsilon_pct" in raw:
+        config.sweep_epsilon_pct = _positive_float(
+            raw.get("sweep_epsilon_pct"), config.sweep_epsilon_pct, lower=0.0, upper=0.5
+        )
+    if "sweep_lookback_bars" in raw:
+        config.sweep_lookback_bars = _positive_int(
+            raw.get("sweep_lookback_bars"), config.sweep_lookback_bars, lower=10, upper=1000
+        )
+    if "sweep_confirm_window" in raw:
+        config.sweep_confirm_window = _positive_int(
+            raw.get("sweep_confirm_window"), config.sweep_confirm_window, lower=1, upper=100
+        )
+
     feature_section = raw.get("feature") or raw.get("features")
     if isinstance(feature_section, Mapping):
         if "strict_legacy_mode" in feature_section:
@@ -582,6 +674,15 @@ def _resolve_config(raw: Mapping[str, Any] | None) -> LiquidityConfig:
         config.min_points_alpha = max(2.0, config.min_points_alpha)
         config.tolerance_eqh_ticks = None
         config.tolerance_eql_ticks = None
+        config.tolerance_mode = "ticks"
+        config.tolerance_percent = 0.0
+        config.cluster_price_window_pct = 0.0
+        config.cluster_time_window_bars = 1
+        config.min_distance_bars = 1
+        config.sweep_min_move_atr = config.sweep_atr_multiplier
+        config.sweep_epsilon_pct = 0.0
+        config.sweep_lookback_bars = max(10, config.sweep_lookback_bars)
+        config.sweep_confirm_window = max(1, config.sweep_confirm_window)
 
     if not config.feature_relaxed_clustering:
         config.merge_clusters = False
@@ -705,7 +806,7 @@ def _detect_swings(
                     higher = False
                     break
             if higher:
-                swings.append({"t": int(ts), "price": price})
+                swings.append({"t": int(ts), "price": price, "idx": index})
         else:
             price = _coerce_float(candle.get("l"))
             if price is None:
@@ -724,7 +825,7 @@ def _detect_swings(
                     lower = False
                     break
             if lower:
-                swings.append({"t": int(ts), "price": price})
+                swings.append({"t": int(ts), "price": price, "idx": index})
     return swings
 
 
@@ -736,9 +837,11 @@ def _cluster_swings(
     level_type: str,
     timeframe: str,
     min_points: int,
-    allow_merge: bool,
-    merge_distance: float,
-    merge_overlap_ratio: float,
+    tolerance_mode: str,
+    tolerance_value: float,
+    cluster_price_pct: float,
+    cluster_time_window_bars: int,
+    min_distance_bars: int,
     reason_sink: List[Dict[str, Any]] | None = None,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, int], int]:
     if not swings:
@@ -753,124 +856,95 @@ def _cluster_swings(
         _append_reason(reason_sink, "no_swings")
         return [], [], {}, 0
 
-    ordered = sorted(swings, key=lambda item: item.get("t", 0))
+    ordered = sorted(swings, key=lambda item: (item.get("t", 0), item.get("idx", 0)))
     clusters: List[Dict[str, Any]] = []
+    merge_operations = 0
     for swing in ordered:
         price_value = _coerce_float(swing.get("price"))
         time_value = swing.get("t")
+        idx_value = swing.get("idx")
         if price_value is None or not isinstance(time_value, (int, float)):
             continue
+        try:
+            idx = int(idx_value)
+        except (TypeError, ValueError):
+            idx = len(clusters)
         quantised_price = _quantise(price_value, tick_size)
         matched = False
         for cluster in clusters:
-            if abs(cluster["anchor"] - quantised_price) <= tolerance:
-                cluster["prices"].append(quantised_price)
-                cluster["swings"].append(int(time_value))
-                median_price = statistics.median(cluster["prices"]) if cluster["prices"] else quantised_price
-                cluster["anchor"] = _quantise(median_price, tick_size)
-                matched = True
-                break
+            anchor = cluster["anchor"]
+            price_window = max(
+                cluster_price_pct * max(abs(anchor), abs(quantised_price)),
+                tick_size or 0.0,
+            )
+            if abs(anchor - quantised_price) > price_window + 1e-12:
+                continue
+            indices = cluster["indices"]
+            if indices:
+                if min(abs(idx - existing) for existing in indices) > cluster_time_window_bars:
+                    continue
+            cluster["prices"].append(quantised_price)
+            cluster["swings"].append(int(time_value))
+            cluster["indices"].append(idx)
+            if not cluster.get("merged"):
+                cluster["merged"] = True
+                merge_operations += 1
+            median_price = statistics.median(cluster["prices"]) if cluster["prices"] else quantised_price
+            cluster["anchor"] = _quantise(median_price, tick_size)
+            matched = True
+            break
         if not matched:
             clusters.append(
                 {
                     "anchor": quantised_price,
                     "prices": [quantised_price],
                     "swings": [int(time_value)],
+                    "indices": [idx],
+                    "merged": False,
                 }
             )
 
-    merge_operations = 0
-    if (
-        allow_merge
-        and len(clusters) > 1
-        and tolerance > 0.0
-        and tick_size
-        and tick_size > 0.0
-        and merge_distance > 0.0
-        and merge_overlap_ratio > 0.0
-    ):
-        # Repeatedly merge neighbouring clusters that are close in price and share constituents.
-        clusters.sort(key=lambda entry: entry["anchor"])
-        merged = True
-        while merged and len(clusters) > 1:
-            merged = False
-            for idx in range(len(clusters) - 1):
-                left = clusters[idx]
-                for jdx in range(idx + 1, len(clusters)):
-                    right = clusters[jdx]
-                    price_gap = abs(left["anchor"] - right["anchor"])
-                    if price_gap > merge_distance:
-                        break
-                    left_swings = set(left["swings"])
-                    right_swings = set(right["swings"])
-                    if not left_swings or not right_swings:
-                        continue
-                    shared = left_swings & right_swings
-                    overlap_ratio = len(shared) / max(1, min(len(left_swings), len(right_swings)))
-                    if overlap_ratio >= merge_overlap_ratio:
-                        left["prices"].extend(right["prices"])
-                        left["swings"].extend(right["swings"])
-                        left["anchor"] = _quantise(
-                            statistics.median(left["prices"]), tick_size
-                        )
-                        del clusters[jdx]
-                        merge_operations += 1
-                        merged = True
-                        break
-                if merged:
-                    break
-            if merged:
-                clusters.sort(key=lambda entry: entry["anchor"])
-
+    tolerance_mode = (tolerance_mode or "ticks").lower()
     payload: List[Dict[str, Any]] = []
     candidates: List[Dict[str, Any]] = []
     reason_hist: Counter[str] = Counter()
 
-    required_points = max(2, min_points)
+    for cluster in clusters:
+        indices_sorted = sorted(set(cluster["indices"]))
+        filtered_indices: List[int] = []
+        for candidate_idx in indices_sorted:
+            if not filtered_indices or candidate_idx - filtered_indices[-1] >= min_distance_bars:
+                filtered_indices.append(candidate_idx)
+        cluster["filtered_indices"] = filtered_indices
+
     for cluster in clusters:
         swings_ts = sorted(set(cluster["swings"]))
+        indices_sorted = cluster.get("filtered_indices", [])
+        prices = cluster.get("prices", [])
         candidate_entry: Dict[str, Any] = {
             "type": level_type,
             "tf": timeframe,
             "swings": swings_ts,
-            "tolerance": tolerance,
+            "indices": indices_sorted,
+            "tolerance": None,
             "rejected": False,
             "reason": None,
             "details": {},
         }
-        prices = cluster.get("prices", [])
-        level_price_estimate = None
-        if prices:
-            level_price_estimate = statistics.median(prices)
-            level_price_estimate = _quantise(level_price_estimate, tick_size)
-            candidate_entry["price"] = level_price_estimate
 
-        if len(swings_ts) < required_points:
-            LOGGER.debug(
-                "Skipping swing cluster due to size",
-                extra={
-                    "reason": "min_points_fail",
-                    "tf": timeframe,
-                    "level_type": level_type,
-                    "swings": swings_ts,
-                    "required": required_points,
-                    "tolerance": tolerance,
-                    "tick_size": tick_size,
-                },
-            )
+        if len(indices_sorted) < max(2, min_points):
             _append_reason(
                 reason_sink,
                 "min_points_fail",
                 swings=swings_ts,
-                tolerance=tolerance,
-                tick_size=tick_size,
-                required=required_points,
+                indices=indices_sorted,
+                required=min_points,
             )
             candidate_entry["rejected"] = True
             candidate_entry["reason"] = "min_points_fail"
             candidate_entry["details"] = {
-                "required": required_points,
-                "observed": len(swings_ts),
+                "required": min_points,
+                "observed": len(indices_sorted),
             }
             candidates.append(candidate_entry)
             reason_hist["min_points_fail"] += 1
@@ -884,10 +958,24 @@ def _cluster_swings(
             reason_hist["no_prices"] += 1
             continue
 
-        level_price = level_price_estimate if level_price_estimate is not None else statistics.median(prices)
-        level_price = _quantise(level_price, tick_size)
+        level_price = _quantise(statistics.median(prices), tick_size)
+        intra_range = max(prices) - min(prices) if prices else 0.0
+        intra_ticks = intra_range / (tick_size or 1.0) if tick_size else 0.0
+
+        tolerance_price = tolerance
+        if tolerance_mode == "percent" and tolerance_value > 0:
+            tolerance_price = max(level_price * tolerance_value, tick_size or 0.0)
+
         candidate_entry["price"] = level_price
+        candidate_entry["tolerance"] = tolerance_price
         candidate_entry["reason"] = "kept"
+        candidate_entry["details"] = {
+            "intra_range": intra_range,
+            "intra_range_ticks": intra_ticks,
+            "merged": bool(cluster.get("merged")),
+            "cluster_members": len(prices),
+            "cluster_window_pct": cluster_price_pct,
+        }
         candidates.append(candidate_entry)
         reason_hist["kept"] += 1
         payload.append(
@@ -896,7 +984,14 @@ def _cluster_swings(
                 "tf": timeframe,
                 "price": level_price,
                 "swings": swings_ts,
-                "tolerance": tolerance,
+                "indices": indices_sorted,
+                "tolerance": tolerance_price,
+                "cluster": {
+                    "members": len(prices),
+                    "intra_range": intra_range,
+                    "intra_range_ticks": intra_ticks,
+                    "merged": bool(cluster.get("merged")),
+                },
             }
         )
 
@@ -976,6 +1071,11 @@ def _prepare_levels(
     degraded_timeframes: List[str] = []
 
     tick_value = float(tick_size) if tick_size and tick_size > 0 else 0.0
+    tolerance_mode = (config.tolerance_mode or "ticks").lower()
+    tolerance_percent_value = config.tolerance_percent if config.tolerance_percent > 0 else 0.0
+    if tolerance_mode == "percent" and tolerance_percent_value <= 0.0:
+        tolerance_percent_value = 0.0004
+
     eqh_ticks = float(config.tolerance_eqh_ticks) if config.tolerance_eqh_ticks else float(config.r_ticks or 1)
     if eqh_ticks <= 0:
         eqh_ticks = float(config.r_ticks or 1)
@@ -993,11 +1093,9 @@ def _prepare_levels(
 
     eqh_tolerance = _ticks_to_tolerance(eqh_ticks)
     eql_tolerance = _ticks_to_tolerance(eql_ticks)
-    merge_distance_price = (
-        _ticks_to_tolerance(config.merge_ticks)
-        if config.merge_clusters and tick_value > 0.0
-        else 0.0
-    )
+    cluster_price_pct = max(0.0, config.cluster_price_window_pct)
+    cluster_time_window_bars = max(1, int(config.cluster_time_window_bars))
+    min_distance_bars = max(1, int(config.min_distance_bars))
     minute_seed = _extract_candles(frames.get("1m"))
 
     LOGGER.debug(
@@ -1007,10 +1105,14 @@ def _prepare_levels(
             "r_ticks": config.r_ticks,
             "tolerance_eqh": eqh_tolerance,
             "tolerance_eql": eql_tolerance,
+            "tolerance_mode": tolerance_mode,
+            "tolerance_percent": tolerance_percent_value,
             "swing_window": config.swing_window,
             "lookback": config.lookback_swings,
             "min_points_dynamic": config.min_points_dynamic,
-            "merge_distance": merge_distance_price,
+            "cluster_price_pct": cluster_price_pct,
+            "cluster_time_window_bars": cluster_time_window_bars,
+            "min_distance_bars": min_distance_bars,
         },
     )
 
@@ -1159,11 +1261,15 @@ def _prepare_levels(
             swings_high,
             tolerance=eqh_tolerance,
             tick_size=tick_size,
+            tolerance_mode=tolerance_mode,
+            tolerance_percent=tolerance_percent_value,
         )
         eql_pairs = _count_pairs_within_tolerance(
             swings_low,
             tolerance=eql_tolerance,
             tick_size=tick_size,
+            tolerance_mode=tolerance_mode,
+            tolerance_percent=tolerance_percent_value,
         )
         frame_diag["eqh"]["pairs_within_tol_before_cluster"] = eqh_pairs
         frame_diag["eqh"]["pairs_within_tol"] = eqh_pairs
@@ -1172,6 +1278,18 @@ def _prepare_levels(
         frame_diag["eqh"]["sample_pairs_top10"] = _sample_swing_pairs(swings_high)
         frame_diag["eql"]["sample_pairs_top10"] = _sample_swing_pairs(swings_low)
 
+        frame_diag["eqh"]["tolerance_mode"] = tolerance_mode
+        frame_diag["eql"]["tolerance_mode"] = tolerance_mode
+        if tolerance_mode == "percent":
+            frame_diag["eqh"]["tolerance_percent"] = tolerance_percent_value
+            frame_diag["eql"]["tolerance_percent"] = tolerance_percent_value
+        else:
+            frame_diag["eqh"].pop("tolerance_percent", None)
+            frame_diag["eql"].pop("tolerance_percent", None)
+        frame_diag["eqh"]["cluster_price_pct"] = cluster_price_pct
+        frame_diag["eql"]["cluster_price_pct"] = cluster_price_pct
+
+        baseline_min_points = 3 if timeframe in {"1m", "5m"} else 2
         if config.min_points_dynamic:
             alpha = config.min_points_alpha if config.min_points_alpha > 0 else 1.0
             min_points_required = max(
@@ -1180,11 +1298,10 @@ def _prepare_levels(
             )
         else:
             min_points_required = max(2, config.min_points_floor)
+        min_points_required = max(baseline_min_points, min_points_required)
 
         frame_diag["eqh"]["min_points_required"] = min_points_required
         frame_diag["eql"]["min_points_required"] = min_points_required
-
-        allow_merge = config.merge_clusters and config.feature_relaxed_clustering
 
         eqh_cluster, eqh_candidates, eqh_hist, eqh_merges = _cluster_swings(
             swings_high,
@@ -1193,9 +1310,11 @@ def _prepare_levels(
             level_type="eqh",
             timeframe=timeframe,
             min_points=min_points_required,
-            allow_merge=allow_merge,
-            merge_distance=merge_distance_price,
-            merge_overlap_ratio=config.merge_overlap_ratio,
+            tolerance_mode=tolerance_mode,
+            tolerance_value=tolerance_percent_value,
+            cluster_price_pct=cluster_price_pct,
+            cluster_time_window_bars=cluster_time_window_bars,
+            min_distance_bars=min_distance_bars,
             reason_sink=frame_diag["eqh"]["reasons"],
         )
         eql_cluster, eql_candidates, eql_hist, eql_merges = _cluster_swings(
@@ -1205,9 +1324,11 @@ def _prepare_levels(
             level_type="eql",
             timeframe=timeframe,
             min_points=min_points_required,
-            allow_merge=allow_merge,
-            merge_distance=merge_distance_price,
-            merge_overlap_ratio=config.merge_overlap_ratio,
+            tolerance_mode=tolerance_mode,
+            tolerance_value=tolerance_percent_value,
+            cluster_price_pct=cluster_price_pct,
+            cluster_time_window_bars=cluster_time_window_bars,
+            min_distance_bars=min_distance_bars,
             reason_sink=frame_diag["eql"]["reasons"],
         )
 
@@ -1390,6 +1511,45 @@ def _detect_sweeps(
 
     diagnostics: Dict[str, Any] = {}
 
+    def _build_swing_fallback_levels(
+        candles: Sequence[Mapping[str, Any]],
+        *,
+        kind: str,
+    ) -> List[Dict[str, Any]]:
+        if not candles:
+            return []
+        swing_window = max(1, config.swing_window)
+        fallback_swings = _detect_swings(
+            candles,
+            window=swing_window,
+            kind="high" if kind == "high" else "low",
+            tick_size=tick_min,
+        )
+        if config.lookback_swings > 0:
+            fallback_swings = fallback_swings[-config.lookback_swings :]
+        seen_prices: set[float] = set()
+        fallback_levels: List[Dict[str, Any]] = []
+        for swing in fallback_swings:
+            price_value = _coerce_float(swing.get("price"))
+            ts_value = swing.get("t")
+            if price_value is None or ts_value is None:
+                continue
+            price_quant = _quantise(price_value, tick_size)
+            key = round(price_quant, 8)
+            if key in seen_prices:
+                continue
+            seen_prices.add(key)
+            fallback_levels.append(
+                {
+                    "type": "eqh_fallback" if kind == "high" else "eql_fallback",
+                    "price": price_quant,
+                    "t": int(ts_value),
+                    "swings": [int(ts_value)],
+                    "source": "swing_fallback",
+                }
+            )
+        return fallback_levels
+
     for timeframe in SUPPORTED_TIMEFRAMES:
         frame_payload = frames.get(timeframe)
         source_label = _frame_source(frame_payload) or "unknown"
@@ -1397,30 +1557,52 @@ def _detect_sweeps(
         upper_levels = upper_levels_by_tf.get(timeframe, [])
         lower_levels = lower_levels_by_tf.get(timeframe, [])
 
+        fallback_upper_used = False
+        fallback_lower_used = False
+        if not upper_levels:
+            fallback_upper = _build_swing_fallback_levels(candles, kind="high")
+            if fallback_upper:
+                upper_levels = fallback_upper
+                fallback_upper_used = True
+        if not lower_levels:
+            fallback_lower = _build_swing_fallback_levels(candles, kind="low")
+            if fallback_lower:
+                lower_levels = fallback_lower
+                fallback_lower_used = True
+
         frame_diag = {
             "used_source": source_label,
             "candles": len(candles),
             "atr_period": config.atr_period,
             "atr_mult": config.sweep_atr_multiplier,
-            "tick_size": tick_size,
-            "upper": {
-                "levels": len(upper_levels),
-                "events": 0,
-                "reasons": [],
-                "candidates_before_atr": 0,
-                "candidates_after_atr": 0,
-                "samples": [],
-            },
-            "lower": {
-                "levels": len(lower_levels),
-                "events": 0,
-                "reasons": [],
-                "candidates_before_atr": 0,
-                "candidates_after_atr": 0,
-                "samples": [],
-            },
-        }
+        "tick_size": tick_size,
+        "upper": {
+            "levels": len(upper_levels),
+            "events": 0,
+            "reasons": [],
+            "candidates_before_atr": 0,
+            "candidates_after_atr": 0,
+            "samples": [],
+            "fallback_used": fallback_upper_used,
+            "fallback_source": "swing" if fallback_upper_used else None,
+        },
+        "lower": {
+            "levels": len(lower_levels),
+            "events": 0,
+            "reasons": [],
+            "candidates_before_atr": 0,
+            "candidates_after_atr": 0,
+            "samples": [],
+            "fallback_used": fallback_lower_used,
+            "fallback_source": "swing" if fallback_lower_used else None,
+        },
+    }
         diagnostics[timeframe] = frame_diag
+
+        if fallback_upper_used:
+            frame_diag["upper"]["fallback_source"] = "swing"
+        if fallback_lower_used:
+            frame_diag["lower"]["fallback_source"] = "swing"
 
         if not upper_levels:
             _append_reason(frame_diag["upper"]["reasons"], "no_levels")
@@ -1529,7 +1711,19 @@ def _detect_sweeps(
         upper_candidate_samples: List[Dict[str, Any]] = []
         lower_candidate_samples: List[Dict[str, Any]] = []
 
+        lookback_start_index = max(0, len(candles) - max(config.sweep_lookback_bars, 1))
+        frame_diag["upper"]["lookback_start"] = lookback_start_index
+        frame_diag["lower"]["lookback_start"] = lookback_start_index
+        frame_diag["upper"]["min_move_atr"] = config.sweep_min_move_atr
+        frame_diag["lower"]["min_move_atr"] = config.sweep_min_move_atr
+        frame_diag["upper"]["confirm_window"] = config.sweep_confirm_window
+        frame_diag["lower"]["confirm_window"] = config.sweep_confirm_window
+        frame_diag["upper"]["epsilon_pct"] = config.sweep_epsilon_pct
+        frame_diag["lower"]["epsilon_pct"] = config.sweep_epsilon_pct
+
         for index, candle in enumerate(candles):
+            if index < lookback_start_index:
+                continue
             high = _coerce_float(candle.get("h"))
             close = _coerce_float(candle.get("c"))
             ts = candle.get("t")
@@ -1537,8 +1731,10 @@ def _detect_sweeps(
                 continue
             high = _quantise(high, tick_size)
             close = _quantise(close, tick_size)
-            atr_component = atr_values[index] * config.sweep_atr_multiplier
+            atr_value = atr_values[index] if index < len(atr_values) else 0.0
+            atr_component = atr_value * config.sweep_atr_multiplier
             atr_limit = max(tick_min, atr_component)
+            min_move = max(config.sweep_min_move_atr * atr_value, tick_min)
             for level in upper_levels:
                 level_price = _coerce_float(level.get("price"))
                 if level_price is None:
@@ -1558,24 +1754,24 @@ def _detect_sweeps(
                 overshoot = high - level_price
                 if overshoot <= 0:
                     continue
-                price_cap = level_price * SWEEP_CAP_PCT if level_price > 0 else None
+                frame_diag["upper"]["candidates_before_atr"] += 1
+                if overshoot < min_move:
+                    _append_reason(
+                        frame_diag["upper"]["reasons"],
+                        "min_move_fail",
+                        level_type=level_type,
+                        overshoot=overshoot,
+                        min_move=min_move,
+                    )
+                    continue
                 epsilon = max(atr_limit, tick_min)
+                if config.sweep_epsilon_pct > 0 and level_price > 0:
+                    epsilon = max(epsilon, level_price * config.sweep_epsilon_pct)
+                price_cap = level_price * SWEEP_CAP_PCT if level_price > 0 else None
                 if price_cap is not None and price_cap > 0:
                     epsilon = min(epsilon, max(price_cap, tick_min))
                 epsilon_samples.append(epsilon)
                 if overshoot <= epsilon:
-                    LOGGER.debug(
-                        "Skipping sweep candidate due to tolerance",
-                        extra={
-                            "reason": "tolerance_fail",
-                            "tf": timeframe,
-                            "level_type": level_type,
-                            "overshoot": overshoot,
-                            "tolerance": epsilon,
-                            "epsilon": epsilon,
-                            "used_source": source_label,
-                        },
-                    )
                     _append_reason(
                         frame_diag["upper"]["reasons"],
                         "tolerance_fail",
@@ -1585,7 +1781,6 @@ def _detect_sweeps(
                         epsilon=epsilon,
                     )
                     continue
-                frame_diag["upper"]["candidates_before_atr"] += 1
                 if len(upper_candidate_samples) < 5:
                     upper_candidate_samples.append(
                         {
@@ -1595,48 +1790,46 @@ def _detect_sweeps(
                             "overshoot": overshoot,
                             "epsilon": epsilon,
                             "atr_limit": atr_limit,
+                            "min_move": min_move,
                         }
                     )
-                atr_cap = max(epsilon * 2.0, tick_min)
-                if overshoot > atr_cap + 1e-9:
-                    LOGGER.debug(
-                        "Skipping sweep candidate due to ATR breach",
-                        extra={
-                            "reason": "atr_breach",
-                            "tf": timeframe,
-                            "level_type": level_type,
-                            "overshoot": overshoot,
-                            "atr_limit": atr_cap,
-                            "epsilon": epsilon,
-                            "used_source": source_label,
-                        },
-                    )
-                    _append_reason(
-                        frame_diag["upper"]["reasons"],
-                        "atr_breach",
-                        level_type=level_type,
-                        overshoot=overshoot,
-                        atr_limit=atr_cap,
-                        epsilon=epsilon,
-                    )
-                    continue
                 frame_diag["upper"]["candidates_after_atr"] += 1
-                if close >= level_price:
+                confirm_idx: int | None = None
+                confirm_close_val = close
+                confirm_limit = min(len(candles), index + config.sweep_confirm_window + 1)
+                for confirm in range(index + 1, confirm_limit):
+                    confirm_close_raw = _coerce_float(candles[confirm].get("c"))
+                    if confirm_close_raw is None:
+                        continue
+                    confirm_close_candidate = _quantise(confirm_close_raw, tick_size)
+                    if confirm_close_candidate <= level_price:
+                        confirm_idx = confirm
+                        confirm_close_val = confirm_close_candidate
+                        break
+                if confirm_idx is None:
                     _append_reason(
                         frame_diag["upper"]["reasons"],
-                        "no_return_close",
+                        "no_return_window",
                         level_type=level_type,
-                        close=close,
-                        level=level_price,
+                        confirm_window=config.sweep_confirm_window,
                     )
                     continue
+                confirm_ts = int(candles[confirm_idx].get("t", ts))
+                return_bars = confirm_idx - index
                 sweeps.append(
                     {
                         "type": "sweep_top",
+                        "tf": timeframe,
                         "level_type": level_type,
                         "level_price": level_price,
                         "t": int(ts),
                         "atr_tolerance": epsilon,
+                        "min_move": min_move,
+                        "level_source": level.get("source", "eq"),
+                        "retest_t": confirm_ts,
+                        "retest_close": confirm_close_val,
+                        "return_bars": return_bars,
+                        "fallback": bool(level.get("source") == "swing_fallback"),
                     }
                 )
                 frame_diag["upper"]["events"] += 1
@@ -1652,6 +1845,8 @@ def _detect_sweeps(
             },
         )
         for index, candle in enumerate(candles):
+            if index < lookback_start_index:
+                continue
             low = _coerce_float(candle.get("l"))
             close = _coerce_float(candle.get("c"))
             ts = candle.get("t")
@@ -1659,8 +1854,10 @@ def _detect_sweeps(
                 continue
             low = _quantise(low, tick_size)
             close = _quantise(close, tick_size)
-            atr_component = atr_values[index] * config.sweep_atr_multiplier
+            atr_value = atr_values[index] if index < len(atr_values) else 0.0
+            atr_component = atr_value * config.sweep_atr_multiplier
             atr_limit = max(tick_min, atr_component)
+            min_move = max(config.sweep_min_move_atr * atr_value, tick_min)
             for level in lower_levels:
                 level_price = _coerce_float(level.get("price"))
                 if level_price is None:
@@ -1680,24 +1877,24 @@ def _detect_sweeps(
                 overshoot = level_price - low
                 if overshoot <= 0:
                     continue
-                price_cap = level_price * SWEEP_CAP_PCT if level_price > 0 else None
+                frame_diag["lower"]["candidates_before_atr"] += 1
+                if overshoot < min_move:
+                    _append_reason(
+                        frame_diag["lower"]["reasons"],
+                        "min_move_fail",
+                        level_type=level_type,
+                        overshoot=overshoot,
+                        min_move=min_move,
+                    )
+                    continue
                 epsilon = max(atr_limit, tick_min)
+                if config.sweep_epsilon_pct > 0 and level_price > 0:
+                    epsilon = max(epsilon, level_price * config.sweep_epsilon_pct)
+                price_cap = level_price * SWEEP_CAP_PCT if level_price > 0 else None
                 if price_cap is not None and price_cap > 0:
                     epsilon = min(epsilon, max(price_cap, tick_min))
                 epsilon_samples.append(epsilon)
                 if overshoot <= epsilon:
-                    LOGGER.debug(
-                        "Skipping sweep candidate due to tolerance",
-                        extra={
-                            "reason": "tolerance_fail",
-                            "tf": timeframe,
-                            "level_type": level_type,
-                            "overshoot": overshoot,
-                            "tolerance": epsilon,
-                            "epsilon": epsilon,
-                            "used_source": source_label,
-                        },
-                    )
                     _append_reason(
                         frame_diag["lower"]["reasons"],
                         "tolerance_fail",
@@ -1707,7 +1904,6 @@ def _detect_sweeps(
                         epsilon=epsilon,
                     )
                     continue
-                frame_diag["lower"]["candidates_before_atr"] += 1
                 if len(lower_candidate_samples) < 5:
                     lower_candidate_samples.append(
                         {
@@ -1717,48 +1913,46 @@ def _detect_sweeps(
                             "overshoot": overshoot,
                             "epsilon": epsilon,
                             "atr_limit": atr_limit,
+                            "min_move": min_move,
                         }
                     )
-                atr_cap = max(epsilon * 2.0, tick_min)
-                if overshoot > atr_cap + 1e-9:
-                    LOGGER.debug(
-                        "Skipping sweep candidate due to ATR breach",
-                        extra={
-                            "reason": "atr_breach",
-                            "tf": timeframe,
-                            "level_type": level_type,
-                            "overshoot": overshoot,
-                            "atr_limit": atr_cap,
-                            "epsilon": epsilon,
-                            "used_source": source_label,
-                        },
-                    )
-                    _append_reason(
-                        frame_diag["lower"]["reasons"],
-                        "atr_breach",
-                        level_type=level_type,
-                        overshoot=overshoot,
-                        atr_limit=atr_cap,
-                        epsilon=epsilon,
-                    )
-                    continue
                 frame_diag["lower"]["candidates_after_atr"] += 1
-                if close <= level_price:
+                confirm_idx = None
+                confirm_close_val = close
+                confirm_limit = min(len(candles), index + config.sweep_confirm_window + 1)
+                for confirm in range(index + 1, confirm_limit):
+                    confirm_close_raw = _coerce_float(candles[confirm].get("c"))
+                    if confirm_close_raw is None:
+                        continue
+                    confirm_close_candidate = _quantise(confirm_close_raw, tick_size)
+                    if confirm_close_candidate >= level_price:
+                        confirm_idx = confirm
+                        confirm_close_val = confirm_close_candidate
+                        break
+                if confirm_idx is None:
                     _append_reason(
                         frame_diag["lower"]["reasons"],
-                        "no_return_close",
+                        "no_return_window",
                         level_type=level_type,
-                        close=close,
-                        level=level_price,
+                        confirm_window=config.sweep_confirm_window,
                     )
                     continue
+                confirm_ts = int(candles[confirm_idx].get("t", ts))
+                return_bars = confirm_idx - index
                 sweeps.append(
                     {
                         "type": "sweep_bottom",
+                        "tf": timeframe,
                         "level_type": level_type,
                         "level_price": level_price,
                         "t": int(ts),
                         "atr_tolerance": epsilon,
+                        "min_move": min_move,
+                        "level_source": level.get("source", "eq"),
+                        "retest_t": confirm_ts,
+                        "retest_close": confirm_close_val,
+                        "return_bars": return_bars,
+                        "fallback": bool(level.get("source") == "swing_fallback"),
                     }
                 )
                 frame_diag["lower"]["events"] += 1
