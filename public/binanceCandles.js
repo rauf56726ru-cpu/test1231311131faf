@@ -7,7 +7,7 @@
 })(typeof self !== "undefined" ? self : this, function () {
   "use strict";
 
-  const BASE_URL = "https://api.binance.com/api/v3/klines";
+  const BASE_URL = "https://fapi.binance.com/fapi/v1/klines";
 
   /**
    * @typedef {Object} Bar
@@ -120,10 +120,14 @@
     if (!symbol || !interval) {
       throw new Error("symbol and interval are required");
     }
-    const url = `${BASE_URL}?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&limit=${encodeURIComponent(
-      limit,
-    )}`;
-    const resp = await fetch(url);
+
+    const cappedLimit = Math.max(1, Math.min(Number(limit) || 500, 1500));
+    const url =
+      `${BASE_URL}?symbol=${encodeURIComponent(symbol)}` +
+      `&interval=${encodeURIComponent(interval)}` +
+      `&limit=${encodeURIComponent(cappedLimit)}`;
+
+    const resp = await fetch(url, { cache: "no-store" });
     if (!resp.ok) {
       throw new Error(`klines ${resp.status}`);
     }

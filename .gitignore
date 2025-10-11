@@ -1,3 +1,6 @@
-.venv/
+.DS_Store
+node_modules/
+dist/
 __pycache__/
-data/live/candles.sqlite*
+*.pyc
+var/

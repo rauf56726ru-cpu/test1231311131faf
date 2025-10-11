@@ -1,0 +1,885 @@
+"""Utilities for normalising and fetching OHLCV data."""
+from __future__ import annotations
+
+import asyncio
+import math
+import threading
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    MutableMapping,
+    Sequence,
+    Tuple,
+)
+
+import httpx
+
+from .binance import BINANCE_FAPI_REST
+
+# Mapping of supported timeframes to their window sizes.
+TIMEFRAME_WINDOWS: Dict[str, timedelta] = {
+    "1m": timedelta(hours=8),
+    "3m": timedelta(hours=24),
+    "5m": timedelta(hours=48),
+    "15m": timedelta(hours=72),
+    "1h": timedelta(days=7),
+    "4h": timedelta(days=30),
+    "1d": timedelta(days=90),
+}
+
+# Explicit duration of a single candle in milliseconds.
+TIMEFRAME_TO_MS: Dict[str, int] = {
+    "1m": 60_000,
+    "3m": 180_000,
+    "5m": 300_000,
+    "15m": 900_000,
+    "1h": 3_600_000,
+    "4h": 14_400_000,
+    "1d": 86_400_000,
+}
+
+
+@dataclass(slots=True)
+class Candle:
+    """Normalized representation of a single OHLCV bar."""
+
+    t: int
+    o: float
+    h: float
+    l: float
+    c: float
+    v: float
+    missing: bool = False
+
+    def as_dict(self, *, include_missing: bool = False) -> Dict[str, float]:
+        data: Dict[str, float | int | bool] = {
+            "t": self.t,
+            "o": self.o,
+            "h": self.h,
+            "l": self.l,
+            "c": self.c,
+            "v": self.v,
+        }
+        if include_missing:
+            data["missing"] = self.missing
+        return data  # type: ignore[return-value]
+
+
+def _align_to_interval(timestamp_ms: int, interval_ms: int) -> int:
+    """Floor the timestamp to the closest interval boundary."""
+
+    if interval_ms <= 0:
+        raise ValueError("interval_ms must be positive")
+    return (timestamp_ms // interval_ms) * interval_ms
+
+
+def _to_candle_mapping(row: Mapping[str, object] | Sequence[object]) -> Candle | None:
+    """Convert raw data from the frontend into an internal candle structure."""
+
+    open_time: int | None = None
+    open_price: float | None = None
+    high_price: float | None = None
+    low_price: float | None = None
+    close_price: float | None = None
+    volume: float | None = None
+
+    if isinstance(row, Mapping):
+        # Accepted keys: time/ts/ts_ms_utc or t; open/o; high/h; low/l; close/c; volume/v.
+        time_value = None
+        for key in ("ts_ms_utc", "time", "t", "openTime", "open_time"):
+            candidate = row.get(key)
+            if candidate is not None:
+                time_value = candidate
+                break
+        if isinstance(time_value, (int, float)):
+            open_time = int(time_value)
+
+        def _num(key: str, fallback: str | None = None) -> float | None:
+            value = row.get(key)
+            if value is None and fallback is not None:
+                value = row.get(fallback)
+            if isinstance(value, (int, float)):
+                return float(value)
+            try:
+                return float(value) if value is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        open_price = _num("o", "open")
+        high_price = _num("h", "high")
+        low_price = _num("l", "low")
+        close_price = _num("c", "close")
+        volume = _num("v", "volume")
+    else:
+        try:
+            open_time = int(row[0])
+            open_price = float(row[1])
+            high_price = float(row[2])
+            low_price = float(row[3])
+            close_price = float(row[4])
+            volume = float(row[5]) if len(row) > 5 else 0.0
+        except (IndexError, TypeError, ValueError):
+            return None
+
+    if not all(
+        value is not None and math.isfinite(value)
+        for value in (open_time, open_price, high_price, low_price, close_price)
+    ):
+        return None
+
+    if volume is None or not math.isfinite(volume):
+        volume = 0.0
+
+    return Candle(
+        t=int(open_time),
+        o=float(open_price),
+        h=float(high_price),
+        l=float(low_price),
+        c=float(close_price),
+        v=float(volume),
+    )
+
+
+def resample_ohlcv(
+    candles: Sequence[Mapping[str, Any]],
+    interval_ms: int,
+) -> List[Dict[str, float | int]]:
+    """Aggregate minute candles into a higher timeframe bucket."""
+
+    if interval_ms <= 0:
+        raise ValueError("interval_ms must be positive")
+
+    buckets: Dict[int, Dict[str, float]] = {}
+    for candle in candles:
+        if not isinstance(candle, Mapping):
+            continue
+        timestamp = candle.get("t")
+        open_price = candle.get("o")
+        high_price = candle.get("h")
+        low_price = candle.get("l")
+        close_price = candle.get("c")
+        volume_value = candle.get("v", 0.0)
+
+        if not isinstance(timestamp, (int, float)):
+            continue
+
+        try:
+            o_value = float(open_price)
+            h_value = float(high_price)
+            l_value = float(low_price)
+            c_value = float(close_price)
+            v_value = float(volume_value) if volume_value is not None else 0.0
+        except (TypeError, ValueError):
+            continue
+
+        if not math.isfinite(o_value) or not math.isfinite(h_value) or not math.isfinite(l_value) or not math.isfinite(c_value):
+            continue
+
+        bucket_start = _align_to_interval(int(timestamp), interval_ms)
+        bucket = buckets.get(bucket_start)
+        if bucket is None:
+            bucket = {
+                "t": int(bucket_start),
+                "o": o_value,
+                "h": h_value,
+                "l": l_value,
+                "c": c_value,
+                "v": v_value,
+            }
+            buckets[bucket_start] = bucket
+        else:
+            bucket["h"] = max(bucket["h"], h_value)
+            bucket["l"] = min(bucket["l"], l_value)
+            bucket["c"] = c_value
+            bucket["v"] += v_value
+
+    return [buckets[key] for key in sorted(buckets)]
+
+
+def aggregate_1m_to_1h(
+    candles: Sequence[Mapping[str, Any] | Sequence[object] | Candle],
+) -> List[Dict[str, float | int]]:
+    """Aggregate one-minute OHLCV candles into one-hour buckets.
+
+    The function aligns candle timestamps to UTC hour boundaries and produces
+    standard OHLCV fields for each one-hour bar. Invalid rows are ignored.
+    """
+
+    hour_ms = TIMEFRAME_TO_MS.get("1h")
+    if not hour_ms:
+        raise ValueError("1h timeframe is not defined in TIMEFRAME_TO_MS")
+
+    parsed: List[Candle] = []
+    for row in candles:
+        candle: Candle | None
+        if isinstance(row, Candle):
+            candle = row
+        elif isinstance(row, Mapping) or isinstance(row, Sequence):
+            candle = _to_candle_mapping(row)  # type: ignore[arg-type]
+        else:
+            candle = None
+        if candle is None:
+            continue
+        parsed.append(candle)
+
+    if not parsed:
+        return []
+
+    parsed.sort(key=lambda item: item.t)
+
+    buckets: Dict[int, Dict[str, float]] = {}
+    for candle in parsed:
+        bucket_start = _align_to_interval(int(candle.t), hour_ms)
+        bucket = buckets.get(bucket_start)
+        if bucket is None:
+            buckets[bucket_start] = {
+                "t": float(bucket_start),
+                "o": float(candle.o),
+                "h": float(candle.h),
+                "l": float(candle.l),
+                "c": float(candle.c),
+                "v": float(candle.v),
+            }
+            continue
+
+        bucket["h"] = max(bucket["h"], float(candle.h))
+        bucket["l"] = min(bucket["l"], float(candle.l))
+        bucket["c"] = float(candle.c)
+        bucket["v"] += float(candle.v)
+
+    ordered: List[Dict[str, float | int]] = []
+    for ts in sorted(buckets):
+        bucket = buckets[ts]
+        ordered.append(
+            {
+                "t": int(ts),
+                "o": float(bucket["o"]),
+                "h": float(bucket["h"]),
+                "l": float(bucket["l"]),
+                "c": float(bucket["c"]),
+                "v": float(bucket["v"]),
+            }
+        )
+
+    return ordered
+
+
+def _aggregate_bucket(
+    minutes: Mapping[int, Candle],
+    *,
+    bucket_start: int,
+    interval_ms: int,
+    minute_interval: int,
+    max_timestamp: int,
+) -> Dict[str, float | int] | None:
+    """Aggregate a contiguous block of minute candles into a single bucket."""
+
+    expected_count = max(1, interval_ms // minute_interval)
+    bucket_end = bucket_start + (expected_count - 1) * minute_interval
+    if bucket_end > max_timestamp:
+        return None
+
+    candles: List[Candle] = []
+    for index in range(expected_count):
+        minute_ts = bucket_start + index * minute_interval
+        candle = minutes.get(minute_ts)
+        if candle is None:
+            return None
+        candles.append(candle)
+
+    if not candles:
+        return None
+
+    open_price = float(candles[0].o)
+    high_price = max(float(item.h) for item in candles)
+    low_price = min(float(item.l) for item in candles)
+    close_price = float(candles[-1].c)
+    volume = sum(float(item.v) for item in candles)
+
+    return {
+        "t": int(bucket_start),
+        "o": open_price,
+        "h": high_price,
+        "l": low_price,
+        "c": close_price,
+        "v": volume,
+    }
+
+
+def build_multi_timeframe_ohlcv(
+    minute_rows: Sequence[Mapping[str, Any] | Sequence[object] | Candle],
+    *,
+    symbol: str | None = None,
+    fetcher: Callable[[str, str], Mapping[str, Any] | Sequence[Mapping[str, Any] | Sequence[object]]]
+    | None = None,
+) -> Dict[str, Dict[str, List[Dict[str, float | int]]]]:
+    """Build OHLCV series for supported timeframes using minute candles as seed.
+
+    The function enforces strict alignment to timeframe windows and skips
+    partially-formed buckets ensuring that each aggregated candle is backed by
+    a complete set of one-minute bars.
+    """
+
+    minute_interval = TIMEFRAME_TO_MS.get("1m")
+    if not minute_interval:
+        raise ValueError("1m timeframe is not defined")
+
+    minutes: Dict[int, Candle] = {}
+    fetch_fn: Callable[[str, str], Mapping[str, Any] | Sequence[Mapping[str, Any] | Sequence[object]]] | None = None
+    if symbol:
+        fetch_fn = fetcher or fetch_ohlcv_sync
+
+    def _payload_to_candles(
+        payload: Mapping[str, Any]
+        | Sequence[Mapping[str, Any] | Sequence[object] | Candle]
+        | None,
+    ) -> List[Candle]:
+        if payload is None:
+            return []
+        rows: Sequence[Mapping[str, Any] | Sequence[object] | Candle]
+        if isinstance(payload, Mapping):
+            raw_rows = payload.get("candles")
+            if not isinstance(raw_rows, Sequence):
+                return []
+            rows = raw_rows  # type: ignore[assignment]
+        elif isinstance(payload, Sequence):
+            rows = payload  # type: ignore[assignment]
+        else:
+            return []
+
+        candles_out: List[Candle] = []
+        for row in rows:
+            if isinstance(row, Candle):
+                candles_out.append(row)
+                continue
+            if isinstance(row, Mapping) or isinstance(row, Sequence):
+                candle_obj = _to_candle_mapping(row)  # type: ignore[arg-type]
+            else:
+                candle_obj = None
+            if candle_obj is not None:
+                candles_out.append(candle_obj)
+        return candles_out
+    for row in minute_rows:
+        candle: Candle | None
+        if isinstance(row, Candle):
+            candle = row
+        elif isinstance(row, Mapping) or isinstance(row, Sequence):
+            candle = _to_candle_mapping(row)  # type: ignore[arg-type]
+        else:
+            candle = None
+        if candle is None:
+            continue
+
+        aligned_ts = _align_to_interval(int(candle.t), minute_interval)
+        if aligned_ts != candle.t:
+            candle = Candle(
+                t=aligned_ts,
+                o=float(candle.o),
+                h=float(candle.h),
+                l=float(candle.l),
+                c=float(candle.c),
+                v=float(candle.v),
+            )
+        minutes[aligned_ts] = candle
+
+    result: Dict[str, Dict[str, List[Dict[str, float | int]]]] = {}
+    if not minutes and fetch_fn and symbol:
+        try:
+            fetched_minutes = _payload_to_candles(fetch_fn(symbol, "1m"))
+        except Exception:  # pragma: no cover - defensive fallback
+            fetched_minutes = []
+        for candle in fetched_minutes:
+            aligned_ts = _align_to_interval(int(candle.t), minute_interval)
+            minutes[aligned_ts] = Candle(
+                t=aligned_ts,
+                o=float(candle.o),
+                h=float(candle.h),
+                l=float(candle.l),
+                c=float(candle.c),
+                v=float(candle.v),
+            )
+
+    if not minutes:
+        for tf in TIMEFRAME_TO_MS:
+            fallback: List[Dict[str, float | int]] = []
+            if fetch_fn and symbol:
+                try:
+                    fetched_payload = fetch_fn(symbol, tf)
+                except Exception:  # pragma: no cover - defensive fallback
+                    fetched_payload = None
+                fetched_candles = _payload_to_candles(fetched_payload)
+                if fetched_candles:
+                    fallback = [
+                        Candle(
+                            t=_align_to_interval(int(candle.t), TIMEFRAME_TO_MS[tf]),
+                            o=float(candle.o),
+                            h=float(candle.h),
+                            l=float(candle.l),
+                            c=float(candle.c),
+                            v=float(candle.v),
+                        ).as_dict()
+                        for candle in sorted(fetched_candles, key=lambda c: c.t)
+                    ]
+            result[tf] = {"candles": fallback}
+        return result
+
+    sorted_minutes = sorted(minutes)
+    max_timestamp = sorted_minutes[-1]
+
+    result["1m"] = {
+        "candles": [minutes[ts].as_dict() for ts in sorted_minutes],
+    }
+
+    bucket_cache: Dict[str, List[int]] = {}
+    for tf, interval_ms in TIMEFRAME_TO_MS.items():
+        if tf == "1m":
+            continue
+        if interval_ms <= 0:
+            result[tf] = {"candles": []}
+            continue
+
+        bucket_candidates = bucket_cache.get(tf)
+        if bucket_candidates is None:
+            bucket_set = {
+                _align_to_interval(ts, interval_ms)
+                for ts in sorted_minutes
+            }
+            bucket_candidates = sorted(bucket_set)
+            bucket_cache[tf] = bucket_candidates
+
+        aggregated: List[Dict[str, float | int]] = []
+        for bucket_start in bucket_candidates:
+            aggregated_candle = _aggregate_bucket(
+                minutes,
+                bucket_start=bucket_start,
+                interval_ms=interval_ms,
+                minute_interval=minute_interval,
+                max_timestamp=max_timestamp,
+            )
+            if aggregated_candle is None:
+                continue
+            aggregated.append(aggregated_candle)
+
+        if aggregated:
+            result[tf] = {"candles": aggregated}
+            continue
+
+        fallback: List[Dict[str, float | int]] = []
+        if fetch_fn and symbol:
+            try:
+                fetched_payload = fetch_fn(symbol, tf)
+            except Exception:  # pragma: no cover - defensive fallback
+                fetched_payload = None
+            fetched_candles = _payload_to_candles(fetched_payload)
+            if fetched_candles:
+                fallback = [
+                    Candle(
+                        t=_align_to_interval(int(candle.t), interval_ms),
+                        o=float(candle.o),
+                        h=float(candle.h),
+                        l=float(candle.l),
+                        c=float(candle.c),
+                        v=float(candle.v),
+                    ).as_dict()
+                    for candle in sorted(fetched_candles, key=lambda c: c.t)
+                ]
+
+        result[tf] = {"candles": fallback}
+
+    return result
+
+
+def _ensure_cache_entry(symbol: str, timeframe: str) -> CandleCache:
+    key = (symbol.upper(), timeframe)
+    entry = _CANDLE_CACHE.get(key)
+    interval_ms = TIMEFRAME_TO_MS[timeframe]
+    if entry is None or entry.interval_ms != interval_ms:
+        entry = CandleCache(interval_ms=interval_ms)
+        _CANDLE_CACHE[key] = entry
+    return entry
+
+
+def _merge_candles(entry: CandleCache, new_candles: Sequence[Candle]) -> None:
+    if not new_candles:
+        return
+    mapping: Dict[int, Candle] = {candle.t: candle for candle in entry.candles}
+    for candle in new_candles:
+        mapping[candle.t] = candle
+    entry.candles = [mapping[key] for key in sorted(mapping)]
+
+
+def compute_window_end_from_store_or_exchange(
+    entry: CandleCache | None,
+    *,
+    interval_ms: int,
+    exchange_latest_open: int | None = None,
+) -> int:
+    """Compute the exclusive end timestamp for the rolling window."""
+
+    latest_open = exchange_latest_open
+    if entry and entry.candles:
+        latest_open = entry.candles[-1].t if latest_open is None else max(latest_open, entry.candles[-1].t)
+    if latest_open is None:
+        raise ValueError("No candles available to anchor the window")
+    return latest_open + interval_ms
+
+
+async def slice_or_fetch_missing(
+    symbol: str,
+    timeframe: str,
+    *,
+    start_ms: int,
+    end_ms: int,
+    fetcher: Callable[[str, str, int | None, int | None, int | None], Awaitable[Sequence[Mapping[str, object] | Sequence[object]]]],
+    limit: int,
+) -> List[Candle]:
+    """Return candles covering [start_ms, end_ms) fetching only missing tails."""
+
+    interval_ms = TIMEFRAME_TO_MS[timeframe]
+    entry = _ensure_cache_entry(symbol, timeframe)
+    existing: Dict[int, Candle] = {
+        candle.t: candle
+        for candle in entry.candles
+        if start_ms <= candle.t < end_ms
+    }
+
+    cursor = start_ms
+    required_times: List[int] = []
+    while cursor < end_ms:
+        if cursor not in existing:
+            required_times.append(cursor)
+            break
+        cursor += interval_ms
+
+    if required_times:
+        fetch_start = required_times[0]
+        raw_rows = await fetcher(symbol, timeframe, fetch_start, end_ms, limit)
+        fetched = []
+        for row in raw_rows:
+            candle = _to_candle_mapping(row)
+            if candle is None:
+                continue
+            if candle.t < fetch_start or candle.t >= end_ms:
+                continue
+            fetched.append(candle)
+        _merge_candles(entry, fetched)
+        existing = {
+            candle.t: candle
+            for candle in entry.candles
+            if start_ms <= candle.t < end_ms
+        }
+
+    ordered: List[Candle] = []
+    cursor = start_ms
+    while cursor < end_ms:
+        candle = existing.get(cursor)
+        if candle is not None:
+            ordered.append(candle)
+        cursor += interval_ms
+
+    return ordered
+
+
+async def _fetch_binance_klines(
+    symbol: str,
+    timeframe: str,
+    start_ms: int | None,
+    end_ms: int | None,
+    limit: int | None,
+) -> Sequence[Sequence[object]]:
+    params = {
+        "symbol": symbol.upper(),
+        "interval": timeframe,
+    }
+    if start_ms is not None:
+        params["startTime"] = str(start_ms)
+    if end_ms is not None:
+        params["endTime"] = str(end_ms)
+    if limit is not None:
+        params["limit"] = str(limit)
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(BINANCE_FAPI_REST, params=params)
+        response.raise_for_status()
+        data = response.json()
+    if not isinstance(data, Sequence):
+        return []
+    return data  # type: ignore[return-value]
+
+
+async def fetch_ohlcv(
+    symbol: str,
+    timeframe: str,
+    *,
+    hours: int | None = None,
+    fetcher: Callable[[str, str, int | None, int | None, int | None], Awaitable[Sequence[Mapping[str, object] | Sequence[object]]]] | None = None,
+) -> Dict[str, object]:
+    """Fetch OHLC candles anchored to the latest available Binance bar."""
+
+    timeframe = timeframe.lower()
+    if timeframe not in TIMEFRAME_TO_MS:
+        raise ValueError(f"Unsupported timeframe: {timeframe}")
+
+    interval_ms = TIMEFRAME_TO_MS[timeframe]
+    if hours is not None and hours <= 0:
+        raise ValueError("hours must be positive")
+
+    window_ms = (
+        hours * 3_600_000
+        if hours is not None
+        else int(TIMEFRAME_WINDOWS[timeframe].total_seconds() * 1000)
+    )
+    candles_required = max(1, math.ceil(window_ms / interval_ms))
+
+    entry = _ensure_cache_entry(symbol, timeframe)
+    fetcher_fn = fetcher or _fetch_binance_klines
+
+    exchange_latest_open: int | None = None
+    if not entry.candles:
+        raw_rows = await fetcher_fn(symbol, timeframe, None, None, candles_required)
+        fetched = []
+        for row in raw_rows:
+            candle = _to_candle_mapping(row)
+            if candle is None:
+                continue
+            fetched.append(candle)
+        if fetched:
+            exchange_latest_open = fetched[-1].t
+        _merge_candles(entry, fetched)
+    else:
+        tail_start = entry.candles[-1].t + interval_ms
+        raw_rows = await fetcher_fn(symbol, timeframe, tail_start, None, candles_required)
+        fetched = []
+        for row in raw_rows:
+            candle = _to_candle_mapping(row)
+            if candle is None:
+                continue
+            if candle.t <= entry.candles[-1].t:
+                continue
+            fetched.append(candle)
+        if fetched:
+            _merge_candles(entry, fetched)
+            exchange_latest_open = fetched[-1].t
+        else:
+            exchange_latest_open = entry.candles[-1].t
+
+    if exchange_latest_open is None and entry.candles:
+        exchange_latest_open = entry.candles[-1].t
+
+    if exchange_latest_open is None:
+        return {"symbol": symbol.upper(), "tf": timeframe, "candles": [], "last_ts": None}
+
+    end_ms = compute_window_end_from_store_or_exchange(
+        entry,
+        interval_ms=interval_ms,
+        exchange_latest_open=exchange_latest_open,
+    )
+    start_ms = end_ms - candles_required * interval_ms
+
+    candles = await slice_or_fetch_missing(
+        symbol,
+        timeframe,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        fetcher=fetcher_fn,
+        limit=candles_required,
+    )
+
+    payload = {
+        "symbol": symbol.upper(),
+        "tf": timeframe,
+        "candles": [candle.as_dict() for candle in candles],
+        "last_ts": candles[-1].t if candles else None,
+    }
+    return payload
+
+
+def fetch_ohlcv_sync(
+    symbol: str,
+    timeframe: str,
+    *,
+    hours: int | None = None,
+) -> Dict[str, object]:
+    """Synchronous helper for fetching OHLC candles."""
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(fetch_ohlcv(symbol, timeframe, hours=hours))
+
+    result_holder: list[Dict[str, object] | Exception] = []
+
+    def _runner() -> None:
+        try:
+            outcome = asyncio.run(fetch_ohlcv(symbol, timeframe, hours=hours))
+        except Exception as exc:  # pragma: no cover - defensive re-raise
+            result_holder.append(exc)
+        else:
+            result_holder.append(outcome)
+
+    thread = threading.Thread(target=_runner, name="fetch_ohlcv_sync", daemon=True)
+    thread.start()
+    thread.join()
+
+    if not result_holder:
+        raise RuntimeError("fetch_ohlcv_sync thread did not return a result")
+
+    outcome = result_holder[0]
+    if isinstance(outcome, Exception):
+        raise outcome
+    return outcome
+
+
+def _limit_window(interval_ms: int, window: timedelta) -> int:
+    candles_required = max(1, math.ceil(window.total_seconds() * 1000 / interval_ms))
+    return min(1_000, candles_required)
+
+
+def _prepare_index(
+    raw_rows: Iterable[Mapping[str, object] | Sequence[object]]
+) -> tuple[MutableMapping[int, Candle], List[int]]:
+    candles_by_time: MutableMapping[int, Candle] = {}
+    duplicates: List[int] = []
+    for row in raw_rows:
+        candle = _to_candle_mapping(row)
+        if candle is None:
+            continue
+        if candle.t in candles_by_time:
+            duplicates.append(candle.t)
+        candles_by_time[candle.t] = candle
+    return candles_by_time, duplicates
+
+
+def normalise_ohlcv(
+    symbol: str,
+    timeframe: str,
+    raw_rows: Sequence[Mapping[str, object] | Sequence[object]],
+    *,
+    include_diagnostics: bool = False,
+    use_full_span: bool = False,
+) -> Dict[str, object]:
+    """Normalise raw OHLC candles gathered by the frontend into aligned bars."""
+
+    timeframe = timeframe.lower()
+    if timeframe not in TIMEFRAME_WINDOWS:
+        raise ValueError(f"Unsupported timeframe: {timeframe}")
+
+    interval_ms = TIMEFRAME_TO_MS[timeframe]
+    window = TIMEFRAME_WINDOWS[timeframe]
+    candles_by_time, duplicate_times = _prepare_index(raw_rows)
+    limit_default = _limit_window(interval_ms, window)
+    if not candles_by_time:
+        payload: Dict[str, object] = {
+            "symbol": symbol.upper(),
+            "tf": timeframe,
+            "candles": [],
+        }
+        if include_diagnostics:
+            payload["diagnostics"] = {
+                "interval_ms": interval_ms,
+                "expected_candles": limit_default,
+                "unique_candles": 0,
+                "duplicates": duplicate_times,
+                "missing_bars": [],
+                "series": [],
+            }
+        return payload
+
+    ordered_times = sorted(candles_by_time)
+    last_open_ms = _align_to_interval(ordered_times[-1], interval_ms)
+    first_open_ms = _align_to_interval(ordered_times[0], interval_ms)
+    span_candles = max(1, (last_open_ms - first_open_ms) // interval_ms + 1)
+    if use_full_span:
+        limit = span_candles
+    else:
+        limit = min(limit_default, span_candles)
+    start_open_ms = last_open_ms - (limit - 1) * interval_ms
+
+    normalized: List[Candle] = []
+    missing_records: List[Dict[str, float | int]] = []
+    previous_close = None
+    fallback_close = candles_by_time[ordered_times[0]].c
+
+    for offset in range(limit):
+        open_time = start_open_ms + offset * interval_ms
+        candle = candles_by_time.get(open_time)
+        if candle is None:
+            fill_close = previous_close if previous_close is not None else fallback_close
+            candle = Candle(
+                t=open_time,
+                o=fill_close,
+                h=fill_close,
+                l=fill_close,
+                c=fill_close,
+                v=0.0,
+                missing=True,
+            )
+            missing_records.append({"t": open_time, "filled_with": fill_close})
+        else:
+            previous_close = candle.c
+        normalized.append(candle)
+
+    export_candles = [candle.as_dict() for candle in normalized]
+    last_candle = normalized[-1]
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    next_close_ms = last_candle.t + interval_ms
+
+    payload: Dict[str, object] = {
+        "symbol": symbol.upper(),
+        "tf": timeframe,
+        "candles": export_candles,
+        "last_price": last_candle.c,
+        "last_ts": last_candle.t,
+        "next_close_ts": next_close_ms,
+        "time_to_close_ms": max(0, next_close_ms - now_ms),
+    }
+
+    if include_diagnostics:
+        diagnostics = {
+            "interval_ms": interval_ms,
+            "expected_candles": limit,
+            "unique_candles": len(candles_by_time),
+            "duplicates": sorted(set(duplicate_times)),
+            "missing_bars": missing_records,
+            "series": [candle.as_dict(include_missing=True) for candle in normalized],
+        }
+        payload["diagnostics"] = diagnostics
+
+    return payload
+
+
+def normalise_ohlcv_sync(
+    symbol: str,
+    timeframe: str,
+    raw_rows: Sequence[Mapping[str, object] | Sequence[object]],
+    *,
+    include_diagnostics: bool = False,
+    use_full_span: bool = False,
+) -> Dict[str, object]:
+    """Synchronous helper for normalising OHLCV snapshots."""
+
+    return normalise_ohlcv(
+        symbol,
+        timeframe,
+        raw_rows,
+        include_diagnostics=include_diagnostics,
+        use_full_span=use_full_span,
+    )
+
+
+@dataclass(slots=True)
+class CandleCache:
+    """In-memory cache of Binance OHLC candles."""
+
+    interval_ms: int
+    candles: List["Candle"] = field(default_factory=list)
+
+
+_CANDLE_CACHE: Dict[Tuple[str, str], CandleCache] = {}
+
