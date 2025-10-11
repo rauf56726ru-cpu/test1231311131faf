@@ -71,6 +71,7 @@ def test_breaker_block_detected_after_bos_retest() -> None:
     assert block["status"] == "tapped"
     assert block["range"][0] == pytest.approx(99.0)
     assert block["range"][1] == pytest.approx(100.0)
+    assert 0.0 < block.get("confidence", 0.0) <= 1.0
 
 
 def test_mitigation_block_uses_unfilled_body() -> None:
@@ -160,8 +161,23 @@ def test_reversal_block_after_liquidity_grab() -> None:
     assert block["bot"] <= block["top"] + 1e-9
     assert block["mid"] == pytest.approx((block["bot"] + block["top"]) / 2)
     assert block["status"] == "fresh"
+    assert 0.0 < block.get("confidence", 0.0) <= 1.0
     assert stats["rb_raw_count"] == 1
     flow = stats.get("rb_flow", {})
     assert flow.get("eq_found", 0) >= 1
     assert flow.get("impulse", 0) >= 1
     assert not stats.get("base_fallback_used", False)
+    pb_metrics = stats.get("pb_metrics", {})
+    assert pb_metrics.get("built", 0) >= 1
+    pb_trace = stats.get("pb_trace", [])
+    assert any(entry.get("reason_code") == "built" for entry in pb_trace)
+    assert any(entry.get("stage") == "impulse" for entry in stats.get("trace", []) if entry.get("tf") == "15m")
+
+
+def test_smc_reports_no_eq_reason() -> None:
+    candles = [make_15m_candle(idx, 100.0 + idx, 100.0 + idx, 99.0 + idx, 100.0 + idx) for idx in range(6)]
+    config = SMCConfig(min_block_size=0.2, ttl_bars=5)
+    blocks, diagnostics = detect_smc_blocks(candles, timeframe="15m", config=config)
+    assert blocks == []
+    pb_trace = diagnostics.get("pb_trace", [])
+    assert any(entry.get("reason_code") == "no_eq" for entry in pb_trace)

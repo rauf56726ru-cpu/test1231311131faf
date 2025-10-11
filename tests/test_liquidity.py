@@ -122,6 +122,14 @@ def test_liquidity_detects_equal_levels_and_sweeps() -> None:
     summary = diagnostics.get("summary")
     assert isinstance(summary, dict)
     assert summary.get("eqh") == len(eqh_levels)
+    assert summary.get("eqh_filtered") == len(eqh_levels)
+    assert summary.get("eqh_raw") >= len(eqh_levels)
+    assert isinstance(summary.get("eqh_reasons"), list)
+    assert summary.get("has_degraded") is False
+    metrics_block = diagnostics.get("metrics")
+    assert isinstance(metrics_block, dict)
+    assert metrics_block.get("raw_candidates_eqh") >= len(eqh_levels)
+    assert metrics_block.get("tick_size_unresolved") == 0
     levels_diag = diagnostics.get("levels")
     assert isinstance(levels_diag, dict)
     tf_diag = levels_diag.get("15m")
@@ -136,10 +144,22 @@ def test_liquidity_detects_equal_levels_and_sweeps() -> None:
     assert eql_diag.get("pairs_within_tol_before_cluster") == eql_diag.get("pairs_within_tol")
     assert isinstance(eqh_diag.get("sample_pairs_top10"), list)
     assert isinstance(eql_diag.get("sample_pairs_top10"), list)
+    assert eqh_diag.get("raw_count") >= eqh_diag.get("filtered_count")
+    assert eql_diag.get("raw_count") >= eql_diag.get("filtered_count")
+    assert isinstance(eqh_diag.get("reason_histogram"), dict)
+    assert isinstance(eql_diag.get("reason_histogram"), dict)
+    candidates = liquidity.get("candidates")
+    assert isinstance(candidates, dict)
+    eqh_candidates = candidates.get("eqh")
+    assert isinstance(eqh_candidates, list)
+    assert any(not entry.get("rejected") for entry in eqh_candidates)
+    eql_candidates = candidates.get("eql")
+    assert isinstance(eql_candidates, list)
+    assert any(not entry.get("rejected") for entry in eql_candidates)
     tick_diag = diagnostics.get("tick_size")
     assert isinstance(tick_diag, dict)
     assert tick_diag.get("normalized_symbol") == "BTCUSDT"
-    assert tick_diag.get("source") in {"hardcoded", "exchange", "auto"}
+    assert tick_diag.get("source") == "param"
     assert tick_diag.get("value") == 0.1
 
 
@@ -176,6 +196,13 @@ def test_liquidity_respects_atr_tolerance() -> None:
     summary = diagnostics.get("summary")
     assert isinstance(summary, dict)
     assert summary.get("sweeps") == 0
+    assert summary.get("eqh_raw") >= summary.get("eqh_filtered")
+    metrics_block = diagnostics.get("metrics")
+    assert isinstance(metrics_block, dict)
+    assert metrics_block.get("raw_candidates_eqh") >= len(liquidity["eqh"])
+    candidates = liquidity.get("candidates")
+    assert isinstance(candidates, dict)
+    assert isinstance(candidates.get("eqh"), list)
 
 
 
@@ -238,6 +265,7 @@ def test_liquidity_aggregates_minute_seed() -> None:
     summary = diagnostics.get("summary")
     assert isinstance(summary, dict)
     assert summary.get("eqh") == len(liquidity["eqh"])
+    assert isinstance(summary.get("degraded_timeframes"), list)
 
 
 def test_liquidity_detects_pdh_pdl_sweeps_from_minute_seed() -> None:
@@ -268,13 +296,13 @@ def test_liquidity_detects_pdh_pdl_sweeps_from_minute_seed() -> None:
         symbol="BTCUSDT",
         tick_size=1.0,
         selection={"end": selection_end},
-            config={
-                "r_ticks": 2,
-                "lookback": 10,
-                "swing_window": 1,
-                "atr_period": 3,
-                "sweep_atr_multiplier": 2.0,
-            },
+        config={
+            "r_ticks": 2,
+            "lookback": 10,
+            "swing_window": 1,
+            "atr_period": 3,
+            "sweep_atr_multiplier": 2.0,
+        },
     )
 
     sweeps = liquidity["sweeps"]
@@ -315,4 +343,3 @@ def test_build_equal_liquidity_levels_detects_second_touch() -> None:
     expected_low_price = (lows[4] + lows[10]) / 2.0
     assert abs(eqh_entry["price"] - expected_high_price) < 1e-6
     assert abs(eql_entry["price"] - expected_low_price) < 1e-6
-

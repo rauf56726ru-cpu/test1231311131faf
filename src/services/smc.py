@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence
 
 
@@ -25,6 +25,23 @@ class SMCConfig:
     base_max_atr: float = 0.8
     base_min_overlap: float = 0.5
     impulse_min_cover: float = 0.6
+    allow_bos_substitute: bool = True
+    sweep_choch_max_bars: dict[str, int] = field(
+        default_factory=lambda: {"15m": 12, "1h": 20, "4h": 28}
+    )
+    sweep_choch_default_max_bars: int = 16
+    sweep_choch_extension_factor: float = 1.5
+    opposite_bos_max_bars: dict[str, int] = field(
+        default_factory=lambda: {"15m": 12, "1h": 18, "4h": 24}
+    )
+    opposite_bos_default_max_bars: int = 14
+    block_dedup_strategy: str = "priority"
+    dedup_weight_tf: float = 0.5
+    dedup_weight_recency: float = 0.3
+    dedup_weight_confidence: float = 0.2
+    feature_strict_legacy_mode: bool = False
+    feature_extended_windows: bool = True
+    feature_block_scored_dedup: bool = True
 
 
 def _candle_body_range(candle: Mapping[str, float]) -> tuple[float, float]:
@@ -338,11 +355,53 @@ def _timeframe_priority(timeframe: str | None) -> float:
     return magnitude * weight
 
 
+def _block_score(
+    block: Mapping[str, object],
+    *,
+    latest_idx: int,
+    weights: Mapping[str, float],
+) -> float:
+    tf_rank = _timeframe_priority(str(block.get("tf") or ""))
+    tf_component = 0.0
+    if tf_rank > 0.0:
+        tf_component = min(tf_rank / 10080.0, 1.0)
+
+    created_idx = int(block.get("_created_idx", latest_idx))
+    recency_component = 0.0
+    if latest_idx > 0:
+        recency_component = 1.0 - min(max(latest_idx - created_idx, 0) / latest_idx, 1.0)
+
+    try:
+        confidence_component = float(block.get("confidence", 1.0))
+    except (TypeError, ValueError):
+        confidence_component = 1.0
+    confidence_component = max(0.0, min(confidence_component, 1.0))
+
+    tf_weight = max(0.0, float(weights.get("tf", 0.0)))
+    recency_weight = max(0.0, float(weights.get("recency", 0.0)))
+    confidence_weight = max(0.0, float(weights.get("confidence", 0.0)))
+    total_weight = tf_weight + recency_weight + confidence_weight
+    if total_weight <= 0.0:
+        total_weight = 1.0
+        tf_weight = 0.5
+        recency_weight = 0.3
+        confidence_weight = 0.2
+
+    return (
+        tf_weight * tf_component
+        + recency_weight * recency_component
+        + confidence_weight * confidence_component
+    ) / total_weight
+
+
 def _deduplicate_blocks(
     blocks: List[MutableMapping[str, object]],
     block: MutableMapping[str, object],
     *,
     priorities: Mapping[str, int] | None = None,
+    strategy: str = "priority",
+    weights: Mapping[str, float] | None = None,
+    latest_idx: int = 0,
     trace: List[Dict[str, object]] | None = None,
 ) -> tuple[bool, str | None]:
     direction = block.get("type")
@@ -414,28 +473,60 @@ def _deduplicate_blocks(
 
         replace_existing = False
         reject_reason: str | None = None
-        existing_tf = existing.get("tf")
-        existing_tf_rank = _timeframe_priority(
-            str(existing_tf) if existing_tf is not None else None
-        )
-        if new_tf_rank > existing_tf_rank:
-            kept_label = new_kind.upper() or new_kind
-            replace_existing = True
-        elif abs(new_tf_rank - existing_tf_rank) <= 1e-9:
-            if new_len > existing_len + 1e-12:
+        if strategy == "scored":
+            score_weights = weights or {}
+            existing_score = _block_score(existing, latest_idx=latest_idx, weights=score_weights)
+            new_score = _block_score(block, latest_idx=latest_idx, weights=score_weights)
+            block["score"] = new_score
+            existing["score"] = existing_score
+            if new_score > existing_score + 1e-9:
                 kept_label = new_kind.upper() or new_kind
                 replace_existing = True
-            elif abs(new_len - existing_len) <= 1e-12 and new_created >= int(
-                existing.get("created_at", 0)
-            ):
+            elif new_score < existing_score - 1e-9:
+                reject_reason = "dedup_score_loss" if new_kind == "rb" else None
+            else:
+                existing_tf = existing.get("tf")
+                existing_tf_rank = _timeframe_priority(
+                    str(existing_tf) if existing_tf is not None else None
+                )
+                if new_tf_rank > existing_tf_rank:
+                    kept_label = new_kind.upper() or new_kind
+                    replace_existing = True
+                elif abs(new_tf_rank - existing_tf_rank) <= 1e-9:
+                    if new_len > existing_len + 1e-12:
+                        kept_label = new_kind.upper() or new_kind
+                        replace_existing = True
+                    elif abs(new_len - existing_len) <= 1e-12 and new_created >= int(
+                        existing.get("created_at", 0)
+                    ):
+                        kept_label = new_kind.upper() or new_kind
+                        replace_existing = True
+        else:
+            existing_tf = existing.get("tf")
+            existing_tf_rank = _timeframe_priority(
+                str(existing_tf) if existing_tf is not None else None
+            )
+            if new_tf_rank > existing_tf_rank:
                 kept_label = new_kind.upper() or new_kind
                 replace_existing = True
+            elif abs(new_tf_rank - existing_tf_rank) <= 1e-9:
+                if new_len > existing_len + 1e-12:
+                    kept_label = new_kind.upper() or new_kind
+                    replace_existing = True
+                elif abs(new_len - existing_len) <= 1e-12 and new_created >= int(
+                    existing.get("created_at", 0)
+                ):
+                    kept_label = new_kind.upper() or new_kind
+                    replace_existing = True
         if trace is not None:
             trace.append(
                 {
                     "type": existing_kind.upper() or existing_kind,
                     "overlap_pct": float(coverage),
                     "kept": kept_label,
+                    "strategy": strategy,
+                    "new_score": block.get("score"),
+                    "existing_score": existing.get("score"),
                 }
             )
         if replace_existing:
@@ -479,7 +570,11 @@ def detect_smc_blocks(
         "rb_impulse_ok": False,
         "rb_impulse_diag": {},
         "bb_flow": {"ob_found": 0, "invalidated": 0, "opposite_bos": 0},
-        "bb_reject": {"no_ob": 0, "no_invalidation": 0, "no_opposite_bos": 0},
+        "bb_reject": {"no_ob": 0, "no_invalidation": 0, "no_opposite_bos": 0, "proximity_fail": 0},
+        "pb_metrics": {"attempts": 0, "built": 0, "by_tf": {}},
+        "pb_trace": [],
+        "sweep_to_choch_bars": [],
+        "trace": [],
     }
     rb_debug: Dict[str, Any] = diagnostics.setdefault("rb_debug", {})
 
@@ -487,11 +582,33 @@ def detect_smc_blocks(
         return [], diagnostics
 
     cfg = config or SMCConfig()
+    if cfg.feature_strict_legacy_mode:
+        cfg.feature_extended_windows = False
+        cfg.feature_block_scored_dedup = False
+        cfg.allow_bos_substitute = False
+        cfg.block_dedup_strategy = "priority"
+        cfg.sweep_choch_extension_factor = 1.0
+    if not cfg.feature_extended_windows:
+        cfg.sweep_choch_extension_factor = 1.0
+    if not cfg.feature_block_scored_dedup:
+        cfg.block_dedup_strategy = "priority"
+    dedup_strategy = (cfg.block_dedup_strategy or "priority").lower()
+    if cfg.feature_block_scored_dedup and dedup_strategy == "priority":
+        dedup_strategy = "scored"
+    if dedup_strategy not in {"priority", "scored"}:
+        dedup_strategy = "priority"
     structure_events = _normalise_events(structure_flags)
     base_ob_zones = _normalise_ob_zones(ob_zones)
     liquidity = _liquidity_levels(liquidity_levels)
 
     blocks: List[MutableMapping[str, object]] = []
+
+    latest_idx = len(candles) - 1 if candles else 0
+    dedup_weights = {
+        "tf": max(0.0, float(cfg.dedup_weight_tf)),
+        "recency": max(0.0, float(cfg.dedup_weight_recency)),
+        "confidence": max(0.0, float(cfg.dedup_weight_confidence)),
+    }
 
     window_start_ms = cfg.zones_window_start_ms
     window_end_ms = cfg.window_end_ms_prev_closed
@@ -541,11 +658,15 @@ def detect_smc_blocks(
         if extra:
             for key, value in extra.items():
                 block[key] = value
+        block.setdefault("confidence", float(block.get("confidence", 1.0)))
         trace_list: List[Dict[str, object]] | None = [] if trace is not None else None
         appended, reject = _deduplicate_blocks(
             blocks,
             block,
             priorities=block_priorities,
+            strategy=dedup_strategy,
+            weights=dedup_weights,
+            latest_idx=latest_idx,
             trace=trace_list,
         )
         if appended:
@@ -563,6 +684,16 @@ def detect_smc_blocks(
     # Breaker Blocks
     bb_flow: Dict[str, int] = diagnostics.get("bb_flow", {})
     bb_reject: Dict[str, int] = diagnostics.get("bb_reject", {})
+    opposite_limit_base = cfg.opposite_bos_max_bars.get(timeframe) if isinstance(cfg.opposite_bos_max_bars, Mapping) else None
+    if opposite_limit_base is None and isinstance(cfg.opposite_bos_max_bars, Mapping):
+        opposite_limit_base = cfg.opposite_bos_max_bars.get("default")
+    if opposite_limit_base is None:
+        opposite_limit_base = cfg.opposite_bos_default_max_bars
+    opposite_limit_base = max(1, int(opposite_limit_base))
+    opposite_limit_soft = int(round(opposite_limit_base * max(1.0, cfg.sweep_choch_extension_factor)))
+    opposite_limit_extended = opposite_limit_soft
+    soft_cap = int(round(opposite_limit_extended * 1.5))
+
     for zone in base_ob_zones:
         direction = _direction_from_zone(zone.get("type"))
         if direction not in {"supply", "demand"}:
@@ -600,6 +731,7 @@ def detect_smc_blocks(
         bb_flow["invalidated"] = bb_flow.get("invalidated", 0) + 1
         invalidation_ts = int(candles[invalidation_idx]["t"])
         desired_direction = _opposite_direction(direction)
+        bb_confidence = 1.0
         bos_event: Mapping[str, object] | None = None
         for event in structure_events:
             if str(event.get("kind")) != "bos":
@@ -615,8 +747,15 @@ def detect_smc_blocks(
             event_idx = _find_candle_index_by_ts(candles, int(event.get("t", 0)))
             if event_idx is None:
                 continue
-            if event_idx - invalidation_idx > 20:
-                continue
+            distance = event_idx - invalidation_idx
+            if distance > opposite_limit_extended:
+                if cfg.feature_extended_windows and distance <= max(opposite_limit_extended, soft_cap):
+                    bb_flow.setdefault("opposite_bos_soft", 0)
+                    bb_flow["opposite_bos_soft"] += 1
+                    bb_confidence = max(0.2, opposite_limit_extended / max(distance, 1))
+                else:
+                    bb_reject["proximity_fail"] = bb_reject.get("proximity_fail", 0) + 1
+                    continue
             bos_event = event
             break
         if bos_event is None:
@@ -631,6 +770,7 @@ def detect_smc_blocks(
             created_idx=bos_idx,
             direction=desired_direction,
             created_at=bos_ts,
+            extra={"confidence": bb_confidence},
         )
     if bb_flow.get("ob_found", 0) == 0:
         bb_reject["no_ob"] = max(bb_reject.get("no_ob", 0), 1)
@@ -742,9 +882,6 @@ def detect_smc_blocks(
     choch_events_window = [
         event for event in structure_events_window if str(event.get("kind")) == "choch"
     ]
-    if not choch_events_window:
-        diagnostics["rb_reject_no_choch"] = max(diagnostics["rb_reject_no_choch"], 1)
-        reject_counters["no_choch"] = max(reject_counters.get("no_choch", 0), 1)
 
     def _pivot_span_for_tf(label: str) -> int:
         if label == "1h":
@@ -804,6 +941,35 @@ def detect_smc_blocks(
     if not eq_candidates:
         diagnostics["rb_reject_no_eq"] = max(diagnostics["rb_reject_no_eq"], 1)
         reject_counters["no_eq"] = max(reject_counters.get("no_eq", 0), 1)
+        diagnostics.setdefault("pb_trace", []).append({"tf": timeframe, "stage": "eq", "reason_code": "no_eq"})
+
+    stage_counts = {
+        "eq": {"in": len(eq_candidates), "out": len(eq_candidates)},
+        "sweep": {"in": len(eq_candidates), "out": 0},
+        "structure": {"in": 0, "out": 0},
+        "base": {"in": 0, "out": 0},
+        "impulse": {"in": 0, "out": 0},
+    }
+    sweep_success = 0
+    structure_success = 0
+    base_success = 0
+    impulse_success = 0
+    sweep_limit_base = cfg.sweep_choch_max_bars.get(timeframe) if isinstance(cfg.sweep_choch_max_bars, Mapping) else None
+    if sweep_limit_base is None and isinstance(cfg.sweep_choch_max_bars, Mapping):
+        sweep_limit_base = cfg.sweep_choch_max_bars.get("default")
+    if sweep_limit_base is None:
+        sweep_limit_base = cfg.sweep_choch_default_max_bars
+    sweep_limit_base = max(1, int(sweep_limit_base))
+    sweep_limit_extended = int(round(sweep_limit_base * max(1.0, cfg.sweep_choch_extension_factor)))
+    sweep_hist_local: List[Dict[str, Any]] = []
+    pb_metrics_block = diagnostics["pb_metrics"]
+    pb_trace_list = diagnostics["pb_trace"]
+    metrics_by_tf = pb_metrics_block["by_tf"].setdefault(timeframe, {"attempts": 0, "built": 0})
+
+    bos_events_window = [event for event in structure_events_window if str(event.get("kind")) == "bos"]
+    if not choch_events_window and not (cfg.allow_bos_substitute and bos_events_window):
+        diagnostics["rb_reject_no_choch"] = max(diagnostics["rb_reject_no_choch"], 1)
+        reject_counters["no_choch"] = max(reject_counters.get("no_choch", 0), 1)
 
     def _range_block_base(
         sweep_idx: int, choch_idx: int, direction: str
@@ -927,6 +1093,36 @@ def detect_smc_blocks(
         return None
 
     for eq_entry in eq_candidates:
+        pb_metrics_block["attempts"] = pb_metrics_block.get("attempts", 0) + 1
+        metrics_by_tf["attempts"] = metrics_by_tf.get("attempts", 0) + 1
+        pb_record: Dict[str, Any] = {
+            "tf": timeframe,
+            "eq_type": eq_entry.get("type"),
+            "eq_idx": int(eq_entry.get("second_idx", -1)),
+            "stage": "eq",
+            "reason_code": None,
+            "bars": {},
+        }
+        block_confidence = 1.0
+
+        def _push_pb_trace(reason: str, stage: str) -> None:
+            pb_record["reason_code"] = reason
+            pb_record["stage"] = stage
+            entry: Dict[str, Any] = {
+                "tf": pb_record.get("tf"),
+                "eq_type": pb_record.get("eq_type"),
+                "eq_idx": pb_record.get("eq_idx"),
+                "stage": stage,
+                "reason_code": reason,
+                "bars": dict(pb_record.get("bars", {})),
+            }
+            flags = pb_record.get("flags")
+            if isinstance(flags, list) and flags:
+                entry["flags"] = list(flags)
+            confidence_value = pb_record.get("confidence")
+            if confidence_value is not None:
+                entry["confidence"] = confidence_value
+            pb_trace_list.append(entry)
         flow_counters["eq_found"] = flow_counters.get("eq_found", 0) + 1
         trend_direction = "up" if eq_entry["type"] == "eql" else "down"
         block_direction = "demand" if trend_direction == "up" else "supply"
@@ -938,6 +1134,7 @@ def detect_smc_blocks(
         sweep_idx: int | None = None
         recovery_idx: int | None = None
         start_idx = int(eq_entry["second_idx"]) + 1
+        stage_counts["sweep"]["in"] += 1
         for idx in range(start_idx, len(candles)):
             ts_idx = int(candles[idx]["t"])
             if window_end_ms is not None and ts_idx > window_end_ms:
@@ -991,15 +1188,23 @@ def detect_smc_blocks(
         if sweep_idx is None or recovery_idx is None:
             diagnostics["rb_reject_no_sweep"] += 1
             reject_counters["no_sweep"] = reject_counters.get("no_sweep", 0) + 1
+            _push_pb_trace("no_sweep", "sweep")
             continue
 
         flow_counters["sweep"] = flow_counters.get("sweep", 0) + 1
         rb_debug["last_sweep_idx"] = sweep_idx
         rb_debug["last_recovery_idx"] = recovery_idx
+        stage_counts["sweep"]["out"] += 1
+        sweep_success += 1
+        pb_record["stage"] = "sweep"
+        pb_record.setdefault("bars", {})["sweep_idx"] = int(sweep_idx)
+        pb_record.setdefault("bars", {})["recovery_idx"] = int(recovery_idx)
 
         min_choch_idx = sweep_idx + 1
         choch_event: Mapping[str, object] | None = None
         choch_idx: int | None = None
+        structure_kind = "choch"
+        stage_counts["structure"]["in"] += 1
         for event in choch_events_window:
             event_dir = _normalise_direction_label(event.get("direction"))
             if trend_direction == "up" and event_dir not in {"up", "demand"}:
@@ -1016,9 +1221,30 @@ def detect_smc_blocks(
             choch_idx = event_idx
             break
 
+        if (choch_event is None or choch_idx is None) and cfg.allow_bos_substitute:
+            for event in bos_events_window:
+                event_dir = _normalise_direction_label(event.get("direction"))
+                if trend_direction == "up" and event_dir not in {"up", "demand"}:
+                    continue
+                if trend_direction == "down" and event_dir not in {"down", "supply"}:
+                    continue
+                event_ts = int(event.get("t", 0))
+                event_idx = _find_candle_index_by_ts(candles, event_ts)
+                if event_idx is None or event_idx < min_choch_idx:
+                    continue
+                if window_end_ms is not None and event_ts > window_end_ms:
+                    continue
+                choch_event = event
+                choch_idx = event_idx
+                structure_kind = "bos"
+                block_confidence *= 0.85
+                pb_record.setdefault("flags", []).append("bos_substitute")
+                break
+
         if choch_event is None or choch_idx is None:
             diagnostics["rb_reject_no_choch"] += 1
             reject_counters["no_choch"] = reject_counters.get("no_choch", 0) + 1
+            _push_pb_trace("no_structure", "structure")
             continue
 
         if window_start_ms is not None:
@@ -1028,25 +1254,51 @@ def detect_smc_blocks(
 
         flow_counters["choch"] = flow_counters.get("choch", 0) + 1
         rb_debug["last_choch_idx"] = choch_idx
+        rb_debug["structure_kind"] = structure_kind
+        distance_bars = max(1, choch_idx - sweep_idx)
+        rb_debug["sweep_to_choch_bars"] = distance_bars
+        pb_record.setdefault("bars", {})["sweep_to_structure"] = distance_bars
+        sweep_hist_local.append({"tf": timeframe, "bars": distance_bars, "limit": sweep_limit_extended, "kind": structure_kind})
+        if distance_bars > sweep_limit_extended:
+            if cfg.feature_extended_windows:
+                adjustment = max(1.0, distance_bars / max(sweep_limit_extended, 1))
+                block_confidence *= max(0.2, 1.0 / adjustment)
+                pb_record.setdefault("flags", []).append("structure_extended")
+            else:
+                diagnostics["rb_reject_no_choch"] += 1
+                reject_counters["no_choch"] = reject_counters.get("no_choch", 0) + 1
+                _push_pb_trace("sweep_choch_window", "structure")
+                continue
+        stage_counts["structure"]["out"] += 1
+        structure_success += 1
+        pb_record["stage"] = "structure"
+        pb_record["structure_kind"] = structure_kind
 
         base_candidate = _range_block_base(sweep_idx, choch_idx, block_direction)
         fallback_used = False
         choch_ts = int(choch_event.get("t", 0))
+        stage_counts["base"]["in"] += 1
         if base_candidate is None and cfg.allow_base_fallback:
             base_candidate = _fallback_ob_base(
                 block_direction, choch_idx, choch_ts, eq_price
             )
             if base_candidate is not None:
                 fallback_used = True
+                block_confidence *= 0.9
+                pb_record.setdefault("flags", []).append("base_fallback")
 
         if base_candidate is None:
             diagnostics["rb_reject_no_base"] += 1
             reject_counters["no_base"] = reject_counters.get("no_base", 0) + 1
+            _push_pb_trace("no_base", "base")
             continue
 
         flow_counters["base"] = flow_counters.get("base", 0) + 1
         if fallback_used:
             diagnostics["base_fallback_used"] = True
+        stage_counts["base"]["out"] += 1
+        base_success += 1
+        pb_record["stage"] = "base"
 
         base_range, base_idx = base_candidate
         base_span = float(base_range[1] - base_range[0])
@@ -1136,15 +1388,22 @@ def detect_smc_blocks(
             "sigma20": impulse_sigma if math.isfinite(impulse_sigma) else None,
         }
 
+        stage_counts["impulse"]["in"] += 1
         if impulse_idx is None:
             diagnostics["rb_reject_no_impulse"] += 1
             reject_counters["no_impulse"] = reject_counters.get("no_impulse", 0) + 1
+            pb_record["stage"] = "impulse"
+            pb_record["reason_code"] = "no_impulse"
+            pb_trace_list.append(dict(pb_record))
             continue
 
         diagnostics["rb_impulse_ok"] = True
         flow_counters["impulse"] = flow_counters.get("impulse", 0) + 1
         impulse_ts = int(candles[impulse_idx].get("t", choch_ts))
         rb_debug["last_impulse_idx"] = impulse_idx
+        stage_counts["impulse"]["out"] += 1
+        impulse_success += 1
+        pb_record["stage"] = "impulse"
 
         base_low = float(base_range[0])
         base_high = float(base_range[1])
@@ -1179,9 +1438,12 @@ def detect_smc_blocks(
         if span_below_min and not allow_small_span:
             rb_debug["emit_reason"] = "min_range"
             diagnostics["reason"] = "min_range"
+            pb_record.setdefault("flags", []).append("min_range")
+            _push_pb_trace("range_collapse", "impulse")
             continue
 
         overlap_entries: List[Dict[str, object]] = []
+        block_confidence = max(0.05, min(block_confidence, 1.0))
         appended, reject_reason, _ = _append_block(
             kind="rb",
             price_range=(base_low, base_high),
@@ -1194,6 +1456,10 @@ def detect_smc_blocks(
                 "bot": float(rb_bot),
                 "mid": float(rb_mid),
                 "direction": rb_direction,
+                "confidence": block_confidence,
+                "structure_kind": structure_kind,
+                "sweep_to_choch_bars": distance_bars,
+                "range_mode": "unrounded_range" if use_raw_bounds else "rounded",
             },
         )
         rb_debug["overlap_with"] = overlap_entries
@@ -1201,14 +1467,49 @@ def detect_smc_blocks(
             diagnostics["rb_raw_count"] += 1
             rb_debug["emit_reason"] = "emitted"
             diagnostics.pop("reason", None)
+            pb_record["confidence"] = round(block_confidence, 3)
+            _push_pb_trace("built", "complete")
+            pb_metrics_block["built"] = pb_metrics_block.get("built", 0) + 1
+            metrics_by_tf["built"] = metrics_by_tf.get("built", 0) + 1
         else:
             emit_reason = reject_reason or "dedup_priority_loss"
             rb_debug["emit_reason"] = emit_reason
             diagnostics["reason"] = emit_reason
+            pb_record.setdefault("flags", []).append("dedup")
+            _push_pb_trace(emit_reason, "dedup")
             continue
 
     has_rb = any(block.get("kind") == "rb" for block in blocks)
     has_bb = any(block.get("kind") == "bb" for block in blocks)
+
+    stage_counts["sweep"]["out"] = sweep_success
+    stage_counts["structure"]["out"] = structure_success
+    stage_counts["base"]["out"] = base_success
+    stage_counts["impulse"]["out"] = impulse_success
+    diagnostics.setdefault("sweep_to_choch_bars", []).extend(sweep_hist_local)
+
+    reason_lookup = {
+        "eq": ("rb_reject_no_eq", "no_eq"),
+        "sweep": ("rb_reject_no_sweep", "no_sweep"),
+        "structure": ("rb_reject_no_choch", "no_choch"),
+        "base": ("rb_reject_no_base", "no_base"),
+        "impulse": ("rb_reject_no_impulse", "no_impulse"),
+    }
+    trace_entries = diagnostics.setdefault("trace", [])
+    for stage_key, metrics in stage_counts.items():
+        reject_field, reason_code = reason_lookup.get(stage_key, (None, "ok"))
+        top_reason = "ok"
+        if reject_field and diagnostics.get(reject_field, 0):
+            top_reason = reason_code
+        trace_entries.append(
+            {
+                "tf": timeframe,
+                "stage": stage_key,
+                "in": int(metrics.get("in", 0)),
+                "out": int(metrics.get("out", 0)),
+                "top_reason": top_reason,
+            }
+        )
 
     if not has_rb:
         reason: str | None = None

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -21,6 +22,8 @@ _SYMBOL_SUFFIXES: tuple[str, ...] = ("PERP",)
 SWEEP_CAP_PCT = 0.004
 
 LOGGER = logging.getLogger(__name__)
+LIQUIDITY_COUNTERS: Counter[str] = Counter()
+MIN_FALLBACK_TICK = 1e-6
 
 
 @dataclass(slots=True)
@@ -32,6 +35,19 @@ class LiquidityConfig:
     r_ticks: int = 5
     atr_period: int = 14
     sweep_atr_multiplier: float = 0.3
+    tolerance_eqh_ticks: float | None = None
+    tolerance_eql_ticks: float | None = None
+    min_points_dynamic: bool = True
+    min_points_alpha: float = 2.0
+    min_points_floor: int = 3
+    merge_clusters: bool = True
+    merge_ticks: float = 3.0
+    merge_overlap_ratio: float = 0.6
+    enable_resample_when_sparse: bool = True
+    degraded_window_floor: int = 1
+    feature_strict_legacy_mode: bool = False
+    feature_relaxed_clustering: bool = True
+    feature_extended_resample: bool = True
 
 
 def _coerce_float(value: Any) -> float | None:
@@ -297,31 +313,57 @@ def resolve_liquidity_tick_size(
     inferred_tick = _infer_tick_size_from_frames(frames)
 
     tick_size: float | None = None
-    tick_source = "auto"
+    tick_source = "unknown"
 
-    if isinstance(hardcoded_tick, (int, float)) and hardcoded_tick > 0:
-        tick_size = float(hardcoded_tick)
-        tick_source = "hardcoded"
-    elif profile_numeric is not None and profile_numeric > 0:
+    if profile_numeric is not None and profile_numeric > 0:
         tick_size = float(profile_numeric)
-        tick_source = "profile"
-    elif exchange_tick is not None and exchange_tick > 0:
-        tick_size = float(exchange_tick)
-        tick_source = "exchange"
-    elif inferred_tick is not None and inferred_tick > 0:
-        tick_size = float(inferred_tick)
-        tick_source = "auto"
+        tick_source = "param"
+        if exchange_tick and not math.isclose(float(exchange_tick), tick_size, rel_tol=1e-9, abs_tol=1e-12):
+            log.debug(
+                "Exchange tick size differs from explicit parameter",
+                extra={
+                    **base_extra,
+                    "tick_size_source": tick_source,
+                    "tick_size": tick_size,
+                    "exchange_tick_size": float(exchange_tick),
+                },
+            )
+    else:
+        if isinstance(hardcoded_tick, (int, float)) and hardcoded_tick > 0:
+            tick_size = float(hardcoded_tick)
+            tick_source = "hardcoded"
+            if exchange_tick and not math.isclose(float(exchange_tick), tick_size, rel_tol=1e-9, abs_tol=1e-12):
+                log.debug(
+                    "Exchange tick size differs from curated fallback",
+                    extra={
+                        **base_extra,
+                        "tick_size_source": tick_source,
+                        "tick_size": tick_size,
+                        "exchange_tick_size": float(exchange_tick),
+                    },
+                )
+        elif exchange_tick is not None and exchange_tick > 0:
+            tick_size = float(exchange_tick)
+            tick_source = "exchange"
+        elif inferred_tick is not None and inferred_tick > 0:
+            tick_size = float(inferred_tick)
+            tick_source = "inferred"
 
     if tick_size is None or tick_size <= 0:
-        log.error(
-            "Unable to resolve positive liquidity tick size",
-            extra={**base_extra, "tick_size_source": "auto"},
+        fallback_tick = inferred_tick if inferred_tick and inferred_tick > 0 else None
+        if fallback_tick is None or fallback_tick <= 0:
+            fallback_tick = MIN_FALLBACK_TICK
+        tick_size = float(fallback_tick)
+        tick_source = "fallback_min"
+        LIQUIDITY_COUNTERS["tick_size_unresolved"] += 1
+        log.warning(
+            "Unable to resolve positive liquidity tick size, using fallback",
+            extra={**base_extra, "tick_size_source": tick_source, "tick_size": tick_size},
         )
-        raise ValueError("Unable to resolve positive liquidity tick size")
 
     if (
         profile_numeric is not None
-        and tick_source != "profile"
+        and tick_source != "param"
         and not math.isclose(profile_numeric, tick_size, rel_tol=1e-12, abs_tol=1e-12)
     ):
         log.warning(
@@ -333,11 +375,15 @@ def resolve_liquidity_tick_size(
                 "profile_tick_size": profile_numeric,
             },
         )
-
-    log.debug(
-        "Resolved liquidity tick size",
-        extra={**base_extra, "tick_size_source": tick_source, "tick_size": tick_size},
-    )
+    elif tick_source == "param":
+        base_extra["tick_size_source"] = tick_source
+        base_extra["tick_size"] = tick_size
+        log.debug("Using explicit liquidity tick size", extra=base_extra)
+    else:
+        log.debug(
+            "Resolved liquidity tick size",
+            extra={**base_extra, "tick_size_source": tick_source, "tick_size": tick_size},
+        )
 
     return tick_size, tick_source
 
@@ -393,14 +439,25 @@ def _append_reason(
 
 
 def _resolve_config(raw: Mapping[str, Any] | None) -> LiquidityConfig:
-    if not isinstance(raw, Mapping):
-        return LiquidityConfig()
-
     config = LiquidityConfig()
+
+    if not isinstance(raw, Mapping):
+        return config
 
     def _positive_int(value: Any, default: int, *, lower: int = 1, upper: int | None = None) -> int:
         try:
             numeric = int(value)
+        except (TypeError, ValueError):
+            return default
+        if numeric < lower:
+            return default
+        if upper is not None and numeric > upper:
+            return upper
+        return numeric
+
+    def _positive_float(value: Any, default: float, *, lower: float = 0.0, upper: float | None = None) -> float:
+        try:
+            numeric = float(value)
         except (TypeError, ValueError):
             return default
         if numeric < lower:
@@ -421,6 +478,118 @@ def _resolve_config(raw: Mapping[str, Any] | None) -> LiquidityConfig:
         numeric = config.sweep_atr_multiplier
     if math.isfinite(numeric) and numeric >= 0:
         config.sweep_atr_multiplier = numeric
+
+    tolerance_section = raw.get("tolerance")
+    if isinstance(tolerance_section, Mapping):
+        eqh = tolerance_section.get("eqh")
+        eql = tolerance_section.get("eql")
+        if eqh is not None:
+            config.tolerance_eqh_ticks = _positive_float(
+                eqh, config.tolerance_eqh_ticks or float(config.r_ticks), lower=0.0, upper=100.0
+            )
+        if eql is not None:
+            config.tolerance_eql_ticks = _positive_float(
+                eql, config.tolerance_eql_ticks or float(config.r_ticks), lower=0.0, upper=100.0
+            )
+    else:
+        if "tolerance_eqh_ticks" in raw:
+            config.tolerance_eqh_ticks = _positive_float(
+                raw.get("tolerance_eqh_ticks"), float(config.r_ticks), lower=0.0, upper=100.0
+            )
+        if "tolerance_eql_ticks" in raw:
+            config.tolerance_eql_ticks = _positive_float(
+                raw.get("tolerance_eql_ticks"), float(config.r_ticks), lower=0.0, upper=100.0
+            )
+
+    min_points_section = raw.get("min_points")
+    if isinstance(min_points_section, Mapping):
+        if "dynamic" in min_points_section:
+            config.min_points_dynamic = bool(min_points_section.get("dynamic"))
+        coefficient = (
+            min_points_section.get("coefficient")
+            or min_points_section.get("alpha")
+            or min_points_section.get("coef")
+        )
+        if coefficient is not None:
+            config.min_points_alpha = _positive_float(
+                coefficient, config.min_points_alpha, lower=0.1, upper=10.0
+            )
+        floor_value = min_points_section.get("min") or min_points_section.get("floor")
+        if floor_value is not None:
+            config.min_points_floor = _positive_int(floor_value, config.min_points_floor, lower=2, upper=10)
+        merge_ticks_value = min_points_section.get("merge_ticks")
+        if merge_ticks_value is not None:
+            config.merge_ticks = _positive_float(
+                merge_ticks_value, config.merge_ticks, lower=0.0, upper=50.0
+            )
+        overlap_value = (
+            min_points_section.get("merge_overlap_ratio")
+            or min_points_section.get("merge_overlap")
+            or min_points_section.get("merge_share")
+        )
+        if overlap_value is not None:
+            config.merge_overlap_ratio = _positive_float(
+                overlap_value, config.merge_overlap_ratio, lower=0.0, upper=1.0
+            )
+        if "merge_clusters" in min_points_section:
+            config.merge_clusters = bool(min_points_section.get("merge_clusters"))
+    else:
+        if "min_points_dynamic" in raw:
+            config.min_points_dynamic = bool(raw.get("min_points_dynamic"))
+        if "min_points_coefficient" in raw:
+            config.min_points_alpha = _positive_float(
+                raw.get("min_points_coefficient"), config.min_points_alpha, lower=0.1, upper=10.0
+            )
+        if "min_points_floor" in raw:
+            config.min_points_floor = _positive_int(
+                raw.get("min_points_floor"), config.min_points_floor, lower=2, upper=10
+            )
+        if "merge_ticks" in raw:
+            config.merge_ticks = _positive_float(raw.get("merge_ticks"), config.merge_ticks, lower=0.0, upper=50.0)
+        if "merge_overlap_ratio" in raw:
+            config.merge_overlap_ratio = _positive_float(
+                raw.get("merge_overlap_ratio"), config.merge_overlap_ratio, lower=0.0, upper=1.0
+            )
+        if "merge_clusters" in raw:
+            config.merge_clusters = bool(raw.get("merge_clusters"))
+
+    if "enable_resample_when_sparse" in raw:
+        config.enable_resample_when_sparse = bool(raw.get("enable_resample_when_sparse"))
+
+    if "degraded_window_floor" in raw:
+        config.degraded_window_floor = _positive_int(
+            raw.get("degraded_window_floor"), config.degraded_window_floor, lower=1, upper=5
+        )
+
+    feature_section = raw.get("feature") or raw.get("features")
+    if isinstance(feature_section, Mapping):
+        if "strict_legacy_mode" in feature_section:
+            config.feature_strict_legacy_mode = bool(feature_section.get("strict_legacy_mode"))
+        if "eql_relaxed_clustering" in feature_section:
+            config.feature_relaxed_clustering = bool(feature_section.get("eql_relaxed_clustering"))
+        if "liquidity_relaxed_clustering" in feature_section:
+            config.feature_relaxed_clustering = bool(feature_section.get("liquidity_relaxed_clustering"))
+        if "extended_resample" in feature_section:
+            config.feature_extended_resample = bool(feature_section.get("extended_resample"))
+
+    if config.feature_strict_legacy_mode:
+        config.feature_relaxed_clustering = False
+        config.feature_extended_resample = False
+        config.min_points_dynamic = False
+        config.merge_clusters = False
+        config.enable_resample_when_sparse = False
+        config.min_points_floor = max(2, config.min_points_floor)
+        config.min_points_alpha = max(2.0, config.min_points_alpha)
+        config.tolerance_eqh_ticks = None
+        config.tolerance_eql_ticks = None
+
+    if not config.feature_relaxed_clustering:
+        config.merge_clusters = False
+        config.min_points_dynamic = False
+        config.min_points_floor = 2
+
+    if not config.feature_extended_resample:
+        config.enable_resample_when_sparse = False
 
     return config
 
@@ -566,8 +735,12 @@ def _cluster_swings(
     tick_size: float | None,
     level_type: str,
     timeframe: str,
+    min_points: int,
+    allow_merge: bool,
+    merge_distance: float,
+    merge_overlap_ratio: float,
     reason_sink: List[Dict[str, Any]] | None = None,
-) -> List[Dict[str, Any]]:
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, int], int]:
     if not swings:
         LOGGER.debug(
             "Skipping swing clustering",
@@ -578,7 +751,7 @@ def _cluster_swings(
             },
         )
         _append_reason(reason_sink, "no_swings")
-        return []
+        return [], [], {}, 0
 
     ordered = sorted(swings, key=lambda item: item.get("t", 0))
     clusters: List[Dict[str, Any]] = []
@@ -606,10 +779,73 @@ def _cluster_swings(
                 }
             )
 
+    merge_operations = 0
+    if (
+        allow_merge
+        and len(clusters) > 1
+        and tolerance > 0.0
+        and tick_size
+        and tick_size > 0.0
+        and merge_distance > 0.0
+        and merge_overlap_ratio > 0.0
+    ):
+        # Repeatedly merge neighbouring clusters that are close in price and share constituents.
+        clusters.sort(key=lambda entry: entry["anchor"])
+        merged = True
+        while merged and len(clusters) > 1:
+            merged = False
+            for idx in range(len(clusters) - 1):
+                left = clusters[idx]
+                for jdx in range(idx + 1, len(clusters)):
+                    right = clusters[jdx]
+                    price_gap = abs(left["anchor"] - right["anchor"])
+                    if price_gap > merge_distance:
+                        break
+                    left_swings = set(left["swings"])
+                    right_swings = set(right["swings"])
+                    if not left_swings or not right_swings:
+                        continue
+                    shared = left_swings & right_swings
+                    overlap_ratio = len(shared) / max(1, min(len(left_swings), len(right_swings)))
+                    if overlap_ratio >= merge_overlap_ratio:
+                        left["prices"].extend(right["prices"])
+                        left["swings"].extend(right["swings"])
+                        left["anchor"] = _quantise(
+                            statistics.median(left["prices"]), tick_size
+                        )
+                        del clusters[jdx]
+                        merge_operations += 1
+                        merged = True
+                        break
+                if merged:
+                    break
+            if merged:
+                clusters.sort(key=lambda entry: entry["anchor"])
+
     payload: List[Dict[str, Any]] = []
+    candidates: List[Dict[str, Any]] = []
+    reason_hist: Counter[str] = Counter()
+
+    required_points = max(2, min_points)
     for cluster in clusters:
         swings_ts = sorted(set(cluster["swings"]))
-        if len(swings_ts) < 2:
+        candidate_entry: Dict[str, Any] = {
+            "type": level_type,
+            "tf": timeframe,
+            "swings": swings_ts,
+            "tolerance": tolerance,
+            "rejected": False,
+            "reason": None,
+            "details": {},
+        }
+        prices = cluster.get("prices", [])
+        level_price_estimate = None
+        if prices:
+            level_price_estimate = statistics.median(prices)
+            level_price_estimate = _quantise(level_price_estimate, tick_size)
+            candidate_entry["price"] = level_price_estimate
+
+        if len(swings_ts) < required_points:
             LOGGER.debug(
                 "Skipping swing cluster due to size",
                 extra={
@@ -617,6 +853,7 @@ def _cluster_swings(
                     "tf": timeframe,
                     "level_type": level_type,
                     "swings": swings_ts,
+                    "required": required_points,
                     "tolerance": tolerance,
                     "tick_size": tick_size,
                 },
@@ -627,13 +864,32 @@ def _cluster_swings(
                 swings=swings_ts,
                 tolerance=tolerance,
                 tick_size=tick_size,
+                required=required_points,
             )
+            candidate_entry["rejected"] = True
+            candidate_entry["reason"] = "min_points_fail"
+            candidate_entry["details"] = {
+                "required": required_points,
+                "observed": len(swings_ts),
+            }
+            candidates.append(candidate_entry)
+            reason_hist["min_points_fail"] += 1
             continue
-        prices = cluster["prices"]
+
         if not prices:
+            candidate_entry["rejected"] = True
+            candidate_entry["reason"] = "no_prices"
+            candidate_entry["details"] = {"swings": swings_ts}
+            candidates.append(candidate_entry)
+            reason_hist["no_prices"] += 1
             continue
-        level_price = statistics.median(prices)
+
+        level_price = level_price_estimate if level_price_estimate is not None else statistics.median(prices)
         level_price = _quantise(level_price, tick_size)
+        candidate_entry["price"] = level_price
+        candidate_entry["reason"] = "kept"
+        candidates.append(candidate_entry)
+        reason_hist["kept"] += 1
         payload.append(
             {
                 "type": level_type,
@@ -643,6 +899,7 @@ def _cluster_swings(
                 "tolerance": tolerance,
             }
         )
+
     if not payload:
         _append_reason(
             reason_sink,
@@ -651,7 +908,10 @@ def _cluster_swings(
             tolerance=tolerance,
             tick_size=tick_size,
         )
-    return payload
+        if not reason_hist:
+            reason_hist["no_clusters"] += 1
+
+    return payload, candidates, dict(reason_hist), merge_operations
 
 
 def _compute_atr_series(
@@ -709,24 +969,52 @@ def _prepare_levels(
     eqh_levels: List[Dict[str, Any]] = []
     eql_levels: List[Dict[str, Any]] = []
 
-    tolerance = 0.0
-    if tick_size and tick_size > 0:
-        tolerance = max(config.r_ticks * tick_size, tick_size)
-
     diagnostics: Dict[str, Any] = {}
+    summary_raw: Dict[str, int] = {"eqh": 0, "eql": 0}
+    summary_filtered: Dict[str, int] = {"eqh": 0, "eql": 0}
+    summary_reasons: Dict[str, Counter[str]] = {"eqh": Counter(), "eql": Counter()}
+    degraded_timeframes: List[str] = []
+
+    tick_value = float(tick_size) if tick_size and tick_size > 0 else 0.0
+    eqh_ticks = float(config.tolerance_eqh_ticks) if config.tolerance_eqh_ticks else float(config.r_ticks or 1)
+    if eqh_ticks <= 0:
+        eqh_ticks = float(config.r_ticks or 1)
+    if config.tolerance_eql_ticks:
+        eql_ticks = float(config.tolerance_eql_ticks)
+    elif config.feature_relaxed_clustering:
+        eql_ticks = max(1.0, eqh_ticks - 1.0)
+    else:
+        eql_ticks = eqh_ticks
+
+    def _ticks_to_tolerance(ticks_value: float) -> float:
+        if tick_value <= 0.0 or ticks_value <= 0.0:
+            return tick_value
+        return max(tick_value, ticks_value * tick_value)
+
+    eqh_tolerance = _ticks_to_tolerance(eqh_ticks)
+    eql_tolerance = _ticks_to_tolerance(eql_ticks)
+    merge_distance_price = (
+        _ticks_to_tolerance(config.merge_ticks)
+        if config.merge_clusters and tick_value > 0.0
+        else 0.0
+    )
+    minute_seed = _extract_candles(frames.get("1m"))
 
     LOGGER.debug(
         "Liquidity swing detection config",
         extra={
             "tick_size": tick_size,
             "r_ticks": config.r_ticks,
-            "tolerance": tolerance,
+            "tolerance_eqh": eqh_tolerance,
+            "tolerance_eql": eql_tolerance,
             "swing_window": config.swing_window,
             "lookback": config.lookback_swings,
+            "min_points_dynamic": config.min_points_dynamic,
+            "merge_distance": merge_distance_price,
         },
     )
 
-    minimum_required = 2 * config.swing_window + 1
+    base_minimum_required = 2 * config.swing_window + 1
 
     for timeframe in SUPPORTED_TIMEFRAMES:
         frame_payload = frames.get(timeframe)
@@ -734,16 +1022,18 @@ def _prepare_levels(
         candles = _extract_candles(frame_payload)
         candle_count = len(candles)
 
-        frame_diag = {
+        frame_diag: Dict[str, Any] = {
             "used_source": source_label,
             "n_bars_total": candle_count,
             "tick_size": tick_size,
-            "r_ticks": config.r_ticks,
-            "tolerance": tolerance,
-            "swing_window": config.swing_window,
+            "swing_window_target": config.swing_window,
+            "effective_window": config.swing_window,
             "lookback": config.lookback_swings,
             "atr_period": config.atr_period,
             "atr_mult": config.sweep_atr_multiplier,
+            "min_points_dynamic": config.min_points_dynamic,
+            "degraded_mode": False,
+            "degraded_reasons": [],
             "reasons": [],
             "eqh": {
                 "swing_count": 0,
@@ -752,6 +1042,12 @@ def _prepare_levels(
                 "pairs_within_tol_before_cluster": 0,
                 "sample_pairs_top10": [],
                 "reasons": [],
+                "raw_count": 0,
+                "filtered_count": 0,
+                "reason_histogram": {},
+                "merge_operations": 0,
+                "min_points_required": 0,
+                "tolerance": eqh_tolerance,
             },
             "eql": {
                 "swing_count": 0,
@@ -760,6 +1056,12 @@ def _prepare_levels(
                 "pairs_within_tol_before_cluster": 0,
                 "sample_pairs_top10": [],
                 "reasons": [],
+                "raw_count": 0,
+                "filtered_count": 0,
+                "reason_histogram": {},
+                "merge_operations": 0,
+                "min_points_required": 0,
+                "tolerance": eql_tolerance,
             },
         }
         diagnostics[timeframe] = frame_diag
@@ -772,6 +1074,44 @@ def _prepare_levels(
                 "used_source": source_label,
             },
         )
+
+        effective_window = config.swing_window
+        minimum_required = base_minimum_required
+        degraded_notes: List[str] = []
+        degrade_mode = False
+
+        if candle_count < minimum_required and config.enable_resample_when_sparse:
+            interval_ms = TIMEFRAME_TO_MS.get(timeframe)
+            if minute_seed and interval_ms:
+                aggregated = resample_ohlcv(minute_seed, interval_ms)
+                if len(aggregated) > candle_count:
+                    candles = aggregated
+                    candle_count = len(candles)
+                    degrade_mode = True
+                    degraded_notes.append("resampled_from_1m")
+                    frame_diag["used_source"] = "aggregated"
+                    LOGGER.debug(
+                        "Liquidity timeframe resampled from minute seed",
+                        extra={
+                            "tf": timeframe,
+                            "candles": candle_count,
+                            "reason": "resample_sparse",
+                        },
+                    )
+
+        if candle_count < minimum_required:
+            max_window = max(config.degraded_window_floor, (candle_count - 1) // 2)
+            if max_window < effective_window and max_window >= config.degraded_window_floor:
+                effective_window = max_window
+                minimum_required = max(1, 2 * effective_window + 1)
+                degrade_mode = True
+                degraded_notes.append("window_shrunk")
+        if effective_window <= 0:
+            effective_window = 1
+            minimum_required = max(1, 2 * effective_window + 1)
+
+        frame_diag["effective_window"] = effective_window
+
         if candle_count < minimum_required:
             LOGGER.debug(
                 "Skipping liquidity timeframe",
@@ -779,7 +1119,8 @@ def _prepare_levels(
                     "tf": timeframe,
                     "reason": "too_few_bars",
                     "candles": candle_count,
-                    "used_source": source_label,
+                    "required": minimum_required,
+                    "used_source": frame_diag["used_source"],
                 },
             )
             _append_reason(
@@ -788,104 +1129,118 @@ def _prepare_levels(
                 candles=candle_count,
                 required=minimum_required,
             )
+            frame_diag["degraded_mode"] = degrade_mode
+            frame_diag["degraded_reasons"] = degraded_notes
+            if degrade_mode:
+                degraded_timeframes.append(timeframe)
             continue
+
         swings_high = _detect_swings(
             candles,
-            window=config.swing_window,
+            window=effective_window,
             kind="high",
-            tick_size=tick_size or 0.0,
+            tick_size=tick_value,
         )
         swings_low = _detect_swings(
             candles,
-            window=config.swing_window,
+            window=effective_window,
             kind="low",
-            tick_size=tick_size or 0.0,
+            tick_size=tick_value,
         )
+
         if config.lookback_swings > 0:
             swings_high = swings_high[-config.lookback_swings :]
             swings_low = swings_low[-config.lookback_swings :]
+
         frame_diag["eqh"]["swing_count"] = len(swings_high)
         frame_diag["eql"]["swing_count"] = len(swings_low)
+
         eqh_pairs = _count_pairs_within_tolerance(
             swings_high,
-            tolerance=tolerance,
+            tolerance=eqh_tolerance,
+            tick_size=tick_size,
+        )
+        eql_pairs = _count_pairs_within_tolerance(
+            swings_low,
+            tolerance=eql_tolerance,
             tick_size=tick_size,
         )
         frame_diag["eqh"]["pairs_within_tol_before_cluster"] = eqh_pairs
         frame_diag["eqh"]["pairs_within_tol"] = eqh_pairs
-        frame_diag["eqh"]["sample_pairs_top10"] = _sample_swing_pairs(swings_high)
-        if eqh_pairs == 0 and len(swings_high) >= 2:
-            LOGGER.debug(
-                "No swing high pairs within tolerance prior to clustering",
-                extra={
-                    "tf": timeframe,
-                    "reason": "pairs_within_tol_before_cluster==0",
-                    "tick_size": tick_size,
-                    "tolerance": tolerance,
-                    "swings": len(swings_high),
-                },
-            )
-        eql_pairs = _count_pairs_within_tolerance(
-            swings_low,
-            tolerance=tolerance,
-            tick_size=tick_size,
-        )
         frame_diag["eql"]["pairs_within_tol_before_cluster"] = eql_pairs
         frame_diag["eql"]["pairs_within_tol"] = eql_pairs
+        frame_diag["eqh"]["sample_pairs_top10"] = _sample_swing_pairs(swings_high)
         frame_diag["eql"]["sample_pairs_top10"] = _sample_swing_pairs(swings_low)
-        if eql_pairs == 0 and len(swings_low) >= 2:
-            LOGGER.debug(
-                "No swing low pairs within tolerance prior to clustering",
-                extra={
-                    "tf": timeframe,
-                    "reason": "pairs_within_tol_before_cluster==0",
-                    "tick_size": tick_size,
-                    "tolerance": tolerance,
-                    "swings": len(swings_low),
-                },
+
+        if config.min_points_dynamic:
+            alpha = config.min_points_alpha if config.min_points_alpha > 0 else 1.0
+            min_points_required = max(
+                config.min_points_floor,
+                math.ceil(effective_window / alpha),
             )
-        LOGGER.debug(
-            "Liquidity swings detected",
-            extra={
-                "tf": timeframe,
-                "swing_highs": len(swings_high),
-                "swing_lows": len(swings_low),
-                "pairs_within_tol_high": frame_diag["eqh"]["pairs_within_tol"],
-                "pairs_within_tol_low": frame_diag["eql"]["pairs_within_tol"],
-                "used_source": source_label,
-            },
-        )
-        eqh_cluster = _cluster_swings(
+        else:
+            min_points_required = max(2, config.min_points_floor)
+
+        frame_diag["eqh"]["min_points_required"] = min_points_required
+        frame_diag["eql"]["min_points_required"] = min_points_required
+
+        allow_merge = config.merge_clusters and config.feature_relaxed_clustering
+
+        eqh_cluster, eqh_candidates, eqh_hist, eqh_merges = _cluster_swings(
             swings_high,
-            tolerance=tolerance,
+            tolerance=eqh_tolerance,
             tick_size=tick_size,
             level_type="eqh",
             timeframe=timeframe,
+            min_points=min_points_required,
+            allow_merge=allow_merge,
+            merge_distance=merge_distance_price,
+            merge_overlap_ratio=config.merge_overlap_ratio,
             reason_sink=frame_diag["eqh"]["reasons"],
         )
-        frame_diag["eqh"]["cluster_count"] = len(eqh_cluster)
-        if not eqh_cluster:
-            LOGGER.debug(
-                "No EQH clusters on timeframe",
-                extra={"tf": timeframe, "reason": "no_clusters"},
-            )
-        eqh_levels.extend(eqh_cluster)
-
-        eql_cluster = _cluster_swings(
+        eql_cluster, eql_candidates, eql_hist, eql_merges = _cluster_swings(
             swings_low,
-            tolerance=tolerance,
+            tolerance=eql_tolerance,
             tick_size=tick_size,
             level_type="eql",
             timeframe=timeframe,
+            min_points=min_points_required,
+            allow_merge=allow_merge,
+            merge_distance=merge_distance_price,
+            merge_overlap_ratio=config.merge_overlap_ratio,
             reason_sink=frame_diag["eql"]["reasons"],
         )
+
+        frame_diag["eqh"]["cluster_count"] = len(eqh_cluster)
+        frame_diag["eqh"]["raw_count"] = len(eqh_candidates)
+        frame_diag["eqh"]["filtered_count"] = len(eqh_cluster)
+        frame_diag["eqh"]["reason_histogram"] = eqh_hist
+        frame_diag["eqh"]["merge_operations"] = eqh_merges
+        frame_diag["eqh"]["candidates"] = eqh_candidates
+
         frame_diag["eql"]["cluster_count"] = len(eql_cluster)
-        if not eql_cluster:
-            LOGGER.debug(
-                "No EQL clusters on timeframe",
-                extra={"tf": timeframe, "reason": "no_clusters"},
-            )
+        frame_diag["eql"]["raw_count"] = len(eql_candidates)
+        frame_diag["eql"]["filtered_count"] = len(eql_cluster)
+        frame_diag["eql"]["reason_histogram"] = eql_hist
+        frame_diag["eql"]["merge_operations"] = eql_merges
+        frame_diag["eql"]["candidates"] = eql_candidates
+
+        eqh_levels.extend(eqh_cluster)
         eql_levels.extend(eql_cluster)
+
+        summary_raw["eqh"] += len(eqh_candidates)
+        summary_raw["eql"] += len(eql_candidates)
+        summary_filtered["eqh"] += len(eqh_cluster)
+        summary_filtered["eql"] += len(eql_cluster)
+        summary_reasons["eqh"].update(eqh_hist)
+        summary_reasons["eql"].update(eql_hist)
+
+        if degrade_mode:
+            frame_diag["degraded_mode"] = True
+            frame_diag["degraded_reasons"] = degraded_notes
+            degraded_timeframes.append(timeframe)
+        else:
+            frame_diag["degraded_mode"] = False
 
         LOGGER.debug(
             "Liquidity timeframe summary",
@@ -899,13 +1254,23 @@ def _prepare_levels(
                 "pairs_within_tol_high": frame_diag["eqh"]["pairs_within_tol"],
                 "pairs_within_tol_low": frame_diag["eql"]["pairs_within_tol"],
                 "tick_size": tick_size,
-                "r_ticks": config.r_ticks,
-                "tolerance": tolerance,
-                "atr_period": config.atr_period,
-                "atr_mult": config.sweep_atr_multiplier,
-                "used_source": source_label,
+                "tolerance_eqh": eqh_tolerance,
+                "tolerance_eql": eql_tolerance,
+                "min_points_required": min_points_required,
+                "used_source": frame_diag["used_source"],
+                "merge_operations_eqh": eqh_merges,
+                "merge_operations_eql": eql_merges,
             },
         )
+
+    diagnostics["_summary"] = {
+        "raw": {key: summary_raw[key] for key in summary_raw},
+        "filtered": {key: summary_filtered[key] for key in summary_filtered},
+        "reason_histogram": {
+            key: dict(counter) for key, counter in summary_reasons.items()
+        },
+        "degraded_timeframes": degraded_timeframes,
+    }
 
     if not eqh_levels:
         LOGGER.debug("No EQH clusters formed", extra={"reason": "no_clusters"})
@@ -1480,6 +1845,23 @@ def build_liquidity_snapshot(
         tick_size=resolved_tick,
         config=resolved_config,
     )
+    level_summary = level_diagnostics.get("_summary", {})
+    levels_by_tf = {key: value for key, value in level_diagnostics.items() if key != "_summary"}
+
+    raw_candidates: Dict[str, List[Dict[str, Any]]] = {"eqh": [], "eql": []}
+    for tf_key, tf_diag in levels_by_tf.items():
+        if not isinstance(tf_diag, Mapping):
+            continue
+        eqh_diag = tf_diag.get("eqh")
+        if isinstance(eqh_diag, Mapping):
+            candidates = eqh_diag.get("candidates")
+            if isinstance(candidates, Sequence):
+                raw_candidates["eqh"].extend(dict(candidate) for candidate in candidates if isinstance(candidate, Mapping))
+        eql_diag = tf_diag.get("eql")
+        if isinstance(eql_diag, Mapping):
+            candidates = eql_diag.get("candidates")
+            if isinstance(candidates, Sequence):
+                raw_candidates["eql"].extend(dict(candidate) for candidate in candidates if isinstance(candidate, Mapping))
 
     daily_candles = _extract_candles(augmented_frames.get("1d"))
     selection_end = None
@@ -1523,6 +1905,39 @@ def build_liquidity_snapshot(
         },
     )
 
+    summary_raw = level_summary.get("raw", {}) if isinstance(level_summary, Mapping) else {}
+    summary_filtered = level_summary.get("filtered", {}) if isinstance(level_summary, Mapping) else {}
+    reason_hist = level_summary.get("reason_histogram", {}) if isinstance(level_summary, Mapping) else {}
+    degraded_timeframes = level_summary.get("degraded_timeframes", []) if isinstance(level_summary, Mapping) else []
+
+    def _ordered_reasons(histogram: Mapping[str, Any] | None) -> List[Dict[str, Any]]:
+        if not isinstance(histogram, Mapping):
+            return []
+        items: List[Dict[str, Any]] = []
+        for reason_code, count in histogram.items():
+            try:
+                numeric = int(count)
+            except (TypeError, ValueError):
+                continue
+            items.append({"reason": str(reason_code), "count": numeric})
+        items.sort(key=lambda entry: (-entry["count"], entry["reason"]))
+        return items
+
+    eqh_reasons = _ordered_reasons(reason_hist.get("eqh") if isinstance(reason_hist, Mapping) else {})
+    eql_reasons = _ordered_reasons(reason_hist.get("eql") if isinstance(reason_hist, Mapping) else {})
+    if not eqh_reasons and not levels["eqh"]:
+        eqh_reasons = [{"reason": "no_candidates", "count": 1}]
+    if not eql_reasons and not levels["eql"]:
+        eql_reasons = [{"reason": "no_candidates", "count": 1}]
+
+    metrics_block = {
+        "tick_size_unresolved": 1 if tick_source == "fallback_min" else 0,
+        "raw_candidates_eqh": int(summary_raw.get("eqh", 0)) if isinstance(summary_raw, Mapping) else 0,
+        "raw_candidates_eql": int(summary_raw.get("eql", 0)) if isinstance(summary_raw, Mapping) else 0,
+        "filtered_eqh": len(levels["eqh"]),
+        "filtered_eql": len(levels["eql"]),
+    }
+
     diagnostics_payload = {
         "config": {
             "swing_window": resolved_config.swing_window,
@@ -1531,6 +1946,17 @@ def build_liquidity_snapshot(
             "atr_period": resolved_config.atr_period,
             "sweep_atr_multiplier": resolved_config.sweep_atr_multiplier,
             "tick_size": resolved_tick,
+            "tolerance_eqh_ticks": resolved_config.tolerance_eqh_ticks or float(resolved_config.r_ticks),
+            "tolerance_eql_ticks": resolved_config.tolerance_eql_ticks or float(resolved_config.r_ticks),
+            "min_points_dynamic": resolved_config.min_points_dynamic,
+            "min_points_alpha": resolved_config.min_points_alpha,
+            "min_points_floor": resolved_config.min_points_floor,
+            "merge_ticks": resolved_config.merge_ticks,
+            "merge_overlap_ratio": resolved_config.merge_overlap_ratio,
+            "enable_resample_when_sparse": resolved_config.enable_resample_when_sparse,
+            "feature_relaxed_clustering": resolved_config.feature_relaxed_clustering,
+            "feature_extended_resample": resolved_config.feature_extended_resample,
+            "feature_strict_legacy_mode": resolved_config.feature_strict_legacy_mode,
         },
         "tick_size": {
             "symbol": symbol,
@@ -1538,13 +1964,27 @@ def build_liquidity_snapshot(
             "source": tick_source,
             "value": resolved_tick,
         },
-        "levels": level_diagnostics,
+        "levels": levels_by_tf,
+        "levels_summary": level_summary,
         "daily": daily_diagnostics,
         "sweeps": sweep_diagnostics,
+        "metrics": metrics_block,
         "summary": {
             "eqh": len(levels["eqh"]),
             "eql": len(levels["eql"]),
             "sweeps": len(sweeps),
+            "eqh_filtered": len(levels["eqh"]),
+            "eql_filtered": len(levels["eql"]),
+            "eqh_raw": int(summary_raw.get("eqh", 0)) if isinstance(summary_raw, Mapping) else 0,
+            "eql_raw": int(summary_raw.get("eql", 0)) if isinstance(summary_raw, Mapping) else 0,
+            "eqh_reasons": eqh_reasons,
+            "eql_reasons": eql_reasons,
+            "reason_histogram": {
+                "eqh": dict(reason_hist.get("eqh", {})) if isinstance(reason_hist, Mapping) else {},
+                "eql": dict(reason_hist.get("eql", {})) if isinstance(reason_hist, Mapping) else {},
+            },
+            "degraded_timeframes": degraded_timeframes,
+            "has_degraded": bool(degraded_timeframes),
         },
     }
 
@@ -1554,6 +1994,7 @@ def build_liquidity_snapshot(
         "pdh": daily_levels["pdh"],
         "pdl": daily_levels["pdl"],
         "sweeps": sweeps,
+        "candidates": raw_candidates,
         "diagnostics": diagnostics_payload,
     }
 

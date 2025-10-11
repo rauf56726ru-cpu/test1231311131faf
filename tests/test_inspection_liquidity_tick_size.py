@@ -131,6 +131,7 @@ def test_inspection_liquidity_uses_normalised_tick_size(
     summary = diagnostics.get("summary")
     assert isinstance(summary, dict)
     assert summary.get("eqh") >= 0
+    assert summary.get("eqh_raw") >= 0
     tick_diag = diagnostics.get("tick_size")
     assert isinstance(tick_diag, dict)
     symbol_map = {0.1: "BTCUSDT", 0.01: "ETHUSDT", 0.001: "SOLUSDT"}
@@ -145,6 +146,11 @@ def test_inspection_liquidity_uses_normalised_tick_size(
     assert isinstance(eqh_diag, dict)
     assert "pairs_within_tol_before_cluster" in eqh_diag
     assert "sample_pairs_top10" in eqh_diag
+    metrics_block = diagnostics.get("metrics")
+    assert isinstance(metrics_block, dict)
+    assert metrics_block.get("raw_candidates_eqh") >= 0
+    levels_summary = diagnostics.get("levels_summary")
+    assert isinstance(levels_summary, dict)
 
 
 def test_inspection_liquidity_prefers_hardcoded_over_exchange(
