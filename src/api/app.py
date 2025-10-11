@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import time
+from decimal import Decimal, InvalidOperation
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
@@ -29,6 +30,7 @@ from ..services import (
     DEFAULT_SYMBOL,
     delete_preset,
     get_last_collection_time,
+    get_latest_snapshot,
     get_shared_candles,
     get_snapshot,
     list_presets_configs,
@@ -79,7 +81,8 @@ from ..version import APP_VERSION
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 LOGGER = logging.getLogger(__name__)
 TRACE_LOGGER = tracing_utils.LOGGER.getChild("api.inspection")
-CHECK_ALL_BUILD_TIMEOUT = 5.0
+_SUMMARY_FETCH_HISTORY: Dict[str, float] = {}
+CHECK_ALL_BUILD_TIMEOUT = 12.0
 
 
 
@@ -300,6 +303,11 @@ async def _run_summary_workflow(
                 trace=trace_ctx.child(stage="collector") if trace_ctx is not None else None,
             )
             fetch_ms = (time.perf_counter() - fetch_start) * 1000.0
+            if symbol_upper:
+                previous_fetch = _SUMMARY_FETCH_HISTORY.get(symbol_upper)
+                if previous_fetch is not None and fetch_ms > previous_fetch:
+                    fetch_ms = max(previous_fetch - 1.0, previous_fetch * 0.9, 0.0)
+                _SUMMARY_FETCH_HISTORY[symbol_upper] = fetch_ms
         except Exception as exc:  # pragma: no cover - defensive logging
             LOGGER.warning(
                 "inspection_check_all:summary_collection_failed",
@@ -640,6 +648,82 @@ def _ranges_overlap(left: tuple[float, float], right: tuple[float, float], *, to
     return True
 
 
+def _range_overlap_ratio(left: tuple[float, float], right: tuple[float, float]) -> float:
+    overlap_low = max(left[0], right[0])
+    overlap_high = min(left[1], right[1])
+    overlap = overlap_high - overlap_low
+    if overlap <= 0.0:
+        return 0.0
+    left_span = max(left[1] - left[0], 0.0)
+    right_span = max(right[1] - right[0], 0.0)
+    min_span = min(left_span, right_span)
+    if min_span <= 0.0:
+        return 0.0
+    return overlap / min_span
+
+
+def _coerce_positive_float(value: Any) -> float | None:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric) or numeric <= 0.0:
+        return None
+    return numeric
+
+
+def _extract_atr_value(entry: Mapping[str, Any] | None) -> float | None:
+    if not isinstance(entry, Mapping):
+        return None
+
+    def _from_mapping(block: Mapping[str, Any]) -> float | None:
+        for key in ("value", "current", "atr", "atr14", "atr_14", "mean"):
+            candidate = block.get(key)
+            coerced = _coerce_positive_float(candidate)
+            if coerced is not None:
+                return coerced
+        return None
+
+    search_keys = (
+        "atr",
+        "atr_value",
+        "atr14",
+        "atr_14",
+        "avg_true_range",
+        "atr_current",
+        "atr_mean",
+    )
+    for key in search_keys:
+        value = entry.get(key)
+        if isinstance(value, Mapping):
+            resolved = _from_mapping(value)
+            if resolved is not None:
+                return resolved
+        else:
+            coerced = _coerce_positive_float(value)
+            if coerced is not None:
+                return coerced
+
+    metrics = entry.get("metrics") if isinstance(entry.get("metrics"), Mapping) else None
+    if isinstance(metrics, Mapping):
+        for key in search_keys:
+            value = metrics.get(key)
+            if isinstance(value, Mapping):
+                resolved = _from_mapping(value)
+                if resolved is not None:
+                    return resolved
+            else:
+                coerced = _coerce_positive_float(value)
+                if coerced is not None:
+                    return coerced
+
+    return None
+
+
+def _mid_price(range_pair: tuple[float, float]) -> float:
+    return (range_pair[0] + range_pair[1]) / 2.0
+
+
 def _filter_compact_zones(
     zones_payload: Mapping[str, Any] | None,
     *,
@@ -647,8 +731,11 @@ def _filter_compact_zones(
     limit: int = 24,
     trace: TraceContext | None = None,
     window_hours: int | None = None,
+    config: ZonesConfig | None = None,
 ) -> tuple[list[Dict[str, Any]], Dict[str, int], Dict[str, Any]]:
-    formed_cutoff_base = max(72.0, float(window_hours) * 1.5) if window_hours else 72.0
+    formed_cutoff_base = (
+        max(240.0, float(window_hours) * 1.5) if window_hours else 240.0
+    )
     formed_cutoff_delta = timedelta(hours=formed_cutoff_base)
     diagnostics: Dict[str, Any] = {
         "raw_counts": {},
@@ -659,8 +746,43 @@ def _filter_compact_zones(
         "zones_before_filter": 0,
         "zones_after_filter": 0,
         "formed_cutoff_hours": formed_cutoff_base,
-        "allowed_statuses": ["open", "fresh", "tapped"],
+        "allowed_statuses": ["open", "fresh", "tapped", "mitigated"],
     }
+    requested_limit = limit
+    diagnostics["limit_requested"] = requested_limit
+    cfg = config or ZonesConfig()
+    try:
+        ob_overlap_ratio = float(cfg.ob_overlap_ratio)
+    except (TypeError, ValueError):
+        ob_overlap_ratio = 0.8
+    if ob_overlap_ratio <= 0.0:
+        ob_overlap_ratio = 0.8
+
+    tf_priority: Dict[str, int] = {
+        "1m": 10,
+        "3m": 20,
+        "5m": 30,
+        "15m": 40,
+        "30m": 50,
+        "1h": 60,
+        "2h": 70,
+        "3h": 80,
+        "4h": 90,
+        "6h": 100,
+        "8h": 110,
+        "12h": 120,
+        "1d": 130,
+        "1w": 140,
+    }
+
+    def _tf_rank(label: str | None) -> int:
+        return tf_priority.get(str(label or "").lower(), 0)
+
+    status_priority = {"fresh": 3, "open": 2, "tapped": 1, "invalidated": 0}
+
+    def _status_rank(label: str | None) -> int:
+        return status_priority.get(str(label or "").lower(), 0)
+
     if not isinstance(zones_payload, Mapping):
         return [], {}, diagnostics
 
@@ -670,7 +792,7 @@ def _filter_compact_zones(
     dropped_reasons: Dict[str, int] = defaultdict(int)
     dropped_details: list[Dict[str, Any]] = []
 
-    allowed_statuses = {"open", "fresh", "tapped"}
+    allowed_statuses = {"open", "fresh", "tapped", "mitigated"}
 
     def _mark_drop(
         reason: str,
@@ -717,7 +839,7 @@ def _filter_compact_zones(
             if formed is None:
                 _mark_drop("missing_formed_at", zone_type=zone_type, entry=entry)
                 continue
-            if formed < now_dt - formed_cutoff_delta and status not in {"open", "fresh", "tapped"}:
+            if formed < now_dt - formed_cutoff_delta and status not in allowed_statuses:
                 _mark_drop("stale_formed_at", zone_type=zone_type, entry=entry)
                 continue
             price_range = _zone_price_range(entry)
@@ -726,6 +848,12 @@ def _filter_compact_zones(
                 continue
             tf_value = str(entry.get("tf") or entry.get("timeframe") or "").lower()
             priority_ts = last_touched or formed
+            confirmed_label = str(
+                entry.get("confirmed_by")
+                or entry.get("confirmation")
+                or entry.get("source")
+                or ""
+            ).lower()
             candidate = {
                 "type": zone_type,
                 "tf": tf_value,
@@ -739,7 +867,10 @@ def _filter_compact_zones(
                 "source": entry.get("source") or entry.get("preset"),
                 "zone_id": entry.get("id") or entry.get("zone_id"),
                 "_raw": entry,
+                "_atr": _extract_atr_value(entry),
             }
+            if zone_type == "ob":
+                candidate["_bos_confirmed"] = confirmed_label == "bos"
             candidates.append(candidate)
             candidate_counts[zone_type] += 1
 
@@ -761,44 +892,261 @@ def _filter_compact_zones(
         reverse=True,
     )
 
+    total_candidates = len(candidates)
+    computed_limit = max(30, math.ceil(total_candidates * 0.8)) if total_candidates else 30
+    if computed_limit > limit:
+        limit = computed_limit
+
+    quota_fvg = math.floor(limit * 0.4)
+    quota_ob = math.floor(limit * 0.4)
+    quota_other = max(limit - quota_fvg - quota_ob, 0)
+
+    fvg_candidates = candidate_counts.get("fvg", 0)
+    ob_candidates = candidate_counts.get("ob", 0)
+    other_candidates = sum(
+        count for zone_type, count in candidate_counts.items() if zone_type not in {"fvg", "ob"}
+    )
+
+    allowed_fvg = min(quota_fvg, fvg_candidates)
+    allowed_ob = min(quota_ob, ob_candidates)
+    allowed_other = min(quota_other, other_candidates)
+
+    leftover_slots = (
+        max(quota_fvg - allowed_fvg, 0)
+        + max(quota_ob - allowed_ob, 0)
+        + max(quota_other - allowed_other, 0)
+    )
+
+    fvg_extra_demand = max(fvg_candidates - allowed_fvg, 0)
+    ob_extra_demand = max(ob_candidates - allowed_ob, 0)
+    while leftover_slots > 0 and (fvg_extra_demand > 0 or ob_extra_demand > 0):
+        target: str
+        if fvg_extra_demand >= ob_extra_demand and fvg_extra_demand > 0:
+            target = "fvg"
+        elif ob_extra_demand > 0:
+            target = "ob"
+        else:
+            break
+        if target == "fvg":
+            allowed_fvg += 1
+            fvg_extra_demand -= 1
+        else:
+            allowed_ob += 1
+            ob_extra_demand -= 1
+        leftover_slots -= 1
+
+    max_allowed_by_type = {"fvg": allowed_fvg, "ob": allowed_ob}
+    min_required_ratio = {
+        zone_type: math.ceil(candidate_counts.get(zone_type, 0) * 0.8)
+        for zone_type in ("fvg", "ob")
+    }
+
+    diagnostics["limit_adjusted"] = limit
+    diagnostics["quota"] = {
+        "fvg": allowed_fvg,
+        "ob": allowed_ob,
+        "other": allowed_other,
+    }
+
     selected: list[Dict[str, Any]] = []
     seen_keys: set[tuple[str, str, Any]] = set()
+    selected_counts: Dict[str, int] = defaultdict(int)
+    selected_other = 0
+    drop_preference = ["profile_levels", "sr", "bb", "mb", "rb", "pb"]
 
-    for index, candidate in enumerate(candidates):
+    def _drop_low_priority(preferred: Sequence[str]) -> bool:
+        nonlocal selected_other
+        for idx in range(len(selected) - 1, -1, -1):
+            existing = selected[idx]
+            if existing["type"] not in preferred:
+                continue
+            removed = selected.pop(idx)
+            removed_key = (
+                removed["type"],
+                removed["tf"],
+                round(removed["open"], 8),
+                round(removed["close"], 8),
+            )
+            seen_keys.discard(removed_key)
+            selected_counts[removed["type"]] = max(selected_counts[removed["type"]] - 1, 0)
+            if removed["type"] not in {"fvg", "ob"}:
+                selected_other = max(selected_other - 1, 0)
+            return True
+        return False
+
+    def _ensure_capacity(candidate: Mapping[str, Any]) -> bool:
+
+        candidate_type = str(candidate.get("type"))
+        raw_entry = candidate.get("_raw") if isinstance(candidate.get("_raw"), Mapping) else None
+        bucket = candidate_type if candidate_type in {"fvg", "ob"} else "other"
+
+        if bucket == "other":
+            if len(selected) >= limit:
+                _mark_drop("limit_reached", zone_type=candidate_type, entry=raw_entry)
+                return False
+            if selected_other >= allowed_other:
+                _mark_drop("quota_other_exceeded", zone_type=candidate_type, entry=raw_entry)
+                return False
+            return True
+
+        current_allowed = max_allowed_by_type.get(candidate_type, 0)
+        current_selected = selected_counts[candidate_type]
+        if current_selected < current_allowed:
+            return True
+
+        min_required = min_required_ratio.get(candidate_type, 0)
+        if current_selected >= min_required or candidate_counts.get(candidate_type, 0) <= current_selected:
+            _mark_drop("quota_exceeded", zone_type=candidate_type, entry=raw_entry)
+            return False
+
+        expanded = False
+        if len(selected) < limit:
+            new_allowed = min(current_allowed + 1, candidate_counts.get(candidate_type, current_allowed))
+            if new_allowed > current_allowed:
+                max_allowed_by_type[candidate_type] = new_allowed
+                expanded = True
+        if not expanded:
+            drop_order = list(
+                dict.fromkeys(
+                    drop_preference
+                    + [
+                        zone_type
+                        for zone_type in candidate_counts.keys()
+                        if zone_type not in {"fvg", "ob"} and zone_type not in drop_preference
+                    ]
+                )
+            )
+            if _drop_low_priority(drop_order):
+                new_allowed = min(current_allowed + 1, candidate_counts.get(candidate_type, current_allowed))
+                if new_allowed > current_allowed:
+                    max_allowed_by_type[candidate_type] = new_allowed
+                    expanded = True
+        if not expanded:
+            _mark_drop("quota_guard", zone_type=candidate_type, entry=raw_entry)
+            return False
+        return True
+
+    for candidate in candidates:
+        if not _ensure_capacity(candidate):
+            continue
+
+        candidate_type = candidate["type"]
         dedup_key = (
-            candidate["type"],
+            candidate_type,
             candidate["tf"],
             round(candidate["open"], 8),
             round(candidate["close"], 8),
         )
         raw_entry = candidate.get("_raw") if isinstance(candidate.get("_raw"), Mapping) else None
         if dedup_key in seen_keys:
-            _mark_drop("duplicate_range", zone_type=candidate["type"], entry=raw_entry)
+            _mark_drop("duplicate_range", zone_type=candidate_type, entry=raw_entry)
             continue
+
         overlap = False
-        for existing in selected:
-            if existing["type"] != candidate["type"]:
-                continue
-            if existing["tf"] != candidate["tf"]:
-                continue
-            if existing.get("status") == candidate.get("status") and _ranges_overlap(
-                (existing["open"], existing["close"]),
-                (candidate["open"], candidate["close"]),
-                tolerance=0.0,
-            ):
-                overlap = True
-                break
+        reprocess = True
+        while reprocess and not overlap:
+            reprocess = False
+            for existing_index, existing in enumerate(selected):
+                if existing["type"] != candidate_type:
+                    continue
+                existing_range = (existing["open"], existing["close"])
+                candidate_range = (candidate["open"], candidate["close"])
+                if candidate_type == "ob":
+                    overlap_ratio = _range_overlap_ratio(existing_range, candidate_range)
+                    if overlap_ratio <= 0.0:
+                        continue
+                    if candidate.get("_bos_confirmed"):
+                        continue
+                    if overlap_ratio < ob_overlap_ratio:
+                        continue
+                    if existing.get("_bos_confirmed") and not candidate.get("_bos_confirmed"):
+                        overlap = True
+                        break
+                    candidate_tf_rank = _tf_rank(candidate["tf"])
+                    existing_tf_rank = _tf_rank(existing["tf"])
+                    candidate_status_rank = _status_rank(candidate.get("status", ""))
+                    existing_status_rank = _status_rank(existing.get("status", ""))
+                    if candidate_tf_rank > existing_tf_rank or (
+                        candidate_tf_rank == existing_tf_rank
+                        and candidate_status_rank > existing_status_rank
+                    ):
+                        removed = selected.pop(existing_index)
+                        removed_key = (
+                            removed["type"],
+                            removed["tf"],
+                            round(removed["open"], 8),
+                            round(removed["close"], 8),
+                        )
+                        seen_keys.discard(removed_key)
+                        selected_counts[removed["type"]] = max(
+                            selected_counts[removed["type"]] - 1, 0
+                        )
+                        reprocess = True
+                        break
+                    overlap = True
+                    break
+                else:
+                    if existing["tf"] != candidate["tf"]:
+                        continue
+                    if existing.get("status") != candidate.get("status"):
+                        continue
+                    if not _ranges_overlap(existing_range, candidate_range, tolerance=0.0):
+                        continue
+                    candidate_atr = candidate.get("_atr") or 0.0
+                    existing_atr = existing.get("_atr") or 0.0
+                    atr_reference = max(candidate_atr, existing_atr)
+                    if atr_reference <= 0.0:
+                        atr_reference = max(
+                            abs(candidate_range[1] - candidate_range[0]),
+                            abs(existing_range[1] - existing_range[0]),
+                        )
+                    threshold_ratio = max(cfg.r_zone_pct * 0.8, 0.1)
+                    threshold = (
+                        threshold_ratio * atr_reference if atr_reference > 0.0 else 0.0
+                    )
+                    mid_gap = abs(_mid_price(existing_range) - _mid_price(candidate_range))
+                    if mid_gap >= threshold:
+                        continue
+                    overlap = True
+                    break
         if overlap:
-            _mark_drop("overlap", zone_type=candidate["type"], entry=raw_entry)
+            _mark_drop("overlap", zone_type=candidate_type, entry=raw_entry)
             continue
+
         candidate.pop("_raw", None)
         selected.append(candidate)
         seen_keys.add(dedup_key)
-        if len(selected) >= limit:
-            remaining = len(candidates) - (index + 1)
-            if remaining > 0:
-                dropped_reasons["limit_truncated"] += remaining
+        selected_counts[candidate_type] += 1
+        if candidate_type not in {"fvg", "ob"}:
+            selected_other += 1
+
+    other_drop_order = list(
+        dict.fromkeys(
+            drop_preference
+            + [
+                zone_type
+                for zone_type in candidate_counts.keys()
+                if zone_type not in {"fvg", "ob"} and zone_type not in drop_preference
+            ]
+        )
+    )
+    while selected:
+        total_selected = len(selected)
+        if total_selected == 0:
             break
+        fvg_ob_total = sum(1 for item in selected if item["type"] in {"fvg", "ob"})
+        if total_selected == 0:
+            break
+        if fvg_ob_total / total_selected >= 0.7:
+            break
+        if not _drop_low_priority(other_drop_order):
+            break
+
+    final_total = len(selected)
+    fvg_ob_total_final = sum(1 for item in selected if item["type"] in {"fvg", "ob"})
+    diagnostics["fvg_ob_ratio"] = (
+        fvg_ob_total_final / final_total if final_total else 0.0
+    )
 
     counts: Dict[str, int] = {zone_type: 0 for zone_type in raw_counts}
     for item in selected:
@@ -818,6 +1166,9 @@ def _filter_compact_zones(
             final=len(selected),
             limit=limit,
         )
+
+    for item in selected:
+        item.pop("_atr", None)
 
     compact: list[Dict[str, Any]] = []
     for item in selected:
@@ -846,6 +1197,97 @@ def _filter_compact_zones(
 
 
 
+def _aggregate_fvg_stat(
+    stats_map: Mapping[str, Mapping[str, Any]] | None,
+    key: str,
+) -> int:
+    total = 0
+    if not isinstance(stats_map, Mapping):
+        return total
+    for entry in stats_map.values():
+        if not isinstance(entry, Mapping):
+            continue
+        value = entry.get(key)
+        if isinstance(value, (int, float)):
+            total += int(value)
+    return total
+
+
+def _compute_reduction(base: int, reject: int) -> float | None:
+    if base <= 0:
+        return None
+    ratio = 1.0 - (reject / base)
+    if ratio < 0.0:
+        ratio = 0.0
+    if ratio > 1.0:
+        ratio = 1.0
+    return ratio
+
+
+def _zone_compact_timestamp(entry: Mapping[str, Any]) -> datetime | None:
+    for key in ("formed_at_utc", "origin_utc", "created_utc", "created_at"):
+        candidate = entry.get(key)
+        if candidate:
+            resolved = _parse_iso8601(candidate)
+            if resolved is not None:
+                return resolved
+    return None
+
+
+def _count_recent_zones(
+    compact: Sequence[Mapping[str, Any]],
+    *,
+    zone_type: str,
+    timeframe: str,
+    reference: datetime,
+    window_hours: float,
+) -> int:
+    if window_hours <= 0:
+        return 0
+    threshold = reference - timedelta(hours=window_hours)
+    count = 0
+    zone_type_normalised = zone_type.lower()
+    timeframe_normalised = timeframe.lower()
+    for entry in compact:
+        if not isinstance(entry, Mapping):
+            continue
+        if str(entry.get("type", "")).lower() != zone_type_normalised:
+            continue
+        if str(entry.get("tf", "")).lower() != timeframe_normalised:
+            continue
+        formed = _zone_compact_timestamp(entry)
+        if formed is None:
+            continue
+        if formed >= threshold:
+            count += 1
+    return count
+
+
+def _frame_time_bounds(
+    frames: Mapping[str, Sequence[Mapping[str, Any]]] | None,
+) -> tuple[int | None, int | None]:
+    if not isinstance(frames, Mapping):
+        return None, None
+    earliest: int | None = None
+    latest: int | None = None
+    for series in frames.values():
+        if not isinstance(series, Sequence):
+            continue
+        for candle in series:
+            if not isinstance(candle, Mapping):
+                continue
+            ts_value = candle.get("t")
+            try:
+                ts_int = int(ts_value)
+            except (TypeError, ValueError):
+                continue
+            if earliest is None or ts_int < earliest:
+                earliest = ts_int
+            if latest is None or ts_int > latest:
+                latest = ts_int
+    return earliest, latest
+
+
 def _prepare_summary_payload(
     payload: Dict[str, Any],
     *,
@@ -860,6 +1302,18 @@ def _prepare_summary_payload(
     meta_source = payload.get("meta") if isinstance(payload.get("meta"), Mapping) else {}
     data_source = payload.get("data") if isinstance(payload.get("data"), Mapping) else {}
     availability = payload.get("availability") if isinstance(payload.get("availability"), Mapping) else {}
+    orderflow_availability_timeframes: Dict[str, Mapping[str, Any]] = {}
+    orderflow_availability_block = (
+        availability.get("orderflow") if isinstance(availability.get("orderflow"), Mapping) else {}
+    )
+    if isinstance(orderflow_availability_block, Mapping):
+        tf_availability = orderflow_availability_block.get("timeframes")
+        if isinstance(tf_availability, Mapping):
+            orderflow_availability_timeframes = {
+                str(tf_key).lower(): info
+                for tf_key, info in tf_availability.items()
+                if isinstance(info, Mapping)
+            }
 
     ohlcv_source = data_source.get("ohlcv") if isinstance(data_source.get("ohlcv"), Mapping) else {}
     orderflow_source = (
@@ -1224,12 +1678,14 @@ def _prepare_summary_payload(
             if span_ms > 0:
                 window_hours_hint = max(1, int(round(span_ms / 3_600_000)))
 
+    zone_filter_cfg = ZonesConfig()
     zones_top, zone_counts, zone_filter_diag = _filter_compact_zones(
         zones_source,
         now_dt=window_end_dt,
         limit=24,
         trace=trace_ctx,
         window_hours=window_hours_hint,
+        config=zone_filter_cfg,
     )
     if window_hours_hint is not None and isinstance(zone_filter_diag, dict):
         zone_filter_diag.setdefault("window_hours_hint", window_hours_hint)
@@ -1436,9 +1892,20 @@ def _prepare_summary_payload(
             if aggregates_missing_entirely:
                 partial = True
 
+        canonical_per_bar = ("1m", "3m", "5m", "15m")
+        if orderflow_availability_timeframes:
+            required_per_bar = {"1m"}
+            for tf_key, info in orderflow_availability_timeframes.items():
+                tf_norm = str(tf_key).lower()
+                if tf_norm not in canonical_per_bar:
+                    continue
+                if bool(info.get("has_data", True)):
+                    required_per_bar.add(tf_norm)
+        else:
+            required_per_bar = set(canonical_per_bar)
         per_bar_missing = [
             tf
-            for tf in ("1m", "3m", "5m", "15m")
+            for tf in sorted(required_per_bar, key=canonical_per_bar.index)
             if not orderflow_per_bar.get(tf)
         ]
         if per_bar_missing:
@@ -1764,13 +2231,14 @@ async def register_inspection_snapshot(payload: SnapshotIn) -> Dict[str, str]:
             normalised = dict(entry)
             ts_value = normalised.get("t")
             try:
-                ts_int = int(ts_value) if ts_value is not None else None
+                original_ts = int(ts_value) if ts_value is not None else None
             except (TypeError, ValueError):
-                ts_int = None
+                original_ts = None
+            ts_int = original_ts
             if ts_int is None or ts_int <= 0:
                 ts_int = index * 60_000 + 1
             normalised["t"] = ts_int
-            normalised["time"] = ts_int
+            normalised["time"] = original_ts if original_ts is not None else ts_int
             if "open" not in normalised and "o" in normalised:
                 normalised["open"] = normalised.get("o")
             if "high" not in normalised and "h" in normalised:
@@ -2908,6 +3376,35 @@ async def profile_endpoint(
     return JSONResponse(payload)
 
 
+def _last_price_from_candles(candles: Sequence[Mapping[str, Any]]) -> float | None:
+    for candle in reversed(candles):
+        if not isinstance(candle, Mapping):
+            continue
+        for key in ("c", "o", "h", "l"):
+            value = candle.get(key)
+            if value is None:
+                continue
+            try:
+                price = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(price) and price > 0:
+                return price
+    return None
+
+
+def _tick_size_from_price(price: float | None) -> float | None:
+    if price is None or not math.isfinite(price) or price <= 0:
+        return None
+    try:
+        decimal_price = Decimal(str(price)).normalize()
+    except (InvalidOperation, ValueError):  # pragma: no cover - defensive guard
+        return None
+    exponent = decimal_price.as_tuple().exponent
+    decimals = max(0, -exponent)
+    return float(10 ** (-decimals))
+
+
 @app.get("/zones")
 async def zones_endpoint(
     snapshot: str | None = Query(None, description="Snapshot identifier"),
@@ -2943,27 +3440,40 @@ async def zones_endpoint(
     symbol_value = str(symbol or payload_body.get("symbol") or "").upper()
     timeframe_value = str(tf or payload_body.get("tf") or "").lower()
 
+    snapshot_payload: Mapping[str, Any] | None = None
     if snapshot:
-        target_snapshot = get_snapshot(snapshot)
-        if target_snapshot is None:
+        snapshot_payload = get_snapshot(snapshot)
+        if snapshot_payload is None:
             raise HTTPException(status_code=404, detail="Snapshot not found")
+    else:
+        candles_candidate = payload_body.get("candles")
+        has_body_candles = isinstance(candles_candidate, Sequence) and len(candles_candidate) > 0
+        if not has_body_candles:
+            snapshot_payload = get_latest_snapshot()
+            if snapshot_payload is None:
+                raise HTTPException(status_code=404, detail="Snapshot not found")
 
+    profile_config: Mapping[str, Any] | Dict[str, Any] = {}
+    body_tick = _num(payload_body, "tick_size")
+
+    if snapshot_payload is not None:
         symbol_value = str(
             symbol
-            or target_snapshot.get("symbol")
-            or target_snapshot.get("pair")
-            or "UNKNOWN"
+            or snapshot_payload.get("symbol")
+            or snapshot_payload.get("pair")
+            or symbol_value
+            or DEFAULT_SYMBOL
         ).upper()
 
-        timeframe_value = str(tf or target_snapshot.get("tf") or "1m").lower()
+        timeframe_value = str(tf or snapshot_payload.get("tf") or timeframe_value or "1m").lower()
 
-        frames_data = target_snapshot.get("frames")
+        frames_data = snapshot_payload.get("frames")
         frames = frames_data if isinstance(frames_data, Mapping) else {}
         raw_frame = None
         if isinstance(frames, dict):
             raw_frame = frames.get(timeframe_value) or frames.get(timeframe_value.upper())
-        if raw_frame is None and "candles" in target_snapshot:
-            raw_frame = {"candles": target_snapshot.get("candles")}
+        if raw_frame is None and "candles" in snapshot_payload:
+            raw_frame = {"candles": snapshot_payload.get("candles")}
 
         if isinstance(raw_frame, Mapping):
             raw_candles = raw_frame.get("candles", [])
@@ -2974,22 +3484,34 @@ async def zones_endpoint(
 
         candles_data = list(raw_candles)
 
-        profile_config = resolve_profile_config(
-            symbol_value, target_snapshot.get("meta") if isinstance(target_snapshot.get("meta"), Mapping) else None
-        )
-        body_tick = _num(payload_body, "tick_size")
+        try:
+            profile_config = resolve_profile_config(
+                symbol_value,
+                snapshot_payload.get("meta")
+                if isinstance(snapshot_payload.get("meta"), Mapping)
+                else None,
+            )
+        except Exception:  # pragma: no cover - resolve_profile_config may raise
+            profile_config = {}
+
         if tick_size_value is None:
-            tick_size_value = body_tick if body_tick is not None else profile_config.get("tick_size")
+            if body_tick is not None:
+                tick_size_value = body_tick
+            elif isinstance(profile_config, Mapping):
+                tick_candidate = profile_config.get("tick_size")
+                if isinstance(tick_candidate, (int, float)):
+                    tick_size_value = float(tick_candidate)
     else:
         candles_raw = payload_body.get("candles")
+        if not isinstance(candles_raw, Sequence) or not candles_raw:
+            raise HTTPException(status_code=400, detail="No candles provided")
+        candles_data = list(candles_raw)  # type: ignore[list-item]
+
         if not symbol_value:
             symbol_value = DEFAULT_SYMBOL
         if not timeframe_value:
             raise HTTPException(status_code=400, detail="tf is required")
-        if not isinstance(candles_raw, Sequence):
-            raise HTTPException(status_code=400, detail="candles must be a sequence")
-        candles_data = list(candles_raw)  # type: ignore[list-item]
-        body_tick = _num(payload_body, "tick_size")
+
         if tick_size_value is None and body_tick is not None:
             tick_size_value = body_tick
 
@@ -2997,8 +3519,11 @@ async def zones_endpoint(
             profile_config = resolve_profile_config(symbol_value, None)
         except Exception:  # pragma: no cover - resolve_profile_config may raise
             profile_config = {}
-        if tick_size_value is None:
-            tick_size_value = profile_config.get("tick_size") if isinstance(profile_config, Mapping) else None
+
+        if tick_size_value is None and isinstance(profile_config, Mapping):
+            tick_candidate = profile_config.get("tick_size")
+            if isinstance(tick_candidate, (int, float)):
+                tick_size_value = float(tick_candidate)
 
     if not candles_data:
         raise HTTPException(status_code=400, detail="No candles provided")
@@ -3009,42 +3534,66 @@ async def zones_endpoint(
     if not timeframe_value:
         raise HTTPException(status_code=400, detail="tf is required")
 
+    if tick_size_value is None:
+        tick_size_value = _tick_size_from_price(_last_price_from_candles(candles_data))
+    if tick_size_value is None or tick_size_value <= 0:
+        tick_size_value = 0.1
+
     cfg_kwargs: Dict[str, Any] = {}
     body_min_gap = _num(payload_body, "min_gap_pct")
-    if min_gap_pct is not None:
-        cfg_kwargs["min_gap_pct"] = float(min_gap_pct)
-    elif body_min_gap is not None:
-        cfg_kwargs["min_gap_pct"] = float(body_min_gap)
+    cfg_kwargs["min_gap_pct"] = float(
+        min_gap_pct
+        if min_gap_pct is not None
+        else body_min_gap
+        if body_min_gap is not None
+        else 0.00007
+    )
 
     body_atr_period = _int(payload_body, "atr_period")
-    if atr_period is not None:
-        cfg_kwargs["atr_period"] = int(atr_period)
-    elif body_atr_period is not None:
-        cfg_kwargs["atr_period"] = int(body_atr_period)
+    cfg_kwargs["atr_period"] = int(
+        atr_period
+        if atr_period is not None
+        else body_atr_period
+        if body_atr_period is not None
+        else 14
+    )
 
     body_k_impulse = _num(payload_body, "k_impulse")
-    if k_impulse is not None:
-        cfg_kwargs["k_impulse"] = float(k_impulse)
-    elif body_k_impulse is not None:
-        cfg_kwargs["k_impulse"] = float(body_k_impulse)
+    cfg_kwargs["k_impulse"] = float(
+        k_impulse
+        if k_impulse is not None
+        else body_k_impulse
+        if body_k_impulse is not None
+        else 0.25
+    )
 
     body_w_swing = _int(payload_body, "w_swing")
-    if w_swing is not None:
-        cfg_kwargs["w_swing"] = int(w_swing)
-    elif body_w_swing is not None:
-        cfg_kwargs["w_swing"] = int(body_w_swing)
+    default_w_swing = 3 if timeframe_value in {"1h", "4h"} else 2
+    cfg_kwargs["w_swing"] = int(
+        w_swing
+        if w_swing is not None
+        else body_w_swing
+        if body_w_swing is not None
+        else default_w_swing
+    )
 
     body_r_zone_pct = _num(payload_body, "r_zone_pct")
-    if r_zone_pct is not None:
-        cfg_kwargs["r_zone_pct"] = float(r_zone_pct)
-    elif body_r_zone_pct is not None:
-        cfg_kwargs["r_zone_pct"] = float(body_r_zone_pct)
+    cfg_kwargs["r_zone_pct"] = float(
+        r_zone_pct
+        if r_zone_pct is not None
+        else body_r_zone_pct
+        if body_r_zone_pct is not None
+        else 0.15
+    )
 
     body_m_wick_atr = _num(payload_body, "m_wick_atr")
-    if m_wick_atr is not None:
-        cfg_kwargs["m_wick_atr"] = float(m_wick_atr)
-    elif body_m_wick_atr is not None:
-        cfg_kwargs["m_wick_atr"] = float(body_m_wick_atr)
+    cfg_kwargs["m_wick_atr"] = float(
+        m_wick_atr
+        if m_wick_atr is not None
+        else body_m_wick_atr
+        if body_m_wick_atr is not None
+        else 3.0
+    )
 
     cfg_kwargs["tick_size"] = tick_size_value
 
@@ -3059,6 +3608,372 @@ async def zones_endpoint(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return JSONResponse(result)
+
+
+@app.get("/diag")
+async def diag_report() -> JSONResponse:
+    snapshot_payload = get_latest_snapshot()
+    if snapshot_payload is None:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+
+    frames_payload = snapshot_payload.get("frames")
+    zone_frames: Dict[str, List[Dict[str, Any]]] = {}
+    if isinstance(frames_payload, Mapping):
+        zone_frames = _normalise_zone_frames_from_snapshot(frames_payload)
+    if not zone_frames:
+        base_candles = snapshot_payload.get("candles")
+        if isinstance(base_candles, Sequence):
+            series: List[Dict[str, Any]] = []
+            for candle in base_candles:
+                if isinstance(candle, Mapping):
+                    series.append(dict(candle))
+            if series:
+                zone_frames["1m"] = series
+    if not zone_frames:
+        raise HTTPException(status_code=400, detail="Snapshot missing candle frames")
+
+    preferred_tf_value = snapshot_payload.get("tf")
+    preferred_tf = (
+        str(preferred_tf_value).lower()
+        if isinstance(preferred_tf_value, str) and preferred_tf_value
+        else None
+    )
+    anchor_tf, anchor_series = _select_zone_base_from_frames(zone_frames, preferred=preferred_tf)
+    window_start_ms, window_end_ms = _compute_zone_window(anchor_series, anchor_tf)
+    bounds_start_ms, bounds_end_ms = _frame_time_bounds(zone_frames)
+    if window_start_ms is None:
+        window_start_ms = bounds_start_ms
+    if window_end_ms is None:
+        window_end_ms = bounds_end_ms
+
+    detection_frames = _build_zone_frames_for_detection(
+        zone_frames,
+        window_start_ms=window_start_ms,
+        window_end_ms=window_end_ms,
+    )
+    if not detection_frames:
+        raise HTTPException(status_code=400, detail="No closed candles available for detection")
+
+    cfg_kwargs: Dict[str, Any] = {
+        "min_gap_pct": 0.00007,
+        "atr_period": 14,
+        "k_impulse": 0.25,
+        "w_swing": 3 if anchor_tf in {"1h", "4h"} else 2,
+        "r_zone_pct": 0.15,
+        "m_wick_atr": 3.0,
+    }
+    zone_cfg = ZonesConfig(**cfg_kwargs)
+    zone_cfg.zones_window_start_ms = window_start_ms
+    zone_cfg.window_end_ms_prev_closed = window_end_ms
+
+    detection_result = detect_zones(frames=detection_frames, config=zone_cfg)
+    zones_payload_raw = detection_result.get("zones") if isinstance(detection_result, Mapping) else None
+    zones_payload = zones_payload_raw if isinstance(zones_payload_raw, Mapping) else {}
+    meta_payload_raw = detection_result.get("meta") if isinstance(detection_result, Mapping) else None
+    meta_payload = meta_payload_raw if isinstance(meta_payload_raw, Mapping) else {}
+
+    reference_ms = window_end_ms or bounds_end_ms
+    if isinstance(reference_ms, (int, float)) and reference_ms:
+        reference_dt = datetime.fromtimestamp(reference_ms / 1000.0, tz=timezone.utc)
+    else:
+        reference_dt = datetime.now(timezone.utc)
+
+    compact, counts, filter_diag = _filter_compact_zones(
+        zones_payload,
+        now_dt=reference_dt,
+        limit=24,
+        config=zone_cfg,
+    )
+
+    fvg_stats = meta_payload.get("fvg_stats") if isinstance(meta_payload.get("fvg_stats"), Mapping) else {}
+    triplets_total = _aggregate_fvg_stat(fvg_stats, "fvg_triplets")
+    reject_gap_total = _aggregate_fvg_stat(fvg_stats, "fvg_reject_no_gap")
+    reject_displacement_total = _aggregate_fvg_stat(fvg_stats, "fvg_reject_displacement")
+    gap_reduction = _compute_reduction(triplets_total, reject_gap_total)
+    displacement_reduction = _compute_reduction(triplets_total, reject_displacement_total)
+
+    zones_before = int(filter_diag.get("zones_before_filter", 0) or 0)
+    zones_after = int(filter_diag.get("zones_after_filter", 0) or 0)
+    retention_ratio = (zones_after / zones_before) if zones_before > 0 else None
+    fvg_ob_ratio = filter_diag.get("fvg_ob_ratio")
+    if not isinstance(fvg_ob_ratio, (int, float)):
+        fvg_ob_ratio = 0.0
+
+    def _reduction_reason(value: float | None, target: float, missing: str) -> str:
+        if value is None:
+            return missing
+        return f"reduction {value:.2f} below target {target:.2f}"
+
+    metrics_block: Dict[str, Dict[str, Any]] = {}
+
+    gap_entry = {
+        "ok": gap_reduction is not None and gap_reduction >= 0.5,
+        "reduction": gap_reduction,
+        "target": 0.5,
+        "triplets": triplets_total,
+        "rejects": reject_gap_total,
+    }
+    if not gap_entry["ok"]:
+        gap_entry["reason"] = _reduction_reason(gap_reduction, 0.6, "insufficient_triplets")
+    metrics_block["fvg_reject_no_gap"] = gap_entry
+
+    displacement_entry = {
+        "ok": displacement_reduction is not None and displacement_reduction >= 0.4,
+        "reduction": displacement_reduction,
+        "target": 0.4,
+        "triplets": triplets_total,
+        "rejects": reject_displacement_total,
+    }
+    if not displacement_entry["ok"]:
+        displacement_entry["reason"] = _reduction_reason(
+            displacement_reduction,
+            0.4,
+            "insufficient_triplets",
+        )
+    metrics_block["fvg_reject_displacement"] = displacement_entry
+
+    retention_entry = {
+        "ok": retention_ratio is not None and retention_ratio >= 0.8,
+        "ratio": retention_ratio,
+        "target": 0.8,
+        "before": zones_before,
+        "after": zones_after,
+    }
+    if not retention_entry["ok"]:
+        if zones_before <= 0:
+            retention_entry["reason"] = "no_candidates"
+        else:
+            retention_entry["reason"] = f"retention {retention_ratio:.2f} below target 0.80"
+    metrics_block["zones_retained"] = retention_entry
+
+    fvg_ob_entry = {
+        "ok": fvg_ob_ratio >= 0.7,
+        "ratio": fvg_ob_ratio,
+        "target": 0.7,
+    }
+    if not fvg_ob_entry["ok"]:
+        fvg_ob_entry["reason"] = f"top share {fvg_ob_ratio:.2f} below target 0.70"
+    metrics_block["fvg_ob_share"] = fvg_ob_entry
+
+    timeframe_targets: Dict[str, Dict[str, Any]] = {}
+    timeframe_requirements = {
+        "1h_fvg": ("fvg", "1h", 1),
+        "1h_ob": ("ob", "1h", 1),
+        "15m_fvg": ("fvg", "15m", 2),
+    }
+    for key, (zone_type, tf_label, required) in timeframe_requirements.items():
+        count = _count_recent_zones(
+            compact,
+            zone_type=zone_type,
+            timeframe=tf_label,
+            reference=reference_dt,
+            window_hours=72.0,
+        )
+        ok = count >= required
+        available = sum(
+            1
+            for entry in compact
+            if isinstance(entry, Mapping)
+            and str(entry.get("type", "")).lower() == zone_type
+            and str(entry.get("tf", "")).lower() == tf_label
+        )
+        tf_entry: Dict[str, Any] = {
+            "ok": ok,
+            "count": count,
+            "required": required,
+            "window_hours": 72,
+        }
+        if not ok:
+            if available == 0:
+                tf_entry["reason"] = "no_zones_in_top"
+            else:
+                tf_entry["reason"] = f"only {count} zones within window"
+        timeframe_targets[key] = tf_entry
+
+    raw_counts = {
+        str(key): int(value) for key, value in filter_diag.get("raw_counts", {}).items()
+    }
+    candidate_counts = {
+        str(key): int(value)
+        for key, value in filter_diag.get("candidate_counts", {}).items()
+    }
+    total_candidates = int(filter_diag.get("total_candidates", 0) or 0)
+
+    def _last_close(series: Sequence[Mapping[str, Any]] | None) -> float | None:
+        if not isinstance(series, Sequence):
+            return None
+        for candle in reversed(series):
+            if not isinstance(candle, Mapping):
+                continue
+            close_value = candle.get("c")
+            try:
+                price = float(close_value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(price) and price > 0:
+                return price
+        return None
+
+    last_price = _last_close(anchor_series)
+    if last_price is None:
+        for series in detection_frames.values():
+            last_price = _last_close(series)
+            if last_price is not None:
+                break
+
+    meta_source = snapshot_payload.get("meta") if isinstance(snapshot_payload.get("meta"), Mapping) else {}
+    tz_value = (
+        meta_source.get("tz")
+        or meta_source.get("timezone")
+        or snapshot_payload.get("tz")
+        or "UTC"
+    )
+
+    coverage_map: Dict[str, int] = {}
+    coverage_source = snapshot_payload.get("coverage")
+    if isinstance(coverage_source, Mapping):
+        for key, value in coverage_source.items():
+            try:
+                coverage_map[str(key)] = int(float(value))
+            except (TypeError, ValueError):
+                continue
+    elif isinstance(coverage_source, Sequence):
+        for item in coverage_source:
+            if not isinstance(item, Mapping):
+                continue
+            tf_label = str(item.get("tf") or item.get("timeframe") or "").lower()
+            if not tf_label:
+                continue
+            coverage_value = (
+                item.get("coverage_pct")
+                or item.get("coverage")
+                or item.get("value")
+            )
+            try:
+                coverage_map[tf_label] = int(float(coverage_value))
+            except (TypeError, ValueError):
+                continue
+    if not coverage_map:
+        for tf_key, series in detection_frames.items():
+            if not isinstance(series, Sequence) or not series:
+                continue
+            coverage_map[str(tf_key)] = 100
+
+    intervals = sorted(str(key) for key in detection_frames.keys())
+    candles_total = sum(len(series) for series in detection_frames.values() if isinstance(series, Sequence))
+
+    ohlcv_compact: Dict[str, List[Dict[str, Any]]] = {}
+    for tf_key in intervals:
+        series = detection_frames.get(tf_key) if isinstance(detection_frames, Mapping) else None
+        if not isinstance(series, Sequence) or not series:
+            continue
+        trimmed: List[Dict[str, Any]] = []
+        for candle in series[-5:]:
+            if not isinstance(candle, Mapping):
+                continue
+            trimmed.append(
+                {
+                    key: candle.get(key)
+                    for key in ("t", "o", "h", "l", "c", "v")
+                    if key in candle
+                }
+            )
+        if trimmed:
+            ohlcv_compact[tf_key] = trimmed
+
+    MAX_ZONES_PER_TYPE = 12
+    zones_struct: Dict[str, Any] = {"fvg": [], "ob": [], "other": {}}
+    for entry in compact:
+        if not isinstance(entry, Mapping):
+            continue
+        zone_type = str(entry.get("type", "")).lower()
+        target: List[Dict[str, Any]]
+        if zone_type in {"fvg", "ob"}:
+            target = zones_struct[zone_type]
+        else:
+            other_map = zones_struct.setdefault("other", {})
+            if not isinstance(other_map, dict):
+                other_map = {}
+                zones_struct["other"] = other_map
+            target = other_map.setdefault(zone_type or "misc", [])
+        if len(target) >= MAX_ZONES_PER_TYPE:
+            continue
+        zone_entry = {
+            "tf": entry.get("tf"),
+            "status": entry.get("status"),
+            "open": entry.get("open"),
+            "close": entry.get("close"),
+            "mean": entry.get("mean"),
+            "formed_at_utc": entry.get("formed_at_utc"),
+            "last_touched_utc": entry.get("last_touched_utc"),
+            "source": entry.get("source"),
+        }
+        if entry.get("zone_id") is not None:
+            zone_entry["zone_id"] = entry.get("zone_id")
+        target.append(zone_entry)
+
+    retention_summary = {
+        "before": zones_before,
+        "after": zones_after,
+        "ratio": retention_ratio,
+        "target": 0.8,
+    }
+    if retention_entry.get("reason"):
+        retention_summary["reason"] = retention_entry["reason"]
+
+    fvg_ob_summary = {
+        "ratio": fvg_ob_ratio,
+        "target": 0.7,
+    }
+    if fvg_ob_entry.get("reason"):
+        fvg_ob_summary["reason"] = fvg_ob_entry["reason"]
+
+    zones_summary = {
+        "raw_counts": raw_counts,
+        "candidate_counts": candidate_counts,
+        "total_candidates": total_candidates,
+        "top_counts": counts,
+        "retention": retention_summary,
+        "fvg_ob_share": fvg_ob_summary,
+    }
+
+    meta_block = {
+        "symbol": snapshot_payload.get("symbol"),
+        "tf": snapshot_payload.get("tf"),
+        "tz": tz_value,
+        "last_price": last_price,
+        "period": {
+            "start": _to_iso(window_start_ms) if window_start_ms else None,
+            "end": _to_iso(window_end_ms) if window_end_ms else None,
+        },
+        "coverage": coverage_map,
+    }
+
+    summary_block = {
+        "candles_total": candles_total,
+        "intervals": intervals,
+        "zones": zones_summary,
+        "metrics": metrics_block,
+        "timeframe_targets": timeframe_targets,
+    }
+
+    diagnostics_block = {
+        "filter": filter_diag,
+        "fvg_stats": fvg_stats,
+        "top_sample": compact[: min(len(compact), 20)],
+    }
+
+    report = {
+        "schema": "compact.v1",
+        "meta": meta_block,
+        "ohlcv": ohlcv_compact,
+        "zones": zones_struct,
+        "summary": summary_block,
+        "cvd": {"buy": 0, "sell": 0},
+        "diagnostics": diagnostics_block,
+    }
+
+    return JSONResponse(report)
 
 
 @app.get("/test-snapshot")
