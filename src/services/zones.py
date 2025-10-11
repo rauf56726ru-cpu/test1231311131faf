@@ -25,13 +25,13 @@ Candle = Mapping[str, Any]
 class Config:
     """Configuration bundle controlling the detectors."""
 
-    tick_size: float | None = None
+    tick_size: float | None = 0.1
     atr_period: int = 14
     k_impulse: float = 0.25
     w_swing: int = 2
     r_zone_pct: float = 0.15
     displacement_body: float = 0.6
-    displacement_range: float = 1.1
+    displacement_range: float = 1.2
     displacement_body_floor: float = 0.25
     displacement_range_floor: float = 0.5
     base_min_bars: int = 1
@@ -40,9 +40,9 @@ class Config:
     base_min_overlap: float = 0.5
     impulse_min_cover: float = 0.6
     ob_body_max_atr: float = 1.0
-    ob_overlap_ratio: float = 0.75
+    ob_overlap_ratio: float = 0.8
     ob_distance_atr: float = 0.25
-    min_block_ratio: float = 0.2
+    min_block_ratio: float = 0.15
     epsilon_ticks: float = 1.0
     liquidity_window: int = 3
     sr_merge_pct: float = 0.0002
@@ -51,9 +51,9 @@ class Config:
     allow_base_fallback: bool = True
     base_fallback_max_age: int = 200
     base_fallback_max_distance_atr: float = 3.0
-    min_gap_atr_ratio: float = 0.08
+    min_gap_atr_ratio: float = 0.1
     min_gap_tick_multiple: float = 2.0
-    min_gap_pct: float = 0.0003
+    min_gap_pct: float = 0.00007
     m_wick_atr: float = 3.0
 
 
@@ -155,7 +155,10 @@ def _resolve_tick_size(cfg: Config, frames: Mapping[str, Sequence[Candle]], time
         cfg.tick_size = float(inferred)
         return float(inferred)
 
-    return None
+    if cfg.tick_size is None or cfg.tick_size <= 0:
+        cfg.tick_size = 0.1
+
+    return float(cfg.tick_size)
 
 
 def _rolling_return_sigma(
@@ -327,9 +330,13 @@ def _resolve_fvg_gap(
     next_low_wick, next_high_wick = _candle_range(next_candle)
     next_body_low, next_body_high = _body_range(next_candle)
 
-    atr_ok = math.isfinite(atr_value) and atr_value > 0
     wick_limit = None
-    if atr_ok and cfg.m_wick_atr and cfg.m_wick_atr > 0:
+    if (
+        cfg.m_wick_atr
+        and cfg.m_wick_atr > 0
+        and math.isfinite(atr_value)
+        and atr_value > 0
+    ):
         wick_limit = cfg.m_wick_atr * float(atr_value)
 
     if wick_limit is not None:
@@ -344,55 +351,17 @@ def _resolve_fvg_gap(
         if next_lower_wick > wick_limit:
             next_low_wick = next_body_low
 
-    bullish_candidates = [
-        ("wick_wick", prev_high_wick, next_low_wick),
-        ("wick_body", prev_high_wick, next_body_low),
-        ("body_wick", prev_body_high, next_low_wick),
-        ("body_body", prev_body_high, next_body_low),
-    ]
-    bearish_candidates = [
-        ("wick_wick", next_high_wick, prev_low_wick),
-        ("wick_body", next_body_high, prev_low_wick),
-        ("body_wick", next_high_wick, prev_body_low),
-        ("body_body", next_body_high, prev_body_low),
-    ]
+    up_base = max(prev_high_wick, prev_body_high)
+    up_cap = min(next_low_wick, next_body_low)
+    up_gap = up_cap - up_base
+    if up_gap > 0:
+        return "up", up_base, up_cap, "wick_body"
 
-    combo_priority = {
-        "wick_body": 0,
-        "wick_wick": 1,
-        "body_wick": 2,
-        "body_body": 3,
-    }
-
-    def _select_candidate(candidates: list[tuple[str, float, float]]) -> tuple[float, float, str, float] | None:
-        best: tuple[float, float, str, float] | None = None
-        for label, bottom, top in candidates:
-            gap = top - bottom
-            if gap <= 0:
-                continue
-            if best is None:
-                best = (bottom, top, label, gap)
-                continue
-            _, _, best_label, best_gap = best
-            if gap < best_gap - 1e-9:
-                best = (bottom, top, label, gap)
-                continue
-            if abs(gap - best_gap) <= 1e-9:
-                priority_new = combo_priority.get(label, 99)
-                priority_best = combo_priority.get(best_label, 99)
-                if priority_new < priority_best:
-                    best = (bottom, top, label, gap)
-        return best
-
-    bullish_best = _select_candidate(bullish_candidates)
-    if bullish_best is not None:
-        bottom, top, label, _ = bullish_best
-        return "up", bottom, top, label
-
-    bearish_best = _select_candidate(bearish_candidates)
-    if bearish_best is not None:
-        bottom, top, label, _ = bearish_best
-        return "down", bottom, top, label
+    down_base = max(next_high_wick, next_body_high)
+    down_cap = min(prev_low_wick, prev_body_low)
+    down_gap = down_cap - down_base
+    if down_gap > 0:
+        return "down", down_base, down_cap, "wick_body"
 
     return None
 

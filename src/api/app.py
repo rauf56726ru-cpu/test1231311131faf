@@ -754,9 +754,9 @@ def _filter_compact_zones(
     try:
         ob_overlap_ratio = float(cfg.ob_overlap_ratio)
     except (TypeError, ValueError):
-        ob_overlap_ratio = 0.75
+        ob_overlap_ratio = 0.8
     if ob_overlap_ratio <= 0.0:
-        ob_overlap_ratio = 0.75
+        ob_overlap_ratio = 0.8
 
     tf_priority: Dict[str, int] = {
         "1m": 10,
@@ -3536,6 +3536,8 @@ async def zones_endpoint(
 
     if tick_size_value is None:
         tick_size_value = _tick_size_from_price(_last_price_from_candles(candles_data))
+    if tick_size_value is None or tick_size_value <= 0:
+        tick_size_value = 0.1
 
     cfg_kwargs: Dict[str, Any] = {}
     body_min_gap = _num(payload_body, "min_gap_pct")
@@ -3544,7 +3546,7 @@ async def zones_endpoint(
         if min_gap_pct is not None
         else body_min_gap
         if body_min_gap is not None
-        else 0.0003
+        else 0.00007
     )
 
     body_atr_period = _int(payload_body, "atr_period")
@@ -3653,7 +3655,7 @@ async def diag_report() -> JSONResponse:
         raise HTTPException(status_code=400, detail="No closed candles available for detection")
 
     cfg_kwargs: Dict[str, Any] = {
-        "min_gap_pct": 0.0003,
+        "min_gap_pct": 0.00007,
         "atr_period": 14,
         "k_impulse": 0.25,
         "w_swing": 3 if anchor_tf in {"1h", "4h"} else 2,
