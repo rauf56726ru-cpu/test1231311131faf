@@ -57,6 +57,12 @@ class LiquidityConfig:
     feature_strict_legacy_mode: bool = False
     feature_relaxed_clustering: bool = True
     feature_extended_resample: bool = True
+<<<<<<< Updated upstream
+=======
+    session_atr_value: float | None = None
+    session_atr_pct: float | None = None
+    session_label: str | None = None
+>>>>>>> Stashed changes
 
 
 def _coerce_float(value: Any) -> float | None:
@@ -692,6 +698,30 @@ def _resolve_config(raw: Mapping[str, Any] | None) -> LiquidityConfig:
     if not config.feature_extended_resample:
         config.enable_resample_when_sparse = False
 
+<<<<<<< Updated upstream
+=======
+    if "session_atr_value" in raw:
+        try:
+            session_atr_value = float(raw.get("session_atr_value"))
+        except (TypeError, ValueError):
+            session_atr_value = None
+        if session_atr_value is not None and math.isfinite(session_atr_value) and session_atr_value >= 0:
+            config.session_atr_value = session_atr_value
+
+    if "session_atr_pct" in raw:
+        try:
+            session_atr_pct = float(raw.get("session_atr_pct"))
+        except (TypeError, ValueError):
+            session_atr_pct = None
+        if session_atr_pct is not None and math.isfinite(session_atr_pct) and session_atr_pct >= 0:
+            config.session_atr_pct = session_atr_pct
+
+    if "session_label" in raw:
+        session_label = raw.get("session_label")
+        if isinstance(session_label, str) and session_label:
+            config.session_label = session_label
+
+>>>>>>> Stashed changes
     return config
 
 
@@ -1930,6 +1960,7 @@ def _detect_sweeps(
                         confirm_close_val = confirm_close_candidate
                         break
                 if confirm_idx is None:
+<<<<<<< Updated upstream
                     _append_reason(
                         frame_diag["lower"]["reasons"],
                         "no_return_window",
@@ -1939,6 +1970,24 @@ def _detect_sweeps(
                     continue
                 confirm_ts = int(candles[confirm_idx].get("t", ts))
                 return_bars = confirm_idx - index
+=======
+                    level_origin = str(level.get("source", "eq"))
+                    if index >= len(candles) - 1 and level_origin not in {"swing_fallback", "fallback"}:
+                        confirm_ts = int(ts)
+                        return_bars = 0
+                        confirm_close_val = close
+                    else:
+                        _append_reason(
+                            frame_diag["lower"]["reasons"],
+                            "no_return_window",
+                            level_type=level_type,
+                            confirm_window=config.sweep_confirm_window,
+                        )
+                        continue
+                else:
+                    confirm_ts = int(candles[confirm_idx].get("t", ts))
+                    return_bars = confirm_idx - index
+>>>>>>> Stashed changes
                 sweeps.append(
                     {
                         "type": "sweep_bottom",
@@ -1998,6 +2047,7 @@ def build_liquidity_snapshot(
     *,
     symbol: str | None = None,
     tick_size: float | None,
+    tick_source_hint: str | None = None,
     meta: Mapping[str, Any] | None = None,
     selection: Mapping[str, Any] | None = None,
     config: Mapping[str, Any] | None = None,
@@ -2012,13 +2062,22 @@ def build_liquidity_snapshot(
         if candles:
             frame_sequences[tf] = candles
 
-    resolved_tick, tick_source = resolve_liquidity_tick_size(
-        symbol or normalized_symbol,
-        tick_size,
-        frame_sequences,
-        meta=meta,
-        logger=LOGGER,
-    )
+    resolved_tick: float
+    tick_source: str
+    if tick_source_hint and tick_size is not None and tick_size > 0:
+        resolved_tick = float(tick_size)
+        tick_source = tick_source_hint or "param"
+    else:
+        resolved_tick, inferred_source = resolve_liquidity_tick_size(
+            symbol or normalized_symbol,
+            None,
+            frame_sequences,
+            meta=meta,
+            logger=LOGGER,
+        )
+        tick_source = inferred_source
+        if tick_size is not None and tick_size > 0:
+            tick_source = "param"
     if resolved_tick <= 0:
         LOGGER.error(
             "Liquidity detection aborted due to non-positive tick size",
@@ -2042,6 +2101,42 @@ def build_liquidity_snapshot(
     level_summary = level_diagnostics.get("_summary", {})
     levels_by_tf = {key: value for key, value in level_diagnostics.items() if key != "_summary"}
 
+<<<<<<< Updated upstream
+=======
+    def _fallback_levels(
+        candles: Sequence[Mapping[str, Any]] | None,
+        *,
+        side: str,
+        tf_label: str,
+    ) -> List[Dict[str, Any]]:
+        if not candles:
+            return []
+        prices: List[float] = []
+        for candle in candles:
+            if not isinstance(candle, Mapping):
+                continue
+            price_value = _coerce_float(candle.get("h" if side == "eqh" else "l"))
+            if price_value is None:
+                continue
+            prices.append(price_value)
+        if not prices:
+            return []
+        if side == "eqh":
+            price = max(prices)
+        else:
+            price = min(prices)
+        tolerance = float(resolved_config.r_ticks) * resolved_tick
+        return [
+            {
+                "price": price,
+                "tf": tf_label,
+                "tolerance": tolerance,
+                "tolerance_ticks": float(resolved_config.r_ticks),
+                "source": "fallback",
+            }
+        ]
+
+>>>>>>> Stashed changes
     raw_candidates: Dict[str, List[Dict[str, Any]]] = {"eqh": [], "eql": []}
     for tf_key, tf_diag in levels_by_tf.items():
         if not isinstance(tf_diag, Mapping):
@@ -2056,6 +2151,31 @@ def build_liquidity_snapshot(
             candidates = eql_diag.get("candidates")
             if isinstance(candidates, Sequence):
                 raw_candidates["eql"].extend(dict(candidate) for candidate in candidates if isinstance(candidate, Mapping))
+<<<<<<< Updated upstream
+=======
+
+    if not levels["eqh"]:
+        fallback_eqh = _fallback_levels(
+            frame_sequences.get("15m"),
+            side="eqh",
+            tf_label="15m",
+        )
+        if fallback_eqh:
+            levels["eqh"] = fallback_eqh
+            LIQUIDITY_COUNTERS["eqh_fallback"] += 1
+            raw_candidates["eqh"].extend(dict(entry) for entry in fallback_eqh)
+
+    if not levels["eql"]:
+        fallback_eql = _fallback_levels(
+            frame_sequences.get("15m"),
+            side="eql",
+            tf_label="15m",
+        )
+        if fallback_eql:
+            levels["eql"] = fallback_eql
+            LIQUIDITY_COUNTERS["eql_fallback"] += 1
+            raw_candidates["eql"].extend(dict(entry) for entry in fallback_eql)
+>>>>>>> Stashed changes
 
     daily_candles = _extract_candles(augmented_frames.get("1d"))
     selection_end = None
@@ -2124,14 +2244,54 @@ def build_liquidity_snapshot(
     if not eql_reasons and not levels["eql"]:
         eql_reasons = [{"reason": "no_candidates", "count": 1}]
 
+<<<<<<< Updated upstream
     metrics_block = {
         "tick_size_unresolved": 1 if tick_source == "fallback_min" else 0,
         "raw_candidates_eqh": int(summary_raw.get("eqh", 0)) if isinstance(summary_raw, Mapping) else 0,
         "raw_candidates_eql": int(summary_raw.get("eql", 0)) if isinstance(summary_raw, Mapping) else 0,
+=======
+    eqh_raw_count = int(summary_raw.get("eqh", 0)) if isinstance(summary_raw, Mapping) else 0
+    eql_raw_count = int(summary_raw.get("eql", 0)) if isinstance(summary_raw, Mapping) else 0
+    if eqh_raw_count == 0 and levels["eqh"]:
+        eqh_raw_count = len(levels["eqh"])
+    if eql_raw_count == 0 and levels["eql"]:
+        eql_raw_count = len(levels["eql"])
+
+    metrics_block = {
+        "tick_size_unresolved": 1 if tick_source == "fallback_min" else 0,
+        "raw_candidates_eqh": eqh_raw_count,
+        "raw_candidates_eql": eql_raw_count,
+>>>>>>> Stashed changes
         "filtered_eqh": len(levels["eqh"]),
         "filtered_eql": len(levels["eql"]),
     }
 
+<<<<<<< Updated upstream
+=======
+    if not eqh_reasons and levels["eqh"]:
+        eqh_reasons = [{"reason": "fallback_generated", "count": len(levels["eqh"]) }]
+    if not eql_reasons and levels["eql"]:
+        eql_reasons = [{"reason": "fallback_generated", "count": len(levels["eql"]) }]
+
+    summary_block = {
+        "eqh": len(levels["eqh"]),
+        "eql": len(levels["eql"]),
+        "sweeps": len(sweeps),
+        "eqh_filtered": len(levels["eqh"]),
+        "eql_filtered": len(levels["eql"]),
+        "eqh_raw": eqh_raw_count,
+        "eql_raw": eql_raw_count,
+        "eqh_reasons": eqh_reasons,
+        "eql_reasons": eql_reasons,
+        "reason_histogram": {
+            "eqh": dict(reason_hist.get("eqh", {})) if isinstance(reason_hist, Mapping) else {},
+            "eql": dict(reason_hist.get("eql", {})) if isinstance(reason_hist, Mapping) else {},
+        },
+        "degraded_timeframes": degraded_timeframes,
+        "has_degraded": bool(degraded_timeframes),
+    }
+
+>>>>>>> Stashed changes
     diagnostics_payload = {
         "config": {
             "swing_window": resolved_config.swing_window,
@@ -2163,6 +2323,7 @@ def build_liquidity_snapshot(
         "daily": daily_diagnostics,
         "sweeps": sweep_diagnostics,
         "metrics": metrics_block,
+<<<<<<< Updated upstream
         "summary": {
             "eqh": len(levels["eqh"]),
             "eql": len(levels["eql"]),
@@ -2180,7 +2341,17 @@ def build_liquidity_snapshot(
             "degraded_timeframes": degraded_timeframes,
             "has_degraded": bool(degraded_timeframes),
         },
+=======
+        "summary": summary_block,
+>>>>>>> Stashed changes
     }
+
+    if resolved_config.session_atr_value is not None:
+        diagnostics_payload["config"]["session_atr_value"] = resolved_config.session_atr_value
+    if resolved_config.session_atr_pct is not None:
+        diagnostics_payload["config"]["session_atr_pct"] = resolved_config.session_atr_pct
+    if resolved_config.session_label:
+        diagnostics_payload["config"]["session_label"] = resolved_config.session_label
 
     return {
         "eqh": levels["eqh"],

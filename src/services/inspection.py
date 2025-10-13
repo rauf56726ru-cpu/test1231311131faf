@@ -2003,6 +2003,7 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
         liquidity_frames,
         symbol=symbol,
         tick_size=tick_size,
+        tick_source_hint=tick_size_source,
         meta=raw_meta,
         selection=selection,
         config=liquidity_config if isinstance(liquidity_config, Mapping) else None,

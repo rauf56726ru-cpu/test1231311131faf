@@ -8,7 +8,7 @@ be evaluated purely from OHLCV candles without relying on external state.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from collections import deque
 from decimal import Decimal
@@ -57,6 +57,7 @@ class Config:
     min_gap_pct: float = 0.00007
     max_gap_age_bars: int = 300
     m_wick_atr: float = 3.0
+    pivot_overrides: Dict[str, int] = field(default_factory=dict)
 
 
 _PIVOT_WINDOWS: Dict[str, int] = {"15m": 2, "1h": 3, "4h": 4}
@@ -375,7 +376,13 @@ def _resolve_fvg_gap(
     return None
 
 
-def _pivot_span(tf: str) -> int:
+def _pivot_span(tf: str, cfg: Config | None = None) -> int:
+    if cfg is not None:
+        overrides = getattr(cfg, "pivot_overrides", None)
+        if isinstance(overrides, Mapping):
+            override_value = overrides.get(tf)
+            if isinstance(override_value, int) and override_value > 0:
+                return override_value
     return _PIVOT_WINDOWS.get(tf, 2)
 
 
@@ -505,7 +512,8 @@ def _detect_structure(
     tick_size: float | None,
     cfg: Config,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    pivots = _detect_pivots(candles, _pivot_span(tf))
+    pivot_span = _pivot_span(tf, cfg)
+    pivots = _detect_pivots(candles, pivot_span)
     bos_events: List[Dict[str, Any]] = []
     choch_events: List[Dict[str, Any]] = []
     trend: str | None = None
@@ -624,6 +632,8 @@ def _fvgs_for_tf(
         price_mid_abs = abs(price_mid)
         pct_ok = price_mid_abs <= 0 or (gap_abs / price_mid_abs) >= cfg.min_gap_pct
         abs_ok = gap_min <= 0 or gap_abs >= gap_min
+        if not abs_ok and cfg.min_gap_tick_multiple <= 0:
+            abs_ok = gap_abs > 0
         if not (abs_ok and pct_ok):
             if stats is not None:
                 stats["fvg_reject_no_gap"] = stats.get("fvg_reject_no_gap", 0) + 1
@@ -905,7 +915,7 @@ def _ob_for_tf(
     smc_payload: Dict[str, Any] = {"structure": [], "liquidity": [], "ob": []}
     tick = tick_size or _infer_tick_size(candles)
     epsilon = tick or 0.0
-    pivot_span = _pivot_span(tf)
+    pivot_span = _pivot_span(tf, cfg)
     pivots = _detect_pivots(candles, pivot_span)
     liquidity_levels: Dict[str, List[Dict[str, Any]]] = {"eqh": [], "eql": [], "pdh": [], "pdl": []}
     for pivot in pivots:
@@ -1249,7 +1259,7 @@ def _sr_levels(
     tick = tick_size or _infer_tick_size(candles_4h)
     epsilon_pct = cfg.sr_merge_pct
     levels: List[Dict[str, Any]] = []
-    pivots = _detect_pivots(candles_4h, _pivot_span("4h"))
+    pivots = _detect_pivots(candles_4h, _pivot_span("4h", cfg))
     for pivot in pivots[-4:]:
         price = float(pivot["price"])
         level_type = "resistance" if pivot["type"] == "ph" else "support"

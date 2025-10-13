@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, List, Mapping, MutableMapping, Optional,
 
 from datetime import datetime, timedelta, timezone
 from math import ceil
+from contextlib import asynccontextmanager
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
@@ -19,7 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
 from ..services import (
     DataQualityError,
@@ -96,7 +97,8 @@ class CandleIn(BaseModel):
     c: float
     v: float
 
-    @validator("v")
+    @field_validator("v")
+    @classmethod
     def _validate_volume(cls, value: float) -> float:
         if value <= 0:
             raise ValueError("Volume must be positive")
@@ -114,10 +116,12 @@ class OrderflowFootprintIn(BaseModel):
     imbalance: Optional[float] = None
     absorption: Optional[bool] = None
 
-    @validator("delta", always=True)
-    def _validate_delta(cls, value: Optional[float], values: Dict[str, Any]) -> float:
-        bid = values.get("bid", 0.0)
-        ask = values.get("ask", 0.0)
+    @field_validator("delta")
+    @classmethod
+    def _validate_delta(cls, value: Optional[float], info: ValidationInfo) -> float:
+        data = info.data
+        bid = data.get("bid", 0.0)
+        ask = data.get("ask", 0.0)
         delta_value = value if value is not None else ask - bid
         if abs(delta_value - (ask - bid)) > 1e-3:
             raise ValueError("delta must equal ask - bid")
@@ -146,19 +150,22 @@ class SnapshotIn(BaseModel):
     meta: Optional[Dict[str, Any]] = None
     lookback_days: int = Field(7, ge=1, le=30)
 
-    @validator("symbol")
+    @field_validator("symbol")
+    @classmethod
     def _validate_symbol(cls, value: str) -> str:
         if not value or not value.strip():
             raise ValueError("symbol is required")
         return value.upper().strip()
 
-    @validator("tf")
+    @field_validator("tf")
+    @classmethod
     def _validate_tf(cls, value: str) -> str:
         if not value or not value.strip():
             raise ValueError("tf is required")
         return value.strip().lower()
 
-    @validator("candles")
+    @field_validator("candles")
+    @classmethod
     def _limit_candles(cls, value: List[CandleIn]) -> List[CandleIn]:
         if len(value) > 5000:
             raise ValueError("candles limit exceeded (max 5000)")
@@ -368,6 +375,7 @@ async def _run_summary_workflow(
         network_backfill=False,
         strict_window=True,
         trace=trace_ctx.child(stage="pipeline") if trace_ctx is not None else None,
+        progress=progress,
     )
     compute_ms = (time.perf_counter() - compute_start) * 1000.0
     TRACE_LOGGER.debug(
@@ -538,13 +546,15 @@ class AnalysisRequest(BaseModel):
     snapshot_id: str
     analysis_type: str
 
-    @validator("snapshot_id")
+    @field_validator("snapshot_id")
+    @classmethod
     def _validate_snapshot_id(cls, value: str) -> str:
         if not value or not value.strip():
             raise ValueError("snapshot_id is required")
         return value
 
-    @validator("analysis_type")
+    @field_validator("analysis_type")
+    @classmethod
     def _validate_analysis_type(cls, value: str) -> str:
         allowed = {"tpo", "zones", "liquidity"}
         if value not in allowed:
@@ -554,7 +564,17 @@ class AnalysisRequest(BaseModel):
 PUBLIC_DIR = PROJECT_ROOT / "public"
 TEMPLATES_DIR = PROJECT_ROOT / "templates"
 
-app = FastAPI(title="Chart OHLC API")
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    if not hasattr(app.state, "ohlcv_cache"):
+        app.state.ohlcv_cache = {}
+    if not hasattr(app.state, "snapshots"):
+        app.state.snapshots = {}
+    yield
+
+
+app = FastAPI(title="Chart OHLC API", lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -577,13 +597,6 @@ async def add_no_store_header(request: Request, call_next):
         response.headers["Cache-Control"] = "no-store"
     return response
 
-
-@app.on_event("startup")
-async def _startup() -> None:
-    if not hasattr(app.state, "ohlcv_cache"):
-        app.state.ohlcv_cache = {}
-    if not hasattr(app.state, "snapshots"):
-        app.state.snapshots = {}
 
 def _parse_iso8601(value: Any) -> datetime | None:
     if not value or not isinstance(value, str):
@@ -2203,6 +2216,9 @@ async def register_inspection_snapshot(payload: SnapshotIn) -> Dict[str, str]:
         last_candle = source_candles[-1] if source_candles else CandleIn(t=0, o=0, h=0, l=0, c=0, v=1)
         book_state = _fallback_book(symbol, last_candle)
 
+    if isinstance(book_state, MutableMapping) and not isinstance(book_state.get("top_levels"), Sequence):
+        book_state["top_levels"] = []
+
     orderflow_payload["footprint"] = (
         footprint_snapshot.get("per_bar", [])
         if isinstance(footprint_snapshot, Mapping)
@@ -2221,7 +2237,7 @@ async def register_inspection_snapshot(payload: SnapshotIn) -> Dict[str, str]:
     if isinstance(cvd_snapshot, Mapping):
         orderflow_payload["cvd_aggregates"] = cvd_snapshot.get("aggregates", {})
 
-    snapshot = payload.dict(exclude_none=True)
+    snapshot = payload.model_dump(exclude_none=True)
     if not snapshot.get("candles") and source_candles:
         snapshot["candles"] = [c.dict() for c in source_candles]
     original_candles: list[dict[str, object]] = []
@@ -4013,4 +4029,3 @@ async def index() -> HTMLResponse:
     except FileNotFoundError as exc:  # pragma: no cover - deployment guard
         raise HTTPException(status_code=500, detail="Index template is missing") from exc
     return HTMLResponse(content=html.replace("__STATIC_VERSION__", STATIC_VERSION))
-

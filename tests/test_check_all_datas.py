@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 import asyncio
 import json
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 import time
 
 import pytest
@@ -255,7 +255,7 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
         "serialize_ms",
         "size_bytes",
     }.issubset(timing_block.keys())
-    assert body["status"] == "ok"
+    assert body["status"] == "ready"
 
     meta = body["meta"]
     assert meta["symbol"] == payload["symbol"]
@@ -272,14 +272,50 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
     assert isinstance(meta["invalid_candle_stages"], dict)
     assert meta.get("sanitized") is True
     assert isinstance(meta.get("sessions_empty"), bool)
+    assert meta.get("pipeline_preset") == "summary_72h"
+    stage_timing = meta.get("stage_timing")
+    assert isinstance(stage_timing, Mapping)
+    expected_stages = {"gaps", "rollups", "delta", "vwap_tpo", "zones", "vitrines"}
+    assert expected_stages.issubset(stage_timing.keys())
+    for stage_name in expected_stages:
+        stage_entry = stage_timing[stage_name]
+        assert isinstance(stage_entry, Mapping)
+        assert stage_entry.get("status") in {"complete", "error"}
     for stage_counts in meta["invalid_candle_stages"].values():
         assert isinstance(stage_counts, dict)
+    readiness = meta.get("readiness", {})
+    assert readiness.get("ready") is True
+    assert readiness.get("missing") == []
+    readiness_requirements = readiness.get("requirements", {})
+    assert isinstance(readiness_requirements, Mapping)
 
     data_block = body["data"]
     assert data_block["symbol"] == payload["symbol"]
     timeframes = data_block["timeframes"]
     expected_tfs = {"1m", "5m", "15m", "1h", "4h", "1d"}
     assert set(timeframes.keys()) == expected_tfs
+<<<<<<< Updated upstream
+=======
+    showcases = data_block["showcases"]
+    assert set(showcases.keys()) == {"A", "B"}
+    showcase_a = showcases["A"]
+    showcase_b = showcases["B"]
+    for showcase in (showcase_a, showcase_b):
+        assert {"items", "completeness", "sources"}.issubset(showcase.keys())
+        assert isinstance(showcase["items"], list)
+        assert isinstance(showcase["completeness"], Mapping)
+        assert isinstance(showcase["sources"], Mapping)
+    completeness_a = showcase_a["completeness"]
+    assert {"window_hours", "counts", "open_entries", "missing_modules", "valid", "validation_errors"}.issubset(
+        completeness_a.keys()
+    )
+    assert isinstance(completeness_a["missing_modules"], list)
+    assert isinstance(completeness_a["validation_errors"], list)
+    completeness_b = showcase_b["completeness"]
+    assert {"sessions", "missing_modules", "valid", "validation_errors"}.issubset(completeness_b.keys())
+    assert isinstance(completeness_b["missing_modules"], list)
+    assert isinstance(completeness_b["validation_errors"], list)
+>>>>>>> Stashed changes
     for tf, summary in timeframes.items():
         assert set(summary.keys()) == {"zones", "sweeps", "atr", "vwap_sessions"}
         zones_summary = summary["zones"]
@@ -302,9 +338,18 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
     assert isinstance(body["notes"], list)
 
     diagnostics = meta.get("diagnostics", {})
+<<<<<<< Updated upstream
     assert {"liquidity", "zones", "vwap_tpo", "orderflow", "coverage", "api", "sessions"}.issubset(
         diagnostics.keys()
     )
+=======
+    assert {"liquidity", "zones", "vwap_tpo", "orderflow", "coverage", "api", "sessions", "readiness"}.issubset(
+        diagnostics.keys()
+    )
+    showcases_diag = diagnostics.get("showcases", {})
+    assert isinstance(showcases_diag, Mapping)
+    assert set(showcases_diag.keys()) == {"A", "B"}
+>>>>>>> Stashed changes
     api_diag = diagnostics.get("api", {})
     assert {"requests", "retries", "rate_limit_hits", "backoffs"}.issubset(api_diag.keys())
     coverage_diag = diagnostics.get("coverage", {})
@@ -339,13 +384,135 @@ async def test_check_all_reports_invalid_timestamps() -> None:
     )
 
     assert result is not None
-    assert result["status"] == "ok"
+    assert result["status"] == "ready"
     meta = result["meta"]
     assert meta["invalid_ts_count"] >= 1
     assert meta["invalid_candles_count"] >= meta["invalid_ts_count"]
     assert meta["invalid_candle_stages"]
     assert result["notes"], "expected notes for invalid timestamps"
     assert any("invalid timestamps" in note for note in result["notes"])
+
+
+@pytest.mark.anyio("asyncio")
+async def test_readiness_requires_ohlcv(monkeypatch) -> None:
+    base = datetime(2024, 1, 2, 0, 0, tzinfo=UTC)
+    payload = _build_snapshot_payload(base, count=120)
+    snapshot = {
+        "id": "readiness-ohlcv",
+        "symbol": payload["symbol"],
+        "tf": "1m",
+        "frames": {"1m": {"tf": "1m", "candles": payload["candles"]}},
+        "selection": {"start": payload["candles"][0]["t"], "end": payload["candles"][-1]["t"]},
+    }
+
+    original_build_multi = check_all_datas.build_multi_tf_ohlcv
+
+    async def fake_build_multi_tf(*args, **kwargs):
+        result = await original_build_multi(*args, **kwargs)
+        timeframes = kwargs.get("timeframes")
+        if not isinstance(timeframes, Sequence):
+            if len(args) >= 3:
+                timeframes = args[2]
+        if not isinstance(timeframes, Sequence):
+            timeframes = ()
+        for tf in ("15m", "1h"):
+            frame = result.get(tf)
+            if isinstance(frame, Mapping):
+                frame["candles"] = []
+            else:
+                result[tf] = {"candles": []}
+        return result
+
+    monkeypatch.setattr(check_all_datas, "build_multi_tf_ohlcv", fake_build_multi_tf)
+
+    result = await check_all_datas.build_check_all_datas(
+        snapshot,
+        now_utc=base + timedelta(hours=4),
+        hours=4,
+    )
+
+    assert result is not None
+    assert result["status"] == "insufficient_data"
+    assert "readiness.ohlcv" in result["missing_fields"]
+    readiness = result["meta"].get("readiness", {})
+    assert readiness.get("ready") is False
+    assert "readiness.ohlcv" in readiness.get("missing", [])
+
+
+@pytest.mark.anyio("asyncio")
+async def test_readiness_requires_orderflow(monkeypatch) -> None:
+    base = datetime(2024, 1, 3, 0, 0, tzinfo=UTC)
+    payload = _build_snapshot_payload(base, count=120)
+    snapshot = {
+        "id": "readiness-orderflow",
+        "symbol": payload["symbol"],
+        "tf": "1m",
+        "frames": {"1m": {"tf": "1m", "candles": payload["candles"]}},
+        "selection": {"start": payload["candles"][0]["t"], "end": payload["candles"][-1]["t"]},
+    }
+
+    original_orderflow = check_all_datas._build_orderflow_block
+
+    async def fake_orderflow_block(*args, **kwargs):
+        block, diag = await original_orderflow(*args, **kwargs)
+        for tf in ("15m", "1h"):
+            frame = block.get(tf)
+            if isinstance(frame, Mapping):
+                frame["per_bar"] = []
+            else:
+                block[tf] = {"per_bar": [], "summary": {}}
+        return block, diag
+
+    monkeypatch.setattr(check_all_datas, "_build_orderflow_block", fake_orderflow_block)
+
+    result = await check_all_datas.build_check_all_datas(
+        snapshot,
+        now_utc=base + timedelta(hours=4),
+        hours=4,
+    )
+
+    assert result is not None
+    assert result["status"] == "insufficient_data"
+    assert "readiness.orderflow" in result["missing_fields"]
+    readiness = result["meta"].get("readiness", {})
+    assert readiness.get("ready") is False
+    assert "readiness.orderflow" in readiness.get("missing", [])
+
+
+@pytest.mark.anyio("asyncio")
+async def test_readiness_requires_session_completeness(monkeypatch) -> None:
+    base = datetime(2024, 1, 4, 0, 0, tzinfo=UTC)
+    payload = _build_snapshot_payload(base, count=120)
+    snapshot = {
+        "id": "readiness-sessions",
+        "symbol": payload["symbol"],
+        "tf": "1m",
+        "frames": {"1m": {"tf": "1m", "candles": payload["candles"]}},
+        "selection": {"start": payload["candles"][0]["t"], "end": payload["candles"][-1]["t"]},
+    }
+
+    original_compute = check_all_datas._compute_session_completeness
+
+    def fake_compute_session_completeness(*args, **kwargs):
+        result = original_compute(*args, **kwargs)
+        overriden = dict(result)
+        overriden["status"] = "empty"
+        return overriden
+
+    monkeypatch.setattr(check_all_datas, "_compute_session_completeness", fake_compute_session_completeness)
+
+    result = await check_all_datas.build_check_all_datas(
+        snapshot,
+        now_utc=base + timedelta(hours=4),
+        hours=4,
+    )
+
+    assert result is not None
+    assert result["status"] == "insufficient_data"
+    assert "readiness.sessions" in result["missing_fields"]
+    readiness = result["meta"].get("readiness", {})
+    assert readiness.get("ready") is False
+    assert "readiness.sessions" in readiness.get("missing", [])
 
 
 def test_topup_limits_window_to_last_collection(client: TestClient) -> None:
@@ -476,15 +643,20 @@ def test_orderflow_block_matches_spec(client: TestClient) -> None:
     diag_block = orderflow_block.get("diag")
     assert isinstance(diag_block, dict)
 
-    minute_series = orderflow_block["1m"]["per_bar"]
+    minute_block = orderflow_block["1m"]
+    minute_series = minute_block["per_bar"]
     assert isinstance(minute_series, list)
     assert minute_series
-    assert len(minute_series) <= 240
+    assert len(minute_series) == check_all_datas.ORDERFLOW_REQUIRED_HOURS * 60
     minute_entry = minute_series[-1]
     assert "delta" in minute_entry and "cvd" in minute_entry
+    summary_1m = minute_block.get("summary", {})
+    assert summary_1m.get("minutes") == check_all_datas.ORDERFLOW_REQUIRED_HOURS * 60
+    assert summary_1m.get("minutes_with_trades") >= 0
 
     for tf in ("3m", "5m", "15m", "1h"):
-        series = orderflow_block[tf]["per_bar"]
+        block = orderflow_block[tf]
+        series = block["per_bar"]
         assert isinstance(series, list)
         if series:
             entry = series[0]
@@ -492,6 +664,10 @@ def test_orderflow_block_matches_spec(client: TestClient) -> None:
                 assert isinstance(entry[key], (int, float))
             if "bars" in entry:
                 assert isinstance(entry["bars"], int)
+        summary = block.get("summary", {})
+        assert "delta_sum" in summary and "volume_sum" in summary
+        if tf in {"15m", "1h"}:
+            assert series, f"Expected aggregated series for {tf} to be non-empty"
 
 
 def test_vwap_tpo_sessions_include_aliases(client: TestClient) -> None:
@@ -511,15 +687,236 @@ def test_vwap_tpo_sessions_include_aliases(client: TestClient) -> None:
 
     sessions = body["meta"]["diagnostics"]["vwap_tpo"]["sessions"]
     ny_session = sessions["ny"]
-    assert ny_session["open_utc"].endswith("13:30:00Z")
-    assert ny_session["close_utc"].endswith("16:30:00Z")
+    assert ny_session["open_utc"].endswith("11:30:00Z")
+    assert ny_session["close_utc"].endswith("14:30:00Z")
     assert ny_session["sd2"]["plus"] >= ny_session["sd1"]["plus"]
     assert "poc" in ny_session
     assert "ib_high" in ny_session
     assert "ib_low" in ny_session
+    completeness_block = ny_session.get("completeness", {})
+    assert completeness_block
+    assert isinstance(completeness_block, dict)
+    assert completeness_block.get("status") in {"complete", "partial", "empty", "na"}
+    assert completeness_block.get("tf") in {"1m", "3m"}
 
     daily_block = body["meta"]["diagnostics"]["vwap_tpo"]["daily"]
     assert daily_block["vwap"] is not None
+<<<<<<< Updated upstream
+=======
+
+
+def test_recent_zone_focus_filters_window(client: TestClient, monkeypatch) -> None:
+    base = datetime(2024, 6, 1, 0, 0, tzinfo=UTC)
+    payload = _build_snapshot_payload(base, count=12 * 60)
+
+    recent_iso = (base + timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+    stale_iso = (base - timedelta(hours=80)).isoformat().replace("+00:00", "Z")
+
+    def fake_detect_zones(*args, **kwargs):
+        return {
+            "zones": {
+                "fvg": [
+                    {
+                        "tf": "15m",
+                        "direction": "up",
+                        "top": 105.0,
+                        "bot": 103.0,
+                        "mid": 104.0,
+                        "created_utc": recent_iso,
+                        "status": "open",
+                    },
+                    {
+                        "tf": "1h",
+                        "direction": "down",
+                        "top": 140.0,
+                        "bot": 138.0,
+                        "mid": 139.0,
+                        "created_utc": stale_iso,
+                        "status": "tapped",
+                    },
+                ],
+                "fvl": [],
+                "ob": [
+                    {
+                        "tf": "1h",
+                        "type": "supply",
+                        "open": 120.0,
+                        "close": 121.2,
+                        "mean": 120.6,
+                        "origin_utc": recent_iso,
+                        "status": "fresh",
+                        "fill_ratio": 0.7,
+                    },
+                    {
+                        "tf": "15m",
+                        "type": "demand",
+                        "open": 90.0,
+                        "close": 91.0,
+                        "mean": 90.5,
+                        "origin_utc": stale_iso,
+                        "status": "tapped",
+                    },
+                ],
+                "mb": [],
+                "bb": [],
+                "rb": [],
+                "pb": [],
+                "sr": [],
+                "profile_levels": [],
+            },
+            "meta": {},
+        }
+
+    monkeypatch.setattr(check_all_datas, "detect_zones", fake_detect_zones)
+
+    captured_configs: list[Mapping[str, Any]] = []
+    sweep_ts = int((base + timedelta(hours=2)).timestamp() * 1000)
+
+    def fake_build_liquidity_snapshot(
+        frames,
+        *,
+        symbol,
+        tick_size,
+        tick_source_hint=None,
+        meta=None,
+        selection=None,
+        config=None,
+    ):
+        captured_configs.append(config or {})
+        sweeps = [
+            {
+                "type": "sweep_top",
+                "tf": "15m",
+                "level_type": "eqh",
+                "level_price": 104.0,
+                "t": sweep_ts,
+                "retest_t": sweep_ts,
+                "atr_tolerance": 0.1,
+                "min_move": 0.2,
+                "level_source": "eq",
+            },
+            {
+                "type": "sweep_top",
+                "tf": "1h",
+                "level_type": "eqh",
+                "level_price": 104.0,
+                "t": sweep_ts,
+                "retest_t": sweep_ts,
+                "atr_tolerance": 0.1,
+                "min_move": 0.2,
+                "level_source": "eq",
+            },
+        ]
+        diagnostics = {
+            "config": dict(config or {}),
+            "metrics": {},
+            "summary": {},
+            "tick_size": {"value": tick_size},
+        }
+        return {
+            "eqh": [],
+            "eql": [],
+            "pdh": [],
+            "pdl": [],
+            "sweeps": sweeps,
+            "candidates": {"eqh": [], "eql": []},
+            "diagnostics": diagnostics,
+        }
+
+    monkeypatch.setattr(check_all_datas, "build_liquidity_snapshot", fake_build_liquidity_snapshot)
+
+    create_response = client.post("/inspection/snapshot", json=payload)
+    assert create_response.status_code == 200
+    snapshot_id = create_response.json()["snapshot_id"]
+
+    response = client.get(
+        "/inspection/check-all",
+        params={"snapshot": snapshot_id, "hours": 4},
+    )
+    assert response.status_code == 200
+    body = response.json()
+
+    zones_recent = body["data"]["zones"]["recent"]
+    assert zones_recent["window_hours"] == 72
+    assert zones_recent["meta"]["has_recent"] is True
+
+    fvg_recent = zones_recent["fvg"]
+    assert len(fvg_recent) == 1
+    assert fvg_recent[0]["status"] == "open"
+    assert fvg_recent[0]["mid"] == pytest.approx(104.0)
+    assert "sweeps" in fvg_recent[0]
+    assert fvg_recent[0]["sweeps"], "Expected sweep linkage on recent zone"
+
+    ob_recent = zones_recent["ob"]
+    assert len(ob_recent) == 1
+    assert ob_recent[0]["status"] == "mitigated"
+    assert ob_recent[0]["type"] == "supply"
+
+    reasons_fvg = zones_recent["meta"]["reasons"]["fvg"]
+    reasons_ob = zones_recent["meta"]["reasons"]["ob"]
+
+    sweeps_public = body["data"]["liquidity"].get("sweeps", [])
+    assert len(sweeps_public) == 1
+    sweep_entry = sweeps_public[0]
+    assert sweep_entry.get("zone_links"), "Expected sweep to include linked zones"
+
+    assert captured_configs, "Expected liquidity config to be captured"
+    dynamic_config = captured_configs[0]
+    assert isinstance(dynamic_config, Mapping)
+
+
+def test_session_window_converts_berlin_to_utc() -> None:
+    ny_start, ny_end = next(
+        (start, end)
+        for name, start, end in check_all_datas.VWAP_TPO_SESSIONS
+        if name == "ny"
+    )
+    anchor_pre = datetime(2024, 3, 29, 20, 0, tzinfo=UTC)
+    pre_start, pre_end, pre_close = check_all_datas._session_window(
+        int(anchor_pre.timestamp() * 1000), ny_start, ny_end
+    )
+    expected_pre_start = datetime(2024, 3, 29, 12, 30, tzinfo=UTC)
+    expected_pre_close = datetime(2024, 3, 29, 15, 30, tzinfo=UTC)
+    assert pre_start == int(expected_pre_start.timestamp() * 1000)
+    assert pre_close == int(expected_pre_close.timestamp() * 1000)
+    assert pre_end == pre_close - check_all_datas.MINUTE_INTERVAL_MS
+
+    anchor_post = datetime(2024, 4, 2, 20, 0, tzinfo=UTC)
+    post_start, post_end, post_close = check_all_datas._session_window(
+        int(anchor_post.timestamp() * 1000), ny_start, ny_end
+    )
+    expected_post_start = datetime(2024, 4, 2, 11, 30, tzinfo=UTC)
+    expected_post_close = datetime(2024, 4, 2, 14, 30, tzinfo=UTC)
+    assert post_start == int(expected_post_start.timestamp() * 1000)
+    assert post_close == int(expected_post_close.timestamp() * 1000)
+    assert post_end == post_close - check_all_datas.MINUTE_INTERVAL_MS
+    assert post_close - post_start == 3 * 60 * 60 * 1000
+
+
+def test_session_completeness_partial_detection() -> None:
+    start_dt = datetime(2024, 4, 1, 11, 30, tzinfo=UTC)
+    start_ms = int(start_dt.timestamp() * 1000)
+    close_ms = start_ms + 3 * 60 * 60 * 1000
+    end_ms = start_ms + (30 - 1) * check_all_datas.MINUTE_INTERVAL_MS
+    candles = [
+        {"t": start_ms + index * check_all_datas.MINUTE_INTERVAL_MS, "o": 0.0, "h": 0.0, "l": 0.0, "c": 0.0, "v": 1.0}
+        for index in range(30)
+    ]
+
+    completeness = check_all_datas._compute_session_completeness(
+        candles,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        close_ms=close_ms,
+        interval_ms=check_all_datas.MINUTE_INTERVAL_MS,
+        timeframe="1m",
+    )
+
+    assert completeness["bars_observed"] == 30
+    assert completeness["bars_expected"] == 180
+    assert completeness["status"] == "partial"
+    assert completeness["coverage_ratio"] == pytest.approx(30 / 180)
+>>>>>>> Stashed changes
 
 
 def test_session_detailed_mode_returns_placeholder(client: TestClient) -> None:
@@ -626,7 +1023,7 @@ async def test_check_all_with_fixture_snapshot_file() -> None:
     )
 
     assert result is not None
-    assert result["status"] == "ok"
+    assert result["status"] == "ready"
     meta = result["meta"]
     assert meta["symbol"] == snapshot["symbol"]
     assert meta["invalid_candles_count"] == 0
