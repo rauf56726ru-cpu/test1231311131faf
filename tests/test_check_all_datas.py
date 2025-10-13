@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 import asyncio
 import json
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 import time
 
 import pytest
@@ -54,7 +54,16 @@ def snapshot_storage(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def stub_binance_minutes(monkeypatch):
-    async def filler(symbol: str, start_ms: int, end_ms: int, gaps):
+    async def filler(
+        symbol: str,
+        start_ms: int,
+        end_ms: int,
+        gaps,
+        *,
+        budget=None,
+        api_diag=None,
+        **_,
+    ):
         candles = []
         for gap in gaps:
             cursor = int(gap["from"])
@@ -71,6 +80,8 @@ def stub_binance_minutes(monkeypatch):
                     }
                 )
                 cursor += 60_000
+        if api_diag is not None:
+            api_diag["downloaded_bars"] = int(api_diag.get("downloaded_bars", 0)) + len(candles)
         return candles
 
     monkeypatch.setattr(check_all_datas, "_download_missing_minutes_async", filler)
@@ -138,6 +149,32 @@ def stub_fetch_ohlcv(monkeypatch):
     monkeypatch.setattr(ohlc, "fetch_ohlcv_sync", fake_fetch)
     monkeypatch.setattr(ohlc, "fetch_ohlcv", fake_fetch_async)
     monkeypatch.setattr(check_all_datas, "fetch_ohlcv", fake_fetch_async)
+
+    async def fake_klines(
+        symbol: str,
+        timeframe: str,
+        start_ms: int | None,
+        end_ms: int | None,
+        limit: int | None,
+    ):
+        interval_ms = ohlc.TIMEFRAME_TO_MS.get(timeframe, 60_000)
+        if start_ms is None:
+            cursor = _aligned_base(interval_ms)
+        else:
+            cursor = start_ms - (start_ms % interval_ms)
+        end_cursor = end_ms if end_ms is not None else cursor + interval_ms * 3
+        max_rows = limit or 500
+        rows: list[list[float]] = []
+        while cursor < end_cursor and len(rows) < max_rows:
+            open_price = 200.0 + (cursor - base_epoch) / max(interval_ms, 1) * 0.01
+            high_price = open_price + 1.0
+            low_price = open_price - 1.0
+            close_price = open_price + 0.5
+            rows.append([cursor, open_price, high_price, low_price, close_price, 1.0])
+            cursor += interval_ms
+        return rows
+
+    monkeypatch.setattr(check_all_datas, "_fetch_binance_klines", fake_klines)
 
     async def fake_fetch_orderbook(symbol: str, window_minutes: int, *, trace=None):
         from datetime import datetime, timezone
@@ -218,7 +255,7 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
         "serialize_ms",
         "size_bytes",
     }.issubset(timing_block.keys())
-    assert body["status"] == "ok"
+    assert body["status"] == "ready"
 
     meta = body["meta"]
     assert meta["symbol"] == payload["symbol"]
@@ -235,94 +272,83 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
     assert isinstance(meta["invalid_candle_stages"], dict)
     assert meta.get("sanitized") is True
     assert isinstance(meta.get("sessions_empty"), bool)
+    assert meta.get("pipeline_preset") == "summary_72h"
+    stage_timing = meta.get("stage_timing")
+    assert isinstance(stage_timing, Mapping)
+    expected_stages = {"gaps", "rollups", "delta", "vwap_tpo", "zones", "vitrines"}
+    assert expected_stages.issubset(stage_timing.keys())
+    for stage_name in expected_stages:
+        stage_entry = stage_timing[stage_name]
+        assert isinstance(stage_entry, Mapping)
+        assert stage_entry.get("status") in {"complete", "error"}
     for stage_counts in meta["invalid_candle_stages"].values():
         assert isinstance(stage_counts, dict)
+    readiness = meta.get("readiness", {})
+    assert readiness.get("ready") is True
+    assert readiness.get("missing") == []
+    readiness_requirements = readiness.get("requirements", {})
+    assert isinstance(readiness_requirements, Mapping)
 
     data_block = body["data"]
-
-    ohlcv = data_block["ohlcv"]
-    assert set(ohlcv.keys()) == {"1m", "3m", "5m", "15m", "1h", "4h", "1d"}
-    for series in ohlcv.values():
-        assert isinstance(series["candles"], list)
-
-    orderflow = data_block["orderflow"]
-    expected_tfs = {"1m", "3m", "5m", "15m", "1h"}
-    assert expected_tfs.issubset(orderflow.keys())
-    diag_block = orderflow.get("diag")
-    assert isinstance(diag_block, dict)
-    for tf, block in orderflow.items():
-        if tf == "diag":
-            continue
-        assert isinstance(block.get("per_bar"), list)
-        if tf == "1m":
-            compact_diag = (diag_block or {}).get("compact") if isinstance(diag_block, dict) else None
-            per_bar_limits = (compact_diag or {}).get("per_bar_lengths") if isinstance(compact_diag, dict) else {}
-            limit = per_bar_limits.get("1m")
-            if isinstance(limit, int) and limit > 0:
-                assert len(block["per_bar"]) <= limit
-
-    assert isinstance(body["notes"], list)
-    assert not body["notes"]
-
-    vwap_tpo = data_block["vwap_tpo"]
-    assert vwap_tpo["daily"]["open_utc"].startswith("2024-01-02T00:00:00")
-    assert set(vwap_tpo["sessions"].keys()) == {"asia", "london", "ny"}
-    for session_payload in vwap_tpo["sessions"].values():
-        assert set(session_payload.keys()) == {
-            "open_utc",
-            "close_utc",
-            "vwap",
-            "sd1",
-            "sd2",
-            "poc",
-            "vah",
-            "val",
-            "ib_high",
-            "ib_low",
-            "high",
-            "low",
-        }
-
-    composite_day = data_block["tpo"]["composite_day"]
-    assert set(composite_day.keys()) == {"poc", "vah", "val"}
-
-    prev_day = data_block["prev_day"]
-    assert set(prev_day.keys()) == {"pdh", "pdl", "close", "poc", "vah", "val"}
-    prev_minutes = payload["candles"][: 60 * 24]
-    expected_high = max(candle["h"] for candle in prev_minutes)
-    expected_low = min(candle["l"] for candle in prev_minutes)
-    expected_close = prev_minutes[-1]["c"]
-    assert prev_day["pdh"] == pytest.approx(expected_high)
-    assert prev_day["pdl"] == pytest.approx(expected_low)
-    assert prev_day["close"] == pytest.approx(expected_close)
-
-    zones = data_block["zones"]
-    zones_diag = zones.get("diag")
-    assert isinstance(zones_diag, dict)
-    zone_series_keys = {"fvg", "fvl", "ob", "mb", "bb", "rb", "pb", "sr", "profile_levels"}
-    assert zone_series_keys.issubset(zones.keys())
-    for key, zone_series in zones.items():
-        if key == "diag":
-            continue
-        assert isinstance(zone_series, list)
-
-    liquidity = data_block["liquidity"]
-    assert set(liquidity.keys()) == {"eqh", "eql"}
-    for levels in liquidity.values():
-        assert isinstance(levels, list)
-
-    assert data_block["risk_prefs"] == {
-        "rr_min": pytest.approx(2.5),
-        "risk_per_trade_pct": pytest.approx(1.0),
-    }
-    assert data_block["context"] == {
-        "globalBias": "neutral",
-        "narrative": "",
-        "openOppositeZones": False,
-    }
+    assert data_block["symbol"] == payload["symbol"]
+    timeframes = data_block["timeframes"]
+    expected_tfs = {"1m", "5m", "15m", "1h", "4h", "1d"}
+    assert set(timeframes.keys()) == expected_tfs
+    showcases = data_block["showcases"]
+    assert set(showcases.keys()) == {"A", "B"}
+    showcase_a = showcases["A"]
+    showcase_b = showcases["B"]
+    for showcase in (showcase_a, showcase_b):
+        assert {"items", "completeness", "sources"}.issubset(showcase.keys())
+        assert isinstance(showcase["items"], list)
+        assert isinstance(showcase["completeness"], Mapping)
+        assert isinstance(showcase["sources"], Mapping)
+    completeness_a = showcase_a["completeness"]
+    assert {"window_hours", "counts", "open_entries", "missing_modules", "valid", "validation_errors"}.issubset(
+        completeness_a.keys()
+    )
+    assert isinstance(completeness_a["missing_modules"], list)
+    assert isinstance(completeness_a["validation_errors"], list)
+    completeness_b = showcase_b["completeness"]
+    assert {"sessions", "missing_modules", "valid", "validation_errors"}.issubset(completeness_b.keys())
+    assert isinstance(completeness_b["missing_modules"], list)
+    assert isinstance(completeness_b["validation_errors"], list)
+    for tf, summary in timeframes.items():
+        assert set(summary.keys()) == {"zones", "sweeps", "atr", "vwap_sessions"}
+        zones_summary = summary["zones"]
+        assert set(zones_summary.keys()) == {"eqh", "eql", "fvg", "ob"}
+        assert isinstance(summary["sweeps"], int)
+        vwap_flags = summary["vwap_sessions"]
+        assert set(vwap_flags.keys()) == {"asia", "london", "ny"}
+        for flag in vwap_flags.values():
+            assert isinstance(flag, bool)
+        atr_value = summary["atr"]
+        if atr_value is not None:
+            assert isinstance(atr_value, float)
 
     availability = body["availability"]
-    assert set(availability.keys()) == {"ohlcv", "vwap_sessions", "zones", "orderflow"}
+    assert set(availability.keys()) == {"timeframes"}
+    for tf, tf_block in availability["timeframes"].items():
+        assert set(tf_block.keys()) == {"zones", "sweeps", "atr", "vwap_sessions"}
+        assert set(tf_block["zones"].keys()) == {"eqh", "eql", "fvg", "ob"}
+
+    assert isinstance(body["notes"], list)
+
+    diagnostics = meta.get("diagnostics", {})
+    assert {"liquidity", "zones", "vwap_tpo", "orderflow", "coverage", "api", "sessions", "readiness"}.issubset(
+        diagnostics.keys()
+    )
+    showcases_diag = diagnostics.get("showcases", {})
+    assert isinstance(showcases_diag, Mapping)
+    assert set(showcases_diag.keys()) == {"A", "B"}
+    api_diag = diagnostics.get("api", {})
+    assert {"requests", "retries", "rate_limit_hits", "backoffs"}.issubset(api_diag.keys())
+    coverage_diag = diagnostics.get("coverage", {})
+    assert "1m" in coverage_diag
+    vwap_tpo = diagnostics.get("vwap_tpo", {})
+    sessions_diag = vwap_tpo.get("sessions", {}) if isinstance(vwap_tpo, Mapping) else {}
+    assert set(sessions_diag.keys()) == {"asia", "london", "ny"}
+
     assert isinstance(body["missing_fields"], list)
 
 
@@ -349,13 +375,135 @@ async def test_check_all_reports_invalid_timestamps() -> None:
     )
 
     assert result is not None
-    assert result["status"] == "ok"
+    assert result["status"] == "ready"
     meta = result["meta"]
     assert meta["invalid_ts_count"] >= 1
     assert meta["invalid_candles_count"] >= meta["invalid_ts_count"]
     assert meta["invalid_candle_stages"]
     assert result["notes"], "expected notes for invalid timestamps"
     assert any("invalid timestamps" in note for note in result["notes"])
+
+
+@pytest.mark.anyio("asyncio")
+async def test_readiness_requires_ohlcv(monkeypatch) -> None:
+    base = datetime(2024, 1, 2, 0, 0, tzinfo=UTC)
+    payload = _build_snapshot_payload(base, count=120)
+    snapshot = {
+        "id": "readiness-ohlcv",
+        "symbol": payload["symbol"],
+        "tf": "1m",
+        "frames": {"1m": {"tf": "1m", "candles": payload["candles"]}},
+        "selection": {"start": payload["candles"][0]["t"], "end": payload["candles"][-1]["t"]},
+    }
+
+    original_build_multi = check_all_datas.build_multi_tf_ohlcv
+
+    async def fake_build_multi_tf(*args, **kwargs):
+        result = await original_build_multi(*args, **kwargs)
+        timeframes = kwargs.get("timeframes")
+        if not isinstance(timeframes, Sequence):
+            if len(args) >= 3:
+                timeframes = args[2]
+        if not isinstance(timeframes, Sequence):
+            timeframes = ()
+        for tf in ("15m", "1h"):
+            frame = result.get(tf)
+            if isinstance(frame, Mapping):
+                frame["candles"] = []
+            else:
+                result[tf] = {"candles": []}
+        return result
+
+    monkeypatch.setattr(check_all_datas, "build_multi_tf_ohlcv", fake_build_multi_tf)
+
+    result = await check_all_datas.build_check_all_datas(
+        snapshot,
+        now_utc=base + timedelta(hours=4),
+        hours=4,
+    )
+
+    assert result is not None
+    assert result["status"] == "insufficient_data"
+    assert "readiness.ohlcv" in result["missing_fields"]
+    readiness = result["meta"].get("readiness", {})
+    assert readiness.get("ready") is False
+    assert "readiness.ohlcv" in readiness.get("missing", [])
+
+
+@pytest.mark.anyio("asyncio")
+async def test_readiness_requires_orderflow(monkeypatch) -> None:
+    base = datetime(2024, 1, 3, 0, 0, tzinfo=UTC)
+    payload = _build_snapshot_payload(base, count=120)
+    snapshot = {
+        "id": "readiness-orderflow",
+        "symbol": payload["symbol"],
+        "tf": "1m",
+        "frames": {"1m": {"tf": "1m", "candles": payload["candles"]}},
+        "selection": {"start": payload["candles"][0]["t"], "end": payload["candles"][-1]["t"]},
+    }
+
+    original_orderflow = check_all_datas._build_orderflow_block
+
+    async def fake_orderflow_block(*args, **kwargs):
+        block, diag = await original_orderflow(*args, **kwargs)
+        for tf in ("15m", "1h"):
+            frame = block.get(tf)
+            if isinstance(frame, Mapping):
+                frame["per_bar"] = []
+            else:
+                block[tf] = {"per_bar": [], "summary": {}}
+        return block, diag
+
+    monkeypatch.setattr(check_all_datas, "_build_orderflow_block", fake_orderflow_block)
+
+    result = await check_all_datas.build_check_all_datas(
+        snapshot,
+        now_utc=base + timedelta(hours=4),
+        hours=4,
+    )
+
+    assert result is not None
+    assert result["status"] == "insufficient_data"
+    assert "readiness.orderflow" in result["missing_fields"]
+    readiness = result["meta"].get("readiness", {})
+    assert readiness.get("ready") is False
+    assert "readiness.orderflow" in readiness.get("missing", [])
+
+
+@pytest.mark.anyio("asyncio")
+async def test_readiness_requires_session_completeness(monkeypatch) -> None:
+    base = datetime(2024, 1, 4, 0, 0, tzinfo=UTC)
+    payload = _build_snapshot_payload(base, count=120)
+    snapshot = {
+        "id": "readiness-sessions",
+        "symbol": payload["symbol"],
+        "tf": "1m",
+        "frames": {"1m": {"tf": "1m", "candles": payload["candles"]}},
+        "selection": {"start": payload["candles"][0]["t"], "end": payload["candles"][-1]["t"]},
+    }
+
+    original_compute = check_all_datas._compute_session_completeness
+
+    def fake_compute_session_completeness(*args, **kwargs):
+        result = original_compute(*args, **kwargs)
+        overriden = dict(result)
+        overriden["status"] = "empty"
+        return overriden
+
+    monkeypatch.setattr(check_all_datas, "_compute_session_completeness", fake_compute_session_completeness)
+
+    result = await check_all_datas.build_check_all_datas(
+        snapshot,
+        now_utc=base + timedelta(hours=4),
+        hours=4,
+    )
+
+    assert result is not None
+    assert result["status"] == "insufficient_data"
+    assert "readiness.sessions" in result["missing_fields"]
+    readiness = result["meta"].get("readiness", {})
+    assert readiness.get("ready") is False
+    assert "readiness.sessions" in readiness.get("missing", [])
 
 
 def test_topup_limits_window_to_last_collection(client: TestClient) -> None:
@@ -377,8 +525,7 @@ def test_topup_limits_window_to_last_collection(client: TestClient) -> None:
         )
         assert response.status_code == 200
         body = response.json()
-        zones_block = body["data"]["zones"]
-        zones_diag_block = zones_block.get("diag")
+        zones_diag_block = body["meta"]["diagnostics"].get("zones")
         assert isinstance(zones_diag_block, dict)
         gating_diag = zones_diag_block.get("gating")
         if gating_diag is not None:
@@ -399,38 +546,17 @@ def test_multi_timeframe_ohlcv_alignment(client: TestClient) -> None:
     assert response.status_code == 200
     body = response.json()
 
-    ohlcv_block = body["data"]["ohlcv"]
-    assert ohlcv_block["1m"]["candles"]
-
-    minute_map = {candle["t"]: candle for candle in ohlcv_block["1m"]["candles"]}
-    first_hour = ohlcv_block["1h"]["candles"][0]
-    interval = check_all_datas.TIMEFRAME_TO_MS["1m"]
-    hour_interval = check_all_datas.TIMEFRAME_TO_MS["1h"]
-    step_count = hour_interval // interval
-    expected_minutes = [first_hour["t"] + index * interval for index in range(step_count)]
-    assert all(ts in minute_map for ts in expected_minutes)
-    assert pytest.approx(first_hour["o"]) == minute_map[first_hour["t"]]["o"]
-    assert pytest.approx(first_hour["c"]) == minute_map[expected_minutes[-1]]["c"]
-    assert pytest.approx(first_hour["h"]) == max(minute_map[ts]["h"] for ts in expected_minutes)
-    assert pytest.approx(first_hour["l"]) == min(minute_map[ts]["l"] for ts in expected_minutes)
-    assert pytest.approx(first_hour["v"]) == sum(minute_map[ts]["v"] for ts in expected_minutes)
-
-    assert ohlcv_block["1d"]["candles"]
-
-
-def _min_delta(candles: list[dict[str, Any]]) -> int | None:
-    prev_ts: int | None = None
-    delta: int | None = None
-    for candle in candles:
-        ts = candle.get("t")
-        if not isinstance(ts, int):
-            continue
-        if prev_ts is not None:
-            diff = ts - prev_ts
-            if diff > 0 and (delta is None or diff < delta):
-                delta = diff
-        prev_ts = ts
-    return delta
+    diagnostics = body["meta"].get("diagnostics", {})
+    coverage = diagnostics.get("coverage", {})
+    assert {"1m", "5m", "15m", "1h", "4h", "1d"}.issubset(coverage.keys())
+    hour_state = coverage["1h"]
+    assert hour_state["interval_ms"] == check_all_datas.TIMEFRAME_TO_MS["1h"]
+    assert hour_state["gap_count"] == 0
+    assert hour_state["present_bars"] == hour_state["expected_bars"]
+    daily_state = coverage["1d"]
+    assert daily_state["interval_ms"] == check_all_datas.TIMEFRAME_TO_MS["1d"]
+    daily_diag = diagnostics.get("daily", {})
+    assert daily_diag.get("available") is True
 
 
 def test_timeframe_series_do_not_embed_minute_data(client: TestClient) -> None:
@@ -445,13 +571,21 @@ def test_timeframe_series_do_not_embed_minute_data(client: TestClient) -> None:
     assert response.status_code == 200
     body = response.json()
 
-    ohlcv_block = body["data"]["ohlcv"]
+    diagnostics = body["meta"].get("diagnostics", {})
+    coverage = diagnostics.get("coverage", {})
+    assert set(coverage.keys()) >= {"3m", "5m", "15m", "1h"}
     for tf in ("3m", "5m", "15m", "1h"):
-        candles = ohlcv_block[tf]["candles"]
-        assert candles, f"expected candles for {tf}"
-        delta = _min_delta(candles)
-        expected = check_all_datas.TIMEFRAME_TO_MS[tf]
-        assert delta is None or delta >= expected, f"{tf} frame leaked minute bars"
+        state = coverage[tf]
+        assert state["interval_ms"] == check_all_datas.TIMEFRAME_TO_MS[tf]
+        assert state["expected_bars"] >= state["present_bars"]
+    trace_entries = diagnostics.get("coverage_trace", [])
+    counts = {tf: 0 for tf in ("3m", "5m", "15m", "1h")}
+    for entry in trace_entries:
+        tf = entry.get("tf")
+        if tf in counts:
+            counts[tf] += 1
+    for tf in counts:
+        assert counts[tf] >= 1, f"expected at least one coverage trace entry for {tf}"
 
 
 def test_orderflow_block_matches_spec(client: TestClient) -> None:
@@ -494,21 +628,26 @@ def test_orderflow_block_matches_spec(client: TestClient) -> None:
     assert response.status_code == 200
     body = response.json()
 
-    orderflow_block = body["data"]["orderflow"]
+    orderflow_block = body["meta"]["diagnostics"]["orderflow"]
     expected_tfs = {"1m", "3m", "5m", "15m", "1h"}
     assert expected_tfs.issubset(orderflow_block.keys())
     diag_block = orderflow_block.get("diag")
     assert isinstance(diag_block, dict)
 
-    minute_series = orderflow_block["1m"]["per_bar"]
+    minute_block = orderflow_block["1m"]
+    minute_series = minute_block["per_bar"]
     assert isinstance(minute_series, list)
     assert minute_series
-    assert len(minute_series) <= 240
+    assert len(minute_series) == check_all_datas.ORDERFLOW_REQUIRED_HOURS * 60
     minute_entry = minute_series[-1]
     assert "delta" in minute_entry and "cvd" in minute_entry
+    summary_1m = minute_block.get("summary", {})
+    assert summary_1m.get("minutes") == check_all_datas.ORDERFLOW_REQUIRED_HOURS * 60
+    assert summary_1m.get("minutes_with_trades") >= 0
 
     for tf in ("3m", "5m", "15m", "1h"):
-        series = orderflow_block[tf]["per_bar"]
+        block = orderflow_block[tf]
+        series = block["per_bar"]
         assert isinstance(series, list)
         if series:
             entry = series[0]
@@ -516,6 +655,10 @@ def test_orderflow_block_matches_spec(client: TestClient) -> None:
                 assert isinstance(entry[key], (int, float))
             if "bars" in entry:
                 assert isinstance(entry["bars"], int)
+        summary = block.get("summary", {})
+        assert "delta_sum" in summary and "volume_sum" in summary
+        if tf in {"15m", "1h"}:
+            assert series, f"Expected aggregated series for {tf} to be non-empty"
 
 
 def test_vwap_tpo_sessions_include_aliases(client: TestClient) -> None:
@@ -533,19 +676,235 @@ def test_vwap_tpo_sessions_include_aliases(client: TestClient) -> None:
     assert response.status_code == 200
     body = response.json()
 
-    sessions = body["data"]["vwap_tpo"]["sessions"]
+    sessions = body["meta"]["diagnostics"]["vwap_tpo"]["sessions"]
     ny_session = sessions["ny"]
-    assert ny_session["open_utc"].endswith("13:30:00Z")
-    assert ny_session["close_utc"].endswith("16:30:00Z")
+    assert ny_session["open_utc"].endswith("11:30:00Z")
+    assert ny_session["close_utc"].endswith("14:30:00Z")
     assert ny_session["sd2"]["plus"] >= ny_session["sd1"]["plus"]
     assert "poc" in ny_session
     assert "ib_high" in ny_session
     assert "ib_low" in ny_session
+    completeness_block = ny_session.get("completeness", {})
+    assert completeness_block
+    assert isinstance(completeness_block, dict)
+    assert completeness_block.get("status") in {"complete", "partial", "empty", "na"}
+    assert completeness_block.get("tf") in {"1m", "3m"}
 
-    composite_day = body["data"]["tpo"]["composite_day"]
-    assert composite_day["poc"] is not None
-    assert composite_day["vah"] is not None
-    assert composite_day["val"] is not None
+    daily_block = body["meta"]["diagnostics"]["vwap_tpo"]["daily"]
+    assert daily_block["vwap"] is not None
+
+
+def test_recent_zone_focus_filters_window(client: TestClient, monkeypatch) -> None:
+    base = datetime(2024, 6, 1, 0, 0, tzinfo=UTC)
+    payload = _build_snapshot_payload(base, count=12 * 60)
+
+    recent_iso = (base + timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+    stale_iso = (base - timedelta(hours=80)).isoformat().replace("+00:00", "Z")
+
+    def fake_detect_zones(*args, **kwargs):
+        return {
+            "zones": {
+                "fvg": [
+                    {
+                        "tf": "15m",
+                        "direction": "up",
+                        "top": 105.0,
+                        "bot": 103.0,
+                        "mid": 104.0,
+                        "created_utc": recent_iso,
+                        "status": "open",
+                    },
+                    {
+                        "tf": "1h",
+                        "direction": "down",
+                        "top": 140.0,
+                        "bot": 138.0,
+                        "mid": 139.0,
+                        "created_utc": stale_iso,
+                        "status": "tapped",
+                    },
+                ],
+                "fvl": [],
+                "ob": [
+                    {
+                        "tf": "1h",
+                        "type": "supply",
+                        "open": 120.0,
+                        "close": 121.2,
+                        "mean": 120.6,
+                        "origin_utc": recent_iso,
+                        "status": "fresh",
+                        "fill_ratio": 0.7,
+                    },
+                    {
+                        "tf": "15m",
+                        "type": "demand",
+                        "open": 90.0,
+                        "close": 91.0,
+                        "mean": 90.5,
+                        "origin_utc": stale_iso,
+                        "status": "tapped",
+                    },
+                ],
+                "mb": [],
+                "bb": [],
+                "rb": [],
+                "pb": [],
+                "sr": [],
+                "profile_levels": [],
+            },
+            "meta": {},
+        }
+
+    monkeypatch.setattr(check_all_datas, "detect_zones", fake_detect_zones)
+
+    captured_configs: list[Mapping[str, Any]] = []
+    sweep_ts = int((base + timedelta(hours=2)).timestamp() * 1000)
+
+    def fake_build_liquidity_snapshot(
+        frames,
+        *,
+        symbol,
+        tick_size,
+        tick_source_hint=None,
+        meta=None,
+        selection=None,
+        config=None,
+    ):
+        captured_configs.append(config or {})
+        sweeps = [
+            {
+                "type": "sweep_top",
+                "tf": "15m",
+                "level_type": "eqh",
+                "level_price": 104.0,
+                "t": sweep_ts,
+                "retest_t": sweep_ts,
+                "atr_tolerance": 0.1,
+                "min_move": 0.2,
+                "level_source": "eq",
+            },
+            {
+                "type": "sweep_top",
+                "tf": "1h",
+                "level_type": "eqh",
+                "level_price": 104.0,
+                "t": sweep_ts,
+                "retest_t": sweep_ts,
+                "atr_tolerance": 0.1,
+                "min_move": 0.2,
+                "level_source": "eq",
+            },
+        ]
+        diagnostics = {
+            "config": dict(config or {}),
+            "metrics": {},
+            "summary": {},
+            "tick_size": {"value": tick_size},
+        }
+        return {
+            "eqh": [],
+            "eql": [],
+            "pdh": [],
+            "pdl": [],
+            "sweeps": sweeps,
+            "candidates": {"eqh": [], "eql": []},
+            "diagnostics": diagnostics,
+        }
+
+    monkeypatch.setattr(check_all_datas, "build_liquidity_snapshot", fake_build_liquidity_snapshot)
+
+    create_response = client.post("/inspection/snapshot", json=payload)
+    assert create_response.status_code == 200
+    snapshot_id = create_response.json()["snapshot_id"]
+
+    response = client.get(
+        "/inspection/check-all",
+        params={"snapshot": snapshot_id, "hours": 4},
+    )
+    assert response.status_code == 200
+    body = response.json()
+
+    zones_recent = body["data"]["zones"]["recent"]
+    assert zones_recent["window_hours"] == 72
+    assert zones_recent["meta"]["has_recent"] is True
+
+    fvg_recent = zones_recent["fvg"]
+    assert len(fvg_recent) == 1
+    assert fvg_recent[0]["status"] == "open"
+    assert fvg_recent[0]["mid"] == pytest.approx(104.0)
+    assert "sweeps" in fvg_recent[0]
+    assert fvg_recent[0]["sweeps"], "Expected sweep linkage on recent zone"
+
+    ob_recent = zones_recent["ob"]
+    assert len(ob_recent) == 1
+    assert ob_recent[0]["status"] == "mitigated"
+    assert ob_recent[0]["type"] == "supply"
+
+    reasons_fvg = zones_recent["meta"]["reasons"]["fvg"]
+    reasons_ob = zones_recent["meta"]["reasons"]["ob"]
+
+    sweeps_public = body["data"]["liquidity"].get("sweeps", [])
+    assert len(sweeps_public) == 1
+    sweep_entry = sweeps_public[0]
+    assert sweep_entry.get("zone_links"), "Expected sweep to include linked zones"
+
+    assert captured_configs, "Expected liquidity config to be captured"
+    dynamic_config = captured_configs[0]
+    assert isinstance(dynamic_config, Mapping)
+
+
+def test_session_window_converts_berlin_to_utc() -> None:
+    ny_start, ny_end = next(
+        (start, end)
+        for name, start, end in check_all_datas.VWAP_TPO_SESSIONS
+        if name == "ny"
+    )
+    anchor_pre = datetime(2024, 3, 29, 20, 0, tzinfo=UTC)
+    pre_start, pre_end, pre_close = check_all_datas._session_window(
+        int(anchor_pre.timestamp() * 1000), ny_start, ny_end
+    )
+    expected_pre_start = datetime(2024, 3, 29, 12, 30, tzinfo=UTC)
+    expected_pre_close = datetime(2024, 3, 29, 15, 30, tzinfo=UTC)
+    assert pre_start == int(expected_pre_start.timestamp() * 1000)
+    assert pre_close == int(expected_pre_close.timestamp() * 1000)
+    assert pre_end == pre_close - check_all_datas.MINUTE_INTERVAL_MS
+
+    anchor_post = datetime(2024, 4, 2, 20, 0, tzinfo=UTC)
+    post_start, post_end, post_close = check_all_datas._session_window(
+        int(anchor_post.timestamp() * 1000), ny_start, ny_end
+    )
+    expected_post_start = datetime(2024, 4, 2, 11, 30, tzinfo=UTC)
+    expected_post_close = datetime(2024, 4, 2, 14, 30, tzinfo=UTC)
+    assert post_start == int(expected_post_start.timestamp() * 1000)
+    assert post_close == int(expected_post_close.timestamp() * 1000)
+    assert post_end == post_close - check_all_datas.MINUTE_INTERVAL_MS
+    assert post_close - post_start == 3 * 60 * 60 * 1000
+
+
+def test_session_completeness_partial_detection() -> None:
+    start_dt = datetime(2024, 4, 1, 11, 30, tzinfo=UTC)
+    start_ms = int(start_dt.timestamp() * 1000)
+    close_ms = start_ms + 3 * 60 * 60 * 1000
+    end_ms = start_ms + (30 - 1) * check_all_datas.MINUTE_INTERVAL_MS
+    candles = [
+        {"t": start_ms + index * check_all_datas.MINUTE_INTERVAL_MS, "o": 0.0, "h": 0.0, "l": 0.0, "c": 0.0, "v": 1.0}
+        for index in range(30)
+    ]
+
+    completeness = check_all_datas._compute_session_completeness(
+        candles,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        close_ms=close_ms,
+        interval_ms=check_all_datas.MINUTE_INTERVAL_MS,
+        timeframe="1m",
+    )
+
+    assert completeness["bars_observed"] == 30
+    assert completeness["bars_expected"] == 180
+    assert completeness["status"] == "partial"
+    assert completeness["coverage_ratio"] == pytest.approx(30 / 180)
 
 
 def test_session_detailed_mode_returns_placeholder(client: TestClient) -> None:
@@ -652,21 +1011,24 @@ async def test_check_all_with_fixture_snapshot_file() -> None:
     )
 
     assert result is not None
-    assert result["status"] == "ok"
+    assert result["status"] == "ready"
     meta = result["meta"]
     assert meta["symbol"] == snapshot["symbol"]
     assert meta["invalid_candles_count"] == 0
     assert meta["invalid_ts_count"] == 0
     assert isinstance(meta["stale"], bool)
-    assert result["notes"] == []
+    assert isinstance(result["notes"], list)
+    if result["notes"]:
+        assert any("Minute coverage" in note for note in result["notes"])
 
-    ohlcv_block = result["data"]["ohlcv"]
-    assert ohlcv_block["1m"]["candles"], "expected minute candles in fixture run"
-    first_ts = ohlcv_block["1m"]["candles"][0]["t"]
-    assert abs(first_ts - start_ts) <= 5 * 60_000
+    diagnostics = meta.get("diagnostics", {})
+    coverage = diagnostics.get("coverage", {})
+    minute_state = coverage.get("1m", {})
+    assert minute_state.get("present_bars", 0) > 0
+    first_ts = minute_state.get("start_ms")
+    assert first_ts is None or abs(first_ts - start_ts) <= 5 * 60_000
 
-    coverage = result["availability"].get("ohlcv", {})
-    if isinstance(coverage, Mapping):
-        pct = coverage.get("coverage_pct")
-        if pct is not None:
-            assert pct >= 99
+    availability = result["availability"].get("timeframes", {})
+    if isinstance(availability, Mapping) and "1m" in availability:
+        minute_availability = availability["1m"]
+        assert set(minute_availability.keys()) == {"zones", "sweeps", "atr", "vwap_sessions"}

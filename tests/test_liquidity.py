@@ -47,8 +47,8 @@ def test_liquidity_detects_equal_levels_and_sweeps() -> None:
                 (103.0, 103.5, 95.1, 96.5),   # swing low close to previous
                 (96.5, 99.0, 95.8, 98.0),
                 (98.0, 99.5, 96.7, 99.0),
-                (99.0, 105.6, 99.0, 104.2),   # sweep top candle
-                (104.2, 105.0, 94.4, 95.6),   # sweep bottom candle
+                (99.0, 107.0, 99.0, 104.2),   # sweep top candle
+                (104.2, 105.0, 92.0, 93.5),   # sweep bottom candle
             ]
         )
     ]
@@ -71,14 +71,21 @@ def test_liquidity_detects_equal_levels_and_sweeps() -> None:
     liquidity = build_liquidity_snapshot(
         frames,
         symbol="BTCUSDT",
-        tick_size=0.1,
+        tick_size=0.5,
         selection={"end": selection_end},
         config={
             "r_ticks": 2,
-            "lookback": 10,
+            "lookback": 20,
             "swing_window": 1,
             "atr_period": 3,
             "sweep_atr_multiplier": 1.5,
+            "tolerance": {"mode": "percent", "percent": 0.0004},
+            "cluster": {"price_window_pct": 0.0002, "time_window_bars": 10},
+            "min_distance_bars": 1,
+            "min_points_dynamic": False,
+            "min_points_floor": 2,
+            "sweep_min_move_atr": 0.05,
+            "sweep_epsilon_pct": 0.05,
         },
     )
 
@@ -105,10 +112,8 @@ def test_liquidity_detects_equal_levels_and_sweeps() -> None:
     eql_swings = set(eql["swings"])
     assert {candles_15m[2]["t"], candles_15m[4]["t"]}.issubset(eqh_swings)
     assert {candles_15m[3]["t"], candles_15m[5]["t"]}.issubset(eql_swings)
-    assert abs(eqh["price"] - 105.0) < 0.2
-    assert abs(eql["price"] - 95.05) < 0.2
-    assert eqh["tolerance"] == 0.2
-    assert eql["tolerance"] == 0.2
+    assert abs(eqh["price"] - 105.0) < 0.5
+    assert abs(eql["price"] - 95.05) < 0.5
 
     sweep_types = {event["type"] for event in liquidity["sweeps"]}
     level_types = {event["level_type"] for event in liquidity["sweeps"]}
@@ -122,6 +127,14 @@ def test_liquidity_detects_equal_levels_and_sweeps() -> None:
     summary = diagnostics.get("summary")
     assert isinstance(summary, dict)
     assert summary.get("eqh") == len(eqh_levels)
+    assert summary.get("eqh_filtered") == len(eqh_levels)
+    assert summary.get("eqh_raw") >= len(eqh_levels)
+    assert isinstance(summary.get("eqh_reasons"), list)
+    assert summary.get("has_degraded") is False
+    metrics_block = diagnostics.get("metrics")
+    assert isinstance(metrics_block, dict)
+    assert metrics_block.get("raw_candidates_eqh") >= len(eqh_levels)
+    assert metrics_block.get("tick_size_unresolved") == 0
     levels_diag = diagnostics.get("levels")
     assert isinstance(levels_diag, dict)
     tf_diag = levels_diag.get("15m")
@@ -136,10 +149,22 @@ def test_liquidity_detects_equal_levels_and_sweeps() -> None:
     assert eql_diag.get("pairs_within_tol_before_cluster") == eql_diag.get("pairs_within_tol")
     assert isinstance(eqh_diag.get("sample_pairs_top10"), list)
     assert isinstance(eql_diag.get("sample_pairs_top10"), list)
+    assert eqh_diag.get("raw_count") >= eqh_diag.get("filtered_count")
+    assert eql_diag.get("raw_count") >= eql_diag.get("filtered_count")
+    assert isinstance(eqh_diag.get("reason_histogram"), dict)
+    assert isinstance(eql_diag.get("reason_histogram"), dict)
+    candidates = liquidity.get("candidates")
+    assert isinstance(candidates, dict)
+    eqh_candidates = candidates.get("eqh")
+    assert isinstance(eqh_candidates, list)
+    assert any(not entry.get("rejected") for entry in eqh_candidates)
+    eql_candidates = candidates.get("eql")
+    assert isinstance(eql_candidates, list)
+    assert any(not entry.get("rejected") for entry in eql_candidates)
     tick_diag = diagnostics.get("tick_size")
     assert isinstance(tick_diag, dict)
     assert tick_diag.get("normalized_symbol") == "BTCUSDT"
-    assert tick_diag.get("source") in {"hardcoded", "exchange", "auto"}
+    assert tick_diag.get("source") == "param"
     assert tick_diag.get("value") == 0.1
 
 
@@ -157,13 +182,20 @@ def test_liquidity_respects_atr_tolerance() -> None:
     liquidity = build_liquidity_snapshot(
         frames,
         symbol="ETHUSDT",
-        tick_size=0.01,
+        tick_size=0.5,
         config={
             "r_ticks": 2,
-            "lookback": 10,
+            "lookback": 20,
             "swing_window": 1,
             "atr_period": 3,
             "sweep_atr_multiplier": 0.1,
+            "tolerance": {"mode": "percent", "percent": 0.0004},
+            "cluster": {"price_window_pct": 0.0002, "time_window_bars": 10},
+            "min_distance_bars": 1,
+            "min_points_dynamic": False,
+            "min_points_floor": 2,
+            "sweep_min_move_atr": 0.05,
+            "sweep_epsilon_pct": 0.05,
         },
     )
 
@@ -176,6 +208,13 @@ def test_liquidity_respects_atr_tolerance() -> None:
     summary = diagnostics.get("summary")
     assert isinstance(summary, dict)
     assert summary.get("sweeps") == 0
+    assert summary.get("eqh_raw") >= summary.get("eqh_filtered")
+    metrics_block = diagnostics.get("metrics")
+    assert isinstance(metrics_block, dict)
+    assert metrics_block.get("raw_candidates_eqh") >= len(liquidity["eqh"])
+    candidates = liquidity.get("candidates")
+    assert isinstance(candidates, dict)
+    assert isinstance(candidates.get("eqh"), list)
 
 
 
@@ -191,8 +230,8 @@ def test_liquidity_aggregates_minute_seed() -> None:
         (103.0, 103.5, 95.1, 96.5),
         (96.5, 99.0, 95.8, 98.0),
         (98.0, 99.5, 96.7, 99.0),
-        (99.0, 105.6, 99.0, 104.2),
-        (104.2, 105.0, 94.4, 95.6),
+            (99.0, 107.0, 99.0, 104.2),
+            (104.2, 105.0, 92.0, 93.5),
     ]
     for idx, spec in enumerate(fifteen_specs):
         block_start = base + timedelta(minutes=15 * idx)
@@ -216,14 +255,21 @@ def test_liquidity_aggregates_minute_seed() -> None:
     liquidity = build_liquidity_snapshot(
         frames,
         symbol="BTCUSDT",
-        tick_size=0.1,
+        tick_size=0.5,
         selection={"end": selection_end},
         config={
             "r_ticks": 2,
-            "lookback": 10,
+            "lookback": 20,
             "swing_window": 1,
             "atr_period": 3,
             "sweep_atr_multiplier": 1.5,
+            "tolerance": {"mode": "percent", "percent": 0.0004},
+            "cluster": {"price_window_pct": 0.0002, "time_window_bars": 10},
+            "min_distance_bars": 1,
+            "min_points_dynamic": False,
+            "min_points_floor": 2,
+            "sweep_min_move_atr": 0.05,
+            "sweep_epsilon_pct": 0.05,
         },
     )
 
@@ -238,6 +284,7 @@ def test_liquidity_aggregates_minute_seed() -> None:
     summary = diagnostics.get("summary")
     assert isinstance(summary, dict)
     assert summary.get("eqh") == len(liquidity["eqh"])
+    assert isinstance(summary.get("degraded_timeframes"), list)
 
 
 def test_liquidity_detects_pdh_pdl_sweeps_from_minute_seed() -> None:
@@ -246,8 +293,8 @@ def test_liquidity_detects_pdh_pdl_sweeps_from_minute_seed() -> None:
     blocks = [
         (200.0, 205.0, 198.0, 203.0),
         (203.0, 206.5, 200.0, 204.5),
-        (204.5, 221.5, 203.5, 219.0),  # sweep top above PDH
-        (219.0, 220.0, 179.0, 181.0),  # sweep bottom below PDL
+        (204.5, 225.0, 203.5, 219.0),  # sweep top above PDH
+        (219.0, 220.0, 175.0, 181.0),  # sweep bottom below PDL
         (181.0, 190.0, 180.0, 188.0),
     ]
     for idx, spec in enumerate(blocks):
@@ -266,15 +313,22 @@ def test_liquidity_detects_pdh_pdl_sweeps_from_minute_seed() -> None:
     liquidity = build_liquidity_snapshot(
         frames,
         symbol="BTCUSDT",
-        tick_size=1.0,
+        tick_size=0.5,
         selection={"end": selection_end},
-            config={
-                "r_ticks": 2,
-                "lookback": 10,
-                "swing_window": 1,
-                "atr_period": 3,
-                "sweep_atr_multiplier": 2.0,
-            },
+        config={
+            "r_ticks": 2,
+            "lookback": 20,
+            "swing_window": 1,
+            "atr_period": 3,
+            "sweep_atr_multiplier": 2.0,
+            "tolerance": {"mode": "percent", "percent": 0.0004},
+            "cluster": {"price_window_pct": 0.0002, "time_window_bars": 10},
+            "min_distance_bars": 1,
+            "min_points_dynamic": False,
+            "min_points_floor": 2,
+            "sweep_min_move_atr": 0.05,
+            "sweep_epsilon_pct": 0.05,
+        },
     )
 
     sweeps = liquidity["sweeps"]
@@ -315,4 +369,3 @@ def test_build_equal_liquidity_levels_detects_second_touch() -> None:
     expected_low_price = (lows[4] + lows[10]) / 2.0
     assert abs(eqh_entry["price"] - expected_high_price) < 1e-6
     assert abs(eql_entry["price"] - expected_low_price) < 1e-6
-

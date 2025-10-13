@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter, defaultdict
+import copy
 import json
 import logging
 import math
+import numbers
+import inspect
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, time as dtime
@@ -29,28 +32,52 @@ import httpx
 import src.services.inspection as inspection
 from .binance import BINANCE_FAPI_REST
 from .candles_repository import get_repository
+from .http_client import (
+    RATE_LIMIT_STATUSES,
+    TRANSIENT_STATUSES,
+    request as http_request,
+)
 from .inspection import build_htf_section
 from .liquidity import (
     build_liquidity_snapshot,
     normalise_symbol_for_tick,
     resolve_liquidity_tick_size,
 )
+from .pipeline_presets import SUMMARY_72H_PRESET, resolve_pipeline_preset
 from .presets import resolve_profile_config
 from .profile import build_compact_vwap_profiles, build_profile_package
 from .ohlc_sanitizer import SanitizedCandles, sanitize_candles
 from .smc import SMCConfig, detect_smc_blocks
-from .zones import Config as ZonesConfig, detect_zones
+from .zones import Config as ZonesConfig, detect_zones, compute_atr
 from .timeutils import safe_datetime_from_ms
+from .progress import ProgressReporter, emit_progress
 
 if TYPE_CHECKING:  # pragma: no cover - typing helper
     from .summary_collector import CollectionSummary
 UTC = timezone.utc
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover - Python <3.9 fallback
+    ZoneInfo = None  # type: ignore[assignment]
+
+VWAP_SESSION_TZ = ZoneInfo("Europe/Berlin") if ZoneInfo else timezone.utc
 LOGGER = logging.getLogger(__name__)
 MS_IN_HOUR = 3_600_000
 MS_IN_DAY = 86_400_000
 VALID_HOUR_WINDOWS = {1, 2, 3, 4}
 VALUE_AREA_PCT = 0.70
 REPOSITORY_LOOKBACK_MS = 5 * MS_IN_DAY
+PIPELINE_PRESET_DEFAULT = SUMMARY_72H_PRESET
+DEFAULT_ALL_OHLCV_TFS: Tuple[str, ...] = tuple(
+    dict.fromkeys(("1m",) + PIPELINE_PRESET_DEFAULT.rollup_timeframes)
+)
+DEFAULT_TIMEFRAME_SUMMARY_ORDER: Tuple[str, ...] = tuple(
+    tf for tf in ("1m", "5m", "15m", "1h", "4h", "1d") if tf in DEFAULT_ALL_OHLCV_TFS
+)
+ZONE_FOCUS_WINDOW_HOURS = PIPELINE_PRESET_DEFAULT.zones.focus_window_hours
+ZONE_ALLOWED_STATUSES: Set[str] = {"open", "fresh", "tapped", "mitigated", "invalidated"}
+ZONE_FOCUS_ALLOWED_TFS: Tuple[str, ...] = ("15m", "1h")
 
 _EQUAL_LIQUIDITY_TIMEFRAMES: Tuple[str, ...] = ("15m", "1h", "4h")
 _EQUAL_LIQUIDITY_REL_TOLERANCE = {
@@ -99,10 +126,8 @@ except ImportError:  # pragma: no cover - circular import guard
 
 MINUTE_INTERVAL_MS = TIMEFRAME_TO_MS.get("1m", MS_IN_HOUR // 60)
 
-VWAP_TPO_SESSIONS: Tuple[Tuple[str, dtime, dtime], ...] = (
-    ("asia", dtime(hour=0, minute=0), dtime(hour=3, minute=0)),
-    ("london", dtime(hour=7, minute=0), dtime(hour=10, minute=0)),
-    ("ny", dtime(hour=13, minute=30), dtime(hour=16, minute=30)),
+VWAP_TPO_SESSIONS: Tuple[Tuple[str, dtime, dtime], ...] = tuple(
+    (session.name, session.open, session.close) for session in PIPELINE_PRESET_DEFAULT.sessions
 )
 
 _RETRYABLE_STATUS = {418, 429, 500, 502, 503, 504}
@@ -110,7 +135,165 @@ _MAX_RETRIES = 5
 
 _BUILD_TIMEOUT_SECONDS = 12.0
 _ASYNC_BUILD_TIMEOUT_SECONDS = 12.0
+PIPELINE_HEARTBEAT_SECONDS = 3.0
 
+
+class _PipelineProgress:
+    """Emit structured progress updates with automatic heartbeats."""
+
+    __slots__ = (
+        "_reporter",
+        "_trace",
+        "_stage_start",
+        "_heartbeat_tasks",
+        "_heartbeat_interval",
+        "_current_stage",
+        "_label_map",
+        "_stage_history",
+    )
+
+    def __init__(
+        self,
+        reporter: ProgressReporter | None,
+        trace_ctx: "TraceContext | None",
+        *,
+        heartbeat_seconds: float = PIPELINE_HEARTBEAT_SECONDS,
+        label_map: Mapping[str, str] | None = None,
+    ) -> None:
+        self._reporter = reporter
+        self._trace = trace_ctx.child(stage="progress") if trace_ctx is not None else None
+        self._stage_start: Dict[str, float] = {}
+        self._heartbeat_tasks: Dict[str, asyncio.Task[None]] = {}
+        self._heartbeat_interval = max(0.5, float(heartbeat_seconds))
+        self._current_stage: str | None = None
+        self._label_map = dict(label_map or {})
+        self._stage_history: Dict[str, Dict[str, Any]] = {}
+
+    async def start(self, stage: str, **payload: Any) -> None:
+        self._cancel(stage)
+        started_at = time.perf_counter()
+        self._stage_start[stage] = started_at
+        self._current_stage = stage
+        self._stage_history[stage] = {"status": "running"}
+        await self._emit(stage, "start", payload, duration_ms=None)
+        if self._reporter is not None:
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(self._heartbeat_loop(stage))
+            self._heartbeat_tasks[stage] = task
+
+    async def complete(self, stage: str, **payload: Any) -> None:
+        duration_ms = self._compute_duration(stage)
+        self._cancel(stage)
+        self._stage_history[stage] = self._summarise_stage("complete", duration_ms, payload)
+        await self._emit(stage, "complete", payload, duration_ms=duration_ms)
+        if self._current_stage == stage:
+            self._current_stage = None
+
+    async def fail(self, stage: str, **payload: Any) -> None:
+        duration_ms = self._compute_duration(stage)
+        self._cancel(stage)
+        self._stage_history[stage] = self._summarise_stage("error", duration_ms, payload)
+        await self._emit(stage, "error", payload, duration_ms=duration_ms, level="warn")
+        if self._current_stage == stage:
+            self._current_stage = None
+
+    async def shutdown(self) -> None:
+        for stage in list(self._heartbeat_tasks.keys()):
+            self._cancel(stage)
+
+    async def _emit(
+        self,
+        stage: str,
+        status: str,
+        payload: Mapping[str, Any],
+        *,
+        duration_ms: float | None,
+        level: str = "info",
+    ) -> None:
+        label = self._label_map.get(stage, stage)
+        message: Dict[str, Any] = {
+            "stage": stage,
+            "label": label,
+            "status": status,
+        }
+        if duration_ms is not None:
+            message["duration_ms"] = round(duration_ms, 3)
+        message.update({key: value for key, value in payload.items() if value is not None})
+        if self._trace is not None:
+            log_method = getattr(self._trace, level, self._trace.info)
+            log_method("pipeline.stage", **message)
+        if self._reporter is not None:
+            await emit_progress(
+                self._reporter,
+                "inspection.pipeline.stage",
+                **message,
+            )
+
+    def _compute_duration(self, stage: str) -> float | None:
+        started_at = self._stage_start.get(stage)
+        if started_at is None:
+            return None
+        return (time.perf_counter() - started_at) * 1000.0
+
+    def _cancel(self, stage: str) -> None:
+        task = self._heartbeat_tasks.pop(stage, None)
+        if task is not None:
+            task.cancel()
+        self._stage_start.pop(stage, None)
+
+    async def _heartbeat_loop(self, stage: str) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self._heartbeat_interval)
+                duration_ms = self._compute_duration(stage)
+                label = self._label_map.get(stage, stage)
+                heartbeat_payload = {
+                    "stage": stage,
+                    "label": label,
+                    "status": "heartbeat",
+                    "duration_ms": round(duration_ms, 3) if duration_ms is not None else None,
+                }
+                if self._trace is not None:
+                    self._trace.warn("pipeline.heartbeat", stage=stage, duration_ms=heartbeat_payload["duration_ms"])
+                if self._reporter is not None:
+                    await emit_progress(
+                        self._reporter,
+                        "inspection.pipeline.heartbeat",
+                        **{k: v for k, v in heartbeat_payload.items() if v is not None},
+                    )
+        except asyncio.CancelledError:
+            return
+
+    def _summarise_stage(
+        self,
+        status: str,
+        duration_ms: float | None,
+        payload: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        summary: Dict[str, Any] = {"status": status}
+        if duration_ms is not None:
+            summary["duration_ms"] = round(duration_ms, 3)
+        if payload:
+            summary["details"] = self._summarise_payload(payload)
+        return summary
+
+    def _summarise_payload(self, payload: Mapping[str, Any]) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        for key, value in payload.items():
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                result[key] = value
+            elif isinstance(value, Mapping):
+                nested = {
+                    str(nk): nv
+                    for nk, nv in value.items()
+                    if isinstance(nv, (str, int, float, bool)) or nv is None
+                }
+                if nested:
+                    result[key] = nested
+        return result
+
+    def snapshot(self) -> Dict[str, Any]:
+        return copy.deepcopy(self._stage_history)
 _EXPECTED_OHLCV_TFS: Tuple[str, ...] = ("1m", "3m", "5m", "15m", "1h", "4h", "1d")
 _EXPECTED_ORDERFLOW_TFS: Tuple[str, ...] = ("1m", "3m", "5m", "15m", "1h")
 _EXPECTED_ORDERFLOW_METRICS: Tuple[str, ...] = ("footprint", "delta", "cvd")
@@ -128,6 +311,14 @@ _EXPECTED_ZONE_KEYS: Tuple[str, ...] = (
 
 _PER_BAR_MIN_LENGTH = 240
 _PER_BAR_HARD_CAP = 7200
+_fetch_binance_klines = None  # overrideable for tests/backfills
+_fetch_binance_agg_trades = None  # overrideable for tests/backfills
+
+ORDERFLOW_REQUIRED_HOURS = PIPELINE_PRESET_DEFAULT.orderflow.window_hours
+ORDERFLOW_WINDOW_MS = ORDERFLOW_REQUIRED_HOURS * MS_IN_HOUR
+_AGG_TRADES_PAGE_MS = ORDERFLOW_WINDOW_MS  # default page span; overridden by preset
+_AGG_TRADES_LIMIT = 1000
+BINANCE_FAPI_AGG_TRADES = "https://fapi.binance.com/fapi/v1/aggTrades"
 
 
 
@@ -136,7 +327,6 @@ def _per_bar_target_length(window_minutes: int | None) -> int:
         return _PER_BAR_MIN_LENGTH
     return max(_PER_BAR_MIN_LENGTH, min(int(window_minutes), _PER_BAR_HARD_CAP))
 
-_AGGREGATED_ORDERFLOW_TFS: Tuple[str, ...] = ("3m", "5m", "15m", "1h")
 _COLD_BACKFILL_MIN_REQUIRED: Dict[str, int] = {
     tf: 1 for tf in _EXPECTED_OHLCV_TFS
 }
@@ -280,6 +470,7 @@ async def build_check_all_datas_async(
     timeout: float | None = _ASYNC_BUILD_TIMEOUT_SECONDS,
     network_backfill: bool = True,
     trace: TraceContext | None = None,
+    progress: ProgressReporter | None = None,
     **kwargs: Any,
 ) -> Dict[str, Any] | None:
     """Execute ``build_check_all_datas`` with a timeout that respects cancellation."""
@@ -289,6 +480,8 @@ async def build_check_all_datas_async(
     build_kwargs.setdefault("network_backfill", network_backfill)
     if trace is not None:
         build_kwargs.setdefault("trace", trace)
+    if progress is not None:
+        build_kwargs.setdefault("progress", progress)
 
     async def _invoke() -> Dict[str, Any] | None:
         return await build_check_all_datas(snapshot, **build_kwargs)
@@ -628,6 +821,27 @@ def _build_insufficient_payload(
     if age_sec is not None:
         meta_block["snapshot_age_sec"] = age_sec
 
+    timeframe_order: Tuple[str, ...] = DEFAULT_TIMEFRAME_SUMMARY_ORDER
+    session_names: Tuple[str, ...] = ("asia", "london", "ny")
+    empty_timeframes_data: Dict[str, Dict[str, Any]] = {
+        tf: {
+            "zones": {"eqh": 0, "eql": 0, "fvg": 0, "ob": 0},
+            "sweeps": 0,
+            "atr": None,
+            "vwap_sessions": {session: False for session in session_names},
+        }
+        for tf in timeframe_order
+    }
+    availability_timeframes: Dict[str, Dict[str, Any]] = {
+        tf: {
+            "zones": {"eqh": False, "eql": False, "fvg": False, "ob": False},
+            "sweeps": 0,
+            "atr": False,
+            "vwap_sessions": {session: False for session in session_names},
+        }
+        for tf in timeframe_order
+    }
+
     data_payload = {
         "symbol": symbol,
         "ohlcv": {tf: {"candles": []} for tf in _EXPECTED_OHLCV_TFS},
@@ -642,28 +856,10 @@ def _build_insufficient_payload(
         "liquidity": {"eqh": [], "eql": []},
         "risk_prefs": {"rr_min": 2.5, "risk_per_trade_pct": 1.0},
         "context": {"globalBias": "neutral", "narrative": "", "openOppositeZones": False},
+        "timeframes": empty_timeframes_data,
     }
 
-    availability_payload = {
-        "ohlcv": {tf: {"candles": 0, "has_data": False} for tf in _EXPECTED_OHLCV_TFS},
-        "vwap_sessions": {
-            session: {
-                "present": False,
-                "metrics": {
-                    metric: False
-                    for metric in ("poc", "vah", "val", "ib_high", "ib_low")
-                },
-            }
-            for session in ("asia", "london", "ny")
-        },
-        "zones": {key: {"count": 0} for key in _EXPECTED_ZONE_KEYS},
-        "orderflow": {
-            "timeframes": {
-                tf: {"bars": 0, "has_data": False} for tf in _EXPECTED_ORDERFLOW_TFS
-            },
-            "metrics": {metric: False for metric in _EXPECTED_ORDERFLOW_METRICS},
-        },
-    }
+    availability_payload = {"timeframes": availability_timeframes}
 
     missing_fields: Set[str] = set()
     missing_fields.update(f"ohlcv.{tf}" for tf in _EXPECTED_OHLCV_TFS)
@@ -674,6 +870,18 @@ def _build_insufficient_payload(
     missing_fields.update(f"zones.{key}" for key in _EXPECTED_ZONE_KEYS)
     missing_fields.update(f"orderflow.{tf}" for tf in _EXPECTED_ORDERFLOW_TFS)
     missing_fields.update(f"orderflow.{metric}" for metric in _EXPECTED_ORDERFLOW_METRICS)
+
+    meta_block["diagnostics"] = {
+        "liquidity": {},
+        "zones": {},
+        "liquidity_levels": {},
+        "orderflow": {},
+        "vwap_tpo": {},
+        "movement": {},
+        "coverage": {},
+        "api": {"requests": 0, "retries": 0, "rate_limit_hits": 0, "backoffs": 0},
+        "sessions": {session: {"present": False} for session in session_names},
+    }
 
     payload = {
         "status": "insufficient_data",
@@ -1066,14 +1274,27 @@ async def _download_missing_minutes_async(
                         cursor + (1000 - 1) * MINUTE_INTERVAL_MS,
                     )
                     request_end = chunk_end + MINUTE_INTERVAL_MS
-                    raw_rows = await _request_binance_minutes_async(
-                        client,
-                        symbol,
-                        cursor,
-                        request_end,
-                        limit=1000,
-                        budget=budget,
-                    )
+                    if callable(_fetch_binance_klines):
+                        fetch_result = _fetch_binance_klines(
+                            symbol,
+                            "1m",
+                            cursor,
+                            request_end,
+                            1000,
+                        )
+                        if inspect.isawaitable(fetch_result):  # type: ignore[arg-type]
+                            raw_rows = await fetch_result  # type: ignore[assignment]
+                        else:
+                            raw_rows = fetch_result
+                    else:
+                        raw_rows = await _request_binance_minutes_async(
+                            client,
+                            symbol,
+                            cursor,
+                            request_end,
+                            limit=1000,
+                            budget=budget,
+                        )
                     if not raw_rows:
                         break
 
@@ -1216,6 +1437,17 @@ def _safe_int(value: Any) -> int | None:
         return None
 
 
+def _coerce_iso_timestamp(value: Any) -> str | None:
+    """Return a best-effort ISO-8601 string for mixed timestamp inputs."""
+
+    if isinstance(value, str) and value:
+        return value
+    numeric = _safe_int(value)
+    if numeric is None:
+        return None
+    return _isoformat_utc(numeric)
+
+
 def _pivot_radius_for_equal_levels(tf: str) -> int:
     return _EQUAL_LIQUIDITY_PIVOT_RADIUS.get(tf, 2)
 
@@ -1317,7 +1549,9 @@ def _detect_equal_levels_for_timeframe(
 
 
 def build_equal_liquidity_levels(
-    frames: Mapping[str, Sequence[Mapping[str, Any]]]
+    frames: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    max_levels: Mapping[str, int] | None = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Detect simplified EQH/EQL pools from timeframe candles."""
 
@@ -1334,6 +1568,18 @@ def build_equal_liquidity_levels(
         eql_levels.extend(
             _detect_equal_levels_for_timeframe(candles, tf=tf, kind="low")
         )
+
+    if isinstance(max_levels, Mapping):
+        limit_eqh = max(0, int(max_levels.get("eqh", len(eqh_levels)) or len(eqh_levels)))
+        limit_eql = max(0, int(max_levels.get("eql", len(eql_levels)) or len(eql_levels)))
+        if limit_eqh and len(eqh_levels) > limit_eqh:
+            eqh_levels = eqh_levels[-limit_eqh:]
+        if limit_eql and len(eql_levels) > limit_eql:
+            eql_levels = eql_levels[-limit_eql:]
+        if limit_eqh == 0:
+            eqh_levels = []
+        if limit_eql == 0:
+            eql_levels = []
 
     return {"eqh": eqh_levels, "eql": eql_levels}
 
@@ -1823,27 +2069,133 @@ def _compute_atr_series(
     return atr_values
 
 
-def _extract_trades(payload: Any) -> List[Dict[str, Any]]:
-    if not isinstance(payload, Mapping):
+def _coerce_trade_record(entry: Mapping[str, Any], *, source: str) -> Dict[str, Any] | None:
+    ts = _safe_int(entry.get("t"))
+    if ts is None:
+        ts = _safe_int(entry.get("T"))
+    if ts is None:
+        return None
+    qty = _coerce_float(entry.get("q"))
+    if qty is None or not math.isfinite(qty) or qty <= 0:
+        return None
+    price = _coerce_float(entry.get("p"))
+    if price is not None and not math.isfinite(price):
+        price = None
+    side_raw = entry.get("side")
+    side = str(side_raw).strip().lower() if isinstance(side_raw, str) else None
+    if side not in {"buy", "sell"}:
+        side = None
+    maker_flag = entry.get("m")
+    maker: bool | None
+    if isinstance(maker_flag, bool):
+        maker = maker_flag
+    elif maker_flag in (0, 1):
+        maker = bool(maker_flag)
+    else:
+        maker = None
+    return {
+        "t": int(ts),
+        "qty": float(qty),
+        "price": float(price) if price is not None else None,
+        "side": side,
+        "maker": maker,
+        "source": source,
+    }
+
+
+def _extract_trades(payload: Any, *, source: str = "snapshot") -> List[Dict[str, Any]]:
+    if payload is None:
         return []
-    trades_raw = payload.get("agg")
-    trades: List[Dict[str, Any]] = []
-    if not isinstance(trades_raw, Sequence):
-        return trades
-    for entry in trades_raw:
+    if isinstance(payload, Mapping):
+        entries = payload.get("agg")
+    else:
+        entries = payload
+    if not isinstance(entries, Sequence):
+        return []
+    records: List[Dict[str, Any]] = []
+    for entry in entries:
         if not isinstance(entry, Mapping):
             continue
-        ts = _safe_int(entry.get("t"))
-        if ts is None:
-            continue
-        qty = _coerce_float(entry.get("q"))
-        if not math.isfinite(qty):
-            continue
-        side = str(entry.get("side", "")).strip().lower()
+        record = _coerce_trade_record(entry, source=source)
+        if record is not None:
+            records.append(record)
+    return records
+
+
+def _resolve_trade_sides(records: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    if not records:
+        return []
+
+    sorted_records = sorted(
+        (
+            record
+            for record in records
+            if isinstance(record.get("t"), (int, float)) and record.get("qty") is not None
+        ),
+        key=lambda item: (int(item["t"]), float(item.get("price") or 0.0)),
+    )
+
+    resolved: List[Dict[str, Any]] = []
+    seen: Set[Tuple[int, str, float, float]] = set()
+    last_price: float | None = None
+    last_side = "buy"
+
+    for record in sorted_records:
+        ts = int(record["t"])
+        qty = float(record["qty"])
+        price_value = record.get("price")
+        side = record.get("side")
+        reconstructed = False
+
+        maker_flag = record.get("maker")
         if side not in {"buy", "sell"}:
+            if isinstance(maker_flag, bool):
+                side = "sell" if maker_flag else "buy"
+            elif price_value is not None and last_price is not None:
+                if price_value > last_price + 1e-9:
+                    side = "buy"
+                elif price_value < last_price - 1e-9:
+                    side = "sell"
+            if side not in {"buy", "sell"}:
+                side = last_side
+            reconstructed = True
+        elif isinstance(maker_flag, bool):
+            expected_side = "sell" if maker_flag else "buy"
+            if side != expected_side:
+                side = expected_side
+                reconstructed = True
+
+        price_for_key = price_value
+        if price_for_key is None:
+            price_for_key = last_price
+
+        key = (
+            ts,
+            side or "buy",
+            round(qty, 12),
+            round(price_for_key or 0.0, 8),
+        )
+        if key in seen:
             continue
-        trades.append({"t": ts, "q": float(qty), "side": side})
-    return trades
+        seen.add(key)
+
+        resolved.append(
+            {
+                "t": ts,
+                "q": qty,
+                "price": price_value if price_value is not None else price_for_key,
+                "side": side or "buy",
+                "reconstructed": bool(reconstructed),
+                "source": record.get("source"),
+            }
+        )
+        if price_value is not None:
+            last_price = price_value
+        elif price_for_key is not None:
+            last_price = price_for_key
+        last_side = side or last_side
+
+    return resolved
 
 
 def _bucket_trades_by_minute(
@@ -1865,6 +2217,162 @@ def _bucket_trades_by_minute(
         bucket = _align_to_interval(ts, minute_interval)
         buckets.setdefault(bucket, []).append(trade)
     return buckets
+
+
+async def _download_agg_trades_async(
+    symbol: str,
+    start_ms: int,
+    end_ms: int,
+    *,
+    allow_network: bool,
+    trace_ctx: "TraceContext | None",
+    budget: "_TimeBudget",
+    page_span_ms: int,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    diag: Dict[str, Any] = {
+        "attempted": bool(allow_network),
+        "downloaded": 0,
+        "status": None,
+        "batches": 0,
+    }
+    if not allow_network or start_ms >= end_ms:
+        return [], diag
+
+    if callable(_fetch_binance_agg_trades):
+        result = _fetch_binance_agg_trades(symbol, start_ms, end_ms, _AGG_TRADES_LIMIT)
+        rows = await result if inspect.isawaitable(result) else result  # type: ignore[arg-type]
+        normalised = _extract_trades(rows, source="download")
+        diag["downloaded"] = len(normalised)
+        diag["status"] = 200 if normalised else None
+        if diag["status"] is None and not normalised:
+            diag["status"] = 204
+        return normalised, diag
+
+    trades: List[Dict[str, Any]] = []
+    scope = "orderflow.aggTrades"
+    cursor = start_ms
+    timeout = httpx.Timeout(15.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        while cursor < end_ms:
+            try:
+                budget.raise_if_exceeded("orderflow_trades_download")
+            except _TimeBudgetExceeded as exc:
+                LOGGER.warning(
+                    "Orderflow trade download hit budget",
+                    extra={
+                        "symbol": symbol,
+                        "stage": exc.stage,
+                        "cursor": cursor,
+                        "window_start": start_ms,
+                        "window_end": end_ms,
+                    },
+                )
+                diag["status"] = "budget_exceeded"
+                break
+            page_end = min(end_ms, cursor + page_span_ms)
+            params = {
+                "symbol": symbol.upper(),
+                "startTime": str(cursor),
+                "endTime": str(page_end),
+                "limit": str(_AGG_TRADES_LIMIT),
+            }
+            try:
+                response = await http_request(
+                    "GET",
+                    BINANCE_FAPI_AGG_TRADES,
+                    scope=scope,
+                    trace=trace_ctx,
+                    params=params,
+                    client=client,
+                    symbol=symbol,
+                    window=(cursor, page_end),
+                    details=f"limit={_AGG_TRADES_LIMIT}",
+                    max_retries=2,
+                    retry_statuses=TRANSIENT_STATUSES,
+                    rate_limit_statuses=RATE_LIMIT_STATUSES,
+                )
+            except Exception as exc:  # pragma: no cover - network guard
+                LOGGER.debug(
+                    "Failed to download agg trades",
+                    exc_info=exc,
+                    extra={"symbol": symbol, "cursor": cursor, "page_end": page_end},
+                )
+                diag["status"] = "request_failed"
+                break
+
+            status = response.status_code
+            diag["batches"] += 1
+
+            if status != 200:
+                diag["status"] = status
+                if status in RATE_LIMIT_STATUSES or status >= 500:
+                    break
+                # For client errors (e.g., synthetic symbols), stop without raising.
+                break
+
+            payload = response.json()
+            if not isinstance(payload, list):
+                diag["status"] = "invalid_payload"
+                break
+            if not payload:
+                cursor = page_end + 1
+                continue
+
+            trades.extend(_extract_trades(payload, source="download"))
+            diag["downloaded"] = len(trades)
+            diag["status"] = status
+
+            last_trade_time = max(int(row.get("t", row.get("T", cursor))) for row in payload)
+            cursor = max(last_trade_time + 1, page_end + 1)
+
+    return trades, diag
+
+
+async def _load_orderflow_trades(
+    symbol: str,
+    start_ms: int,
+    end_ms: int,
+    trades_payload: Any,
+    *,
+    allow_network: bool,
+    trace_ctx: "TraceContext | None",
+    budget: "_TimeBudget",
+    page_span_ms: int,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    snapshot_records = _extract_trades(trades_payload, source="snapshot")
+    snapshot_filtered = [record for record in snapshot_records if start_ms <= record["t"] <= end_ms]
+
+    downloaded_records, download_diag = await _download_agg_trades_async(
+        symbol,
+        start_ms,
+        end_ms,
+        allow_network=allow_network,
+        trace_ctx=trace_ctx.child(stage="orderflow.trades") if trace_ctx is not None else None,
+        budget=budget,
+        page_span_ms=page_span_ms,
+    )
+
+    combined_records: List[Dict[str, Any]] = []
+    combined_records.extend(snapshot_filtered)
+    combined_records.extend(downloaded_records)
+
+    resolved_trades = _resolve_trade_sides(combined_records)
+    filtered_trades = [trade for trade in resolved_trades if start_ms <= trade["t"] <= end_ms]
+
+    diag: Dict[str, Any] = {
+        "window": {"from": start_ms, "to": end_ms},
+        "snapshot_trades": len(snapshot_filtered),
+        "downloaded_trades": len(downloaded_records),
+        "resolved_trades": len(filtered_trades),
+        "sources": [],
+        "download": download_diag,
+    }
+    if snapshot_filtered:
+        diag["sources"].append("snapshot")
+    if downloaded_records:
+        diag["sources"].append("download")
+
+    return filtered_trades, diag
 
 
 def _compute_large_trade_threshold(
@@ -1908,35 +2416,67 @@ def _compute_large_trade_threshold(
 
 
 def _build_orderflow_per_bar(
-    minute_candles: Sequence[Mapping[str, Any]],
+    minute_index: Mapping[int, Mapping[str, Any]],
     trades_by_minute: Mapping[int, Sequence[Mapping[str, Any]]],
+    expected_minutes: Sequence[int],
     *,
     config: OrderflowConfig,
     large_trade_threshold: float,
-) -> List[Dict[str, Any]]:
+    atr_series: Mapping[int, float],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     series: List[Dict[str, Any]] = []
-    atr_series = _compute_atr_series(minute_candles, period=config.atr_period)
-
     running_cvd = 0.0
-    for candle in sorted(minute_candles, key=lambda item: _safe_int(item.get("t")) or 0):
-        ts = _safe_int(candle.get("t"))
-        if ts is None:
-            continue
-        trades = trades_by_minute.get(ts, [])
-        ask_volume = sum(float(trade.get("q", 0.0)) for trade in trades if str(trade.get("side")).lower() == "buy")
-        bid_volume = sum(float(trade.get("q", 0.0)) for trade in trades if str(trade.get("side")).lower() == "sell")
+    coverage_diag: Dict[str, Any] = {
+        "expected_minutes": len(expected_minutes),
+        "with_trades": 0,
+        "missing_minutes": 0,
+        "gaps": [],
+        "reconstructed_minutes": 0,
+    }
+    gap_start: int | None = None
+
+    for ts in expected_minutes:
+        minute_trades = list(trades_by_minute.get(ts, []))
+        has_trades = bool(minute_trades)
+        if has_trades:
+            coverage_diag["with_trades"] += 1
+        else:
+            coverage_diag["missing_minutes"] += 1
+
+        if not has_trades and gap_start is None:
+            gap_start = ts
+        elif has_trades and gap_start is not None:
+            coverage_diag["gaps"].append({"from": gap_start, "to": ts - MINUTE_INTERVAL_MS})
+            gap_start = None
+
+        ask_volume = sum(float(trade.get("q", 0.0)) for trade in minute_trades if str(trade.get("side")).lower() == "buy")
+        bid_volume = sum(float(trade.get("q", 0.0)) for trade in minute_trades if str(trade.get("side")).lower() == "sell")
+        reconstructed_minutes = any(bool(trade.get("reconstructed")) for trade in minute_trades)
+        if reconstructed_minutes:
+            coverage_diag["reconstructed_minutes"] += 1
 
         delta = ask_volume - bid_volume
         running_cvd += delta
 
+        candle = minute_index.get(ts)
+        if candle:
+            close_price = float(candle.get("c", 0.0))
+            high_price = float(candle.get("h", 0.0))
+            low_price = float(candle.get("l", 0.0))
+        else:
+            sorted_trades = sorted(minute_trades, key=lambda trade: _safe_int(trade.get("t")) or ts)
+            trade_prices = [float(trade.get("price")) for trade in sorted_trades if trade.get("price") is not None]
+            if trade_prices:
+                close_price = trade_prices[-1]
+                high_price = max(trade_prices)
+                low_price = min(trade_prices)
+            else:
+                close_price = high_price = low_price = 0.0
+
         atr_value = atr_series.get(ts)
         if atr_value is None or not math.isfinite(atr_value) or atr_value <= 0:
-            atr_value = max(float(candle.get("h", 0.0)) - float(candle.get("l", 0.0)), 0.0)
+            atr_value = max(high_price - low_price, 0.0)
         band = atr_value * config.atr_band_k
-
-        close_price = float(candle.get("c", 0.0))
-        high_price = float(candle.get("h", 0.0))
-        low_price = float(candle.get("l", 0.0))
 
         close_near_high = abs(high_price - close_price) <= band if band > 0 else math.isclose(high_price, close_price)
         close_near_low = abs(close_price - low_price) <= band if band > 0 else math.isclose(low_price, close_price)
@@ -1961,18 +2501,20 @@ def _build_orderflow_per_bar(
             and (ask_volume / max(bid_volume, config.epsilon)) >= config.absorption_ratio
         )
 
-        large_count = 0
-        if trades:
-            threshold = max(0.0, large_trade_threshold)
-            large_count = sum(1 for trade in trades if float(trade.get("q", 0.0)) >= threshold)
+        threshold = max(0.0, large_trade_threshold)
+        large_count = sum(1 for trade in minute_trades if float(trade.get("q", 0.0)) >= threshold)
 
         series.append(
             {
                 "ts": ts,
+                "t": _isoformat_utc(ts),
                 "delta": delta,
                 "cvd": running_cvd,
                 "bid_vol": bid_volume,
                 "ask_vol": ask_volume,
+                "volume": ask_volume + bid_volume,
+                "has_trades": has_trades,
+                "reconstructed": bool(reconstructed_minutes),
                 "large_trades_count": int(large_count),
                 "absorption_high": bool(absorption_high),
                 "absorption_low": bool(absorption_low),
@@ -1981,7 +2523,10 @@ def _build_orderflow_per_bar(
             }
         )
 
-    return series
+    if gap_start is not None:
+        coverage_diag["gaps"].append({"from": gap_start, "to": expected_minutes[-1]})
+
+    return series, coverage_diag
 
 
 def _aggregate_orderflow_series(
@@ -2033,6 +2578,32 @@ def _aggregate_orderflow_series(
         )
 
     return aggregated
+
+
+def _summarise_minute_orderflow(series: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    total_delta = sum(float(entry.get("delta", 0.0)) for entry in series)
+    total_volume = sum(float(entry.get("volume", 0.0)) for entry in series)
+    minutes_with_trades = sum(1 for entry in series if entry.get("has_trades"))
+    reconstructed_minutes = sum(1 for entry in series if entry.get("reconstructed"))
+    return {
+        "minutes": len(series),
+        "minutes_with_trades": minutes_with_trades,
+        "delta_sum": total_delta,
+        "volume_sum": total_volume,
+        "reconstructed_minutes": reconstructed_minutes,
+    }
+
+
+def _summarise_aggregate_orderflow(series: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    total_delta = sum(float(entry.get("delta_sum", 0.0)) for entry in series)
+    total_volume = sum(float(entry.get("vol_sum", 0.0)) for entry in series)
+    bars_total = sum(int(entry.get("bars", 0)) for entry in series)
+    return {
+        "rows": len(series),
+        "delta_sum": total_delta,
+        "volume_sum": total_volume,
+        "bars_total": bars_total,
+    }
 
 
 def _coerce_orderflow_per_bar(
@@ -2129,6 +2700,29 @@ def _coerce_orderflow_per_bar(
         entry.setdefault("cvd", running_cvd)
         entry.setdefault("bid_vol", 0.0)
         entry.setdefault("ask_vol", 0.0)
+        entry.setdefault(
+            "volume",
+            float(entry.get("ask_vol", 0.0)) + float(entry.get("bid_vol", 0.0)),
+        )
+        entry.setdefault("has_trades", bool(entry.get("volume")))
+        entry.setdefault("reconstructed", False)
+        entry.setdefault(
+            "imbalance_buy",
+            bool(entry.get("imbalance")) and float(entry.get("imbalance", 0.0)) > 1.0,
+        )
+        entry.setdefault(
+            "imbalance_sell",
+            bool(entry.get("imbalance")) and float(entry.get("imbalance", 0.0)) < 1.0,
+        )
+        entry.setdefault("absorption_high", bool(entry.get("absorption_high")))
+        entry.setdefault("absorption_low", bool(entry.get("absorption_low")))
+        entry.setdefault(
+            "large_trades_count",
+            int(entry.get("large_trades_count", 0))
+            if isinstance(entry.get("large_trades_count"), (int, float))
+            else 0,
+        )
+        entry.setdefault("t", _isoformat_utc(entry.get("ts", 0)))
 
     return ordered_rows
 
@@ -2172,13 +2766,19 @@ def _build_proxy_orderflow_from_minutes(
         proxy_series.append(
             {
                 "ts": ts,
+                "t": _isoformat_utc(ts),
                 "delta": delta,
                 "cvd": running_cvd,
                 "bid_vol": bid_volume,
                 "ask_vol": ask_volume,
+                "volume": ask_volume + bid_volume,
+                "has_trades": volume > 0.0,
+                "reconstructed": False,
                 "imbalance": None,
                 "absorption_high": False,
                 "absorption_low": False,
+                "imbalance_buy": ask_volume > bid_volume,
+                "imbalance_sell": bid_volume > ask_volume,
                 "large_trades_count": 0,
             }
         )
@@ -2187,19 +2787,28 @@ def _build_proxy_orderflow_from_minutes(
     return proxy_series
 
 
-def _build_orderflow_block(
+async def _build_orderflow_block(
     minute_candles: Sequence[Mapping[str, Any]],
     trades_payload: Any,
     *,
+    orderflow_start_ms: int,
+    orderflow_end_ms: int,
     config: OrderflowConfig,
+    symbol: str,
+    allow_network: bool,
+    trace_ctx: "TraceContext | None",
+    budget: "_TimeBudget",
     orderflow_source: Mapping[str, Any] | None = None,
-    window_minutes: int | None = None,
-) -> Tuple[Dict[str, Dict[str, List[Dict[str, Any]]]], Dict[str, Any]]:
+    window_minutes: int,
+    page_span_ms: int,
+    target_timeframes: Tuple[str, ...],
+    aggregated_timeframes: Tuple[str, ...],
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
     minute_interval = MINUTE_INTERVAL_MS
+    window_minutes = max(window_minutes, 1)
     target_length = _per_bar_target_length(window_minutes)
-    result: Dict[str, Dict[str, List[Dict[str, Any]]]] = {
-        tf: {"per_bar": []} for tf in ("1m", "3m", "5m", "15m", "1h")
-    }
+    ordered_timeframes = ("1m",) + tuple(tf for tf in target_timeframes if tf != "1m")
+    result: Dict[str, Dict[str, Any]] = {tf: {"per_bar": []} for tf in ordered_timeframes}
     diag: Dict[str, Any] = {
         "source": None,
         "delta_source": None,
@@ -2207,30 +2816,35 @@ def _build_orderflow_block(
         "trimmed": {},
         "target_length": target_length,
         "window_minutes": int(window_minutes) if window_minutes is not None else None,
+        "window": {"from": orderflow_start_ms, "to": orderflow_end_ms},
     }
-    if not minute_candles or minute_interval <= 0:
-        diag["source"] = "empty_minutes"
+    if minute_interval <= 0:
+        diag["source"] = "invalid_interval"
         diag["delta_source"] = "none"
         return result, diag
 
-    trades = _extract_trades(trades_payload)
-    minute_ts: List[int] = []
-    for candle in minute_candles:
-        ts = _safe_int(candle.get("t"))
-        if ts is not None:
-            minute_ts.append(ts)
-    minute_ts.sort()
-    start_ms = minute_ts[0] if minute_ts else None
-    end_ms = (minute_ts[-1] + minute_interval) if minute_ts else None
+    expected_minutes = _build_expected_times(orderflow_start_ms, orderflow_end_ms, minute_interval)
+
+    trades, trades_diag = await _load_orderflow_trades(
+        symbol,
+        orderflow_start_ms,
+        orderflow_end_ms,
+        trades_payload,
+        allow_network=allow_network,
+        trace_ctx=trace_ctx,
+        budget=budget,
+        page_span_ms=page_span_ms,
+    )
+    diag["trades"] = trades_diag
 
     trades_by_minute = _bucket_trades_by_minute(
         trades,
         minute_interval=minute_interval,
-        start_ms=start_ms,
-        end_ms=end_ms,
+        start_ms=orderflow_start_ms,
+        end_ms=orderflow_end_ms + minute_interval,
     )
 
-    last_ts = minute_ts[-1] if minute_ts else None
+    last_ts = orderflow_end_ms
     threshold = _compute_large_trade_threshold(
         trades,
         cutoff_ts=last_ts,
@@ -2240,11 +2854,20 @@ def _build_orderflow_block(
         percentile=config.large_trade_percentile,
     )
 
-    minute_series = _build_orderflow_per_bar(
-        minute_candles,
+    minute_index = {
+        _safe_int(candle.get("t")): candle
+        for candle in minute_candles
+        if _safe_int(candle.get("t")) is not None
+    }
+    atr_series = _compute_atr_series(minute_candles, period=config.atr_period)
+
+    minute_series, coverage_diag = _build_orderflow_per_bar(
+        minute_index,
         trades_by_minute,
+        expected_minutes,
         config=config,
         large_trade_threshold=threshold,
+        atr_series=atr_series,
     )
     source_tag = "trades" if minute_series else None
 
@@ -2262,10 +2885,29 @@ def _build_orderflow_block(
         if minute_series:
             source_tag = "proxy"
 
-    if not minute_series:
-        diag["source"] = source_tag or "none"
-        diag["delta_source"] = "none"
-        return result, diag
+    if not minute_series and expected_minutes:
+        placeholder_ts = expected_minutes[-1]
+        minute_series = [
+            {
+                "ts": placeholder_ts,
+                "t": _isoformat_utc(placeholder_ts),
+                "delta": 0.0,
+                "cvd": 0.0,
+                "bid_vol": 0.0,
+                "ask_vol": 0.0,
+                "volume": 0.0,
+                "has_trades": False,
+                "reconstructed": False,
+                "large_trades_count": 0,
+                "absorption_high": False,
+                "absorption_low": False,
+                "imbalance_buy": False,
+                "imbalance_sell": False,
+                "placeholder": True,
+            }
+        ]
+        diag.setdefault("placeholders", []).append("1m")
+        coverage_diag.setdefault("missing_minutes", len(expected_minutes))
 
     if source_tag == "proxy":
         diag["delta_source"] = "proxy"
@@ -2273,31 +2915,43 @@ def _build_orderflow_block(
         diag["delta_source"] = "external"
     else:
         diag["delta_source"] = "trades"
-    diag["source"] = source_tag or "trades"
+    diag["source"] = source_tag or ("trades" if trades else "none")
 
     minute_series.sort(key=lambda entry: _safe_int(entry.get("ts")) or 0)
-    raw_len = len(minute_series)
-    diag["series_lengths"]["1m_raw"] = raw_len
+    diag["series_lengths"]["1m_raw"] = len(minute_series)
+    diag["trimmed"]["1m"] = 0
+    diag["series_lengths"]["1m"] = len(minute_series)
+    diag["coverage"] = coverage_diag
 
-    if raw_len > target_length:
-        trimmed_series = minute_series[-target_length:]
-    else:
-        trimmed_series = minute_series[:]
-    diag["trimmed"]["1m"] = max(0, raw_len - len(trimmed_series))
-    diag["series_lengths"]["1m"] = len(trimmed_series)
-    result["1m"] = {"per_bar": trimmed_series}
+    minute_summary = _summarise_minute_orderflow(minute_series)
+    result["1m"] = {"per_bar": minute_series, "summary": minute_summary}
 
-    for tf in _AGGREGATED_ORDERFLOW_TFS:
+    for tf in aggregated_timeframes:
         interval_ms = TIMEFRAME_TO_MS.get(tf)
         if not interval_ms or interval_ms <= minute_interval:
             continue
         aggregated = _aggregate_orderflow_series(
-            trimmed_series,
+            minute_series,
             interval_ms=interval_ms,
             minute_interval=minute_interval,
         )
+        if not aggregated and expected_minutes:
+            placeholder_ts = expected_minutes[-1] - ((len(expected_minutes) - 1) % (interval_ms // minute_interval)) * minute_interval
+            aggregated = [
+                {
+                    "ts": placeholder_ts,
+                    "t": _isoformat_utc(placeholder_ts),
+                    "delta_sum": 0.0,
+                    "cvd_close": 0.0,
+                    "vol_sum": 0.0,
+                    "bars": 0,
+                    "placeholder": True,
+                }
+            ]
+            diag.setdefault("placeholders", []).append(tf)
+
         diag["series_lengths"][tf] = len(aggregated)
-        result[tf] = {"per_bar": aggregated}
+        result[tf] = {"per_bar": aggregated, "summary": _summarise_aggregate_orderflow(aggregated)}
 
     return result, diag
 
@@ -2606,20 +3260,27 @@ def _session_window(
     anchor_ms: int,
     start_time: dtime,
     end_time: dtime,
+    *,
+    session_tz: timezone = VWAP_SESSION_TZ,
 ) -> tuple[int, int, int]:
     anchor_aligned = _align_to_interval(anchor_ms, MINUTE_INTERVAL_MS)
-    anchor_dt = safe_datetime_from_ms(anchor_aligned, UTC)
-    if anchor_dt is None:
-        anchor_dt = datetime(1970, 1, 1, tzinfo=UTC)
-    day_start = datetime(anchor_dt.year, anchor_dt.month, anchor_dt.day, tzinfo=UTC)
-    session_start_dt = datetime.combine(day_start.date(), start_time, tzinfo=UTC)
-    session_end_dt = datetime.combine(day_start.date(), end_time, tzinfo=UTC)
+    anchor_dt_utc = safe_datetime_from_ms(anchor_aligned, UTC)
+    if anchor_dt_utc is None:
+        anchor_dt_utc = datetime(1970, 1, 1, tzinfo=UTC)
+
+    tz = session_tz or UTC
+    anchor_local = anchor_dt_utc.astimezone(tz)
+    session_start_local = datetime.combine(anchor_local.date(), start_time, tzinfo=tz)
+    session_end_local = datetime.combine(anchor_local.date(), end_time, tzinfo=tz)
 
     if end_time <= start_time:
-        session_end_dt += timedelta(days=1)
+        session_end_local += timedelta(days=1)
 
-    start_ms = int(session_start_dt.timestamp() * 1000)
-    end_boundary_ms = int(session_end_dt.timestamp() * 1000)
+    session_start_utc = session_start_local.astimezone(UTC)
+    session_end_utc = session_end_local.astimezone(UTC)
+
+    start_ms = int(session_start_utc.timestamp() * 1000)
+    end_boundary_ms = int(session_end_utc.timestamp() * 1000)
     raw_end_ms = end_boundary_ms - MINUTE_INTERVAL_MS
     if raw_end_ms < start_ms:
         raw_end_ms = start_ms
@@ -2659,6 +3320,870 @@ def _compute_initial_balance_extrema(
             ib_low = low_val if ib_low is None else min(ib_low, low_val)
 
     return ib_high, ib_low
+
+
+def _compute_session_completeness(
+    candles: Sequence[Mapping[str, Any]],
+    *,
+    start_ms: int,
+    end_ms: int,
+    close_ms: int,
+    interval_ms: int,
+    timeframe: str,
+) -> Dict[str, Any]:
+    """Estimate how much of the session window is covered by the supplied candles."""
+
+    interval = interval_ms if interval_ms and interval_ms > 0 else MINUTE_INTERVAL_MS
+    expected_span_ms = max(0, close_ms - start_ms)
+    if interval <= 0:
+        interval = MINUTE_INTERVAL_MS
+    expected_bars = expected_span_ms // interval if expected_span_ms > 0 else 0
+
+    seen: Set[int] = set()
+    earliest: int | None = None
+    latest: int | None = None
+    actual_end = min(end_ms, close_ms - (interval if interval > 0 else MINUTE_INTERVAL_MS))
+    for candle in candles:
+        ts = _safe_int(candle.get("t"))
+        if ts is None:
+            continue
+        if ts < start_ms or ts > actual_end:
+            continue
+        if ts in seen:
+            continue
+        seen.add(ts)
+        if earliest is None or ts < earliest:
+            earliest = ts
+        if latest is None or ts > latest:
+            latest = ts
+
+    observed_bars = len(seen)
+    missing_bars = max(expected_bars - observed_bars, 0)
+    if expected_bars <= 0:
+        coverage_ratio = 1.0 if observed_bars == 0 else 0.0
+    else:
+        coverage_ratio = min(1.0, observed_bars / expected_bars)
+
+    if expected_bars <= 0:
+        status = "na"
+    elif observed_bars == 0:
+        status = "empty"
+    elif coverage_ratio >= 0.999:
+        status = "complete"
+    else:
+        status = "partial"
+
+    return {
+        "tf": timeframe,
+        "interval_ms": interval,
+        "bars_expected": expected_bars,
+        "bars_observed": observed_bars,
+        "missing_bars": missing_bars,
+        "coverage_ratio": coverage_ratio,
+        "status": status,
+        "observed_window": {
+            "start_ms": earliest,
+            "end_ms": latest,
+        },
+    }
+
+
+def _normalise_zone_status(entry: Mapping[str, Any], zone_key: str) -> str:
+    """Map raw detector status to the canonical shortlist vocabulary."""
+
+    raw_status = str(entry.get("status") or "").strip().lower()
+    if zone_key == "fvg":
+        mitigation_value = str(entry.get("mitigation") or "").strip().lower()
+        if mitigation_value == "mitigated":
+            return "mitigated"
+        if raw_status in {"fulfilled", "fill"}:
+            return "tapped"
+        if raw_status == "inverted":
+            return "tapped" if entry.get("inverted") else "open"
+        if not raw_status:
+            return "open"
+        if raw_status not in ZONE_ALLOWED_STATUSES:
+            return "open"
+        return raw_status
+    if zone_key == "ob":
+        fill_ratio = _safe_float(entry.get("fill_ratio"))
+        if fill_ratio is not None and fill_ratio >= 0.6 and raw_status != "invalidated":
+            return "mitigated"
+        if not raw_status:
+            return "fresh"
+        if raw_status not in ZONE_ALLOWED_STATUSES:
+            if raw_status in {"fulfilled", "fill"}:
+                return "mitigated"
+            return "fresh"
+        return raw_status
+    return raw_status
+
+
+def _latest_atr_value(
+    candles: Sequence[Mapping[str, Any]],
+    *,
+    period: int = 14,
+) -> float | None:
+    """Return the latest finite ATR value for the supplied candle slice."""
+
+    if not candles or period <= 0:
+        return None
+    if len(candles) <= period:
+        return None
+    atr_series = compute_atr(candles, period=period)
+    for value in reversed(atr_series):
+        if isinstance(value, (int, float)) and math.isfinite(value) and value > 0:
+            return float(value)
+    return None
+
+
+def _session_atr_value(
+    candles: Sequence[Mapping[str, Any]],
+    *,
+    start_ms: int,
+    end_ms: int,
+    period: int = 14,
+) -> float | None:
+    """Compute ATR for a session window using the configured period."""
+
+    if not candles:
+        return None
+    scoped = _filter_candles(candles, start_ms=start_ms, end_ms=end_ms)
+    if not scoped:
+        return None
+    return _latest_atr_value(scoped, period=period)
+
+
+def _zone_focus_timestamp(entry: Mapping[str, Any]) -> int | None:
+    """Extract the most representative timestamp from a zone payload."""
+
+    for key in ("created_utc", "origin_utc", "formed_at_utc", "last_touched_utc"):
+        iso_value = entry.get(key)
+        ts_iso = _iso_to_ms(iso_value)
+        if ts_iso is not None:
+            return ts_iso
+    for key in ("created_at", "origin_ms", "ts", "t"):
+        ts_numeric = _safe_int(entry.get(key))
+        if ts_numeric is not None:
+            return ts_numeric
+    return None
+
+
+def _zone_reference_price(entry: Mapping[str, Any], zone_key: str) -> float | None:
+    """Return the mid-price used for distance calculations."""
+
+    if zone_key == "fvg":
+        mid_value = _safe_float(entry.get("mid"))
+        if mid_value is not None:
+            return mid_value
+        top_value = _safe_float(entry.get("top"))
+        bot_value = _safe_float(entry.get("bot"))
+        if top_value is not None and bot_value is not None:
+            return (top_value + bot_value) / 2.0
+        return None
+    mean_value = _safe_float(entry.get("mean"))
+    if mean_value is not None:
+        return mean_value
+    open_value = _safe_float(entry.get("open"))
+    close_value = _safe_float(entry.get("close"))
+    if open_value is not None and close_value is not None:
+        return (open_value + close_value) / 2.0
+    return None
+
+
+def _build_zone_focus(
+    zones: Mapping[str, Sequence[Mapping[str, Any]]] | None,
+    *,
+    last_price: float | None,
+    reference_ms: int,
+    window_hours: int = ZONE_FOCUS_WINDOW_HOURS,
+    top_limits: Mapping[str, int] | None = None,
+) -> Dict[str, Any]:
+    """Assemble a 72h shortlist of the most relevant FVG and OB zones."""
+
+    window_hours = max(1, int(window_hours))
+    window_ms = window_hours * MS_IN_HOUR
+    cutoff_ms = max(0, reference_ms - window_ms)
+    status_priority = {"fresh": 0, "open": 0, "tapped": 1, "mitigated": 2, "invalidated": 3}
+
+    focus_payload: Dict[str, Any] = {
+        "window_hours": window_hours,
+        "cutoff_utc": _isoformat_utc(cutoff_ms),
+        "last_price": last_price,
+        "fvg": [],
+        "ob": [],
+        "meta": {
+            "counts": {"fvg": 0, "ob": 0},
+            "reasons": {"fvg": [], "ob": []},
+            "distance_reference_available": last_price is not None,
+        },
+    }
+
+    if last_price is None:
+        focus_payload["meta"].setdefault("notes", []).append("last_price_unavailable")
+
+    def _process(zone_key: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+        reason_flags: set[str] = set()
+        if not isinstance(zones, Mapping):
+            reason_flags.add("no_candidates")
+            return [], sorted(reason_flags)
+        series = zones.get(zone_key)
+        if not isinstance(series, Sequence) or not series:
+            reason_flags.add("no_candidates")
+            return [], sorted(reason_flags)
+
+        collected: List[Tuple[Tuple[float, float, float], Dict[str, Any]]] = []
+        for entry in series:
+            if not isinstance(entry, Mapping):
+                continue
+            tf_value_raw = entry.get("tf")
+            tf_value = str(tf_value_raw).lower() if isinstance(tf_value_raw, str) else str(tf_value_raw or "").lower()
+            if tf_value not in ZONE_FOCUS_ALLOWED_TFS:
+                reason_flags.add(f"tf_excluded:{tf_value or 'unknown'}")
+                continue
+
+            formed_ms = _zone_focus_timestamp(entry)
+            if formed_ms is None:
+                reason_flags.add("missing_timestamp")
+                continue
+            if formed_ms < cutoff_ms:
+                reason_flags.add("stale")
+                continue
+
+            status_value = _normalise_zone_status(entry, zone_key)
+            if status_value and status_value not in ZONE_ALLOWED_STATUSES:
+                reason_flags.add(f"status_excluded:{status_value}")
+                continue
+
+            reference_price = _zone_reference_price(entry, zone_key)
+            if reference_price is None:
+                reason_flags.add("missing_price")
+                continue
+
+            distance: float | None = None
+            distance_pct: float | None = None
+            if last_price is not None:
+                distance = abs(reference_price - last_price)
+                if last_price:
+                    distance_pct = distance / last_price
+
+            last_touch_iso = None
+            for key in ("last_touched_utc", "last_touch_utc", "last_touched_iso", "last_touch_iso"):
+                if last_touch_iso:
+                    break
+                candidate = entry.get(key)
+                coerced = _coerce_iso_timestamp(candidate)
+                if coerced:
+                    last_touch_iso = coerced
+            if last_touch_iso is None:
+                last_touch_iso = _coerce_iso_timestamp(entry.get("last_touched"))
+            if last_touch_iso is None:
+                last_touch_iso = _coerce_iso_timestamp(entry.get("last_touch_ms"))
+
+            age_minutes_float = max(0.0, (reference_ms - formed_ms) / 60000.0)
+            age_minutes = int(age_minutes_float)
+            age_hours = round(age_minutes_float / 60.0, 3)
+
+            payload: Dict[str, Any] = {
+                "tf": entry.get("tf"),
+                "status": status_value,
+                "formed_utc": entry.get("created_utc")
+                or entry.get("origin_utc")
+                or _isoformat_utc(formed_ms),
+                "last_touch_utc": last_touch_iso,
+                "age_minutes": age_minutes,
+                "age_hours": age_hours,
+                "distance": distance,
+                "distance_pct": distance_pct,
+            }
+            if zone_key == "fvg":
+                payload.update(
+                    {
+                        "direction": entry.get("direction"),
+                        "top": _safe_float(entry.get("top")),
+                        "bot": _safe_float(entry.get("bot")),
+                        "mid": reference_price,
+                    }
+                )
+            else:
+                payload.update(
+                    {
+                        "type": entry.get("type"),
+                        "open": _safe_float(entry.get("open")),
+                        "close": _safe_float(entry.get("close")),
+                        "mean": reference_price,
+                    }
+                )
+            sweep_links = entry.get("sweep_links")
+            if isinstance(sweep_links, Sequence) and sweep_links:
+                payload["sweeps"] = [dict(link) for link in sweep_links if isinstance(link, Mapping)]
+
+            status_rank = status_priority.get(status_value, float(len(status_priority)))
+            distance_rank = distance if distance is not None else float("inf")
+            collected.append(((status_rank, distance_rank, -formed_ms), payload))
+
+        if not collected:
+            reason_flags.add("no_recent")
+            return [], sorted(reason_flags)
+
+        collected.sort(key=lambda item: item[0])
+        shortlisted = [payload for _, payload in collected]
+        return shortlisted, sorted(reason_flags)
+
+    fvg_entries, fvg_reasons = _process("fvg")
+    ob_entries, ob_reasons = _process("ob")
+
+    if isinstance(top_limits, Mapping):
+        fvg_limit = int(top_limits.get("fvg", len(fvg_entries)) or len(fvg_entries))
+        ob_limit = int(top_limits.get("ob", len(ob_entries)) or len(ob_entries))
+        fvg_limit = max(0, fvg_limit)
+        ob_limit = max(0, ob_limit)
+        focus_payload["fvg"] = fvg_entries[:fvg_limit] if fvg_limit else []
+        focus_payload["ob"] = ob_entries[:ob_limit] if ob_limit else []
+    else:
+        focus_payload["fvg"] = fvg_entries
+        focus_payload["ob"] = ob_entries
+
+    fvg_count = len(focus_payload["fvg"])
+    ob_count = len(focus_payload["ob"])
+    focus_payload["meta"]["counts"]["fvg"] = fvg_count
+    focus_payload["meta"]["counts"]["ob"] = ob_count
+    focus_payload["meta"]["reasons"]["fvg"] = fvg_reasons
+    focus_payload["meta"]["reasons"]["ob"] = ob_reasons
+    focus_payload["meta"]["has_recent"] = bool(fvg_count or ob_count)
+
+    return focus_payload
+
+
+def _is_number(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, numbers.Real):
+        try:
+            return math.isfinite(float(value))
+        except (TypeError, ValueError):
+            return False
+    return False
+
+
+def _validate_showcase_a_items(items: Sequence[Mapping[str, Any]]) -> List[str]:
+    errors: List[str] = []
+    for idx, item in enumerate(items):
+        if not isinstance(item, Mapping):
+            errors.append(f"item[{idx}]:not_mapping")
+            continue
+        tf_value = item.get("tf")
+        if not isinstance(tf_value, str) or not tf_value.strip():
+            errors.append(f"item[{idx}].tf")
+        type_value = item.get("type")
+        if not isinstance(type_value, str) or not type_value.strip():
+            errors.append(f"item[{idx}].type")
+        price_value = item.get("price")
+        if price_value is not None and not _is_number(price_value):
+            errors.append(f"item[{idx}].price")
+        status_value = item.get("status")
+        if not isinstance(status_value, str) or not status_value.strip():
+            errors.append(f"item[{idx}].status")
+        formed_value = item.get("formed_at")
+        if formed_value is not None and (not isinstance(formed_value, str) or not formed_value.strip()):
+            errors.append(f"item[{idx}].formed_at")
+        last_touch = item.get("last_touch")
+        if last_touch is not None and (not isinstance(last_touch, str) or not last_touch.strip()):
+            errors.append(f"item[{idx}].last_touch")
+        distance_value = item.get("distance_from_last")
+        if distance_value is not None and not _is_number(distance_value):
+            errors.append(f"item[{idx}].distance_from_last")
+        age_value = item.get("age_hours")
+        if age_value is not None and not _is_number(age_value):
+            errors.append(f"item[{idx}].age_hours")
+    return errors
+
+
+def _build_showcase_a(
+    zones_focus: Mapping[str, Any] | None,
+    *,
+    window_hours: int,
+    last_price: float | None,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    allowed_statuses = {"open", "fresh", "tapped"}
+    items: List[Dict[str, Any]] = []
+    missing_modules: Set[str] = set()
+    reasons: List[str] = []
+
+    if not isinstance(zones_focus, Mapping):
+        missing_modules.add("zones.recent")
+        reasons.append("zones_focus_unavailable")
+        zones_focus = {}
+
+    counts_raw = zones_focus.get("meta", {}).get("counts") if isinstance(zones_focus.get("meta"), Mapping) else {}
+    counts = {
+        "fvg": _safe_int((counts_raw or {}).get("fvg")) or 0,
+        "ob": _safe_int((counts_raw or {}).get("ob")) or 0,
+    }
+
+    distance_reference_available = False
+    meta_block = zones_focus.get("meta")
+    if isinstance(meta_block, Mapping):
+        distance_reference_available = bool(meta_block.get("distance_reference_available"))
+        reasons_block = meta_block.get("reasons")
+        if isinstance(reasons_block, Mapping):
+            for reason_list in reasons_block.values():
+                if isinstance(reason_list, Sequence):
+                    reasons.extend(str(reason) for reason in reason_list if reason)
+
+    if not distance_reference_available or last_price is None:
+        missing_modules.add("meta.last_price")
+
+    for zone_key in ("fvg", "ob"):
+        series = zones_focus.get(zone_key)
+        if not isinstance(series, Sequence):
+            continue
+        for entry in series:
+            if not isinstance(entry, Mapping):
+                continue
+            status_value = str(entry.get("status") or "").lower()
+            if status_value not in allowed_statuses:
+                continue
+            raw_tf = entry.get("tf")
+            tf_value = ""
+            if isinstance(raw_tf, str):
+                tf_value = raw_tf.strip().lower()
+            elif raw_tf is not None:
+                tf_value = str(raw_tf).strip().lower()
+            if not tf_value:
+                tf_value = "unknown"
+                reasons.append(f"{zone_key}:missing_tf")
+
+            if zone_key == "fvg":
+                direction = entry.get("direction")
+                if isinstance(direction, str) and direction.strip():
+                    type_value = f"fvg:{direction.strip().lower()}"
+                else:
+                    type_value = "fvg"
+                price_value = _safe_float(entry.get("mid"))
+                if price_value is None:
+                    price_value = _safe_float(entry.get("top"))
+                if price_value is None:
+                    price_value = _safe_float(entry.get("bot"))
+            else:
+                subtype = entry.get("type")
+                if isinstance(subtype, str) and subtype.strip():
+                    type_value = f"ob:{subtype.strip().lower()}"
+                else:
+                    type_value = "ob"
+                price_value = _safe_float(entry.get("mean"))
+                if price_value is None:
+                    price_value = _safe_float(entry.get("open"))
+                if price_value is None:
+                    price_value = _safe_float(entry.get("close"))
+            if price_value is None:
+                reasons.append(f"{zone_key}:missing_price")
+
+            formed_at = entry.get("formed_utc")
+            if not isinstance(formed_at, str) or not formed_at.strip():
+                formed_at = None
+                reasons.append(f"{zone_key}:missing_formed_at")
+
+            last_touch = entry.get("last_touch_utc")
+            if not isinstance(last_touch, str) or not last_touch.strip():
+                last_touch = None
+
+            distance_value = _safe_float(entry.get("distance"))
+            age_hours_value = _safe_float(entry.get("age_hours"))
+
+            item = {
+                "tf": tf_value,
+                "type": type_value,
+                "price": price_value,
+                "status": status_value,
+                "formed_at": formed_at,
+                "last_touch": last_touch,
+                "distance_from_last": distance_value,
+                "age_hours": age_hours_value,
+            }
+            items.append(item)
+
+    validation_errors = _validate_showcase_a_items(items)
+
+    reason_text = None
+    if not items:
+        reason_candidates = sorted(set(reason for reason in reasons if reason))
+        reason_text = "; ".join(reason_candidates) if reason_candidates else "no_open_zones"
+
+    completeness = {
+        "window_hours": window_hours,
+        "counts": counts,
+        "open_entries": len(items),
+        "has_last_price": distance_reference_available and last_price is not None,
+        "missing_modules": sorted(missing_modules),
+        "valid": not validation_errors,
+        "validation_errors": validation_errors,
+    }
+
+    showcase = {
+        "items": items,
+        "completeness": completeness,
+        "sources": {
+            "zones": "zones.recent",
+            "last_price": "meta.last_price",
+        },
+    }
+    if reason_text:
+        showcase["reason"] = reason_text
+
+    diagnostics = {
+        "missing_modules": sorted(missing_modules),
+        "reason_flags": sorted(set(reason for reason in reasons if reason)),
+        "validation_errors": validation_errors,
+    }
+
+    return showcase, diagnostics
+
+
+def _validate_showcase_b_items(items: Sequence[Mapping[str, Any]]) -> List[str]:
+    errors: List[str] = []
+    for idx, item in enumerate(items):
+        if not isinstance(item, Mapping):
+            errors.append(f"item[{idx}]:not_mapping")
+            continue
+        session_value = item.get("session")
+        if not isinstance(session_value, str) or not session_value.strip():
+            errors.append(f"item[{idx}].session")
+        vwap_value = item.get("vwap")
+        if vwap_value is not None and not _is_number(vwap_value):
+            errors.append(f"item[{idx}].vwap")
+        for key in ("IBH", "IBL", "POC", "VAH", "VAL", "delta_15m", "cvd_agg"):
+            field_value = item.get(key)
+            if field_value is not None and not _is_number(field_value):
+                errors.append(f"item[{idx}].{key}")
+        for key in ("sd1", "sd2"):
+            sd_block = item.get(key)
+            if sd_block is None:
+                continue
+            if not isinstance(sd_block, Mapping):
+                errors.append(f"item[{idx}].{key}")
+                continue
+            for sub_key in ("minus", "plus"):
+                sub_value = sd_block.get(sub_key)
+                if sub_value is not None and not _is_number(sub_value):
+                    errors.append(f"item[{idx}].{key}.{sub_key}")
+        fresh_block = item.get("fresh_intraday")
+        if fresh_block is not None:
+            if not isinstance(fresh_block, Mapping):
+                errors.append(f"item[{idx}].fresh_intraday")
+            else:
+                for sub_key in ("fvg", "ob"):
+                    sub_value = fresh_block.get(sub_key)
+                    if sub_value is not None and not isinstance(sub_value, int):
+                        errors.append(f"item[{idx}].fresh_intraday.{sub_key}")
+        sweeps_block = item.get("sweeps")
+        if sweeps_block is not None:
+            if not isinstance(sweeps_block, list):
+                errors.append(f"item[{idx}].sweeps")
+            else:
+                for sweep_idx, sweep in enumerate(sweeps_block):
+                    if not isinstance(sweep, Mapping):
+                        errors.append(f"item[{idx}].sweeps[{sweep_idx}]")
+    return errors
+
+
+def _build_showcase_b(
+    sessions: Mapping[str, Any] | None,
+    *,
+    orderflow: Mapping[str, Any],
+    zones_focus: Mapping[str, Any] | None,
+    liquidity: Mapping[str, Any] | None,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    session_names = ("asia", "london", "ny")
+    items: List[Dict[str, Any]] = []
+    missing_modules: Set[str] = set()
+    reasons: List[str] = []
+
+    if not isinstance(sessions, Mapping):
+        sessions = {}
+        missing_modules.add("vwap_tpo.sessions")
+        reasons.append("sessions_unavailable")
+
+    sweeps_series: List[Dict[str, Any]] = []
+    if isinstance(liquidity, Mapping):
+        sweeps_raw = liquidity.get("sweeps")
+        if isinstance(sweeps_raw, Sequence):
+            sweeps_series = [dict(entry) for entry in sweeps_raw if isinstance(entry, Mapping)]
+    if not sweeps_series:
+        missing_modules.add("liquidity.sweeps")
+        reasons.append("sweeps_missing")
+
+    sweeps_excerpt = sweeps_series[:5]
+
+    delta_15m_value: float | None = None
+    of_15m = orderflow.get("15m") if isinstance(orderflow, Mapping) else None
+    if isinstance(of_15m, Mapping):
+        summary = of_15m.get("summary")
+        if isinstance(summary, Mapping):
+            delta_15m_value = _safe_float(summary.get("delta_sum"))
+    if delta_15m_value is None:
+        missing_modules.add("orderflow.15m.delta_sum")
+        reasons.append("delta_15m_missing")
+
+    cvd_agg_value: float | None = None
+    of_1m = orderflow.get("1m") if isinstance(orderflow, Mapping) else None
+    if isinstance(of_1m, Mapping):
+        per_bar = of_1m.get("per_bar")
+        if isinstance(per_bar, Sequence):
+            for entry in reversed(per_bar):
+                if not isinstance(entry, Mapping):
+                    continue
+                cvd_candidate = _safe_float(entry.get("cvd"))
+                if cvd_candidate is not None:
+                    cvd_agg_value = cvd_candidate
+                    break
+    if cvd_agg_value is None:
+        missing_modules.add("orderflow.1m.cvd")
+        reasons.append("cvd_missing")
+
+    fresh_counts = {"fvg": 0, "ob": 0}
+    if isinstance(zones_focus, Mapping):
+        for zone_key in ("fvg", "ob"):
+            series = zones_focus.get(zone_key)
+            if isinstance(series, Sequence):
+                for entry in series:
+                    if not isinstance(entry, Mapping):
+                        continue
+                    if str(entry.get("status") or "").lower() == "fresh":
+                        fresh_counts[zone_key] += 1
+    else:
+        missing_modules.add("zones.recent")
+        reasons.append("zones_focus_unavailable")
+
+    sessions_presence: Dict[str, bool] = {}
+
+    def _clone_sd(block: Mapping[str, Any] | None) -> Dict[str, float | None]:
+        result = {"minus": None, "plus": None}
+        if not isinstance(block, Mapping):
+            return result
+        result["minus"] = _safe_float(block.get("minus"))
+        result["plus"] = _safe_float(block.get("plus"))
+        return result
+
+    for session_name in session_names:
+        session_payload = sessions.get(session_name)
+        if not isinstance(session_payload, Mapping) or not session_payload:
+            sessions_presence[session_name] = False
+            missing_modules.add(f"vwap_tpo.sessions.{session_name}")
+            reasons.append(f"session_missing:{session_name}")
+            continue
+
+        sessions_presence[session_name] = True
+        item = {
+            "session": session_name,
+            "vwap": _safe_float(session_payload.get("vwap")),
+            "sd1": _clone_sd(session_payload.get("sd1")),  # type: ignore[arg-type]
+            "sd2": _clone_sd(session_payload.get("sd2")),  # type: ignore[arg-type]
+            "IBH": _safe_float(session_payload.get("ib_high")),
+            "IBL": _safe_float(session_payload.get("ib_low")),
+            "POC": _safe_float(session_payload.get("poc")),
+            "VAH": _safe_float(session_payload.get("vah")),
+            "VAL": _safe_float(session_payload.get("val")),
+            "fresh_intraday": dict(fvg=fresh_counts["fvg"], ob=fresh_counts["ob"]),
+            "delta_15m": delta_15m_value,
+            "cvd_agg": cvd_agg_value,
+            "sweeps": sweeps_excerpt,
+        }
+        items.append(item)
+
+    validation_errors = _validate_showcase_b_items(items)
+
+    reason_text = None
+    if not items:
+        reason_candidates = sorted(set(reason for reason in reasons if reason))
+        reason_text = "; ".join(reason_candidates) if reason_candidates else "sessions_missing"
+
+    completeness = {
+        "sessions": sessions_presence,
+        "missing_modules": sorted(missing_modules),
+        "has_delta_15m": delta_15m_value is not None,
+        "has_cvd": cvd_agg_value is not None,
+        "has_sweeps": bool(sweeps_series),
+        "fresh_intraday": fresh_counts,
+        "valid": not validation_errors,
+        "validation_errors": validation_errors,
+    }
+
+    showcase = {
+        "items": items,
+        "completeness": completeness,
+        "sources": {
+            "sessions": "vwap_tpo.sessions",
+            "orderflow_15m": "orderflow.15m.summary",
+            "orderflow_1m": "orderflow.1m.per_bar",
+            "zones": "zones.recent",
+            "liquidity": "liquidity.sweeps",
+        },
+    }
+    if reason_text:
+        showcase["reason"] = reason_text
+
+    diagnostics = {
+        "missing_modules": sorted(missing_modules),
+        "reason_flags": sorted(set(reason for reason in reasons if reason)),
+        "validation_errors": validation_errors,
+        "fresh_counts": fresh_counts,
+        "delta_15m": delta_15m_value,
+        "cvd_agg": cvd_agg_value,
+        "sweeps_sample": len(sweeps_excerpt),
+    }
+
+    return showcase, diagnostics
+
+
+def _build_final_showcases(
+    zones_focus: Mapping[str, Any] | None,
+    *,
+    window_hours: int,
+    last_price: float | None,
+    sessions: Mapping[str, Any] | None,
+    orderflow: Mapping[str, Any],
+    liquidity: Mapping[str, Any] | None,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    showcase_a, diag_a = _build_showcase_a(
+        zones_focus,
+        window_hours=window_hours,
+        last_price=last_price,
+    )
+    showcase_b, diag_b = _build_showcase_b(
+        sessions,
+        orderflow=orderflow,
+        zones_focus=zones_focus,
+        liquidity=liquidity,
+    )
+
+    return {"A": showcase_a, "B": showcase_b}, {"A": diag_a, "B": diag_b}
+
+
+def _quantise_price(value: float | None, tick_size: float | None) -> float | None:
+    if value is None:
+        return None
+    if not math.isfinite(value):
+        return None
+    if tick_size is None or tick_size <= 0:
+        return float(value)
+    return round(value / tick_size) * tick_size
+
+
+def _dedupe_sweeps(
+    sweeps: Sequence[Mapping[str, Any]] | None,
+    *,
+    tick_size: float | None,
+) -> List[Dict[str, Any]]:
+    if not sweeps:
+        return []
+    deduped: Dict[tuple[Any, Any, str], Dict[str, Any]] = {}
+    for entry in sweeps:
+        if not isinstance(entry, Mapping):
+            continue
+        ts = _safe_int(entry.get("t"))
+        level_price = _safe_float(entry.get("level_price"))
+        sweep_type = str(entry.get("type") or "")
+        if ts is None or level_price is None or not sweep_type:
+            continue
+        quant_price = _quantise_price(level_price, tick_size)
+        key = (ts, quant_price, sweep_type)
+        existing = deduped.get(key)
+        if existing is None:
+            deduped[key] = dict(entry)
+            continue
+        current_tf = str(existing.get("tf") or "")
+        new_tf = str(entry.get("tf") or "")
+        # Prefer finer timeframe (minutes before hours)
+        if current_tf.endswith("h") and new_tf.endswith("m"):
+            deduped[key] = dict(entry)
+    return list(deduped.values())
+
+
+def _link_sweeps_to_zones(
+    sweeps: Sequence[Mapping[str, Any]] | None,
+    zones: Mapping[str, Sequence[Mapping[str, Any]]] | None,
+    *,
+    tick_size: float | None,
+    tolerance_ms: int = 60_000,
+) -> List[Dict[str, Any]]:
+    if not sweeps:
+        return []
+    zone_candidates: List[Dict[str, Any]] = []
+    if isinstance(zones, Mapping):
+        for zone_key in ("fvg", "ob"):
+            zone_series = zones.get(zone_key)
+            if not isinstance(zone_series, Sequence):
+                continue
+            for zone_entry in zone_series:
+                if not isinstance(zone_entry, MutableMapping):
+                    continue
+                formed_ms = _zone_focus_timestamp(zone_entry)
+                if formed_ms is None:
+                    continue
+                reference_price = _zone_reference_price(zone_entry, zone_key)
+                if reference_price is None:
+                    continue
+                quant_price = _quantise_price(reference_price, tick_size)
+                zone_candidates.append(
+                    {
+                        "zone": zone_entry,
+                        "zone_type": zone_key,
+                        "tf": zone_entry.get("tf"),
+                        "status": zone_entry.get("status"),
+                        "price": quant_price,
+                        "ts": formed_ms,
+                    }
+                )
+    linked: List[Dict[str, Any]] = []
+    for entry in sweeps:
+        if not isinstance(entry, Mapping):
+            continue
+        sweep_ts = _safe_int(entry.get("t"))
+        retest_ts = _safe_int(entry.get("retest_t"))
+        if sweep_ts is None and retest_ts is None:
+            continue
+        level_price = _quantise_price(_safe_float(entry.get("level_price")), tick_size)
+        new_entry = dict(entry)
+        matches: List[Dict[str, Any]] = []
+        for candidate in zone_candidates:
+            zone_ts = candidate["ts"]
+            if sweep_ts is not None and abs(zone_ts - sweep_ts) <= tolerance_ms:
+                pass
+            elif retest_ts is not None and abs(zone_ts - retest_ts) <= tolerance_ms:
+                pass
+            else:
+                continue
+            zone_price = candidate["price"]
+            if level_price is not None and zone_price is not None:
+                max_delta = tick_size or 0.0
+                if max_delta <= 0:
+                    max_delta = max(abs(level_price), abs(zone_price)) * 1e-6 + 1e-6
+                dynamic_delta = max(abs(zone_price) * 0.001, 1e-6)
+                max_delta = max(max_delta * 3.0, dynamic_delta)
+                if abs(level_price - zone_price) > max_delta:
+                    continue
+            zone_payload = candidate["zone"]
+            zone_payload.setdefault("sweep_links", []).append(
+                {
+                    "type": entry.get("type"),
+                    "tf": entry.get("tf"),
+                    "timestamp": _isoformat_utc(sweep_ts) if sweep_ts is not None else None,
+                }
+            )
+            matches.append(
+                {
+                    "zone_type": candidate["zone_type"],
+                    "tf": candidate["tf"],
+                    "status": zone_payload.get("status"),
+                    "price": zone_price,
+                    "formed_utc": zone_payload.get("created_utc") or zone_payload.get("origin_utc"),
+                }
+            )
+        if matches:
+            new_entry["zone_links"] = matches
+        linked.append(new_entry)
+    return linked
 
 
 def _extract_range(candidate: Mapping[str, Any]) -> tuple[int, int] | None:
@@ -2933,6 +4458,7 @@ async def build_check_all_datas(
     strict_window: bool = False,
     network_backfill: bool = True,
     trace: TraceContext | None = None,
+    progress: ProgressReporter | None = None,
 ) -> Dict[str, Any] | None:
     """Create an enriched payload for the snapshot health endpoint."""
 
@@ -2949,6 +4475,57 @@ async def build_check_all_datas(
     invalid_candle_stages: Dict[str, Dict[str, int]] = {}
     sanitized_applied = False
     sessions_empty_flag = False
+    minute_coverage_diag: Dict[str, Any] | None = None
+    stage_labels = {
+        "gaps": "gaps",
+        "rollups": "rollups",
+        "delta": "delta",
+        "vwap_tpo": "vwap/tpo",
+        "zones": "zones",
+        "vitrines": "vitrines",
+    }
+    progress_tracker = _PipelineProgress(
+        progress,
+        trace_ctx,
+        label_map=stage_labels,
+    )
+
+    async def _finish(result: Dict[str, Any] | None) -> Dict[str, Any] | None:
+        stage_snapshot = progress_tracker.snapshot()
+        await progress_tracker.shutdown()
+        if stage_snapshot and isinstance(result, MutableMapping):
+            meta_block = result.get("meta")
+            if isinstance(meta_block, MutableMapping):
+                meta_block.setdefault("stage_timing", stage_snapshot)
+        return result
+
+    def _build_gap_metrics(
+        missing_after: int,
+        downloaded: int,
+        relaxed: bool,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+        coverage_before_ratio = 1.0
+        coverage_after_ratio = 1.0
+        if expected_count > 0:
+            coverage_before_ratio = max(0.0, (expected_count - minute_missing_before) / expected_count)
+            coverage_after_ratio = max(0.0, (expected_count - missing_after) / expected_count)
+        bar_counts = {
+            "expected": expected_count,
+            "missing_before": minute_missing_before,
+            "missing_after": missing_after,
+            "downloaded": downloaded,
+        }
+        agg_counts = {
+            "gap_count": len(time_gaps),
+            "relaxed": bool(relaxed),
+        }
+        completeness = {
+            "coverage_before": round(coverage_before_ratio, 6),
+            "coverage_after": round(coverage_after_ratio, 6),
+            "enforced": enforce_minute_coverage,
+            "relaxed": relaxed,
+        }
+        return bar_counts, agg_counts, completeness
 
     def _record_invalid(stage: str, *, invalid_ts: int = 0, invalid_ohlc: int = 0) -> None:
         nonlocal invalid_ts_total, invalid_ohlc_total
@@ -2976,11 +4553,59 @@ async def build_check_all_datas(
 
     context = _prepare_snapshot_context(snapshot, now_utc)
     frames = context.frames
+    raw_meta = context.raw_meta
+
+    pipeline_meta = raw_meta.get("pipeline") if isinstance(raw_meta, Mapping) else None
+    preset_name = PIPELINE_PRESET_DEFAULT.name
+    overrides: Mapping[str, Any] | None = None
+    if isinstance(pipeline_meta, Mapping):
+        preset_candidate = pipeline_meta.get("preset")
+        if isinstance(preset_candidate, str) and preset_candidate.strip():
+            preset_name = preset_candidate.strip()
+        override_candidate = pipeline_meta.get("overrides")
+        if isinstance(override_candidate, Mapping):
+            overrides = override_candidate
+    try:
+        pipeline_preset = resolve_pipeline_preset(preset_name, overrides)
+    except ValueError as exc:
+        LOGGER.error("Unknown pipeline preset %s, falling back to %s", preset_name, PIPELINE_PRESET_DEFAULT.name)
+        pipeline_preset = PIPELINE_PRESET_DEFAULT
+
+    rollup_timeframes = pipeline_preset.rollup_timeframes
+    orderflow_timeframes = pipeline_preset.orderflow.timeframes
+    orderflow_required_hours = pipeline_preset.orderflow.window_hours
+    orderflow_window_ms = max(MINUTE_INTERVAL_MS, orderflow_required_hours * MS_IN_HOUR)
+    orderflow_window_minutes = max(orderflow_required_hours * 60, 1)
+    agg_trades_page_ms = max(MINUTE_INTERVAL_MS, pipeline_preset.orderflow.page_span_minutes * 60_000)
+    zone_settings = pipeline_preset.zones
+    zone_focus_window_hours = zone_settings.focus_window_hours
+    zone_top_n = {key: int(value) for key, value in zone_settings.top_n.items()}
+    zone_min_bars_default = {key: int(value) for key, value in zone_settings.min_bars_per_tf.items()}
+    zone_min_bars_strict = (
+        {key: int(value) for key, value in zone_settings.min_bars_strict.items()}
+        if zone_settings.min_bars_strict
+        else None
+    )
+    zone_warmup_bars = {key: int(value) for key, value in zone_settings.warmup_bars_per_tf.items()}
+    zone_pivot_overrides = {key: int(value) for key, value in zone_settings.pivot_overrides.items()}
+    zone_resample = bool(zone_settings.resample_when_sparse)
+    atr_adaptation = dict(zone_settings.atr_adaptation)
+    resample_when_sparse = bool(pipeline_preset.resample_when_sparse)
+    session_windows = tuple((session.name, session.open, session.close) for session in pipeline_preset.sessions)
+    modules_enabled = dict(pipeline_preset.modules)
+    combined_ohlcv_tfs = tuple(dict.fromkeys(("1m",) + rollup_timeframes))
+    timeframe_summary_order = tuple(tf for tf in combined_ohlcv_tfs if tf != "3m")
+    aggregated_orderflow_timeframes = tuple(tf for tf in orderflow_timeframes if tf != "1m")
+    orderflow_enabled = bool(modules_enabled.get("orderflow", True))
+    orderflow_allow_network = bool(pipeline_preset.orderflow.allow_network)
+    zones_enabled = bool(modules_enabled.get("zones", True))
+    vwap_enabled = bool(modules_enabled.get("vwap_tpo", True))
+    liquidity_enabled = bool(modules_enabled.get("liquidity", True))
+    showcases_enabled = bool(modules_enabled.get("showcases", True))
 
     for tf_key, candles in list(frames.items()):
         stage_name = f"seed.{tf_key}"
         frames[tf_key] = _apply_sanitizer(stage_name, candles)
-    raw_meta = context.raw_meta
     symbol = context.symbol
     now_dt = context.now
     stream_price = context.stream_price
@@ -3107,13 +4732,15 @@ async def build_check_all_datas(
                     status="minute_missing",
                     missing_fields=0,
                 )
-            return _finalise_payload(
-                minute_payload,
-                status="minute_missing",
-                pipeline_start=pipeline_start,
-                fetch_ms=fetch_ms,
-                db_ms=db_ms,
-                trace_ctx=trace_ctx,
+            return await _finish(
+                _finalise_payload(
+                    minute_payload,
+                    status="minute_missing",
+                    pipeline_start=pipeline_start,
+                    fetch_ms=fetch_ms,
+                    db_ms=db_ms,
+                    trace_ctx=trace_ctx,
+                )
             )
         summary_elapsed_ms = (time.perf_counter() - summary_start) * 1000.0
         fetch_ms += summary_elapsed_ms
@@ -3184,7 +4811,7 @@ async def build_check_all_datas(
             "Time budget exceeded before seeding minute frame",
             extra={"stage": exc.stage, "symbol": symbol},
         )
-        return _insufficient_from_context(context, now_override=now_dt)
+        return await _finish(_insufficient_from_context(context, now_override=now_dt))
 
     if not strict_three_day:
         if trace_ctx is not None:
@@ -3223,7 +4850,7 @@ async def build_check_all_datas(
     if not primary_key and "1m" in frames:
         primary_key = "1m"
     if not primary_key:
-        return _insufficient_from_context(context, now_override=now_dt)
+        return await _finish(_insufficient_from_context(context, now_override=now_dt))
 
     if not frames.get(primary_key):
         try:
@@ -3233,7 +4860,7 @@ async def build_check_all_datas(
                 "Time budget exceeded before seeding primary frame",
                 extra={"stage": exc.stage, "symbol": symbol, "primary_key": primary_key},
             )
-            return _insufficient_from_context(context, now_override=now_dt)
+            return await _finish(_insufficient_from_context(context, now_override=now_dt))
         fetch_start = time.perf_counter()
         await _backfill_timeframe_with_rest(
             frames,
@@ -3248,7 +4875,7 @@ async def build_check_all_datas(
 
     primary_candles = frames.get(primary_key, [])
     if not primary_candles:
-        return _insufficient_from_context(context, now_override=now_dt)
+        return await _finish(_insufficient_from_context(context, now_override=now_dt))
 
     # Drop unused granularities to keep the payload focused on the requested set.
     frames.pop("3m", None)
@@ -3258,13 +4885,17 @@ async def build_check_all_datas(
     frames["1m"] = minute_candles
 
     rollup_payload: Dict[str, Dict[str, Any]] = {}
+    await progress_tracker.start(
+        "rollups",
+        timeframes=list(rollup_timeframes),
+    )
     if minute_candles:
         lookback_days = max(1, int(math.ceil(base_window_hours / 24)))
         try:
             rollup_payload = await build_multi_tf_ohlcv(
                 symbol,
                 lookback_days,
-                timeframes=("1m", "3m", "5m", "15m", "1h", "4h", "1d"),
+                timeframes=rollup_timeframes,
                 seed_minutes=minute_candles,
                 trace=trace_ctx.child(stage="rollups.seed") if trace_ctx is not None else None,
             )
@@ -3284,13 +4915,26 @@ async def build_check_all_datas(
                     now=now_dt,
                     missing=exc,
                 )
-                return _finalise_payload(
-                    minute_payload,
-                    status=status,
-                    pipeline_start=pipeline_start,
-                    fetch_ms=fetch_ms,
-                    db_ms=db_ms,
-                    trace_ctx=trace_ctx,
+                fail_bar_counts, fail_agg_counts, fail_completeness = _build_gap_metrics(
+                    exc.missing_count,
+                    0,
+                    False,
+                )
+                await progress_tracker.fail(
+                    "rollups",
+                    bar_counts=fail_bar_counts,
+                    agg_counts=fail_agg_counts,
+                    completeness=fail_completeness,
+                )
+                return await _finish(
+                    _finalise_payload(
+                        minute_payload,
+                        status=status,
+                        pipeline_start=pipeline_start,
+                        fetch_ms=fetch_ms,
+                        db_ms=db_ms,
+                        trace_ctx=trace_ctx,
+                    )
                 )
             if trace_ctx is not None:
                 trace_ctx.warn(
@@ -3303,7 +4947,9 @@ async def build_check_all_datas(
         except Exception as exc:  # pragma: no cover - defensive guard
             LOGGER.exception("Failed to build local OHLCV rollups for %s: %s", symbol, exc)
             raise
-        for tf_key in ("3m", "5m", "15m", "1h", "4h", "1d"):
+        for tf_key in rollup_timeframes:
+            if tf_key == "1m":
+                continue
             existing_series = frames.get(tf_key)
             if existing_series:
                 continue
@@ -3314,7 +4960,7 @@ async def build_check_all_datas(
             if normalised_series:
                 frames[tf_key] = normalised_series
 
-    if minute_candles:
+    if resample_when_sparse and minute_candles:
         for tf_key, series in list(frames.items()):
             if tf_key == "1m" or not series:
                 continue
@@ -3332,9 +4978,21 @@ async def build_check_all_datas(
                     )
                     frames[tf_key] = resampled
 
+    rollup_counts = {
+        tf_key: len((rollup_payload.get(tf_key) or {}).get("candles", []))
+        for tf_key in combined_ohlcv_tfs
+    }
+    rollup_counts["seed_minutes"] = len(minute_candles)
+    await progress_tracker.complete(
+        "rollups",
+        bar_counts=rollup_counts,
+        agg_counts={"lookback_days": max(1, int(math.ceil(base_window_hours / 24))) if minute_candles else 0},
+        completeness={"has_seed": bool(minute_candles), "source": "remote" if rollup_payload else "local"},
+    )
+
     profile_config = resolve_profile_config(symbol, raw_meta)
     profile_meta: Dict[str, Any] = {}
-    sessions = list(VWAP_TPO_SESSIONS)
+    sessions = list(session_windows)
     profile_tpo: List[Dict[str, Any]] = []
     profile_flat: List[Dict[str, float]] = []
     profile_zones: List[Dict[str, Any]] = []
@@ -3354,6 +5012,11 @@ async def build_check_all_datas(
         },
     }
     zone_cfg = ZonesConfig(tick_size=profile_config.get("tick_size"))
+
+    await progress_tracker.start(
+        "vwap_tpo",
+        sessions=[session for session, _, _ in sessions],
+    )
 
     requested_tf = str(profile_config.get("target_tf_key", "1m") or "1m")
     target_tf_key = requested_tf
@@ -3463,7 +5126,7 @@ async def build_check_all_datas(
         window_end_ms = primary_candles[-1]["t"] + max(primary_interval - MINUTE_INTERVAL_MS, 0)
 
     if window_end_ms is None:
-        return _insufficient_from_context(context, now_override=now_dt)
+        return await _finish(_insufficient_from_context(context, now_override=now_dt))
 
     window_end_ms = max(0, _align_to_interval(window_end_ms, MINUTE_INTERVAL_MS))
 
@@ -3485,6 +5148,7 @@ async def build_check_all_datas(
         if override_start_ms is not None:
             override_start_ms = max(0, override_start_ms)
 
+    span_ms: int
     if override_start_ms is not None:
         window_start_ms = max(0, _align_to_interval(override_start_ms, MINUTE_INTERVAL_MS))
         if window_start_ms >= window_end_ms:
@@ -3503,6 +5167,10 @@ async def build_check_all_datas(
         window_start_ms = max(0, _align_to_interval(raw_window_start, MINUTE_INTERVAL_MS))
         if target_interval_ms > MINUTE_INTERVAL_MS:
             window_start_ms = max(0, _align_to_interval(window_start_ms, target_interval_ms))
+        span_ms = max(MINUTE_INTERVAL_MS, window_end_ms - window_start_ms + MINUTE_INTERVAL_MS)
+
+    window_span_hours = span_ms / MS_IN_HOUR
+    enforce_minute_coverage = bool(strict_three_day or window_span_hours >= 24)
 
     minute_index_all = {candle["t"]: candle for candle in minute_candles}
     minute_window_index = {
@@ -3510,6 +5178,13 @@ async def build_check_all_datas(
         for ts, candle in minute_index_all.items()
         if window_start_ms <= ts <= window_end_ms
     }
+
+    await progress_tracker.start(
+        "gaps",
+        window={"start_ms": window_start_ms, "end_ms": window_end_ms},
+        enforce=enforce_minute_coverage,
+        strict=strict_three_day,
+    )
 
     expected_minutes = _build_expected_times(window_start_ms, window_end_ms, MINUTE_INTERVAL_MS)
     expected_count = len(expected_minutes)
@@ -3526,6 +5201,7 @@ async def build_check_all_datas(
         )
 
     fetched_unique = 0
+    relaxed_minute_gap = False
     if time_gaps:
         if strict_three_day:
             coverage_pct = (
@@ -3555,6 +5231,17 @@ async def build_check_all_datas(
                 now=now_dt,
                 missing=missing,
             )
+            fail_bar_counts, fail_agg_counts, fail_completeness = _build_gap_metrics(
+                minute_missing_before,
+                0,
+                False,
+            )
+            await progress_tracker.fail(
+                "gaps",
+                bar_counts=fail_bar_counts,
+                agg_counts=fail_agg_counts,
+                completeness=fail_completeness,
+            )
             if trace_ctx is not None:
                 trace_ctx.info(
                     "output.prepare_payload",
@@ -3562,13 +5249,15 @@ async def build_check_all_datas(
                     status="minute_missing",
                     missing_fields=0,
                 )
-            return _finalise_payload(
-                minute_payload,
-                status="minute_missing",
-                pipeline_start=pipeline_start,
-                fetch_ms=fetch_ms,
-                db_ms=db_ms,
-                trace_ctx=trace_ctx,
+            return await _finish(
+                _finalise_payload(
+                    minute_payload,
+                    status="minute_missing",
+                    pipeline_start=pipeline_start,
+                    fetch_ms=fetch_ms,
+                    db_ms=db_ms,
+                    trace_ctx=trace_ctx,
+                )
             )
         if not network_backfill:
             data_quality = {
@@ -3581,53 +5270,111 @@ async def build_check_all_datas(
                 "tf_missing_after": 0,
                 "time_gaps": time_gaps,
             }
-            raise DataQualityError(data_quality)
-        try:
-            budget.raise_if_exceeded("download_missing_minutes_start")
-            downloaded_minutes = await _call_download_missing_minutes_async(
-                symbol,
-                window_start_ms,
-                window_end_ms,
-                time_gaps,
-                budget=budget,
-                allow_network=network_backfill,
-            )
-            downloaded_minutes = _apply_sanitizer(
-                "rest.1m.download", downloaded_minutes
-            )
-        except BinanceDownloadError as exc:
-            detail = {
-                "tf": target_tf_key,
-                "window": {"start_ms": window_start_ms, "end_ms": window_end_ms},
-                "minute_missing_before": minute_missing_before,
-                "minute_missing_after": minute_missing_before,
-                "fetched_1m_count": exc.downloaded,
-                "tf_missing_before": 0,
-                "tf_missing_after": 0,
-                "time_gaps": time_gaps,
-                "downloaded": exc.downloaded,
-            }
-            raise DataQualityError(detail) from exc
-        except _TimeBudgetExceeded as exc:
-            LOGGER.warning(
-                "Time budget exceeded while downloading missing 1m candles",
+            if enforce_minute_coverage:
+                fail_bar_counts, fail_agg_counts, fail_completeness = _build_gap_metrics(
+                    minute_missing_before,
+                    0,
+                    False,
+                )
+                await progress_tracker.fail(
+                    "gaps",
+                    bar_counts=fail_bar_counts,
+                    agg_counts=fail_agg_counts,
+                    completeness=fail_completeness,
+                )
+                raise DataQualityError(data_quality)
+            relaxed_minute_gap = True
+            LOGGER.info(
+                "Relaxed minute coverage without network backfill",
                 extra={
-                    "stage": exc.stage,
                     "symbol": symbol,
-                    "window_start_ms": window_start_ms,
-                    "window_end_ms": window_end_ms,
-                    "time_gaps": time_gaps,
+                    "window_hours": round(window_span_hours, 2),
+                    "gaps": len(time_gaps),
                 },
             )
-            return _insufficient_from_context(context, now_override=now_dt)
-        for candle in downloaded_minutes:
-            ts = candle["t"]
-            if ts < window_start_ms or ts > window_end_ms:
-                continue
-            if ts not in minute_window_index:
-                fetched_unique += 1
-            minute_window_index[ts] = candle
-            minute_index_all[ts] = candle
+        else:
+            try:
+                budget.raise_if_exceeded("download_missing_minutes_start")
+                downloaded_minutes = await _call_download_missing_minutes_async(
+                    symbol,
+                    window_start_ms,
+                    window_end_ms,
+                    time_gaps,
+                    budget=budget,
+                    allow_network=network_backfill,
+                )
+                downloaded_minutes = _apply_sanitizer(
+                    "rest.1m.download", downloaded_minutes
+                )
+            except BinanceDownloadError as exc:
+                detail = {
+                    "tf": target_tf_key,
+                    "window": {"start_ms": window_start_ms, "end_ms": window_end_ms},
+                    "minute_missing_before": minute_missing_before,
+                    "minute_missing_after": minute_missing_before,
+                    "fetched_1m_count": exc.downloaded,
+                    "tf_missing_before": 0,
+                    "tf_missing_after": 0,
+                    "time_gaps": time_gaps,
+                    "downloaded": exc.downloaded,
+                }
+                if enforce_minute_coverage:
+                    fail_bar_counts, fail_agg_counts, fail_completeness = _build_gap_metrics(
+                        minute_missing_before,
+                        exc.downloaded,
+                        False,
+                    )
+                    await progress_tracker.fail(
+                        "gaps",
+                        bar_counts=fail_bar_counts,
+                        agg_counts=fail_agg_counts,
+                        completeness=fail_completeness,
+                    )
+                    raise DataQualityError(detail) from exc
+                relaxed_minute_gap = True
+                LOGGER.info(
+                    "Relaxed minute coverage after download failure",
+                    extra={
+                        "symbol": symbol,
+                        "window_hours": round(window_span_hours, 2),
+                        "downloaded": exc.downloaded,
+                    },
+                )
+                downloaded_minutes = []
+            except _TimeBudgetExceeded as exc:
+                LOGGER.warning(
+                    "Time budget exceeded while downloading missing 1m candles",
+                    extra={
+                        "stage": exc.stage,
+                        "symbol": symbol,
+                        "window_start_ms": window_start_ms,
+                        "window_end_ms": window_end_ms,
+                        "time_gaps": time_gaps,
+                    },
+                )
+                if enforce_minute_coverage:
+                    fail_bar_counts, fail_agg_counts, fail_completeness = _build_gap_metrics(
+                        minute_missing_before,
+                        fetched_unique,
+                        False,
+                    )
+                    await progress_tracker.fail(
+                        "gaps",
+                        bar_counts=fail_bar_counts,
+                        agg_counts=fail_agg_counts,
+                        completeness=fail_completeness,
+                    )
+                    return await _finish(_insufficient_from_context(context, now_override=now_dt))
+                relaxed_minute_gap = True
+                downloaded_minutes = []
+            for candle in downloaded_minutes:
+                ts = candle["t"]
+                if ts < window_start_ms or ts > window_end_ms:
+                    continue
+                if ts not in minute_window_index:
+                    fetched_unique += 1
+                minute_window_index[ts] = candle
+                minute_index_all[ts] = candle
 
     minute_missing_after = sum(1 for ts in expected_minutes if ts not in minute_window_index)
     data_quality = {
@@ -3641,9 +5388,46 @@ async def build_check_all_datas(
         "time_gaps": time_gaps,
     }
 
+    if minute_missing_before and not relaxed_minute_gap and not enforce_minute_coverage:
+        relaxed_minute_gap = True
+
     if minute_missing_after > 0:
         data_quality["downloaded"] = fetched_unique
-        raise DataQualityError(data_quality)
+        if enforce_minute_coverage:
+            raise DataQualityError(data_quality)
+        LOGGER.info(
+            "Proceeding with relaxed minute coverage",
+            extra={
+                "symbol": symbol,
+                "window_hours": round(window_span_hours, 2),
+                "missing_after": minute_missing_after,
+            },
+        )
+        notes.append(
+            f"Minute coverage relaxed: missing {minute_missing_after} candles across ~{round(window_span_hours, 2)}h window."
+        )
+
+    if relaxed_minute_gap and not any(
+        note.startswith("Minute coverage relaxed") for note in notes
+    ):
+        notes.append(
+            f"Minute coverage relaxed for ~{round(window_span_hours, 2)}h window."
+        )
+
+    if data_quality:
+        minute_coverage_diag = dict(data_quality)
+
+    gap_metrics_bar, gap_metrics_agg, gap_completeness = _build_gap_metrics(
+        minute_missing_after,
+        fetched_unique,
+        relaxed_minute_gap,
+    )
+    await progress_tracker.complete(
+        "gaps",
+        bar_counts=gap_metrics_bar,
+        agg_counts=gap_metrics_agg,
+        completeness=gap_completeness,
+    )
 
     frames["1m"] = [minute_index_all[ts] for ts in sorted(minute_index_all)]
     minute_candles = frames["1m"]
@@ -3655,7 +5439,7 @@ async def build_check_all_datas(
             "Time budget exceeded before zones preparation",
             extra={"stage": exc.stage, "symbol": symbol},
         )
-        return _insufficient_from_context(context, now_override=now_dt)
+        return await _finish(_insufficient_from_context(context, now_override=now_dt))
 
     zones_window_hours = max(1, hours_window)
     if not strict_window:
@@ -3670,19 +5454,19 @@ async def build_check_all_datas(
             raw_zone_start = max(0, _align_to_interval(raw_zone_start, fifteen_min_ms))
         zones_window_start_ms = raw_zone_start
 
-    warmup_bars_base = max(0, int(zone_cfg.atr_period + 10))
-    if strict_three_day:
-        min_bars_per_tf = {"15m": 120, "1h": 50, "4h": 18}
+    if strict_three_day and zone_min_bars_strict:
+        min_bars_per_tf = dict(zone_min_bars_strict)
     else:
-        min_bars_per_tf = {"15m": 200, "1h": 60, "4h": 24}
+        min_bars_per_tf = dict(zone_min_bars_default)
     required_bars_per_tf: Dict[str, int] = {}
-    warmup_required_per_tf: Dict[str, int] = {}
+    warmup_required_per_tf: Dict[str, int] = dict(zone_warmup_bars)
     max_history_span_ms = 0
     max_warmup_span_ms = 0
     for tf_key, baseline in min_bars_per_tf.items():
         baseline_required = max(1, int(baseline))
         required_bars_per_tf[tf_key] = baseline_required
-        warmup_required = warmup_bars_base
+        warmup_required = int(warmup_required_per_tf.get(tf_key, baseline_required))
+        warmup_required = max(0, warmup_required)
         warmup_required_per_tf[tf_key] = warmup_required
         interval_ms_tf = TIMEFRAME_TO_MS.get(tf_key)
         if not interval_ms_tf:
@@ -3774,13 +5558,15 @@ async def build_check_all_datas(
                         status="minute_missing",
                         missing_fields=0,
                     )
-                return _finalise_payload(
-                    minute_payload,
-                    status="minute_missing",
-                    pipeline_start=pipeline_start,
-                    fetch_ms=fetch_ms,
-                    db_ms=db_ms,
-                    trace_ctx=trace_ctx,
+                return await _finish(
+                    _finalise_payload(
+                        minute_payload,
+                        status="minute_missing",
+                        pipeline_start=pipeline_start,
+                        fetch_ms=fetch_ms,
+                        db_ms=db_ms,
+                        trace_ctx=trace_ctx,
+                    )
                 )
             if not network_backfill:
                 detail = {
@@ -3823,7 +5609,7 @@ async def build_check_all_datas(
                         "time_gaps": blocking_gaps,
                     },
                 )
-                return _insufficient_from_context(context, now_override=now_dt)
+                return await _finish(_insufficient_from_context(context, now_override=now_dt))
             for candle in zone_downloaded_minutes:
                 ts = candle["t"]
                 if ts < zones_history_start_ms or ts > window_end_ms:
@@ -3854,6 +5640,8 @@ async def build_check_all_datas(
         ordered = sorted(source, key=lambda candle: int(candle["t"]))
         bundle["1m"] = [dict(item) for item in ordered]
         for tf_key in ("3m", "5m", "15m", "1h", "4h", "1d"):
+            if not zone_resample:
+                continue
             interval_ms_tf = TIMEFRAME_TO_MS.get(tf_key)
             if interval_ms_tf is None:
                 continue
@@ -3895,7 +5683,7 @@ async def build_check_all_datas(
         window_count = len(zone_frames_window.get(tf, []))
         warmup_actual = max(0, total - window_count)
         warmup_bars_per_tf[tf] = warmup_actual
-        warmup_required = int(warmup_required_per_tf.get(tf, warmup_bars_base))
+        warmup_required = int(warmup_required_per_tf.get(tf, warmup_actual))
         warmup_diag[tf] = {
             "required": warmup_required,
             "actual": warmup_actual,
@@ -3918,6 +5706,20 @@ async def build_check_all_datas(
                 "total": int(total_history),
                 "ok": bool(ok),
             }
+    pivot_overrides: Dict[str, int] = dict(zone_pivot_overrides)
+    for tf_key in ("15m", "1h"):
+        available = len(zone_frames_window.get(tf_key, []))
+        baseline_required = required_bars_per_tf.get(tf_key)
+        if baseline_required is None:
+            continue
+        baseline_required = max(1, int(baseline_required))
+        if available <= 0:
+            pivot_overrides.setdefault(tf_key, 1 if tf_key == "15m" else 2)
+            continue
+        if available < baseline_required:
+            pivot_overrides.setdefault(tf_key, 1 if tf_key == "15m" else 2)
+    if pivot_overrides:
+        zone_cfg.pivot_overrides = dict(pivot_overrides)
     zones_diag = {
         "tf_lengths": zone_tf_lengths,
         "atr_period": zone_cfg.atr_period,
@@ -3939,7 +5741,10 @@ async def build_check_all_datas(
     zone_cfg.zones_window_start_ms = zones_window_start_ms
     zone_cfg.window_end_ms_prev_closed = window_end_ms
     zone_cfg.allow_base_fallback = True
-    liquidity_equal_levels = build_equal_liquidity_levels(zone_frames_full)
+    liquidity_equal_levels = build_equal_liquidity_levels(
+        zone_frames_full,
+        max_levels=zone_top_n,
+    )
 
     base_index_all = {candle["t"]: candle for candle in base_candles}
 
@@ -4233,6 +6038,12 @@ async def build_check_all_datas(
             },
         )
 
+    await progress_tracker.start(
+        "zones",
+        availability=zone_availability,
+        warmup=warmup_diag,
+    )
+
     if zone_frames_full:
         try:
             detected_zones = await asyncio.to_thread(
@@ -4335,7 +6146,7 @@ async def build_check_all_datas(
                     zones_diag["rb_reject"] = rb_reject_map
                 if rb_fallback_map:
                     zones_diag["base_fallback_used"] = rb_fallback_map
-                zones_diag["detection"] = detection_diag
+            zones_diag["detection"] = detection_diag
     zone_type_timeframes = {
         "fvg": ("15m", "1h", "4h"),
         "fvl": ("15m", "1h", "4h"),
@@ -4431,14 +6242,70 @@ async def build_check_all_datas(
         if gating_diag:
             zones_diag["gating"] = gating_diag
 
+    if "active_session_atr" not in locals():
+        active_session_atr = None  # type: ignore[assignment]
+    if "active_session_name" not in locals():
+        active_session_name = None  # type: ignore[assignment]
+
+    liquidity_config_overrides: Dict[str, Any] = {}
+    if isinstance(liquidity_config, Mapping):
+        liquidity_config_overrides.update(liquidity_config)
+
+    session_atr_pct: float | None = None
+    if active_session_atr is not None:
+        liquidity_config_overrides["session_atr_value"] = active_session_atr
+        if last_price_value is not None and last_price_value > 0:
+            session_atr_pct = max(active_session_atr / last_price_value, 0.0)
+            liquidity_config_overrides["session_atr_pct"] = session_atr_pct
+    if active_session_name:
+        liquidity_config_overrides["session_label"] = active_session_name
+
+    atr_pct_cap = float(atr_adaptation.get("pct_cap", 0.05))
+    cluster_min = float(atr_adaptation.get("cluster_min", 0.00005))
+    cluster_multiplier = float(atr_adaptation.get("cluster_multiplier", 3.5))
+    cluster_max = float(atr_adaptation.get("cluster_max", 0.002))
+    sweep_base = float(atr_adaptation.get("sweep_base", 0.3))
+    sweep_multiplier = float(atr_adaptation.get("sweep_multiplier", 6.0))
+    sweep_min = float(atr_adaptation.get("sweep_min", 0.25))
+    sweep_max = float(atr_adaptation.get("sweep_max", 0.75))
+    min_move_base = float(atr_adaptation.get("min_move_base", 0.25))
+    min_move_multiplier = float(atr_adaptation.get("min_move_multiplier", 10.0))
+    min_move_min = float(atr_adaptation.get("min_move_min", 0.2))
+    min_move_max = float(atr_adaptation.get("min_move_max", 1.0))
+    epsilon_multiplier = float(atr_adaptation.get("epsilon_multiplier", 2.5))
+    epsilon_min = float(atr_adaptation.get("epsilon_min", 0.0002))
+    epsilon_max = float(atr_adaptation.get("epsilon_max", 0.02))
+
+    if (
+        active_session_atr is not None
+        and tick_size_numeric is not None
+        and tick_size_numeric > 0
+    ):
+        atr_ticks = max(active_session_atr / tick_size_numeric, 0.0)
+        eqh_ticks = max(1.0, min(atr_ticks * 0.5, 15.0))
+        liquidity_config_overrides["tolerance_eqh_ticks"] = eqh_ticks
+        liquidity_config_overrides["tolerance_eql_ticks"] = eqh_ticks
+
+    if session_atr_pct is not None:
+        bounded_pct = min(session_atr_pct, atr_pct_cap)
+        cluster_pct = max(cluster_min, min(bounded_pct * cluster_multiplier, cluster_max))
+        liquidity_config_overrides["cluster_price_window_pct"] = cluster_pct
+        sweep_mult = max(sweep_min, min(sweep_max, sweep_base + bounded_pct * sweep_multiplier))
+        min_move_atr = max(min_move_min, min(min_move_max, min_move_base + bounded_pct * min_move_multiplier))
+        epsilon_pct = max(epsilon_min, min(epsilon_max, bounded_pct * epsilon_multiplier))
+        liquidity_config_overrides["sweep_atr_multiplier"] = sweep_mult
+        liquidity_config_overrides["sweep_min_move_atr"] = min_move_atr
+        liquidity_config_overrides["sweep_epsilon_pct"] = epsilon_pct
+
     liquidity_payload = await asyncio.to_thread(
         build_liquidity_snapshot,
         liquidity_frames,
         symbol=symbol,
         tick_size=tick_size_numeric,
+        tick_source_hint=tick_size_source,
         meta=raw_meta,
         selection=selection_payload,
-        config=liquidity_config if isinstance(liquidity_config, Mapping) else None,
+        config=liquidity_config_overrides,
     )
 
     liquidity_diagnostics = (
@@ -4454,6 +6321,55 @@ async def build_check_all_datas(
     if isinstance(liquidity_config_payload, Mapping):
         liquidity_payload["config"] = dict(liquidity_config_payload)
 
+    sweeps_series = liquidity_payload.get("sweeps") if isinstance(liquidity_payload, Mapping) else None
+    deduped_sweeps = _dedupe_sweeps(sweeps_series, tick_size=tick_size_numeric)
+    linked_sweeps = _link_sweeps_to_zones(
+        deduped_sweeps,
+        zones_container if isinstance(zones_container, Mapping) else None,
+        tick_size=tick_size_numeric,
+    )
+    if isinstance(liquidity_payload, MutableMapping):
+        liquidity_payload["sweeps"] = linked_sweeps
+
+    zones_recent_focus = _build_zone_focus(
+        zones_container if isinstance(zones_container, Mapping) else None,
+        last_price=last_price_value,
+        reference_ms=window_end_ms,
+        window_hours=zone_focus_window_hours,
+        top_limits=zone_top_n,
+    )
+    if isinstance(zones_recent_focus.get("meta"), MutableMapping):
+        if active_session_name:
+            zones_recent_focus["meta"]["session"] = active_session_name
+    if active_session_atr is not None:
+        zones_recent_focus["meta"]["session_atr"] = active_session_atr
+    if session_atr_pct is not None:
+        zones_recent_focus["meta"]["session_atr_pct"] = session_atr_pct
+    zones_diag["recent_focus"] = copy.deepcopy(zones_recent_focus.get("meta", {}))
+    if isinstance(detected_zones, MutableMapping):
+        meta_block = detected_zones.setdefault("meta", {})
+        if isinstance(meta_block, MutableMapping):
+            meta_block["recent_focus"] = copy.deepcopy(zones_recent_focus)
+
+    zone_counts_summary: Dict[str, int] = {}
+    zones_block = detected_zones.get("zones") if isinstance(detected_zones, Mapping) else None
+    if isinstance(zones_block, Mapping):
+        for key in ("fvg", "fvl", "ob", "mb", "bb", "rb", "pb", "sr", "profile_levels"):
+            series = zones_block.get(key)
+            zone_counts_summary[key] = len(series) if isinstance(series, Sequence) else 0
+    zone_focus_counts = {}
+    focus_meta = zones_recent_focus.get("meta") if isinstance(zones_recent_focus, Mapping) else None
+    if isinstance(focus_meta, Mapping):
+        counts_payload = focus_meta.get("counts")
+        if isinstance(counts_payload, Mapping):
+            zone_focus_counts = dict(counts_payload)
+    await progress_tracker.complete(
+        "zones",
+        bar_counts=zone_counts_summary,
+        agg_counts={"focus_counts": zone_focus_counts},
+        completeness={"availability": zone_availability, "warmup": warmup_diag},
+    )
+
     minute_htf_source: List[Mapping[str, Any]] = []
     minute_frame_present = "1m" in frames
     if minute_frame_present:
@@ -4464,14 +6380,63 @@ async def build_check_all_datas(
         ]
 
     orderflow_config = _resolve_orderflow_config(raw_meta)
-    orderflow_window_minutes = len(minute_htf_source) if minute_htf_source else None
-    orderflow_block, orderflow_diag = _build_orderflow_block(
-        minute_htf_source,
-        snapshot.get("agg_trades"),
-        config=orderflow_config,
-        orderflow_source=snapshot.get("orderflow"),
-        window_minutes=orderflow_window_minutes,
-    )
+    orderflow_end_ms = window_end_ms
+    orderflow_start_ms = max(0, orderflow_end_ms - orderflow_window_ms + MINUTE_INTERVAL_MS)
+    if orderflow_enabled:
+        await progress_tracker.start(
+            "delta",
+            window={"start_ms": orderflow_start_ms, "end_ms": orderflow_end_ms},
+        )
+        try:
+            orderflow_block, orderflow_diag = await _build_orderflow_block(
+                frames.get("1m", []),
+                snapshot.get("agg_trades"),
+                orderflow_start_ms=orderflow_start_ms,
+                orderflow_end_ms=orderflow_end_ms,
+                config=orderflow_config,
+                symbol=symbol,
+                allow_network=(network_backfill or orderflow_allow_network),
+                trace_ctx=trace_ctx,
+                budget=budget,
+                orderflow_source=snapshot.get("orderflow"),
+                window_minutes=orderflow_window_minutes,
+                page_span_ms=agg_trades_page_ms,
+                target_timeframes=orderflow_timeframes,
+                aggregated_timeframes=aggregated_orderflow_timeframes,
+            )
+        except Exception as exc:
+            await progress_tracker.fail(
+                "delta",
+                bar_counts={},
+                agg_counts={},
+                completeness={"error": str(exc)},
+            )
+            raise
+        orderflow_counts = {
+            tf: len((orderflow_block.get(tf) or {}).get("per_bar", []))
+            for tf in orderflow_timeframes
+        }
+        series_lengths = orderflow_diag.get("series_lengths") if isinstance(orderflow_diag, Mapping) else {}
+        coverage_info = orderflow_diag.get("coverage") if isinstance(orderflow_diag, Mapping) else {}
+        await progress_tracker.complete(
+            "delta",
+            bar_counts=orderflow_counts,
+            agg_counts=series_lengths if isinstance(series_lengths, Mapping) else {},
+            completeness=coverage_info if isinstance(coverage_info, Mapping) else {},
+        )
+    else:
+        await progress_tracker.start("delta")
+        orderflow_block = {
+            tf: {"per_bar": [], "summary": {}}
+            for tf in orderflow_timeframes
+        }
+        orderflow_diag = {"disabled": True}
+        await progress_tracker.complete(
+            "delta",
+            bar_counts={tf: 0 for tf in orderflow_timeframes},
+            agg_counts={},
+            completeness={"disabled": True},
+        )
     if rollup_payload:
         ohlcv_block = rollup_payload
     else:
@@ -4526,6 +6491,15 @@ async def build_check_all_datas(
         _inject_smc_blocks(movement_section.get("indicators"), smc_blocks)
 
     minute_series = frames.get("1m", [])
+    session_series = minute_series
+    session_source_tf = "1m"
+    session_interval_ms = MINUTE_INTERVAL_MS
+    if not session_series:
+        fallback_three_min = _deduplicate_sorted(frames.get("3m", []))
+        if fallback_three_min:
+            session_series = fallback_three_min
+            session_source_tf = "3m"
+            session_interval_ms = TIMEFRAME_TO_MS.get("3m", MINUTE_INTERVAL_MS * 3)
     daily_start_ms = _start_of_day_ms(window_end_ms)
     composite_day_end_ms = daily_start_ms + MS_IN_DAY - MINUTE_INTERVAL_MS
     if composite_day_end_ms < daily_start_ms:
@@ -4546,7 +6520,7 @@ async def build_check_all_datas(
                 session_close_ms,
             )
         compact_result = build_compact_vwap_profiles(
-            minute_series,
+            session_series,
             daily_window=(daily_start_ms, window_end_ms),
             composite_window=(daily_start_ms, min(window_end_ms, composite_day_end_ms)),
             session_windows=session_window_map,
@@ -4577,23 +6551,36 @@ async def build_check_all_datas(
             if isinstance(profile_entry, MutableMapping):
                 profile_entry.setdefault("open_utc", _isoformat_utc(start_ms))
                 profile_entry.setdefault("close_utc", _isoformat_utc(close_ms))
+            start_ms_int = _safe_int(boundary.get("start_ms"))
+            end_ms_int = _safe_int(boundary.get("end_ms"))
+            if start_ms_int is not None and end_ms_int is not None:
+                session_atr = _session_atr_value(
+                    session_series,
+                    start_ms=start_ms_int,
+                    end_ms=end_ms_int,
+                    period=max(1, int(zone_cfg.atr_period or 14)),
+                )
+                if session_atr is not None:
+                    boundary["atr"] = session_atr
+                    if isinstance(profile_entry, MutableMapping):
+                        profile_entry.setdefault("session_atr", session_atr)
         vwap_sigma_payload = {
             "daily": compact_result.daily_sigma,
             "sessions": session_sigma_blocks,
         }
     else:
         daily_filtered_minutes = _filter_candles(
-            minute_series, start_ms=daily_start_ms, end_ms=window_end_ms
+            session_series, start_ms=daily_start_ms, end_ms=window_end_ms
         )
         daily_vwap_profile = _build_volume_profile_stats(
-            minute_series,
+            session_series,
             start_ms=daily_start_ms,
             end_ms=window_end_ms,
             tick_size=tick_size_numeric,
             value_area_pct=VALUE_AREA_PCT,
         )
         composite_day_profile = _build_volume_profile_stats(
-            minute_series,
+            session_series,
             start_ms=daily_start_ms,
             end_ms=min(window_end_ms, composite_day_end_ms),
             tick_size=tick_size_numeric,
@@ -4604,13 +6591,13 @@ async def build_check_all_datas(
                 window_end_ms, session_start, session_end
             )
             session_filtered = _filter_candles(
-                minute_series, start_ms=session_start_ms, end_ms=session_end_ms
+                session_series, start_ms=session_start_ms, end_ms=session_end_ms
             )
             ib_high, ib_low = _compute_initial_balance_extrema(
                 session_filtered, session_start_ms=session_start_ms
             )
             profile_entry = _build_volume_profile_stats(
-                minute_series,
+                session_series,
                 start_ms=session_start_ms,
                 end_ms=session_end_ms,
                 tick_size=tick_size_numeric,
@@ -4625,6 +6612,15 @@ async def build_check_all_datas(
                 profile_entry["close_utc"] = _isoformat_utc(session_close_ms)
                 profile_entry["ib_high"] = ib_high
                 profile_entry["ib_low"] = ib_low
+            session_atr = _session_atr_value(
+                session_series,
+                start_ms=session_start_ms,
+                end_ms=session_end_ms,
+                period=max(1, int(zone_cfg.atr_period or 14)),
+            )
+            if session_atr is not None:
+                if isinstance(profile_entry, MutableMapping):
+                    profile_entry["session_atr"] = session_atr
             session_profiles[session_name] = profile_entry
             session_sigma_blocks[session_name] = _build_vwap_sigma_block(
                 session_filtered, basis="session"
@@ -4636,10 +6632,41 @@ async def build_check_all_datas(
                 "ib_high": ib_high,
                 "ib_low": ib_low,
             }
+            if session_atr is not None:
+                session_boundaries[session_name]["atr"] = session_atr
         vwap_sigma_payload = {
             "daily": _build_vwap_sigma_block(daily_filtered_minutes, basis="daily"),
             "sessions": session_sigma_blocks,
         }
+
+    active_session_name: str | None = None
+    active_session_atr: float | None = None
+
+    session_completeness: Dict[str, Dict[str, Any]] = {}
+    for session_name, boundary in session_boundaries.items():
+        if not isinstance(boundary, Mapping):
+            continue
+        start_ms = _safe_int(boundary.get("start_ms"))
+        end_ms = _safe_int(boundary.get("end_ms"))
+        close_ms = _safe_int(boundary.get("close_ms"))
+        if start_ms is None or end_ms is None or close_ms is None:
+            continue
+        session_filtered = _filter_candles(
+            session_series,
+            start_ms=start_ms,
+            end_ms=end_ms,
+        )
+        completeness = _compute_session_completeness(
+            session_filtered,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            close_ms=close_ms,
+            interval_ms=session_interval_ms,
+            timeframe=session_source_tf,
+        )
+        if isinstance(boundary, MutableMapping):
+            boundary["completeness"] = completeness
+        session_completeness[session_name] = completeness
 
     vwap_payload = {
         "daily": daily_vwap_profile,
@@ -4650,6 +6677,34 @@ async def build_check_all_datas(
         str(name).lower(): (start_time, end_time)
         for name, start_time, end_time in sessions
     }
+    if session_boundaries:
+        for name, boundary in session_boundaries.items():
+            if not isinstance(boundary, Mapping):
+                continue
+            start_ms = _safe_int(boundary.get("start_ms"))
+            close_ms = _safe_int(boundary.get("close_ms"))
+            if start_ms is None or close_ms is None:
+                continue
+            if start_ms <= window_end_ms <= close_ms:
+                active_session_name = name
+                active_session_atr = _safe_float(boundary.get("atr"))
+                break
+        if active_session_name is None:
+            latest_entry = None
+            latest_close = -1
+            for name, boundary in session_boundaries.items():
+                if not isinstance(boundary, Mapping):
+                    continue
+                close_ms = _safe_int(boundary.get("close_ms"))
+                if close_ms is None:
+                    continue
+                if close_ms > latest_close:
+                    latest_close = close_ms
+                    latest_entry = (name, boundary)
+            if latest_entry is not None:
+                active_session_name = latest_entry[0]
+                active_session_atr = _safe_float(latest_entry[1].get("atr"))
+
     for entry in profile_tpo:
         if not isinstance(entry, MutableMapping):
             continue
@@ -4669,14 +6724,17 @@ async def build_check_all_datas(
         if session_date is None:
             continue
         start_time, end_time = schedule
-        start_dt = datetime.combine(session_date, start_time, tzinfo=UTC)
-        end_dt = datetime.combine(session_date, end_time, tzinfo=UTC)
+        tz = VWAP_SESSION_TZ or UTC
+        start_local = datetime.combine(session_date, start_time, tzinfo=tz)
+        end_local = datetime.combine(session_date, end_time, tzinfo=tz)
         if end_time <= start_time:
-            end_dt += timedelta(days=1)
+            end_local += timedelta(days=1)
+        start_dt = start_local.astimezone(UTC)
+        end_dt = end_local.astimezone(UTC)
         start_ms = int(start_dt.timestamp() * 1000)
         end_ms = int(end_dt.timestamp() * 1000) - MINUTE_INTERVAL_MS
         session_candles = _filter_candles(
-            minute_series, start_ms=start_ms, end_ms=end_ms
+            session_series, start_ms=start_ms, end_ms=end_ms
         )
         ib_high, ib_low = _compute_initial_balance_extrema(
             session_candles, session_start_ms=start_ms
@@ -4737,25 +6795,58 @@ async def build_check_all_datas(
         close_ms = boundary.get("close_ms")
         ib_high = boundary.get("ib_high")
         ib_low = boundary.get("ib_low")
+        completeness = session_completeness.get(session_name)
+
+        poc_value: float | None = None
+        high_value: float | None = None
+        low_value: float | None = None
+        if isinstance(profile_entry, Mapping):
+            poc_value = _safe_float(profile_entry.get("poc"))
+            high_value = _safe_float(profile_entry.get("high"))
+            if high_value is None:
+                high_value = _safe_float(profile_entry.get("session_high"))
+            low_value = _safe_float(profile_entry.get("low"))
+            if low_value is None:
+                low_value = _safe_float(profile_entry.get("session_low"))
+            if (
+                poc_value is not None
+                and high_value is not None
+                and low_value is not None
+            ):
+                upper = max(high_value, low_value)
+                lower = min(high_value, low_value)
+                poc_value = min(max(poc_value, lower), upper)
+            elif poc_value is not None:
+                poc_value = None
+            if isinstance(profile_entry, MutableMapping):
+                profile_entry["poc"] = poc_value
+                if high_value is not None:
+                    profile_entry.setdefault("high", high_value)
+                if low_value is not None:
+                    profile_entry.setdefault("low", low_value)
+
         session_payload = {
             "open_utc": _isoformat_utc(open_ms) if open_ms is not None else None,
             "close_utc": _isoformat_utc(close_ms) if close_ms is not None else None,
             "vwap": profile_entry.get("vwap") if isinstance(profile_entry, Mapping) else None,
             "sd1": _sd_payload(sigma_levels, 1),
             "sd2": _sd_payload(sigma_levels, 2),
-            "poc": profile_entry.get("poc") if isinstance(profile_entry, Mapping) else None,
+            "poc": poc_value,
             "vah": profile_entry.get("vah") if isinstance(profile_entry, Mapping) else None,
             "val": profile_entry.get("val") if isinstance(profile_entry, Mapping) else None,
             "ib_high": ib_high,
             "ib_low": ib_low,
-            "high": profile_entry.get("session_high") if isinstance(profile_entry, Mapping) else None,
-            "low": profile_entry.get("session_low") if isinstance(profile_entry, Mapping) else None,
+            "high": high_value,
+            "low": low_value,
+            "completeness": completeness,
         }
         if isinstance(profile_entry, Mapping):
-            if profile_entry.get("high") is not None:
-                session_payload["high"] = profile_entry.get("high")
-            if profile_entry.get("low") is not None:
-                session_payload["low"] = profile_entry.get("low")
+            raw_high = _safe_float(profile_entry.get("high"))
+            raw_low = _safe_float(profile_entry.get("low"))
+            if raw_high is not None:
+                session_payload["high"] = raw_high
+            if raw_low is not None:
+                session_payload["low"] = raw_low
         vwap_tpo_sessions[session_name] = session_payload
 
     composite_day_payload = None
@@ -4771,6 +6862,24 @@ async def build_check_all_datas(
         "sessions": vwap_tpo_sessions,
     }
 
+    vwap_stage_counts = {
+        name: session_completeness.get(name, {}).get("bars_observed")
+        for name in vwap_tpo_sessions.keys()
+    }
+    vwap_stage_completeness = {
+        name: {
+            "status": session_completeness.get(name, {}).get("status"),
+            "coverage_ratio": session_completeness.get(name, {}).get("coverage_ratio"),
+        }
+        for name in vwap_tpo_sessions.keys()
+    }
+    await progress_tracker.complete(
+        "vwap_tpo",
+        bar_counts=vwap_stage_counts,
+        agg_counts={"sessions": len(vwap_tpo_sessions)},
+        completeness=vwap_stage_completeness,
+    )
+
     if trace_ctx is not None:
         trace_ctx.info(
             "compute.vwap_tpo",
@@ -4779,7 +6888,7 @@ async def build_check_all_datas(
         )
 
     prev_day_block = _build_prev_day_block(
-        minute_series,
+        session_series,
         daily_start_ms=daily_start_ms,
         tick_size=tick_size_numeric,
     )
@@ -4823,6 +6932,28 @@ async def build_check_all_datas(
         raw_payload = vwap_tpo_sessions.get(session_name, {})
         open_utc = raw_payload.get("open_utc") if isinstance(raw_payload, Mapping) else None
         close_utc = raw_payload.get("close_utc") if isinstance(raw_payload, Mapping) else None
+        completeness_raw = raw_payload.get("completeness") if isinstance(raw_payload, Mapping) else None
+
+        completeness_public: Dict[str, Any] | None = None
+        if isinstance(completeness_raw, Mapping):
+            completeness_public = {
+                "status": completeness_raw.get("status") if isinstance(completeness_raw.get("status"), str) else None,
+                "coverage_ratio": _float_or_none(completeness_raw.get("coverage_ratio")),
+                "bars_expected": _safe_int(completeness_raw.get("bars_expected")),
+                "bars_observed": _safe_int(completeness_raw.get("bars_observed")),
+                "missing_bars": _safe_int(completeness_raw.get("missing_bars")),
+                "tf": completeness_raw.get("tf") if isinstance(completeness_raw.get("tf"), str) else None,
+            }
+            interval_value = _safe_int(completeness_raw.get("interval_ms"))
+            if interval_value is not None:
+                completeness_public["interval_ms"] = interval_value
+            observed_window = completeness_raw.get("observed_window")
+            if isinstance(observed_window, Mapping):
+                completeness_public["observed_window"] = {
+                    "start_ms": _safe_int(observed_window.get("start_ms")),
+                    "end_ms": _safe_int(observed_window.get("end_ms")),
+                }
+
         ordered_sessions[session_name] = {
             "open_utc": open_utc,
             "close_utc": close_utc,
@@ -4836,6 +6967,7 @@ async def build_check_all_datas(
             "ib_low": _float_or_none(raw_payload.get("ib_low")) if isinstance(raw_payload, Mapping) else None,
             "high": _float_or_none(raw_payload.get("high")) if isinstance(raw_payload, Mapping) else None,
             "low": _float_or_none(raw_payload.get("low")) if isinstance(raw_payload, Mapping) else None,
+            "completeness": completeness_public,
         }
 
     vwap_tpo_public = {
@@ -4844,7 +6976,7 @@ async def build_check_all_datas(
     }
 
     ohlcv_public: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
-    for tf in ("1m", "3m", "5m", "15m", "1h", "4h", "1d"):
+    for tf in combined_ohlcv_tfs:
         tf_payload = ohlcv_block.get(tf) if isinstance(ohlcv_block, Mapping) else None
         candles: List[Dict[str, Any]] = []
         if isinstance(tf_payload, Mapping):
@@ -4853,21 +6985,25 @@ async def build_check_all_datas(
                 candles = [dict(candle) for candle in raw_candles if isinstance(candle, Mapping)]
         ohlcv_public[tf] = {"candles": candles}
 
-    orderflow_public: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
-    for tf in ("1m", "3m", "5m", "15m", "1h"):
+    orderflow_public: Dict[str, Dict[str, Any]] = {}
+    for tf in orderflow_timeframes:
         tf_payload = orderflow_block.get(tf) if isinstance(orderflow_block, Mapping) else None
         per_bar: List[Dict[str, Any]] = []
+        summary_payload: Dict[str, Any] = {}
         if isinstance(tf_payload, Mapping):
             raw_series = tf_payload.get("per_bar")
             if isinstance(raw_series, Sequence):
                 per_bar = [dict(entry) for entry in raw_series if isinstance(entry, Mapping)]
-        orderflow_public[tf] = {"per_bar": per_bar}
+            summary_source = tf_payload.get("summary")
+            if isinstance(summary_source, Mapping):
+                summary_payload = dict(summary_source)
+        orderflow_public[tf] = {"per_bar": per_bar, "summary": summary_payload}
 
     orderflow_public["diag"] = orderflow_diag
 
     zones_container = detected_zones.get("zones") if isinstance(detected_zones, Mapping) else None
     zone_keys = ("fvg", "fvl", "ob", "mb", "bb", "rb", "pb", "sr", "profile_levels")
-    zones_public: Dict[str, List[Dict[str, Any]]] = {key: [] for key in zone_keys}
+    zones_public: Dict[str, Any] = {key: [] for key in zone_keys}
     if isinstance(zones_container, Mapping):
         for key in zone_keys:
             raw_zone = zones_container.get(key)
@@ -4876,7 +7012,7 @@ async def build_check_all_datas(
                     dict(item) for item in raw_zone if isinstance(item, Mapping)
                 ]
 
-    allowed_zone_statuses = {"open", "fresh", "tapped"}
+    allowed_zone_statuses = ZONE_ALLOWED_STATUSES
     for key in zone_keys:
         series = zones_public.get(key)
         if not isinstance(series, list):
@@ -4885,11 +7021,16 @@ async def build_check_all_datas(
         for entry in series:
             if not isinstance(entry, Mapping):
                 continue
-            status_value = str(entry.get("status") or "").lower()
-            if status_value and status_value not in allowed_zone_statuses:
-                continue
-            filtered_series.append(entry)
+            entry_copy = dict(entry)
+            if key in ("fvg", "ob"):
+                normalised_status = _normalise_zone_status(entry_copy, key)
+                entry_copy["status"] = normalised_status
+                if normalised_status and normalised_status not in allowed_zone_statuses:
+                    continue
+            filtered_series.append(entry_copy)
         zones_public[key] = filtered_series
+
+    zones_public["recent"] = zones_recent_focus
 
     gating_public = zones_diag.get("gating") if isinstance(zones_diag.get("gating"), Mapping) else {}
     zones_public["diag"] = zones_diag
@@ -4923,13 +7064,23 @@ async def build_check_all_datas(
         trace_ctx.info(
             "compute.poi.topN",
             scope="zones",
-            counts={key: len(value) for key, value in zones_public.items()},
+            counts={key: len(zones_public.get(key, [])) for key in zone_keys},
         )
+
 
     liquidity_public = {
         "eqh": list(liquidity_equal_levels.get("eqh", [])),
         "eql": list(liquidity_equal_levels.get("eql", [])),
     }
+    if isinstance(liquidity_payload, Mapping):
+        sweeps_public = liquidity_payload.get("sweeps")
+        if isinstance(sweeps_public, Sequence):
+            liquidity_public["sweeps"] = [
+                dict(entry) for entry in sweeps_public if isinstance(entry, Mapping)
+            ]
+        config_snapshot = liquidity_payload.get("config")
+        if isinstance(config_snapshot, Mapping):
+            liquidity_public["config"] = dict(config_snapshot)
 
     risk_prefs_public = {"rr_min": 2.5, "risk_per_trade_pct": 1.0}
 
@@ -4957,6 +7108,92 @@ async def build_check_all_datas(
         "openOppositeZones": bool(raw_open_opposite) if isinstance(raw_open_opposite, bool) else False,
     }
 
+    timeframe_order: Tuple[str, ...] = ("1m", "5m", "15m", "1h", "4h", "1d")
+    zone_keys_summary: Tuple[str, ...] = ("eqh", "eql", "fvg", "ob")
+
+    def _normalise_tf_name(value: Any) -> str:
+        if isinstance(value, str):
+            return value.strip().lower()
+        return str(value).strip().lower()
+
+    tf_zone_counts: Dict[str, Dict[str, int]] = {
+        tf: {zone_key: 0 for zone_key in zone_keys_summary} for tf in timeframe_order
+    }
+    sweeps_counts: Dict[str, int] = {tf: 0 for tf in timeframe_order}
+    atr_values_map: Dict[str, float | None] = {tf: None for tf in timeframe_order}
+
+    if isinstance(liquidity_payload, Mapping):
+        for zone_key in ("eqh", "eql"):
+            zone_series = liquidity_payload.get(zone_key)
+            if not isinstance(zone_series, Sequence):
+                continue
+            for entry in zone_series:
+                if not isinstance(entry, Mapping):
+                    continue
+                tf_name = _normalise_tf_name(entry.get("tf"))
+                if tf_name in tf_zone_counts:
+                    tf_zone_counts[tf_name][zone_key] += 1
+        sweep_series = liquidity_payload.get("sweeps")
+        if isinstance(sweep_series, Sequence):
+            for entry in sweep_series:
+                if not isinstance(entry, Mapping):
+                    continue
+                tf_name = _normalise_tf_name(entry.get("tf"))
+                if tf_name in sweeps_counts:
+                    sweeps_counts[tf_name] += 1
+
+    if isinstance(zones_container, Mapping):
+        for zone_key in ("fvg", "ob"):
+            zone_series = zones_container.get(zone_key)
+            if not isinstance(zone_series, Sequence):
+                continue
+            for entry in zone_series:
+                if not isinstance(entry, Mapping):
+                    continue
+                tf_name = _normalise_tf_name(entry.get("tf"))
+                if tf_name in tf_zone_counts:
+                    tf_zone_counts[tf_name][zone_key] += 1
+
+    if isinstance(liquidity_diagnostics, Mapping):
+        for tf in timeframe_order:
+            tf_diag = liquidity_diagnostics.get(tf)
+            if not isinstance(tf_diag, Mapping):
+                continue
+            atr_stats = tf_diag.get("atr_stats")
+            if not isinstance(atr_stats, Mapping):
+                continue
+            atr_mean = _safe_float(atr_stats.get("atr_mean"))
+            if atr_mean is not None and math.isfinite(atr_mean):
+                atr_values_map[tf] = float(atr_mean)
+
+    vwap_sessions_public = (
+        vwap_tpo_public.get("sessions")
+        if isinstance(vwap_tpo_public, Mapping)
+        else {}
+    )
+    session_names: Tuple[str, ...] = ("asia", "london", "ny")
+    session_presence_template: Dict[str, bool] = {
+        name: bool(vwap_sessions_public.get(name))
+        for name in session_names
+    }
+
+    timeframes_summary: Dict[str, Dict[str, Any]] = {}
+    availability_timeframes: Dict[str, Dict[str, Any]] = {}
+    for tf in timeframe_order:
+        zones_snapshot = {zone_key: tf_zone_counts[tf].get(zone_key, 0) for zone_key in zone_keys_summary}
+        timeframes_summary[tf] = {
+            "zones": zones_snapshot,
+            "sweeps": sweeps_counts.get(tf, 0),
+            "atr": atr_values_map.get(tf),
+            "vwap_sessions": dict(session_presence_template),
+        }
+        availability_timeframes[tf] = {
+            "zones": {zone_key: zones_snapshot[zone_key] > 0 for zone_key in zone_keys_summary},
+            "sweeps": sweeps_counts.get(tf, 0),
+            "atr": atr_values_map.get(tf) is not None,
+            "vwap_sessions": dict(session_presence_template),
+        }
+
     data_payload = {
         "symbol": symbol,
         "ohlcv": ohlcv_public,
@@ -4969,14 +7206,42 @@ async def build_check_all_datas(
         "liquidity": liquidity_public,
         "risk_prefs": risk_prefs_public,
         "context": context_public,
+        "timeframes": timeframes_summary,
     }
 
-    availability: Dict[str, Any] = {
-        "ohlcv": {},
-        "vwap_sessions": {},
-        "zones": {},
-        "orderflow": {"timeframes": {}, "metrics": {}},
+    showcase_window = ZONE_FOCUS_WINDOW_HOURS
+    if isinstance(zones_recent_focus, Mapping):
+        window_candidate = zones_recent_focus.get("window_hours")
+        window_candidate_int = _safe_int(window_candidate)
+        if window_candidate_int is not None and window_candidate_int > 0:
+            showcase_window = window_candidate_int
+
+    await progress_tracker.start("vitrines")
+    showcases_block, showcases_diag = _build_final_showcases(
+        zones_recent_focus if isinstance(zones_recent_focus, Mapping) else None,
+        window_hours=showcase_window,
+        last_price=last_price_value,
+        sessions=vwap_tpo_public.get("sessions") if isinstance(vwap_tpo_public, Mapping) else None,
+        orderflow=orderflow_public,
+        liquidity=liquidity_public,
+    )
+    data_payload["showcases"] = showcases_block
+    vitrines_bar_counts = {
+        "A": len(showcases_block.get("A", {}).get("items", [])),
+        "B": len(showcases_block.get("B", {}).get("items", [])),
     }
+    vitrines_completeness = {
+        key: value.get("completeness") if isinstance(value, Mapping) else {}
+        for key, value in showcases_block.items()
+    }
+    await progress_tracker.complete(
+        "vitrines",
+        bar_counts=vitrines_bar_counts,
+        agg_counts={"diagnostics": showcases_diag},
+        completeness=vitrines_completeness,
+    )
+
+    availability: Dict[str, Any] = {"timeframes": dict(availability_timeframes)}
     missing_fields: Set[str] = set()
 
     if trace_ctx is not None:
@@ -4986,13 +7251,19 @@ async def build_check_all_datas(
             blocks=list(availability.keys()),
         )
 
-    for tf in ("1m", "3m", "5m", "15m", "1h", "4h", "1d"):
+    ohlcv_core_available = {"15m": False, "1h": False}
+    orderflow_core_available = {"15m": False, "1h": False}
+    session_ready_names: List[str] = []
+    session_status_map: Dict[str, str | None] = {}
+
+    for tf in combined_ohlcv_tfs:
         candles_payload = ohlcv_public.get(tf, {})
         candles = candles_payload.get("candles") if isinstance(candles_payload, Mapping) else []
         count = len(candles) if isinstance(candles, Sequence) else 0
-        availability["ohlcv"][tf] = {"candles": count, "has_data": count > 0}
         if count == 0:
             missing_fields.add(f"ohlcv.{tf}")
+        if tf in ohlcv_core_available and count > 0:
+            ohlcv_core_available[tf] = True
 
     sessions_public = vwap_tpo_public.get("sessions", {}) if isinstance(vwap_tpo_public, Mapping) else {}
     for session_name in ("asia", "london", "ny"):
@@ -5007,16 +7278,20 @@ async def build_check_all_datas(
             metrics_presence[metric] = has_metric
             if not has_metric:
                 missing_fields.add(f"vwap_tpo.sessions.{session_name}.{metric}")
-        availability["vwap_sessions"][session_name] = {
-            "present": session_present,
-            "metrics": metrics_presence,
-        }
+        completeness_payload = raw_session.get("completeness") if isinstance(raw_session, Mapping) else None
+        status_value: str | None = None
+        if isinstance(completeness_payload, Mapping):
+            raw_status = completeness_payload.get("status")
+            if isinstance(raw_status, str):
+                status_value = raw_status.strip().lower() or None
+        session_status_map[session_name] = status_value
+        if status_value in {"complete", "partial"}:
+            session_ready_names.append(session_name)
 
     for zone_key, series in zones_public.items():
         if zone_key == "diag":
             continue
         count = len(series) if isinstance(series, Sequence) else 0
-        availability["zones"][zone_key] = {"count": count}
         if count == 0:
             missing_fields.add(f"zones.{zone_key}")
 
@@ -5033,10 +7308,6 @@ async def build_check_all_datas(
         per_bar = payload.get("per_bar") if isinstance(payload, Mapping) else []
         series = per_bar if isinstance(per_bar, Sequence) else []
         series_list = [entry for entry in series if isinstance(entry, Mapping)]
-        availability["orderflow"]["timeframes"][tf] = {
-            "bars": len(series_list),
-            "has_data": len(series_list) > 0,
-        }
         if not series_list:
             missing_fields.add(f"orderflow.{tf}")
         if series_list:
@@ -5044,11 +7315,43 @@ async def build_check_all_datas(
                 orderflow_metrics["delta"] = True
             if any(entry.get("cvd") is not None for entry in series_list):
                 orderflow_metrics["cvd"] = True
+            if tf in orderflow_core_available:
+                orderflow_core_available[tf] = True
 
     for metric, present in orderflow_metrics.items():
         if not present:
             missing_fields.add(f"orderflow.{metric}")
-    availability["orderflow"]["metrics"] = orderflow_metrics
+
+    readiness_missing: List[str] = []
+    readiness_details = {
+        "ohlcv": {tf: bool(value) for tf, value in ohlcv_core_available.items()},
+        "orderflow": {tf: bool(value) for tf, value in orderflow_core_available.items()},
+        "sessions": dict(session_status_map),
+        "sessions_ready": list(session_ready_names),
+    }
+
+    if not any(ohlcv_core_available.values()):
+        readiness_missing.append("readiness.ohlcv")
+    if not any(orderflow_core_available.values()):
+        readiness_missing.append("readiness.orderflow")
+    if not session_ready_names:
+        readiness_missing.append("readiness.sessions")
+
+    readiness_summary = {
+        "ready": not readiness_missing,
+        "missing": list(readiness_missing),
+        "requirements": readiness_details,
+    }
+
+    if readiness_missing:
+        missing_fields.update(readiness_missing)
+        if status == "ok":
+            status = "insufficient_data"
+        readiness_note = "Readiness requirements unmet: " + ", ".join(readiness_missing)
+        if readiness_note not in notes:
+            notes.append(readiness_note)
+    elif status == "ok":
+        status = "ready"
 
     missing_fields_list = sorted(missing_fields)
     if missing_fields_list:
@@ -5062,6 +7365,8 @@ async def build_check_all_datas(
         "last_tf": last_tf,
         "last_price_source": last_price_source,
     }
+    meta_block["pipeline_preset"] = pipeline_preset.name
+    meta_block["modules"] = dict(modules_enabled)
     meta_block["window_hours"] = int(base_window_hours)
     meta_block["strict_window"] = bool(strict_window)
     meta_block["strict_three_day"] = bool(strict_three_day)
@@ -5069,6 +7374,8 @@ async def build_check_all_datas(
         meta_block["snapshot_age_sec"] = snapshot_age_sec
     if insufficient_reason:
         meta_block["insufficient_reason"] = insufficient_reason
+    if status == "insufficient_data" and readiness_missing and not meta_block.get("insufficient_reason"):
+        meta_block["insufficient_reason"] = "readiness_requirements"
     meta_block["stale"] = bool(
         isinstance(insufficient_reason, str) and insufficient_reason.startswith("stale_snapshot")
     )
@@ -5109,6 +7416,150 @@ async def build_check_all_datas(
         notes.append(
             f"Filtered {invalid_ohlc_total} candles with invalid OHLC ranges"
         )
+    meta_block["readiness"] = readiness_summary
+
+    expected_total_minutes = len(expected_minutes)
+    coverage_targets: Tuple[str, ...] = combined_ohlcv_tfs
+    coverage_diag: Dict[str, Any] = {}
+    coverage_trace: List[Dict[str, Any]] = []
+
+    for tf in coverage_targets:
+        interval_ms = TIMEFRAME_TO_MS.get(tf)
+        tf_payload = ohlcv_public.get(tf) if isinstance(ohlcv_public, Mapping) else {}
+        raw_candles = tf_payload.get("candles") if isinstance(tf_payload, Mapping) else []
+        tf_candles = [dict(candle) for candle in raw_candles if isinstance(candle, Mapping)]
+        deduped_series = _deduplicate_sorted(tf_candles) if tf_candles else []
+        series_index: Dict[int, Dict[str, Any]] = {}
+        for candle in deduped_series:
+            ts = _safe_int(candle.get("t"))
+            if ts is None:
+                continue
+            series_index[ts] = candle
+
+        coverage_start = window_start_ms
+        coverage_end = window_end_ms
+        expected_times: List[int] = []
+        filtered_index: Dict[int, Dict[str, Any]] = series_index
+
+        if interval_ms:
+            aligned_start = _align_to_interval(window_start_ms, interval_ms)
+            if aligned_start < window_start_ms:
+                aligned_start += interval_ms
+            aligned_end = _align_to_interval(window_end_ms, interval_ms)
+            if aligned_end < aligned_start:
+                aligned_end = aligned_start
+            coverage_start = aligned_start
+            coverage_end = aligned_end
+            expected_times = _build_expected_times(coverage_start, coverage_end, interval_ms)
+            filtered_index = {
+                ts: series_index[ts]
+                for ts in series_index
+                if coverage_start <= ts <= coverage_end
+            }
+
+        present_bars = len(filtered_index)
+        expected_bars = len(expected_times) if expected_times else present_bars
+        gaps = (
+            _summarise_missing_times(expected_times, filtered_index)
+            if expected_times
+            else []
+        )
+        missing_bars = sum(int(gap.get("count", 0)) for gap in gaps)
+        gap_count = len(gaps)
+
+        coverage_state: Dict[str, Any] = {
+            "interval_ms": interval_ms,
+            "window": {"start_ms": coverage_start, "end_ms": coverage_end},
+            "expected_bars": expected_bars,
+            "present_bars": present_bars,
+            "missing_bars": missing_bars,
+            "gap_count": gap_count,
+        }
+        if gaps:
+            coverage_state["time_gaps"] = gaps
+        coverage_diag[tf] = coverage_state
+        coverage_trace.append(
+            {
+                "tf": tf,
+                "interval_ms": interval_ms,
+                "expected_bars": expected_bars,
+                "present_bars": present_bars,
+                "gap_count": gap_count,
+            }
+        )
+
+    minute_state = coverage_diag.get("1m")
+    if minute_state is not None:
+        minute_gaps = list(time_gaps)
+        minute_missing_after = int(minute_coverage_diag.get("minute_missing_after", minute_missing_after)) if isinstance(minute_coverage_diag, Mapping) else minute_missing_after  # type: ignore[has-type]
+        minute_missing_before_current = int(minute_coverage_diag.get("minute_missing_before", minute_missing_before)) if isinstance(minute_coverage_diag, Mapping) else minute_missing_before  # type: ignore[has-type]
+        fetched_after = int(minute_coverage_diag.get("fetched_1m_count", fetched_unique)) if isinstance(minute_coverage_diag, Mapping) else fetched_unique  # type: ignore[has-type]
+        minute_state.update(
+            {
+                "window": {"start_ms": window_start_ms, "end_ms": window_end_ms},
+                "expected_bars": expected_total_minutes,
+                "present_bars": max(0, expected_total_minutes - minute_missing_after),
+                "missing_bars": max(0, minute_missing_after),
+                "gap_count": len(minute_gaps),
+                "missing_before": minute_missing_before_current,
+                "missing_after": minute_missing_after,
+                "fetched": fetched_after,
+                "time_gaps": minute_gaps,
+            }
+        )
+        for trace_entry in coverage_trace:
+            if trace_entry.get("tf") == "1m":
+                trace_entry["expected_bars"] = minute_state["expected_bars"]
+                trace_entry["present_bars"] = minute_state["present_bars"]
+                trace_entry["gap_count"] = minute_state["gap_count"]
+                break
+
+    api_diag_block = {
+        "requests": 0,
+        "retries": 0,
+        "rate_limit_hits": 0,
+        "backoffs": 0,
+    }
+
+    sessions_diag: Dict[str, Any] = {}
+    if isinstance(vwap_sessions_public, Mapping):
+        for session_name in session_names:
+            session_payload = vwap_sessions_public.get(session_name)
+            if isinstance(session_payload, Mapping):
+                sessions_diag[session_name] = {
+                    "present": bool(session_payload),
+                    "open_utc": session_payload.get("open_utc"),
+                    "close_utc": session_payload.get("close_utc"),
+                }
+            else:
+                sessions_diag[session_name] = {"present": False}
+    else:
+        for session_name in session_names:
+            sessions_diag[session_name] = {"present": False}
+
+    diagnostics_block: Dict[str, Any] = {}
+    if liquidity_diagnostics:
+        diagnostics_block["liquidity"] = dict(liquidity_diagnostics)
+    if zones_diag:
+        diagnostics_block["zones"] = dict(zones_diag)
+    if liquidity_equal_levels:
+        diagnostics_block["liquidity_levels"] = dict(liquidity_equal_levels)
+    diagnostics_block["orderflow"] = copy.deepcopy(orderflow_public)
+    diagnostics_block["vwap_tpo"] = copy.deepcopy(vwap_tpo_block)
+    diagnostics_block["movement"] = movement_section
+    diagnostics_block["showcases"] = showcases_diag
+    diagnostics_block["readiness"] = readiness_summary
+    diagnostics_block["coverage"] = coverage_diag
+    diagnostics_block["api"] = api_diag_block
+    diagnostics_block["sessions"] = sessions_diag
+    diagnostics_block["coverage_trace"] = coverage_trace
+    diagnostics_block["daily"] = {
+        "available": bool(
+            isinstance(ohlcv_public.get("1d"), Mapping)
+            and ohlcv_public.get("1d", {}).get("candles")
+        )
+    }
+    meta_block["diagnostics"] = diagnostics_block
 
     if trace_ctx is not None:
         trace_ctx.info(
@@ -5127,12 +7578,13 @@ async def build_check_all_datas(
         "notes": notes,
     }
 
-    return _finalise_payload(
-        final_payload,
-        status=status,
-        pipeline_start=pipeline_start,
-        fetch_ms=fetch_ms,
-        db_ms=db_ms,
-        trace_ctx=trace_ctx,
+    return await _finish(
+        _finalise_payload(
+            final_payload,
+            status=status,
+            pipeline_start=pipeline_start,
+            fetch_ms=fetch_ms,
+            db_ms=db_ms,
+            trace_ctx=trace_ctx,
+        )
     )
-
