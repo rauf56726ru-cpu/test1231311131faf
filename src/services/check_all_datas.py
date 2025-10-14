@@ -2434,6 +2434,7 @@ async def _download_agg_trades_async(
     scope = "orderflow.aggTrades"
     cursor = start_ms
     timeout = httpx.Timeout(15.0)
+    min_advance = max(MINUTE_INTERVAL_MS, 1)
     async with httpx.AsyncClient(timeout=timeout) as client:
         while cursor < end_ms:
             try:
@@ -2497,7 +2498,7 @@ async def _download_agg_trades_async(
                 diag["status"] = "invalid_payload"
                 break
             if not payload:
-                cursor = page_end + 1
+                cursor = max(page_end, cursor + min_advance)
                 continue
 
             trades.extend(_extract_trades(payload, source="download"))
@@ -2505,7 +2506,10 @@ async def _download_agg_trades_async(
             diag["status"] = status
 
             last_trade_time = max(int(row.get("t", row.get("T", cursor))) for row in payload)
-            cursor = max(last_trade_time + 1, page_end + 1)
+            next_cursor = max(last_trade_time + 1, cursor + min_advance)
+            if next_cursor <= cursor:
+                next_cursor = cursor + min_advance
+            cursor = min(next_cursor, end_ms)
 
     return trades, diag
 
@@ -4880,8 +4884,6 @@ async def build_check_all_datas(
         )
 
     strict_three_day = bool(strict_window and base_window_hours >= 72)
-    if strict_three_day and network_backfill:
-        network_backfill = False
 
     window_end_guess = _resolve_window_end_ms(
         frames,

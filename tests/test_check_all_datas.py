@@ -693,6 +693,67 @@ def test_orderflow_block_matches_spec(client: TestClient) -> None:
         assert exported_trades == []
 
 
+@pytest.mark.anyio
+async def test_download_agg_trades_paginates_full_window(monkeypatch) -> None:
+    class _DummyStore:
+        def fetch_agg_trades(self, *_, **__):
+            return []
+
+    monkeypatch.setattr(check_all_datas, "get_store", lambda: _DummyStore())
+
+    base_ts = 1_700_000_000_000
+    step_ms = 60_000
+    total = check_all_datas._AGG_TRADES_LIMIT * 2 + 500
+    trades = [
+        {
+            "t": base_ts + index * step_ms,
+            "p": 100.0 + index * 0.01,
+            "q": 1.0 + (index % 5) * 0.25,
+            "m": bool(index % 2),
+        }
+        for index in range(total)
+    ]
+
+    monkeypatch.setattr(check_all_datas, "_fetch_binance_agg_trades", None)
+
+    class _DummyResponse:
+        def __init__(self, payload):
+            self.status_code = 200
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    async def fake_http_request(method, url, *, params=None, **_):
+        assert method == "GET"
+        assert params is not None
+        start_ms = int(params["startTime"])
+        end_ms = int(params["endTime"])
+        limit = int(params["limit"])
+        window = [row for row in trades if start_ms <= row["t"] < end_ms]
+        payload = [dict(row) for row in window[:limit]]
+        return _DummyResponse(payload)
+
+    monkeypatch.setattr(check_all_datas, "http_request", fake_http_request)
+
+    records, diag = await check_all_datas._download_agg_trades_async(
+        "BTCUSDT",
+        base_ts,
+        trades[-1]["t"] + step_ms,
+        allow_network=True,
+        trace_ctx=None,
+        budget=check_all_datas._TimeBudget(None),
+        page_span_ms=12 * 60 * 60 * 1000,
+    )
+
+    assert len(records) == total
+    assert records[0]["t"] == trades[0]["t"]
+    assert records[-1]["t"] == trades[-1]["t"]
+    assert diag["downloaded"] == total
+    assert diag["batches"] >= 3
+    assert diag["status"] == 200
+
+
 def test_vwap_tpo_sessions_include_aliases(client: TestClient) -> None:
     base = datetime(2024, 4, 1, 0, 0, tzinfo=UTC)
     payload = _build_snapshot_payload(base, count=12 * 60)
