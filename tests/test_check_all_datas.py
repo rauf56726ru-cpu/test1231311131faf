@@ -668,6 +668,30 @@ def test_orderflow_block_matches_spec(client: TestClient) -> None:
         if tf in {"15m", "1h"}:
             assert series, f"Expected aggregated series for {tf} to be non-empty"
 
+    orderflow_data = body["data"]["orderflow"]
+    agg_trades_block = orderflow_data.get("agg_trades")
+    assert isinstance(agg_trades_block, dict)
+    assert agg_trades_block.get("symbol") == "BTCUSDT"
+    window_block = agg_trades_block.get("range")
+    assert isinstance(window_block, dict)
+    assert window_block["end_ms"] >= window_block["start_ms"]
+    summary = agg_trades_block.get("summary", {})
+    assert isinstance(summary.get("count"), int)
+    assert isinstance(summary.get("buy"), int)
+    assert isinstance(summary.get("sell"), int)
+    assert isinstance(summary.get("volume"), (int, float))
+    counts_block = agg_trades_block.get("counts")
+    assert isinstance(counts_block, dict)
+    assert counts_block.get("resolved") == summary.get("count")
+    assert counts_block.get("snapshot") >= 0
+    assert counts_block.get("downloaded") >= 0
+    exported_trades = agg_trades_block.get("trades")
+    assert isinstance(exported_trades, list)
+    if summary.get("count"):
+        assert exported_trades
+    else:
+        assert exported_trades == []
+
 
 def test_vwap_tpo_sessions_include_aliases(client: TestClient) -> None:
     base = datetime(2024, 4, 1, 0, 0, tzinfo=UTC)
@@ -959,8 +983,11 @@ async def test_async_builder_timeout_returns_insufficient(monkeypatch):
     result = await check_all_datas.build_check_all_datas_async(snapshot, timeout=0.05)
 
     assert result is not None
-    assert result["status"] == "insufficient_data"
-    assert result["meta"]["insufficient_reason"] == "stale_or_unseeded_buffers"
+    assert result["status"] == "ok"
+    notes = result.get("notes", [])
+    assert any(
+        "extended fallback" in str(note) for note in notes
+    ), "Expected fallback note in response notes"
 
 def test_build_inspection_error_payload_sets_reason() -> None:
     now = datetime(2024, 1, 1, tzinfo=UTC)

@@ -321,6 +321,7 @@ ORDERFLOW_REQUIRED_HOURS = PIPELINE_PRESET_DEFAULT.orderflow.window_hours
 ORDERFLOW_WINDOW_MS = ORDERFLOW_REQUIRED_HOURS * MS_IN_HOUR
 _AGG_TRADES_PAGE_MS = ORDERFLOW_WINDOW_MS  # default page span; overridden by preset
 _AGG_TRADES_LIMIT = 1000
+_AGG_TRADES_EXPORT_LIMIT = 500
 BINANCE_FAPI_AGG_TRADES = "https://fapi.binance.com/fapi/v1/aggTrades"
 
 
@@ -550,7 +551,32 @@ async def build_check_all_datas_async(
                 "network_backfill": build_kwargs.get("network_backfill"),
             },
         )
-        return _insufficient_from_context(context)
+        fallback_kwargs = dict(build_kwargs)
+        fallback_kwargs["time_budget_seconds"] = None
+        try:
+            fallback_result = await build_check_all_datas(snapshot, **fallback_kwargs)
+        except Exception:
+            LOGGER.exception(
+                "Check-all fallback build failed",
+                extra={
+                    "symbol": context.symbol,
+                    "hours": build_kwargs.get("hours"),
+                    "window_hours": build_kwargs.get("window_hours"),
+                    "strict_window": build_kwargs.get("strict_window"),
+                },
+            )
+            return _insufficient_from_context(context)
+        if isinstance(fallback_result, MutableMapping):
+            notes_block = fallback_result.get("notes")
+            fallback_note = (
+                "Primary build exceeded async timeout; completed via extended fallback pipeline."
+            )
+            if isinstance(notes_block, list):
+                if fallback_note not in notes_block:
+                    notes_block.append(fallback_note)
+            else:
+                fallback_result["notes"] = [fallback_note]
+        return fallback_result
 
 
 def _isoformat_utc(timestamp_ms: int) -> str:
@@ -2991,7 +3017,39 @@ async def _build_orderflow_block(
         budget=budget,
         page_span_ms=page_span_ms,
     )
-    diag["trades"] = trades_diag
+    export_trades: List[Dict[str, Any]] = []
+    for trade in trades:
+        if not isinstance(trade, Mapping):
+            continue
+        ts_value = _safe_int(trade.get("t"))
+        qty_value = _coerce_float(trade.get("qty"))
+        if ts_value is None or qty_value is None:
+            continue
+        export_trades.append(
+            {
+                "t": ts_value,
+                "q": qty_value,
+                "side": trade.get("side"),
+                "p": _coerce_float(trade.get("price")),
+            }
+        )
+    export_trades.sort(key=lambda entry: entry["t"])
+    truncated_trades = 0
+    if len(export_trades) > _AGG_TRADES_EXPORT_LIMIT:
+        truncated_trades = len(export_trades) - _AGG_TRADES_EXPORT_LIMIT
+        export_trades = export_trades[-_AGG_TRADES_EXPORT_LIMIT :]
+    summary_total = {
+        "count": len(export_trades) + truncated_trades,
+        "buy": sum(1 for trade in trades if str(trade.get("side")).lower() == "buy"),
+        "sell": sum(1 for trade in trades if str(trade.get("side")).lower() == "sell"),
+        "volume": sum(float(trade.get("qty", 0.0)) for trade in trades),
+    }
+    diag_trades = dict(trades_diag)
+    diag_trades["records"] = export_trades
+    diag_trades["summary"] = summary_total
+    if truncated_trades:
+        diag_trades["truncated"] = truncated_trades
+    diag["trades"] = diag_trades
 
     trades_by_minute = _bucket_trades_by_minute(
         trades,
@@ -4615,6 +4673,7 @@ async def build_check_all_datas(
     network_backfill: bool = True,
     trace: TraceContext | None = None,
     progress: ProgressReporter | None = None,
+    time_budget_seconds: float | None = _BUILD_TIMEOUT_SECONDS,
 ) -> Dict[str, Any] | None:
     """Create an enriched payload for the snapshot health endpoint."""
 
@@ -4705,7 +4764,7 @@ async def build_check_all_datas(
     def _register_invalid_candle(_ts: int, stage: str) -> None:
         _record_invalid(stage, invalid_ts=1)
 
-    budget = _TimeBudget(_BUILD_TIMEOUT_SECONDS)
+    budget = _TimeBudget(time_budget_seconds)
 
     context = _prepare_snapshot_context(snapshot, now_utc)
     frames = context.frames
@@ -7209,6 +7268,94 @@ async def build_check_all_datas(
             if isinstance(summary_source, Mapping):
                 summary_payload = dict(summary_source)
         orderflow_public[tf] = {"per_bar": per_bar, "summary": summary_payload}
+
+    snapshot_window = _filter_agg_trades(
+        snapshot.get("agg_trades"),
+        start_ms=window_start_ms,
+        end_ms=window_end_ms,
+        include_trades=True,
+    )
+    agg_trades_window: Dict[str, Any] | None = None
+    trades_diag = orderflow_diag.get("trades") if isinstance(orderflow_diag, Mapping) else None
+    if isinstance(trades_diag, Mapping):
+        symbol_override: str | None = None
+        agg_payload = snapshot.get("agg_trades")
+        if isinstance(agg_payload, Mapping):
+            symbol_value = agg_payload.get("symbol")
+            if isinstance(symbol_value, str):
+                symbol_override = symbol_value
+        if not symbol_override and isinstance(snapshot.get("symbol"), str):
+            symbol_override = str(snapshot.get("symbol"))
+        records_payload = trades_diag.get("records") if isinstance(trades_diag, Mapping) else None
+        if isinstance(records_payload, Sequence):
+            filtered_payload = {
+                "symbol": symbol_override,
+                "agg": [dict(record) for record in records_payload if isinstance(record, Mapping)],
+            }
+            agg_trades_window = _filter_agg_trades(
+                filtered_payload,
+                start_ms=None,
+                end_ms=None,
+                include_trades=True,
+            )
+        summary_override = trades_diag.get("summary") if isinstance(trades_diag, Mapping) else None
+        if agg_trades_window is None:
+            agg_trades_window = {
+                "symbol": symbol_override,
+                "summary": {"count": 0, "buy": 0, "sell": 0, "volume": 0.0},
+                "trades": [],
+            }
+        if isinstance(summary_override, Mapping):
+            resolved_count = summary_override.get("count")
+            if resolved_count:
+                agg_trades_window["summary"] = {
+                    "count": int(resolved_count),
+                    "buy": int(summary_override.get("buy", agg_trades_window["summary"].get("buy", 0))),
+                    "sell": int(summary_override.get("sell", agg_trades_window["summary"].get("sell", 0))),
+                    "volume": float(summary_override.get("volume", agg_trades_window["summary"].get("volume", 0.0))),
+                }
+        truncated_value = trades_diag.get("truncated")
+        if isinstance(truncated_value, (int, float)) and truncated_value > 0:
+            agg_trades_window["truncated"] = int(truncated_value)
+        summary_count = int(agg_trades_window["summary"].get("count", 0))
+        counts_snapshot = trades_diag.get("snapshot_trades")
+        if counts_snapshot in (None, 0) and summary_count:
+            counts_snapshot = summary_count
+        counts_resolved = trades_diag.get("resolved_trades")
+        if counts_resolved in (None, 0) and summary_count:
+            counts_resolved = summary_count
+        counts_block = {
+            "snapshot": int(counts_snapshot or 0),
+            "downloaded": int(trades_diag.get("downloaded_trades", 0)),
+            "resolved": int(counts_resolved or 0),
+        }
+        agg_trades_window["counts"] = counts_block
+        sources_block = trades_diag.get("sources")
+        if isinstance(sources_block, Sequence) and sources_block:
+            agg_trades_window["sources"] = [str(source) for source in sources_block]
+        elif summary_count:
+            agg_trades_window["sources"] = ["snapshot"]
+        download_block = trades_diag.get("download")
+        if isinstance(download_block, Mapping):
+            agg_trades_window["download"] = dict(download_block)
+    if agg_trades_window is None:
+        agg_trades_window = snapshot_window
+    elif snapshot_window is not None:
+        if (not agg_trades_window.get("trades")) and snapshot_window.get("trades"):
+            agg_trades_window["trades"] = snapshot_window.get("trades", [])
+        existing_summary = agg_trades_window.get("summary", {})
+        if not existing_summary or not existing_summary.get("count"):
+            agg_trades_window["summary"] = snapshot_window.get("summary", existing_summary)
+        if agg_trades_window.get("symbol") is None:
+            agg_trades_window["symbol"] = snapshot_window.get("symbol")
+    if agg_trades_window is not None:
+        agg_trades_window["range"] = {
+            "start_ms": window_start_ms,
+            "end_ms": window_end_ms,
+            "start_utc": _isoformat_utc(window_start_ms),
+            "end_utc": _isoformat_utc(window_end_ms),
+        }
+        orderflow_public["agg_trades"] = agg_trades_window
 
     orderflow_public["diag"] = orderflow_diag
 
