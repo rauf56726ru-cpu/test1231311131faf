@@ -196,6 +196,14 @@ def stub_fetch_ohlcv(monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def stub_vision_ingest(monkeypatch):
+    async def fake_ingest(*args, **kwargs):
+        return {"status": "cached"}
+
+    monkeypatch.setattr(check_all_datas, "_maybe_ingest_vision_data", fake_ingest)
+
+
 def _build_snapshot_payload(base: datetime, count: int = 12) -> dict:
     candles = []
     for index in range(count):
@@ -294,8 +302,6 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
     timeframes = data_block["timeframes"]
     expected_tfs = {"1m", "5m", "15m", "1h", "4h", "1d"}
     assert set(timeframes.keys()) == expected_tfs
-<<<<<<< Updated upstream
-=======
     showcases = data_block["showcases"]
     assert set(showcases.keys()) == {"A", "B"}
     showcase_a = showcases["A"]
@@ -315,7 +321,6 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
     assert {"sessions", "missing_modules", "valid", "validation_errors"}.issubset(completeness_b.keys())
     assert isinstance(completeness_b["missing_modules"], list)
     assert isinstance(completeness_b["validation_errors"], list)
->>>>>>> Stashed changes
     for tf, summary in timeframes.items():
         assert set(summary.keys()) == {"zones", "sweeps", "atr", "vwap_sessions"}
         zones_summary = summary["zones"]
@@ -338,18 +343,12 @@ def test_check_all_returns_structured_payload(client: TestClient) -> None:
     assert isinstance(body["notes"], list)
 
     diagnostics = meta.get("diagnostics", {})
-<<<<<<< Updated upstream
-    assert {"liquidity", "zones", "vwap_tpo", "orderflow", "coverage", "api", "sessions"}.issubset(
-        diagnostics.keys()
-    )
-=======
     assert {"liquidity", "zones", "vwap_tpo", "orderflow", "coverage", "api", "sessions", "readiness"}.issubset(
         diagnostics.keys()
     )
     showcases_diag = diagnostics.get("showcases", {})
     assert isinstance(showcases_diag, Mapping)
     assert set(showcases_diag.keys()) == {"A", "B"}
->>>>>>> Stashed changes
     api_diag = diagnostics.get("api", {})
     assert {"requests", "retries", "rate_limit_hits", "backoffs"}.issubset(api_diag.keys())
     coverage_diag = diagnostics.get("coverage", {})
@@ -701,8 +700,6 @@ def test_vwap_tpo_sessions_include_aliases(client: TestClient) -> None:
 
     daily_block = body["meta"]["diagnostics"]["vwap_tpo"]["daily"]
     assert daily_block["vwap"] is not None
-<<<<<<< Updated upstream
-=======
 
 
 def test_recent_zone_focus_filters_window(client: TestClient, monkeypatch) -> None:
@@ -916,7 +913,6 @@ def test_session_completeness_partial_detection() -> None:
     assert completeness["bars_expected"] == 180
     assert completeness["status"] == "partial"
     assert completeness["coverage_ratio"] == pytest.approx(30 / 180)
->>>>>>> Stashed changes
 
 
 def test_session_detailed_mode_returns_placeholder(client: TestClient) -> None:

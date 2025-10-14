@@ -58,6 +58,7 @@ class Config:
     max_gap_age_bars: int = 300
     m_wick_atr: float = 3.0
     pivot_overrides: Dict[str, int] = field(default_factory=dict)
+    mitigation_fill_ratio: float = 0.6
 
 
 _PIVOT_WINDOWS: Dict[str, int] = {"15m": 2, "1h": 3, "4h": 4}
@@ -1026,7 +1027,8 @@ def _ob_for_tf(
             "confirmed": False,
             "fill_ratio": fill_ratio,
         }
-        if fill_ratio >= 0.6:
+        mitigation_threshold = max(0.0, min(1.0, cfg.mitigation_fill_ratio))
+        if fill_ratio >= mitigation_threshold:
             zone["mitigation"] = "mitigated"
         zones.append(zone)
         raw_metadata.append(

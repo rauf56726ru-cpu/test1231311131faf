@@ -11,6 +11,7 @@ import httpx
 
 from .http_client import RATE_LIMIT_STATUSES, TRANSIENT_STATUSES, request as http_request
 from .tracing import TraceContext
+from .vision_store import get_store
 
 __all__ = [
     "fetch_footprint",
@@ -41,6 +42,34 @@ class OrderflowSnapshot:
 
     def as_dict(self) -> Dict[str, Any]:
         return {"per_bar": self.per_bar, "aggregates": self.aggregates}
+
+
+async def _load_trades_from_store(
+    symbol: str,
+    start_ms: int,
+    end_ms: int,
+) -> List[Dict[str, Any]]:
+    store = get_store()
+    rows = await asyncio.to_thread(
+        store.fetch_agg_trades,
+        symbol,
+        start_ms,
+        end_ms,
+    )
+    if not rows:
+        return []
+    trades: List[Dict[str, Any]] = []
+    for row in rows:
+        trades.append(
+            {
+                "T": int(row["t"]),
+                "p": float(row["p"]),
+                "q": float(row["q"]),
+                "m": bool(row.get("m")),
+                "side": row.get("side"),
+            }
+        )
+    return trades
 
 
 def _isoformat(ms: int) -> str:
@@ -263,41 +292,54 @@ async def fetch_footprint(
 
     trace_ctx = trace.child(stage="footprint") if trace is not None else None
 
-    async with _FOOTPRINT_LOCK:
-        cursor = start_ms
-        batches = 0
-        trades: List[Mapping[str, Any]] = []
-        fallback_status: int | None = None
-        last_window_end: int | None = None
-        fallback_triggered = False
-        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
-            while cursor < end_ms and batches < _MAX_BATCHES:
-                page_end = min(end_ms, cursor + _PAGE_WINDOW_MS)
-                rows, status = await _fetch_trades(
-                    client, symbol_clean, cursor, page_end, trace=trace_ctx
-                )
-                batches += 1
-                last_window_end = page_end
-                if status != 200:
-                    if status in RATE_LIMIT_STATUSES or (
-                        isinstance(status, int) and status >= 500
-                    ) or status is None:
-                        fallback_status = status or 0
-                        fallback_triggered = True
-                        break
-                    raise OrderflowError(f"Unexpected aggTrades status: {status}")
+    batches = 0
+    fallback_status: int | None = None
+    last_window_end: int | None = None
+    fallback_triggered = False
+    trades: List[Mapping[str, Any]] = []
 
-                if not rows:
-                    cursor = page_end + 1
-                    continue
-                trades.extend(rows)
-                last_trade_time = max(int(row.get("T", cursor)) for row in rows)
-                cursor = max(last_trade_time + 1, page_end + 1)
+    store_rows = await _load_trades_from_store(symbol_clean, start_ms, end_ms)
+    if store_rows:
+        trades = store_rows
+        if trace_ctx is not None:
+            trace_ctx.info(
+                "orderflow.data_source",
+                scope="orderflow.aggTrades",
+                symbol=symbol_clean,
+                source="vision_store",
+                rows=len(trades),
+            )
+    else:
+        async with _FOOTPRINT_LOCK:
+            cursor = start_ms
+            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+                while cursor < end_ms and batches < _MAX_BATCHES:
+                    page_end = min(end_ms, cursor + _PAGE_WINDOW_MS)
+                    rows, status = await _fetch_trades(
+                        client, symbol_clean, cursor, page_end, trace=trace_ctx
+                    )
+                    batches += 1
+                    last_window_end = page_end
+                    if status != 200:
+                        if status in RATE_LIMIT_STATUSES or (
+                            isinstance(status, int) and status >= 500
+                        ) or status is None:
+                            fallback_status = status or 0
+                            fallback_triggered = True
+                            break
+                        raise OrderflowError(f"Unexpected aggTrades status: {status}")
 
-            if cursor < end_ms and not fallback_triggered:
-                fallback_triggered = True
-                if fallback_status is None:
-                    fallback_status = 0
+                    if not rows:
+                        cursor = page_end + 1
+                        continue
+                    trades.extend(rows)
+                    last_trade_time = max(int(row.get("T", cursor)) for row in rows)
+                    cursor = max(last_trade_time + 1, page_end + 1)
+
+                if cursor < end_ms and not fallback_triggered:
+                    fallback_triggered = True
+                    if fallback_status is None:
+                        fallback_status = 0
 
         if fallback_status is not None and trace_ctx is not None:
             trace_ctx.warn(

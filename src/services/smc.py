@@ -938,6 +938,47 @@ def detect_smc_blocks(
                 )
                 break
 
+    if not eq_candidates and liquidity:
+        tolerance_cache: Dict[str, float] = {}
+        for level_type, level_price in liquidity:
+            if level_type not in {"eqh", "eql"}:
+                continue
+            tolerance = tolerance_cache.setdefault(
+                level_type,
+                _eq_tolerance(float(level_price), tick_size),
+            )
+            candidate_points: List[tuple[int, int, float]] = []
+            for idx, candle in enumerate(candles):
+                ts_idx = int(candles[idx]["t"])
+                if window_start_ms is not None and ts_idx < window_start_ms:
+                    continue
+                if window_end_ms is not None and ts_idx > window_end_ms:
+                    continue
+                reference = float(candles[idx]["h"] if level_type == "eqh" else candles[idx]["l"])
+                if abs(reference - float(level_price)) <= tolerance:
+                    candidate_points.append((idx, ts_idx, reference))
+            for left_idx in range(len(candidate_points)):
+                first = candidate_points[left_idx]
+                for right_idx in range(left_idx + 1, len(candidate_points)):
+                    second = candidate_points[right_idx]
+                    if second[0] - first[0] < separation:
+                        continue
+                    eq_candidates.append(
+                        {
+                            "type": level_type,
+                            "price": float(level_price),
+                            "first_idx": first[0],
+                            "second_idx": second[0],
+                            "first_ts": first[1],
+                            "second_ts": second[1],
+                        }
+                    )
+                    break
+                if eq_candidates:
+                    break
+            if eq_candidates:
+                break
+
     if not eq_candidates:
         diagnostics["rb_reject_no_eq"] = max(diagnostics["rb_reject_no_eq"], 1)
         reject_counters["no_eq"] = max(reject_counters.get("no_eq", 0), 1)

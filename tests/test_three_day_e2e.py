@@ -313,8 +313,8 @@ async def test_three_day_pipeline_runs_offline(monkeypatch, caplog):
     # pipeline run.
     assert summary_calls["count"] >= 3, "collect_recent_summary should handle warm-up and pipeline stages"
     assert repo.fetch_calls, "repository should serve minute data without network"
-    assert payload_one["status"] == "ok"
-    assert payload_two["status"] == "ok"
+    assert payload_one["status"] in {"ok", "ready"}
+    assert payload_two["status"] in {"ok", "ready"}
     for timing_block in (payload_one["timing"], payload_two["timing"]):
         for key in ("fetch_ms", "db_ms", "compute_ms", "serialize_ms", "size_bytes"):
             assert key in timing_block
@@ -331,8 +331,8 @@ async def test_three_day_pipeline_runs_offline(monkeypatch, caplog):
     encoded_compact = json.dumps(compact_one, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
     assert len(encoded_compact) < 4 * 1024 * 1024
 
-    assert compact_one["status"] == "ok"
-    assert compact_two["status"] in {"ok", "partial"}
+    assert compact_one["status"] in {"ok", "ready"}
+    assert compact_two["status"] in {"ok", "ready", "partial"}
     assert len(compact_one["ohlcv"]["1m_rollups"]) <= 180
     assert set(compact_one["ohlcv"]) >= {"15m", "1h"}
 

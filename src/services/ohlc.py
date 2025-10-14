@@ -22,6 +22,7 @@ from typing import (
 import httpx
 
 from .binance import BINANCE_FAPI_REST
+from .vision_store import get_store
 
 # Mapping of supported timeframes to their window sizes.
 TIMEFRAME_WINDOWS: Dict[str, timedelta] = {
@@ -594,6 +595,17 @@ async def _fetch_binance_klines(
     end_ms: int | None,
     limit: int | None,
 ) -> Sequence[Sequence[object]]:
+    store_rows: List[List[float | int | None]] = await asyncio.to_thread(
+        get_store().fetch_klines,
+        symbol,
+        timeframe,
+        start_ms,
+        end_ms,
+        limit,
+    )
+    if store_rows:
+        return store_rows
+
     params = {
         "symbol": symbol.upper(),
         "interval": timeframe,
@@ -882,4 +894,3 @@ class CandleCache:
 
 
 _CANDLE_CACHE: Dict[Tuple[str, str], CandleCache] = {}
-

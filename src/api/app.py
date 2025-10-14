@@ -20,7 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from pydantic import BaseModel, Field, ValidationInfo, field_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 
 from ..services import (
     DataQualityError,
@@ -75,6 +75,16 @@ from ..services.orderflow import (
 )
 from ..services.tracing import TraceContext
 from ..services.tpo import calculate_session_tpo, calculate_tpo
+from ..services.binance_vision import (
+    DATASET_AGG_TRADES,
+    DATASET_BOOK_DEPTH,
+    DATASET_EXCHANGE_INFO,
+    DATASET_FUNDING_RATE,
+    DATASET_KLINES,
+    DATASET_LIQ_ORDERS,
+    DATASET_OPEN_INTEREST,
+)
+from ..services.vision_ingest import ingest_binance_vision
 from ..meta import Meta
 from ..static_version import STATIC_VERSION
 from ..version import APP_VERSION
@@ -84,6 +94,15 @@ LOGGER = logging.getLogger(__name__)
 TRACE_LOGGER = tracing_utils.LOGGER.getChild("api.inspection")
 _SUMMARY_FETCH_HISTORY: Dict[str, float] = {}
 CHECK_ALL_BUILD_TIMEOUT = 12.0
+VISION_DATASETS = {
+    DATASET_AGG_TRADES,
+    DATASET_KLINES,
+    DATASET_FUNDING_RATE,
+    DATASET_OPEN_INTEREST,
+    DATASET_LIQ_ORDERS,
+    DATASET_BOOK_DEPTH,
+    DATASET_EXCHANGE_INFO,
+}
 
 
 
@@ -164,6 +183,7 @@ class SnapshotIn(BaseModel):
             raise ValueError("tf is required")
         return value.strip().lower()
 
+
     @field_validator("candles")
     @classmethod
     def _limit_candles(cls, value: List[CandleIn]) -> List[CandleIn]:
@@ -171,6 +191,63 @@ class SnapshotIn(BaseModel):
             raise ValueError("candles limit exceeded (max 5000)")
         return value
 
+
+class BinanceVisionIngestRequest(BaseModel):
+    """Request payload for Binance Vision ingestion."""
+
+    symbol: str
+    start_utc: datetime = Field(..., alias="startUtc")
+    end_utc: datetime = Field(..., alias="endUtc")
+    market_source: str = Field("futures_um", alias="marketSource")
+    datasets: Optional[List[str]] = None
+    klines_intervals: Optional[List[str]] = Field(default=None, alias="klinesIntervals")
+    include_exchange_info: bool = Field(True, alias="includeExchangeInfo")
+
+    @field_validator("symbol")
+    @classmethod
+    def _validate_symbol(cls, value: str) -> str:
+        if not value or not value.strip():
+            raise ValueError("symbol is required")
+        return value.upper().strip()
+
+    @field_validator("datasets")
+    @classmethod
+    def _validate_datasets(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        if value is None:
+            return None
+        cleaned: List[str] = []
+        for dataset in value:
+            if not dataset:
+                continue
+            name = dataset.strip()
+            if name not in VISION_DATASETS:
+                raise ValueError(f"Unsupported dataset {dataset}")
+            cleaned.append(name)
+        return cleaned or None
+
+    @field_validator("klines_intervals")
+    @classmethod
+    def _validate_intervals(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        if value is None:
+            return None
+        cleaned = [item.strip() for item in value if item and item.strip()]
+        return cleaned or None
+
+    @model_validator(mode="after")
+    def _validate_range(self) -> "BinanceVisionIngestRequest":
+        if self.start_utc >= self.end_utc:
+            raise ValueError("startUtc must be before endUtc")
+        return self
+
+    def range_ms(self) -> Tuple[int, int]:
+        def _to_ms(value: datetime) -> int:
+            if value.tzinfo is None:
+                ref = value.replace(tzinfo=timezone.utc)
+            else:
+                ref = value.astimezone(timezone.utc)
+            return int(ref.timestamp() * 1000)
+
+        return _to_ms(self.start_utc), _to_ms(self.end_utc)
 
 
 
@@ -1726,7 +1803,7 @@ def _prepare_summary_payload(
         else:
             trace_ctx.warn("compute.poi.empty", reason="filtered_out", **log_fields)
 
-    liquidity_marks: list[Dict[str, Any]] = []
+    marks_by_type: Dict[str, List[Dict[str, Any]]] = {}
     for mark_type, entries in liquidity_source.items():
         if not isinstance(entries, Sequence):
             continue
@@ -1749,8 +1826,28 @@ def _prepare_summary_payload(
             strength_numeric = _float_or_none(strength_value)
             if strength_numeric is not None:
                 mark["strength"] = strength_numeric
-            liquidity_marks.append(mark)
-    liquidity_marks = liquidity_marks[:16]
+            marks_by_type.setdefault(mark_type, []).append(mark)
+
+    eqh_marks = marks_by_type.pop("eqh", [])
+    eql_marks = marks_by_type.pop("eql", [])
+    remaining_marks: List[Dict[str, Any]] = []
+    for marks in marks_by_type.values():
+        remaining_marks.extend(marks)
+
+    liquidity_marks: List[Dict[str, Any]] = []
+    interleave_limit = 16
+    while (eqh_marks or eql_marks) and len(liquidity_marks) < interleave_limit:
+        if eqh_marks:
+            liquidity_marks.append(eqh_marks.pop(0))
+        if len(liquidity_marks) >= interleave_limit:
+            break
+        if eql_marks:
+            liquidity_marks.append(eql_marks.pop(0))
+
+    for mark in eqh_marks + eql_marks + remaining_marks:
+        if len(liquidity_marks) >= interleave_limit:
+            break
+        liquidity_marks.append(mark)
 
     expected_counts = {
         "1m": 72 * 60,
@@ -2137,6 +2234,33 @@ def _prepare_summary_payload(
     return compact_payload
 
 
+
+
+@app.post("/ingest/binance-vision")
+async def ingest_binance_vision_endpoint(
+    payload: BinanceVisionIngestRequest,
+) -> Dict[str, Any]:
+    start_ms, end_ms = payload.range_ms()
+    datasets = list(payload.datasets) if payload.datasets else None
+    if datasets is not None:
+        if payload.include_exchange_info and DATASET_EXCHANGE_INFO not in datasets:
+            datasets.append(DATASET_EXCHANGE_INFO)
+        if not payload.include_exchange_info:
+            datasets = [ds for ds in datasets if ds != DATASET_EXCHANGE_INFO]
+        if not datasets:
+            datasets = None
+
+    trace_ctx = TraceContext(stage="vision.ingest", symbol=payload.symbol)
+    summary = await ingest_binance_vision(
+        symbol=payload.symbol,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        datasets=datasets,
+        klines_intervals=payload.klines_intervals or None,
+        include_exchange_info=payload.include_exchange_info,
+        trace=trace_ctx,
+    )
+    return summary
 
 
 @app.post("/inspection/snapshot")

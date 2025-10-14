@@ -57,12 +57,9 @@ class LiquidityConfig:
     feature_strict_legacy_mode: bool = False
     feature_relaxed_clustering: bool = True
     feature_extended_resample: bool = True
-<<<<<<< Updated upstream
-=======
     session_atr_value: float | None = None
     session_atr_pct: float | None = None
     session_label: str | None = None
->>>>>>> Stashed changes
 
 
 def _coerce_float(value: Any) -> float | None:
@@ -698,8 +695,6 @@ def _resolve_config(raw: Mapping[str, Any] | None) -> LiquidityConfig:
     if not config.feature_extended_resample:
         config.enable_resample_when_sparse = False
 
-<<<<<<< Updated upstream
-=======
     if "session_atr_value" in raw:
         try:
             session_atr_value = float(raw.get("session_atr_value"))
@@ -721,7 +716,6 @@ def _resolve_config(raw: Mapping[str, Any] | None) -> LiquidityConfig:
         if isinstance(session_label, str) and session_label:
             config.session_label = session_label
 
->>>>>>> Stashed changes
     return config
 
 
@@ -1960,17 +1954,6 @@ def _detect_sweeps(
                         confirm_close_val = confirm_close_candidate
                         break
                 if confirm_idx is None:
-<<<<<<< Updated upstream
-                    _append_reason(
-                        frame_diag["lower"]["reasons"],
-                        "no_return_window",
-                        level_type=level_type,
-                        confirm_window=config.sweep_confirm_window,
-                    )
-                    continue
-                confirm_ts = int(candles[confirm_idx].get("t", ts))
-                return_bars = confirm_idx - index
-=======
                     level_origin = str(level.get("source", "eq"))
                     if index >= len(candles) - 1 and level_origin not in {"swing_fallback", "fallback"}:
                         confirm_ts = int(ts)
@@ -1987,7 +1970,6 @@ def _detect_sweeps(
                 else:
                     confirm_ts = int(candles[confirm_idx].get("t", ts))
                     return_bars = confirm_idx - index
->>>>>>> Stashed changes
                 sweeps.append(
                     {
                         "type": "sweep_bottom",
@@ -2101,8 +2083,6 @@ def build_liquidity_snapshot(
     level_summary = level_diagnostics.get("_summary", {})
     levels_by_tf = {key: value for key, value in level_diagnostics.items() if key != "_summary"}
 
-<<<<<<< Updated upstream
-=======
     def _fallback_levels(
         candles: Sequence[Mapping[str, Any]] | None,
         *,
@@ -2136,7 +2116,6 @@ def build_liquidity_snapshot(
             }
         ]
 
->>>>>>> Stashed changes
     raw_candidates: Dict[str, List[Dict[str, Any]]] = {"eqh": [], "eql": []}
     for tf_key, tf_diag in levels_by_tf.items():
         if not isinstance(tf_diag, Mapping):
@@ -2151,8 +2130,6 @@ def build_liquidity_snapshot(
             candidates = eql_diag.get("candidates")
             if isinstance(candidates, Sequence):
                 raw_candidates["eql"].extend(dict(candidate) for candidate in candidates if isinstance(candidate, Mapping))
-<<<<<<< Updated upstream
-=======
 
     if not levels["eqh"]:
         fallback_eqh = _fallback_levels(
@@ -2175,7 +2152,6 @@ def build_liquidity_snapshot(
             levels["eql"] = fallback_eql
             LIQUIDITY_COUNTERS["eql_fallback"] += 1
             raw_candidates["eql"].extend(dict(entry) for entry in fallback_eql)
->>>>>>> Stashed changes
 
     daily_candles = _extract_candles(augmented_frames.get("1d"))
     selection_end = None
@@ -2244,12 +2220,6 @@ def build_liquidity_snapshot(
     if not eql_reasons and not levels["eql"]:
         eql_reasons = [{"reason": "no_candidates", "count": 1}]
 
-<<<<<<< Updated upstream
-    metrics_block = {
-        "tick_size_unresolved": 1 if tick_source == "fallback_min" else 0,
-        "raw_candidates_eqh": int(summary_raw.get("eqh", 0)) if isinstance(summary_raw, Mapping) else 0,
-        "raw_candidates_eql": int(summary_raw.get("eql", 0)) if isinstance(summary_raw, Mapping) else 0,
-=======
     eqh_raw_count = int(summary_raw.get("eqh", 0)) if isinstance(summary_raw, Mapping) else 0
     eql_raw_count = int(summary_raw.get("eql", 0)) if isinstance(summary_raw, Mapping) else 0
     if eqh_raw_count == 0 and levels["eqh"]:
@@ -2261,13 +2231,10 @@ def build_liquidity_snapshot(
         "tick_size_unresolved": 1 if tick_source == "fallback_min" else 0,
         "raw_candidates_eqh": eqh_raw_count,
         "raw_candidates_eql": eql_raw_count,
->>>>>>> Stashed changes
         "filtered_eqh": len(levels["eqh"]),
         "filtered_eql": len(levels["eql"]),
     }
 
-<<<<<<< Updated upstream
-=======
     if not eqh_reasons and levels["eqh"]:
         eqh_reasons = [{"reason": "fallback_generated", "count": len(levels["eqh"]) }]
     if not eql_reasons and levels["eql"]:
@@ -2291,7 +2258,6 @@ def build_liquidity_snapshot(
         "has_degraded": bool(degraded_timeframes),
     }
 
->>>>>>> Stashed changes
     diagnostics_payload = {
         "config": {
             "swing_window": resolved_config.swing_window,
@@ -2323,27 +2289,7 @@ def build_liquidity_snapshot(
         "daily": daily_diagnostics,
         "sweeps": sweep_diagnostics,
         "metrics": metrics_block,
-<<<<<<< Updated upstream
-        "summary": {
-            "eqh": len(levels["eqh"]),
-            "eql": len(levels["eql"]),
-            "sweeps": len(sweeps),
-            "eqh_filtered": len(levels["eqh"]),
-            "eql_filtered": len(levels["eql"]),
-            "eqh_raw": int(summary_raw.get("eqh", 0)) if isinstance(summary_raw, Mapping) else 0,
-            "eql_raw": int(summary_raw.get("eql", 0)) if isinstance(summary_raw, Mapping) else 0,
-            "eqh_reasons": eqh_reasons,
-            "eql_reasons": eql_reasons,
-            "reason_histogram": {
-                "eqh": dict(reason_hist.get("eqh", {})) if isinstance(reason_hist, Mapping) else {},
-                "eql": dict(reason_hist.get("eql", {})) if isinstance(reason_hist, Mapping) else {},
-            },
-            "degraded_timeframes": degraded_timeframes,
-            "has_degraded": bool(degraded_timeframes),
-        },
-=======
         "summary": summary_block,
->>>>>>> Stashed changes
     }
 
     if resolved_config.session_atr_value is not None:

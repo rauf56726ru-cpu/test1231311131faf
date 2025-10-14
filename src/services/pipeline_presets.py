@@ -39,6 +39,7 @@ class OrderflowSettings:
     window_hours: int
     timeframes: Tuple[str, ...]
     page_span_minutes: int
+    allow_network: bool = True
 
 
 @dataclass(slots=True, frozen=True)
@@ -111,6 +112,7 @@ class PipelinePreset:
             window_hours=int(orderflow_overrides.get("window_hours", self.orderflow.window_hours)),
             timeframes=tuple(orderflow_overrides.get("timeframes", self.orderflow.timeframes)),
             page_span_minutes=int(orderflow_overrides.get("page_span_minutes", self.orderflow.page_span_minutes)),
+            allow_network=bool(orderflow_overrides.get("allow_network", self.orderflow.allow_network)),
         )
 
         sessions_override = overrides.get("sessions")
@@ -162,6 +164,7 @@ SUMMARY_72H_PRESET = PipelinePreset(
         window_hours=72,
         timeframes=("1m", "3m", "5m", "15m", "1h"),
         page_span_minutes=72 * 60,
+        allow_network=True,
     ),
     zones=ZoneSettings(
         focus_window_hours=72,

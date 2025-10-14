@@ -49,8 +49,11 @@ from .profile import build_compact_vwap_profiles, build_profile_package
 from .ohlc_sanitizer import SanitizedCandles, sanitize_candles
 from .smc import SMCConfig, detect_smc_blocks
 from .zones import Config as ZonesConfig, detect_zones, compute_atr
+from .settings import get_settings
 from .timeutils import safe_datetime_from_ms
 from .progress import ProgressReporter, emit_progress
+from .vision_ingest import ingest_binance_vision
+from .vision_store import get_store
 
 if TYPE_CHECKING:  # pragma: no cover - typing helper
     from .summary_collector import CollectionSummary
@@ -99,14 +102,11 @@ _EQUAL_LIQUIDITY_PIVOT_RADIUS = {
 try:
     from .ohlc import (
         TIMEFRAME_TO_MS,
-        Candle,
-        _fetch_binance_klines,
         aggregate_1m_to_1h,
         build_multi_timeframe_ohlcv,
         fetch_ohlcv,
         fetch_ohlcv_sync,
         resample_ohlcv,
-        slice_or_fetch_missing,
     )
     from .ohlcv import build_multi_tf_ohlcv, MinuteDataUnavailable
 except ImportError:  # pragma: no cover - circular import guard
@@ -405,6 +405,50 @@ def _prepare_snapshot_context(
         stream_ts=stream_ts,
         has_now_override=now_utc is not None,
     )
+
+
+async def _maybe_ingest_vision_data(
+    symbol: str,
+    start_ms: int,
+    end_ms: int,
+    *,
+    preset,
+    allow_network: bool,
+    trace: "TraceContext | None",
+) -> Dict[str, Any] | None:
+    if not allow_network or start_ms >= end_ms:
+        return None
+
+    store = get_store()
+
+    def _fetch_sample() -> List[List[float | int | None]]:
+        return store.fetch_klines(symbol, "1m", start_ms, end_ms, limit=10)
+
+    coverage_ok = False
+    try:
+        sample = await asyncio.to_thread(_fetch_sample)
+        if sample:
+            first_open = int(sample[0][0])
+            last_open = int(sample[-1][0])
+            coverage_ok = (
+                first_open <= start_ms + 5 * MINUTE_INTERVAL_MS
+                and last_open >= end_ms - 5 * MINUTE_INTERVAL_MS
+            )
+    except Exception:
+        coverage_ok = False
+
+    if coverage_ok:
+        return {"status": "cached", "symbol": symbol, "window": {"start": start_ms, "end": end_ms}}
+
+    ingest_trace = trace.child(stage="vision_ingest") if trace is not None else None
+    summary = await ingest_binance_vision(
+        symbol=symbol,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        klines_intervals=preset.rollup_timeframes,
+        trace=ingest_trace,
+    )
+    return summary
 
 
 def _insufficient_from_context(
@@ -1141,11 +1185,9 @@ def _build_expected_times(start_ms: int, end_ms: int, interval_ms: int) -> List[
     return [start_ms + index * interval_ms for index in range(steps)]
 
 
-def _summarise_missing_period(
+def _summarise_missing_times(
     expected: Sequence[int],
     available: Mapping[int, Mapping[str, Any]],
-    *,
-    interval_ms: int,
 ) -> List[Dict[str, int]]:
     gaps: List[Dict[str, int]] = []
     current_start: int | None = None
@@ -1159,7 +1201,7 @@ def _summarise_missing_period(
             else:
                 current_count += 1
         elif current_start is not None:
-            gaps.append({"from": current_start, "to": ts - interval_ms, "count": current_count})
+            gaps.append({"from": current_start, "to": ts - MINUTE_INTERVAL_MS, "count": current_count})
             current_start = None
             current_count = 0
 
@@ -1168,17 +1210,6 @@ def _summarise_missing_period(
         gaps.append({"from": current_start, "to": last_missing_ts, "count": current_count})
 
     return gaps
-
-
-def _summarise_missing_times(
-    expected: Sequence[int],
-    available: Mapping[int, Mapping[str, Any]],
-) -> List[Dict[str, int]]:
-    return _summarise_missing_period(
-        expected,
-        available,
-        interval_ms=MINUTE_INTERVAL_MS,
-    )
 
 
 def _normalise_binance_row(row: Sequence[object]) -> Dict[str, Any] | None:
@@ -1209,7 +1240,6 @@ async def _request_binance_minutes_async(
     *,
     limit: int,
     budget: _TimeBudget | None = None,
-    api_diag: MutableMapping[str, Any] | None = None,
 ) -> List[Sequence[object]]:
     params = {
         "symbol": symbol.upper(),
@@ -1223,70 +1253,37 @@ async def _request_binance_minutes_async(
     for attempt in range(_MAX_RETRIES):
         if budget is not None:
             budget.raise_if_exceeded("request_binance_minutes")
-        if api_diag is not None:
-            api_diag["requests"] = int(api_diag.get("requests", 0)) + 1
-            if attempt:
-                api_diag["retries"] = int(api_diag.get("retries", 0)) + 1
         try:
             response = await client.get(BINANCE_FAPI_REST, params=params)
             response.raise_for_status()
             data = response.json()
-            if api_diag is not None:
-                api_diag["last_status"] = int(response.status_code)
             if isinstance(data, list):
                 return data  # type: ignore[return-value]
             return []
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
-            if api_diag is not None:
-                status_counts = api_diag.setdefault("status_counts", {})
-                status_counts[status] = int(status_counts.get(status, 0)) + 1
-                api_diag["last_error"] = {
-                    "kind": "http_status",
-                    "status": status,
-                    "detail": str(exc),
-                }
-                if status == 429:
-                    api_diag["rate_limit_hits"] = int(api_diag.get("rate_limit_hits", 0)) + 1
-                errors = api_diag.setdefault("errors", [])
-                if len(errors) < 10:
-                    errors.append({"kind": "http_status", "status": status, "attempt": attempt + 1})
             if status in _RETRYABLE_STATUS and attempt < _MAX_RETRIES - 1:
                 if budget is not None:
                     budget.raise_if_exceeded("request_binance_minutes_backoff")
                     remaining = budget.remaining()
                     if remaining is not None and remaining <= 0:
                         raise
-                    sleep_for = min(delay, max(0.0, remaining))
+                    await asyncio.sleep(min(delay, max(0.0, remaining)))
                 else:
-                    sleep_for = delay
-                if api_diag is not None and sleep_for > 0:
-                    api_diag["backoffs"] = int(api_diag.get("backoffs", 0)) + 1
-                await asyncio.sleep(sleep_for)
+                    await asyncio.sleep(delay)
                 delay *= 2
                 continue
             raise
-        except httpx.RequestError as exc:
-            if api_diag is not None:
-                api_diag["last_error"] = {
-                    "kind": "request_error",
-                    "detail": str(exc),
-                }
-                errors = api_diag.setdefault("errors", [])
-                if len(errors) < 10:
-                    errors.append({"kind": "request_error", "attempt": attempt + 1})
+        except httpx.RequestError:
             if attempt < _MAX_RETRIES - 1:
                 if budget is not None:
                     budget.raise_if_exceeded("request_binance_minutes_retry")
                     remaining = budget.remaining()
                     if remaining is not None and remaining <= 0:
                         raise
-                    sleep_for = min(delay, max(0.0, remaining))
+                    await asyncio.sleep(min(delay, max(0.0, remaining)))
                 else:
-                    sleep_for = delay
-                if api_diag is not None and sleep_for > 0:
-                    api_diag["backoffs"] = int(api_diag.get("backoffs", 0)) + 1
-                await asyncio.sleep(sleep_for)
+                    await asyncio.sleep(delay)
                 delay *= 2
                 continue
             raise
@@ -1300,7 +1297,6 @@ async def _download_missing_minutes_async(
     gaps: Sequence[Mapping[str, int]],
     *,
     budget: _TimeBudget | None = None,
-    api_diag: MutableMapping[str, Any] | None = None,
 ) -> List[Dict[str, Any]]:
     if not gaps:
         return []
@@ -1325,17 +1321,6 @@ async def _download_missing_minutes_async(
                         cursor + (1000 - 1) * MINUTE_INTERVAL_MS,
                     )
                     request_end = chunk_end + MINUTE_INTERVAL_MS
-<<<<<<< Updated upstream
-                    raw_rows = await _request_binance_minutes_async(
-                        client,
-                        symbol,
-                        cursor,
-                        request_end,
-                        limit=1000,
-                        budget=budget,
-                        api_diag=api_diag,
-                    )
-=======
                     if callable(_fetch_binance_klines):
                         fetch_result = _fetch_binance_klines(
                             symbol,
@@ -1357,7 +1342,6 @@ async def _download_missing_minutes_async(
                             limit=1000,
                             budget=budget,
                         )
->>>>>>> Stashed changes
                     if not raw_rows:
                         break
 
@@ -1371,8 +1355,6 @@ async def _download_missing_minutes_async(
                             continue
                         fetched.append(candle)
                         downloaded += 1
-                        if api_diag is not None:
-                            api_diag["downloaded_bars"] = int(api_diag.get("downloaded_bars", 0)) + 1
                         last_open = ts
 
                     if last_open is None:
@@ -1394,7 +1376,6 @@ async def _call_download_missing_minutes_async(
     *,
     budget: _TimeBudget | None,
     allow_network: bool = True,
-    api_diag: MutableMapping[str, Any] | None = None,
 ) -> List[Dict[str, Any]]:
     """Invoke `_download_missing_minutes` while tolerating legacy stubs without budget."""
 
@@ -1402,13 +1383,7 @@ async def _call_download_missing_minutes_async(
         return []
 
     if budget is None:
-        return await _download_missing_minutes_async(
-            symbol,
-            start_ms,
-            end_ms,
-            gaps,
-            api_diag=api_diag,
-        )
+        return await _download_missing_minutes_async(symbol, start_ms, end_ms, gaps)
 
     try:
         return await _download_missing_minutes_async(
@@ -1417,403 +1392,14 @@ async def _call_download_missing_minutes_async(
             end_ms,
             gaps,
             budget=budget,
-            api_diag=api_diag,
         )
     except TypeError as exc:
         message = str(exc)
         if "unexpected keyword argument" not in message or "budget" not in message:
             raise
-        return await _download_missing_minutes_async(
-            symbol,
-            start_ms,
-            end_ms,
-            gaps,
-            api_diag=api_diag,
-        )
+        return await _download_missing_minutes_async(symbol, start_ms, end_ms, gaps)
 
 
-def _normalise_api_diagnostics(diag: Mapping[str, Any] | None) -> Dict[str, Any]:
-    base = {
-        "requests": 0,
-        "retries": 0,
-        "rate_limit_hits": 0,
-        "backoffs": 0,
-    }
-    if not isinstance(diag, Mapping):
-        return base
-
-    def _int_value(key: str) -> int:
-        try:
-            return int(diag.get(key, 0) or 0)
-        except (TypeError, ValueError):
-            return 0
-
-    base["requests"] = _int_value("requests")
-    base["retries"] = _int_value("retries")
-    base["rate_limit_hits"] = _int_value("rate_limit_hits")
-    base["backoffs"] = _int_value("backoffs")
-    downloaded = _int_value("downloaded_bars")
-    if downloaded:
-        base["downloaded_bars"] = downloaded
-
-    status_counts_raw = diag.get("status_counts")
-    if isinstance(status_counts_raw, Mapping):
-        status_counts: Dict[str, int] = {}
-        for status, count in status_counts_raw.items():
-            try:
-                status_key = str(status)
-                status_counts[status_key] = int(count)
-            except (TypeError, ValueError):
-                continue
-        if status_counts:
-            base["status_counts"] = status_counts
-
-    errors_raw = diag.get("errors")
-    if isinstance(errors_raw, Sequence):
-        normalised_errors: List[Dict[str, Any]] = []
-        for entry in errors_raw[:10]:
-            if not isinstance(entry, Mapping):
-                continue
-            normalised_errors.append({str(key): str(value) for key, value in entry.items()})
-        if normalised_errors:
-            base["errors"] = normalised_errors
-
-    last_error = diag.get("last_error")
-    if isinstance(last_error, Mapping):
-        base["last_error"] = {str(key): str(value) for key, value in last_error.items()}
-
-    return base
-
-
-@dataclass(slots=True)
-class _CoverageState:
-    timeframe: str
-    interval_ms: int
-    start_ms: int
-    end_ms: int
-    expected_bars: int
-    present_bars: int
-    missing_spans: List[Dict[str, int]]
-    backfill_requests: int = 0
-    backfill_written: int = 0
-    retry_passes: int = 0
-
-    @property
-    def gap_count(self) -> int:
-        return len(self.missing_spans)
-
-    @property
-    def coverage_pct(self) -> float:
-        if self.expected_bars <= 0:
-            return 100.0
-        return (self.present_bars / self.expected_bars) * 100.0
-
-    def to_payload(self) -> Dict[str, Any]:
-        return {
-            "timeframe": self.timeframe,
-            "start_ms": self.start_ms,
-            "end_ms": self.end_ms,
-            "interval_ms": self.interval_ms,
-            "expected_bars": self.expected_bars,
-            "present_bars": self.present_bars,
-            "coverage_pct": self.coverage_pct,
-            "gap_count": self.gap_count,
-            "missing_spans": [
-                {"start_ms": span["from"], "end_ms": span["to"], "bars": span["count"]}
-                for span in self.missing_spans
-            ],
-            "backfill_requests": self.backfill_requests,
-            "backfill_written": self.backfill_written,
-            "retry_passes": self.retry_passes,
-        }
-
-
-def _align_to_interval_up(value: int, interval_ms: int) -> int:
-    aligned = _align_to_interval(value, interval_ms)
-    if aligned < value:
-        aligned += interval_ms
-    return aligned
-
-
-def _clip_candles_to_window(
-    candles: Sequence[Mapping[str, Any]],
-    *,
-    start_ms: int,
-    end_ms: int,
-) -> List[Dict[str, Any]]:
-    clipped: List[Dict[str, Any]] = []
-    for candle in candles:
-        ts = _safe_int(candle.get("t"))
-        if ts is None:
-            continue
-        if ts < start_ms or ts > end_ms:
-            continue
-        clipped.append(dict(candle))
-    return clipped
-
-
-def _compute_coverage_state(
-    timeframe: str,
-    candles: Sequence[Mapping[str, Any]],
-    *,
-    start_ms: int,
-    end_ms: int,
-) -> _CoverageState:
-    interval_ms = TIMEFRAME_TO_MS.get(timeframe)
-    if interval_ms is None or interval_ms <= 0:
-        return _CoverageState(
-            timeframe=timeframe,
-            interval_ms=0,
-            start_ms=start_ms,
-            end_ms=end_ms,
-            expected_bars=0,
-            present_bars=0,
-            missing_spans=[],
-        )
-
-    aligned_start = _align_to_interval_up(start_ms, interval_ms)
-    aligned_end = _align_to_interval(end_ms, interval_ms)
-    if aligned_end < aligned_start:
-        aligned_end = aligned_start
-
-    expected_times: List[int] = []
-    cursor = aligned_start
-    while cursor <= aligned_end:
-        expected_times.append(cursor)
-        cursor += interval_ms
-
-    expected_bars = len(expected_times)
-    available: Dict[int, Mapping[str, Any]] = {}
-    for candle in candles:
-        ts = _safe_int(candle.get("t"))
-        if ts is None:
-            continue
-        if ts < aligned_start or ts > aligned_end:
-            continue
-        available[ts] = candle
-
-    missing_spans = _summarise_missing_period(
-        expected_times,
-        available,
-        interval_ms=interval_ms,
-    )
-    missing_count = sum(span["count"] for span in missing_spans)
-    present_bars = max(0, expected_bars - missing_count)
-
-    return _CoverageState(
-        timeframe=timeframe,
-        interval_ms=interval_ms,
-        start_ms=aligned_start,
-        end_ms=aligned_end,
-        expected_bars=expected_bars,
-        present_bars=present_bars,
-        missing_spans=[
-            {"from": span["from"], "to": span["to"], "count": span["count"]}
-            for span in missing_spans
-        ],
-    )
-
-
-async def _slice_timeframe_gap(
-    symbol: str,
-    timeframe: str,
-    *,
-    start_ms: int,
-    end_ms: int,
-    expected_bars: int,
-    allow_network: bool,
-) -> List[Dict[str, Any]]:
-    if not allow_network:
-        return []
-    interval_ms = TIMEFRAME_TO_MS.get(timeframe)
-    if interval_ms is None or interval_ms <= 0:
-        return []
-    end_exclusive = end_ms + interval_ms
-    limit = max(expected_bars, 1) + 2
-    candles = await slice_or_fetch_missing(
-        symbol,
-        timeframe,
-        start_ms=start_ms,
-        end_ms=end_exclusive,
-        fetcher=_fetch_binance_klines,
-        limit=limit,
-    )
-    return [candle.as_dict() for candle in candles]
-
-
-async def _backfill_timeframe_gaps(
-    symbol: str,
-    timeframe: str,
-    state: _CoverageState,
-    frames: MutableMapping[str, List[MutableMapping[str, Any]]],
-    sanitize: Callable[[str, Sequence[Mapping[str, Any]]], List[Dict[str, Any]]],
-    *,
-    allow_network: bool,
-    budget: _TimeBudget | None,
-    trace_ctx: "TraceContext | None" = None,
-    api_diag: MutableMapping[str, Any] | None = None,
-) -> Tuple[_CoverageState, int]:
-    if not state.missing_spans or not allow_network:
-        return state, 0
-
-    total_written = 0
-    spans_payload = [
-        {"from": span["from"], "to": span["to"], "count": span["count"]}
-        for span in state.missing_spans
-    ]
-    if trace_ctx is not None:
-        trace_ctx.info(
-            "gaps.backfill_start",
-            scope=f"ohlcv.{timeframe}",
-            stage=f"pass_{state.retry_passes + 1}",
-            spans=spans_payload,
-        )
-
-    if timeframe == "1m":
-        downloaded: List[Dict[str, Any]] = []
-        try:
-            downloaded = await _call_download_missing_minutes_async(
-                symbol,
-                state.start_ms,
-                state.end_ms,
-                spans_payload,
-                budget=budget,
-                allow_network=allow_network,
-                api_diag=api_diag,
-            )
-        except BinanceDownloadError as exc:
-            if trace_ctx is not None:
-                trace_ctx.error(
-                    "gaps.backfill_failed",
-                    scope="ohlcv.1m",
-                    stage=f"pass_{state.retry_passes + 1}",
-                    downloaded=exc.downloaded,
-                    reason=str(exc),
-                )
-            downloaded = []
-        sanitized = sanitize(f"gaps.{timeframe}", downloaded)
-        if sanitized:
-            merged = _merge_candle_collections(frames.get(timeframe, []), sanitized)
-            frames[timeframe] = merged
-            total_written += len(sanitized)
-    else:
-        for span in spans_payload:
-            gap_start = int(span["from"])
-            gap_end = int(span["to"])
-            bars = int(span["count"])
-            fetched = await _slice_timeframe_gap(
-                symbol,
-                timeframe,
-                start_ms=gap_start,
-                end_ms=gap_end,
-                expected_bars=bars,
-                allow_network=allow_network,
-            )
-            if not fetched:
-                continue
-            sanitized = sanitize(f"gaps.{timeframe}", fetched)
-            if not sanitized:
-                continue
-            merged = _merge_candle_collections(frames.get(timeframe, []), sanitized)
-            frames[timeframe] = merged
-            total_written += len(sanitized)
-
-    updated_state = _compute_coverage_state(
-        timeframe,
-        frames.get(timeframe, []),
-        start_ms=state.start_ms,
-        end_ms=state.end_ms,
-    )
-    updated_state.backfill_requests = state.backfill_requests + len(state.missing_spans)
-    updated_state.backfill_written = state.backfill_written + total_written
-    updated_state.retry_passes = state.retry_passes + 1
-
-    if trace_ctx is not None:
-        trace_ctx.info(
-            "gaps.backfill_done",
-            scope=f"ohlcv.{timeframe}",
-            stage=f"pass_{updated_state.retry_passes}",
-            written=total_written,
-            coverage_pct=updated_state.coverage_pct,
-            remaining=updated_state.gap_count,
-        )
-
-    return updated_state, total_written
-
-
-async def _ensure_timeframe_coverage(
-    symbol: str,
-    timeframe: str,
-    *,
-    start_ms: int,
-    end_ms: int,
-    frames: MutableMapping[str, List[MutableMapping[str, Any]]],
-    coverage_states: Dict[str, _CoverageState],
-    coverage_traces: List[Dict[str, Any]],
-    sanitize: Callable[[str, Sequence[Mapping[str, Any]]], List[Dict[str, Any]]],
-    allow_network: bool,
-    budget: _TimeBudget | None,
-    trace_ctx: "TraceContext | None",
-    api_diag: MutableMapping[str, Any] | None,
-    max_passes: int = 2,
-) -> _CoverageState:
-    clipped = _clip_candles_to_window(frames.get(timeframe, []), start_ms=start_ms, end_ms=end_ms)
-    frames[timeframe] = clipped
-    state = _compute_coverage_state(
-        timeframe,
-        clipped,
-        start_ms=start_ms,
-        end_ms=end_ms,
-    )
-    coverage_states[timeframe] = state
-    coverage_traces.append(
-        {
-            "tf": timeframe,
-            "stage": "initial",
-            "in": state.expected_bars,
-            "out": state.present_bars,
-            "top_reason": "gaps" if state.gap_count else "ok",
-        }
-    )
-    passes = 0
-    while state.missing_spans and passes < max_passes and allow_network:
-        passes += 1
-        state, written = await _backfill_timeframe_gaps(
-            symbol,
-            timeframe,
-            state,
-            frames,
-            sanitize,
-            allow_network=allow_network,
-            budget=budget,
-            trace_ctx=trace_ctx,
-            api_diag=api_diag,
-        )
-        coverage_states[timeframe] = state
-        if written == 0:
-            break
-    clipped = _clip_candles_to_window(frames.get(timeframe, []), start_ms=start_ms, end_ms=end_ms)
-    frames[timeframe] = clipped
-    final_state = _compute_coverage_state(
-        timeframe,
-        clipped,
-        start_ms=start_ms,
-        end_ms=end_ms,
-    )
-    final_state.backfill_requests = state.backfill_requests
-    final_state.backfill_written = state.backfill_written
-    final_state.retry_passes = state.retry_passes
-    coverage_states[timeframe] = final_state
-    coverage_traces.append(
-        {
-            "tf": timeframe,
-            "stage": "final",
-            "in": final_state.expected_bars,
-            "out": final_state.present_bars,
-            "top_reason": "ok" if final_state.gap_count == 0 else "missing",
-        }
-    )
-    return final_state
 def _aggregate_from_minutes(
     minute_index: Mapping[int, Mapping[str, Any]],
     open_time: int,
@@ -1910,15 +1496,102 @@ def _coerce_iso_timestamp(value: Any) -> str | None:
 
 
 def _pivot_radius_for_equal_levels(tf: str) -> int:
-    return _EQUAL_LIQUIDITY_PIVOT_RADIUS.get(tf, 2)
+    settings = get_settings().eql_settings
+    mapping = getattr(settings, "pivot_radius_by_tf", {}) or {}
+    value = mapping.get(tf)
+    if value is not None:
+        try:
+            numeric = int(value)
+        except (TypeError, ValueError):
+            numeric = None
+        if numeric is not None and numeric > 0:
+            return numeric
+    fallback = _EQUAL_LIQUIDITY_PIVOT_RADIUS.get(tf)
+    if fallback is not None:
+        return fallback
+    return max(1, int(getattr(settings, "min_separation_bars", 4) // 2) or 1)
 
 
 def _minimum_separation_for_equal_levels(tf: str) -> int:
-    return _EQUAL_LIQUIDITY_MIN_SEPARATION.get(tf, 5)
+    settings = get_settings().eql_settings
+    mapping = getattr(settings, "min_separation_bars_by_tf", {}) or {}
+    value = mapping.get(tf)
+    if value is not None:
+        try:
+            numeric = int(value)
+        except (TypeError, ValueError):
+            numeric = None
+        if numeric is not None and numeric > 0:
+            return numeric
+    fallback = _EQUAL_LIQUIDITY_MIN_SEPARATION.get(tf)
+    if fallback is not None:
+        return fallback
+    try:
+        global_default = int(settings.min_separation_bars)
+    except (TypeError, ValueError):
+        global_default = 5
+    return max(1, global_default)
+
+
+def _bps_to_ratio(value: Any, *, default: float) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return default
+    if numeric <= 0:
+        return max(0.0, default)
+    if numeric > 1:
+        return numeric / 10_000.0
+    return numeric
 
 
 def _relative_tolerance_for_equal_levels(tf: str) -> float:
-    return _EQUAL_LIQUIDITY_REL_TOLERANCE.get(tf, 0.0003)
+    settings = get_settings().eql_settings
+    mapping = getattr(settings, "tolerance_bps_by_tf", {}) or {}
+    value = mapping.get(tf)
+    if value is not None:
+        ratio = _bps_to_ratio(value, default=0.0)
+        if ratio > 0:
+            return ratio
+    fallback = _EQUAL_LIQUIDITY_REL_TOLERANCE.get(tf)
+    if fallback is not None:
+        return fallback
+    base_ratio = _bps_to_ratio(getattr(settings, "tolerance_bps", 0.0), default=0.0003)
+    return base_ratio or 0.0003
+
+
+def _apply_zone_threshold_overrides(cfg: ZonesConfig) -> ZonesConfig:
+    thresholds = get_settings().zone_thresholds
+    sr_tolerance = _bps_to_ratio(
+        getattr(thresholds, "tolerance_bps", 0.0),
+        default=cfg.sr_merge_pct,
+    )
+    if sr_tolerance > 0:
+        cfg.sr_merge_pct = sr_tolerance
+    max_fill = getattr(thresholds, "max_fill_percent", None)
+    if max_fill is not None:
+        try:
+            fill_value = float(max_fill)
+        except (TypeError, ValueError):
+            fill_value = None
+        if fill_value is not None:
+            fill_ratio = fill_value / 100.0 if fill_value > 1 else fill_value
+            cfg.mitigation_fill_ratio = max(0.0, min(1.0, fill_ratio))
+    min_displacement = getattr(thresholds, "min_displacement", None)
+    try:
+        displacement_value = float(min_displacement) if min_displacement is not None else None
+    except (TypeError, ValueError):
+        displacement_value = None
+    if displacement_value is not None and displacement_value > 0:
+        cfg.ob_distance_atr = displacement_value
+    min_sep_bars = getattr(thresholds, "min_separation_bars", None)
+    try:
+        min_sep_numeric = int(min_sep_bars) if min_sep_bars is not None else None
+    except (TypeError, ValueError):
+        min_sep_numeric = None
+    if min_sep_numeric is not None and min_sep_numeric > 0:
+        cfg.base_min_bars = max(cfg.base_min_bars, min_sep_numeric)
+    return cfg
 
 
 def _detect_equal_levels_for_timeframe(
@@ -2010,7 +1683,9 @@ def _detect_equal_levels_for_timeframe(
 
 
 def build_equal_liquidity_levels(
-    frames: Mapping[str, Sequence[Mapping[str, Any]]]
+    frames: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    max_levels: Mapping[str, int] | None = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Detect simplified EQH/EQL pools from timeframe candles."""
 
@@ -2027,6 +1702,18 @@ def build_equal_liquidity_levels(
         eql_levels.extend(
             _detect_equal_levels_for_timeframe(candles, tf=tf, kind="low")
         )
+
+    if isinstance(max_levels, Mapping):
+        limit_eqh = max(0, int(max_levels.get("eqh", len(eqh_levels)) or len(eqh_levels)))
+        limit_eql = max(0, int(max_levels.get("eql", len(eql_levels)) or len(eql_levels)))
+        if limit_eqh and len(eqh_levels) > limit_eqh:
+            eqh_levels = eqh_levels[-limit_eqh:]
+        if limit_eql and len(eql_levels) > limit_eql:
+            eql_levels = eql_levels[-limit_eql:]
+        if limit_eqh == 0:
+            eqh_levels = []
+        if limit_eql == 0:
+            eql_levels = []
 
     return {"eqh": eqh_levels, "eql": eql_levels}
 
@@ -2682,7 +2369,29 @@ async def _download_agg_trades_async(
         "status": None,
         "batches": 0,
     }
-    if not allow_network or start_ms >= end_ms:
+    if start_ms >= end_ms:
+        return [], diag
+
+    store = get_store()
+    store_rows = await asyncio.to_thread(
+        store.fetch_agg_trades,
+        symbol,
+        start_ms,
+        end_ms,
+    )
+    if store_rows:
+        normalised = _extract_trades(store_rows, source="vision_store")
+        diag.update(
+            {
+                "downloaded": len(normalised),
+                "status": "vision_store",
+                "attempted": False,
+                "batches": 1,
+            }
+        )
+        return normalised, diag
+
+    if not allow_network:
         return [], diag
 
     if callable(_fetch_binance_agg_trades):
@@ -4766,132 +4475,27 @@ def _resolve_smc_config(meta: Mapping[str, Any] | None) -> SMCConfig:
     if not isinstance(config_source, Mapping):
         return SMCConfig()
     kwargs: Dict[str, Any] = {}
-
-    def _safe_float(key: str) -> float | None:
-        try:
-            return float(config_source[key])
-        except (TypeError, ValueError, KeyError):
-            return None
-
-    def _safe_int(value: Any) -> int | None:
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return None
-
-    def _safe_float_value(value: Any) -> float | None:
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return None
-
     if "min_block_size" in config_source:
-        numeric = _safe_float("min_block_size")
-        if numeric is not None:
-            kwargs["min_block_size"] = numeric
+        try:
+            kwargs["min_block_size"] = float(config_source["min_block_size"])
+        except (TypeError, ValueError):
+            pass
     if "displacement_factor" in config_source:
-        numeric = _safe_float("displacement_factor")
-        if numeric is not None:
-            kwargs["displacement_factor"] = numeric
+        try:
+            kwargs["displacement_factor"] = float(config_source["displacement_factor"])
+        except (TypeError, ValueError):
+            pass
     if "displacement_lookback" in config_source:
-        numeric = _safe_int(config_source.get("displacement_lookback"))
-        if numeric is not None:
-            kwargs["displacement_lookback"] = numeric
+        try:
+            kwargs["displacement_lookback"] = int(config_source["displacement_lookback"])
+        except (TypeError, ValueError):
+            pass
     if "ttl_bars" in config_source:
-        numeric = _safe_int(config_source.get("ttl_bars"))
-        if numeric is not None:
-            kwargs["ttl_bars"] = numeric
-
-    if "allow_bos_substitute" in config_source:
-        kwargs["allow_bos_substitute"] = bool(config_source.get("allow_bos_substitute"))
-
-    sweep_cfg = config_source.get("sweep_choch")
-    if isinstance(sweep_cfg, Mapping):
-        max_map_raw = sweep_cfg.get("max_bars_per_tf")
-        if isinstance(max_map_raw, Mapping):
-            sweep_map: Dict[str, int] = {}
-            for key, value in max_map_raw.items():
-                numeric = _safe_int(value)
-                if numeric is None:
-                    continue
-                sweep_map[str(key)] = max(1, numeric)
-            if sweep_map:
-                kwargs["sweep_choch_max_bars"] = sweep_map
-        default_val = _safe_int(sweep_cfg.get("default_max_bars"))
-        if default_val is not None and default_val > 0:
-            kwargs["sweep_choch_default_max_bars"] = default_val
-        extension = _safe_float_value(sweep_cfg.get("extension_factor"))
-        if extension is not None and extension > 0:
-            kwargs["sweep_choch_extension_factor"] = extension
-
-    opposite_cfg = config_source.get("opposite_bos")
-    if isinstance(opposite_cfg, Mapping):
-        max_map_raw = opposite_cfg.get("max_bars_per_tf")
-        if isinstance(max_map_raw, Mapping):
-            opposite_map: Dict[str, int] = {}
-            for key, value in max_map_raw.items():
-                numeric = _safe_int(value)
-                if numeric is None:
-                    continue
-                opposite_map[str(key)] = max(1, numeric)
-            if opposite_map:
-                kwargs["opposite_bos_max_bars"] = opposite_map
-        default_val = _safe_int(opposite_cfg.get("default_max_bars"))
-        if default_val is not None and default_val > 0:
-            kwargs["opposite_bos_default_max_bars"] = default_val
-
-    dedup_cfg = config_source.get("block_dedup")
-    if isinstance(dedup_cfg, Mapping):
-        strategy = dedup_cfg.get("strategy")
-        if isinstance(strategy, str):
-            kwargs["block_dedup_strategy"] = strategy.strip().lower()
-        weights = dedup_cfg.get("weights")
-        if isinstance(weights, Mapping):
-            tf_weight = _safe_float_value(weights.get("tf"))
-            recency_weight = _safe_float_value(weights.get("recency"))
-            confidence_weight = _safe_float_value(weights.get("confidence"))
-            if tf_weight is not None:
-                kwargs["dedup_weight_tf"] = tf_weight
-            if recency_weight is not None:
-                kwargs["dedup_weight_recency"] = recency_weight
-            if confidence_weight is not None:
-                kwargs["dedup_weight_confidence"] = confidence_weight
-
-    features_cfg = config_source.get("feature") or config_source.get("features")
-    if isinstance(features_cfg, Mapping):
-        if "strict_legacy_mode" in features_cfg:
-            kwargs["feature_strict_legacy_mode"] = bool(features_cfg.get("strict_legacy_mode"))
-        if "smc_extended_windows" in features_cfg:
-            kwargs["feature_extended_windows"] = bool(features_cfg.get("smc_extended_windows"))
-        if "block_scored_dedup" in features_cfg:
-            kwargs["feature_block_scored_dedup"] = bool(features_cfg.get("block_scored_dedup"))
-
-    cfg = SMCConfig(**kwargs)
-
-    if cfg.feature_strict_legacy_mode:
-        cfg.feature_extended_windows = False
-        cfg.feature_block_scored_dedup = False
-        cfg.allow_bos_substitute = False
-        cfg.block_dedup_strategy = "priority"
-        cfg.sweep_choch_extension_factor = 1.0
-
-    if not cfg.feature_extended_windows:
-        cfg.sweep_choch_extension_factor = 1.0
-
-    if not cfg.feature_block_scored_dedup:
-        cfg.block_dedup_strategy = "priority"
-
-    cfg.block_dedup_strategy = (cfg.block_dedup_strategy or "priority").lower()
-    if cfg.block_dedup_strategy not in {"priority", "scored"}:
-        cfg.block_dedup_strategy = "priority"
-
-    total_weight = cfg.dedup_weight_tf + cfg.dedup_weight_recency + cfg.dedup_weight_confidence
-    if total_weight <= 0:
-        cfg.dedup_weight_tf = 0.5
-        cfg.dedup_weight_recency = 0.3
-        cfg.dedup_weight_confidence = 0.2
-
-    return cfg
+        try:
+            kwargs["ttl_bars"] = int(config_source["ttl_bars"])
+        except (TypeError, ValueError):
+            pass
+    return SMCConfig(**kwargs)
 
 
 def _inject_smc_blocks(target: MutableMapping[str, Any] | None, blocks: Sequence[Mapping[str, Any]]) -> None:
@@ -5098,9 +4702,6 @@ async def build_check_all_datas(
         _record_invalid(stage, invalid_ts=result.invalid_ts, invalid_ohlc=result.invalid_ohlc)
         return result.candles
 
-    def _sanitize_for_stage(stage: str, candles: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
-        return _apply_sanitizer(stage, candles)
-
     def _register_invalid_candle(_ts: int, stage: str) -> None:
         _record_invalid(stage, invalid_ts=1)
 
@@ -5108,22 +4709,6 @@ async def build_check_all_datas(
 
     context = _prepare_snapshot_context(snapshot, now_utc)
     frames = context.frames
-<<<<<<< Updated upstream
-    coverage_states: Dict[str, _CoverageState] = {}
-    api_diagnostics: Dict[str, Any] = {
-        "requests": 0,
-        "retries": 0,
-        "rate_limit_hits": 0,
-        "backoffs": 0,
-        "status_counts": {},
-    }
-    coverage_traces: List[Dict[str, Any]] = []
-    minute_ready = True
-    minute_ready_ts: int | None = None
-    degraded_mode = False
-    degraded_reasons: List[Dict[str, Any]] = []
-    three_day_anchors: Dict[str, int] | None = None
-=======
     raw_meta = context.raw_meta
 
     pipeline_meta = raw_meta.get("pipeline") if isinstance(raw_meta, Mapping) else None
@@ -5168,11 +4753,11 @@ async def build_check_all_datas(
     timeframe_summary_order = tuple(tf for tf in combined_ohlcv_tfs if tf != "3m")
     aggregated_orderflow_timeframes = tuple(tf for tf in orderflow_timeframes if tf != "1m")
     orderflow_enabled = bool(modules_enabled.get("orderflow", True))
+    orderflow_allow_network = bool(pipeline_preset.orderflow.allow_network)
     zones_enabled = bool(modules_enabled.get("zones", True))
     vwap_enabled = bool(modules_enabled.get("vwap_tpo", True))
     liquidity_enabled = bool(modules_enabled.get("liquidity", True))
     showcases_enabled = bool(modules_enabled.get("showcases", True))
->>>>>>> Stashed changes
 
     for tf_key, candles in list(frames.items()):
         stage_name = f"seed.{tf_key}"
@@ -5214,9 +4799,30 @@ async def build_check_all_datas(
         base_window_hours = 4
     base_window_hours = int(base_window_hours)
 
+    vision_ingest_summary: Dict[str, Any] | None = None
+    vision_required_hours: int | None = None
+    if network_backfill:
+        required_hours = max(
+            base_window_hours,
+            pipeline_preset.summary_window_hours,
+            pipeline_preset.orderflow.window_hours,
+            pipeline_preset.zones.focus_window_hours,
+        )
+        vision_required_hours = required_hours
+        ingest_end_ms = now_ms
+        ingest_start_ms = max(0, ingest_end_ms - required_hours * MS_IN_HOUR)
+        vision_ingest_summary = await _maybe_ingest_vision_data(
+            symbol,
+            ingest_start_ms,
+            ingest_end_ms,
+            preset=pipeline_preset,
+            allow_network=network_backfill,
+            trace=trace_ctx,
+        )
+
     strict_three_day = bool(strict_window and base_window_hours >= 72)
-    if strict_three_day:
-        network_backfill = True
+    if strict_three_day and network_backfill:
+        network_backfill = False
 
     window_end_guess = _resolve_window_end_ms(
         frames,
@@ -5582,7 +5188,7 @@ async def build_check_all_datas(
             "profile_levels": [],
         },
     }
-    zone_cfg = ZonesConfig(tick_size=profile_config.get("tick_size"))
+    zone_cfg = _apply_zone_threshold_overrides(ZonesConfig(tick_size=profile_config.get("tick_size")))
 
     await progress_tracker.start(
         "vwap_tpo",
@@ -5710,16 +5316,6 @@ async def build_check_all_datas(
     else:
         hours_window = hours if hours in VALID_HOUR_WINDOWS else min(VALID_HOUR_WINDOWS)
 
-    if strict_three_day:
-        anchor_start_candidate = max(0, window_end_ms - 72 * MS_IN_HOUR + MINUTE_INTERVAL_MS)
-        anchor_start_ms = _align_to_interval(anchor_start_candidate, MINUTE_INTERVAL_MS)
-        three_day_anchors = {
-            "now_ms": now_ms,
-            "start_ms": anchor_start_ms,
-            "end_ms": window_end_ms,
-        }
-        hours_window = 72
-
     override_start_ms: int | None = None
     if window_start_override_ms is not None:
         try:
@@ -5729,13 +5325,7 @@ async def build_check_all_datas(
         if override_start_ms is not None:
             override_start_ms = max(0, override_start_ms)
 
-<<<<<<< Updated upstream
-    if strict_three_day:
-        override_start_ms = anchor_start_ms
-
-=======
     span_ms: int
->>>>>>> Stashed changes
     if override_start_ms is not None:
         window_start_ms = max(0, _align_to_interval(override_start_ms, MINUTE_INTERVAL_MS))
         if window_start_ms >= window_end_ms:
@@ -5759,22 +5349,13 @@ async def build_check_all_datas(
     window_span_hours = span_ms / MS_IN_HOUR
     enforce_minute_coverage = bool(strict_three_day or window_span_hours >= 24)
 
-    minute_candles = _clip_candles_to_window(
-        frames.get("1m", []),
-        start_ms=window_start_ms,
-        end_ms=window_end_ms,
-    )
-    frames["1m"] = minute_candles
+    minute_index_all = {candle["t"]: candle for candle in minute_candles}
+    minute_window_index = {
+        ts: candle
+        for ts, candle in minute_index_all.items()
+        if window_start_ms <= ts <= window_end_ms
+    }
 
-<<<<<<< Updated upstream
-    minute_state = _compute_coverage_state(
-        "1m",
-        minute_candles,
-        start_ms=window_start_ms,
-        end_ms=window_end_ms,
-    )
-    coverage_states["1m"] = minute_state
-=======
     await progress_tracker.start(
         "gaps",
         window={"start_ms": window_start_ms, "end_ms": window_end_ms},
@@ -5786,61 +5367,16 @@ async def build_check_all_datas(
     expected_count = len(expected_minutes)
     time_gaps = _summarise_missing_times(expected_minutes, minute_window_index)
     minute_missing_before = sum(gap["count"] for gap in time_gaps)
->>>>>>> Stashed changes
 
-    minute_missing_initial = minute_state.expected_bars - minute_state.present_bars
-    initial_time_gaps = [
-        {"from": span["from"], "to": span["to"], "count": span["count"]}
-        for span in minute_state.missing_spans
-    ]
-
-    if trace_ctx is not None:
-        trace_ctx.info(
-            "gaps.checking",
-            scope="ohlcv.1m",
-            tf="1m",
-            expected=minute_state.expected_bars,
-            window={"from": window_start_ms, "to": window_end_ms},
-        )
-
-    coverage_traces.append(
-        {
-            "tf": "1m",
-            "stage": "initial",
-            "in": minute_state.expected_bars,
-            "out": minute_state.present_bars,
-            "top_reason": "gaps" if minute_state.gap_count else "ok",
-        }
-    )
-
-    if trace_ctx is not None and initial_time_gaps:
+    if trace_ctx is not None and time_gaps:
         trace_ctx.info(
             "gaps.detected",
             scope="ohlcv.1m",
             tf="1m",
-            count=len(initial_time_gaps),
+            count=len(time_gaps),
             window={"from": window_start_ms, "to": window_end_ms},
         )
 
-<<<<<<< Updated upstream
-    passes = 0
-    while minute_state.missing_spans and passes < 2:
-        passes += 1
-        minute_state, written = await _backfill_timeframe_gaps(
-            symbol,
-            "1m",
-            minute_state,
-            frames,
-            _sanitize_for_stage,
-            allow_network=True,
-            budget=budget,
-            trace_ctx=trace_ctx,
-            api_diag=api_diagnostics,
-        )
-        coverage_states["1m"] = minute_state
-        if written == 0:
-            break
-=======
     fetched_unique = 0
     relaxed_minute_gap = False
     if time_gaps:
@@ -6016,73 +5552,8 @@ async def build_check_all_datas(
                     fetched_unique += 1
                 minute_window_index[ts] = candle
                 minute_index_all[ts] = candle
->>>>>>> Stashed changes
 
-    minute_candles = _clip_candles_to_window(
-        frames.get("1m", []),
-        start_ms=window_start_ms,
-        end_ms=window_end_ms,
-    )
-    frames["1m"] = minute_candles
-    recomputed_state = _compute_coverage_state(
-        "1m",
-        minute_candles,
-        start_ms=window_start_ms,
-        end_ms=window_end_ms,
-    )
-    recomputed_state.backfill_requests = minute_state.backfill_requests
-    recomputed_state.backfill_written = minute_state.backfill_written
-    recomputed_state.retry_passes = minute_state.retry_passes
-    minute_state = recomputed_state
-    coverage_states["1m"] = minute_state
-    minute_missing_before = minute_missing_initial
-    time_gaps = [
-        {"from": span["from"], "to": span["to"], "count": span["count"]}
-        for span in minute_state.missing_spans
-    ]
-    fetched_unique = minute_state.backfill_written
-
-    if minute_state.coverage_pct >= 99.0:
-        minute_ready = True
-        minute_ready_ts = int(time.time() * 1000)
-        if trace_ctx is not None:
-            trace_ctx.info(
-                "gaps.coverage_ready",
-                scope="ohlcv.1m",
-                coverage_pct=minute_state.coverage_pct,
-                window={"from": window_start_ms, "to": window_end_ms},
-            )
-        notes.append("Minute coverage ready ≥99% for 1m window")
-    else:
-        minute_ready = False
-        degraded_mode = True
-        degraded_reasons.append(
-            {
-                "tf": "1m",
-                "spans_unfilled": [
-                    {"start_ms": span["from"], "end_ms": span["to"], "bars": span["count"]}
-                    for span in minute_state.missing_spans
-                ],
-                "provider_reason": "coverage_below_target",
-            }
-        )
-        if trace_ctx is not None:
-            trace_ctx.warn(
-                "gaps.degraded_mode",
-                scope="ohlcv.1m",
-                coverage_pct=minute_state.coverage_pct,
-                remaining=minute_state.gap_count,
-                window={"from": window_start_ms, "to": window_end_ms},
-            )
-        notes.append(
-            "Degraded mode: 1m coverage below 99% after targeted backfill"
-        )
-
-    minute_index_all = {candle["t"]: candle for candle in minute_candles}
-    minute_window_index = dict(minute_index_all)
-
-    expected_minutes = _build_expected_times(window_start_ms, window_end_ms, MINUTE_INTERVAL_MS)
-    minute_missing_after = max(0, minute_state.expected_bars - minute_state.present_bars)
+    minute_missing_after = sum(1 for ts in expected_minutes if ts not in minute_window_index)
     data_quality = {
         "tf": target_tf_key,
         "window": {"start_ms": window_start_ms, "end_ms": window_end_ms},
@@ -6094,19 +5565,6 @@ async def build_check_all_datas(
         "time_gaps": time_gaps,
     }
 
-<<<<<<< Updated upstream
-    tf_cover_targets: List[Tuple[str, int, int]] = [
-        ("5m", window_start_ms, window_end_ms),
-        ("15m", window_start_ms, window_end_ms),
-        ("1h", window_start_ms, window_end_ms),
-        ("4h", window_start_ms, window_end_ms),
-    ]
-    daily_start_ms = max(
-        0,
-        _align_to_interval(window_end_ms - 90 * MS_IN_DAY + MINUTE_INTERVAL_MS, MINUTE_INTERVAL_MS),
-    )
-    tf_cover_targets.append(("1d", daily_start_ms, window_end_ms))
-=======
     if minute_missing_before and not relaxed_minute_gap and not enforce_minute_coverage:
         relaxed_minute_gap = True
 
@@ -6147,96 +5605,9 @@ async def build_check_all_datas(
         agg_counts=gap_metrics_agg,
         completeness=gap_completeness,
     )
->>>>>>> Stashed changes
 
-    for tf_key, tf_start, tf_end in tf_cover_targets:
-        await _ensure_timeframe_coverage(
-            symbol,
-            tf_key,
-            start_ms=tf_start,
-            end_ms=tf_end,
-            frames=frames,
-            coverage_states=coverage_states,
-            coverage_traces=coverage_traces,
-            sanitize=_sanitize_for_stage,
-            allow_network=(network_backfill or tf_key == "1d"),
-            budget=budget,
-            trace_ctx=trace_ctx,
-            api_diag=api_diagnostics,
-        )
-
-    if frames.get("1m"):
-        for tf_key in ("5m", "15m", "1h", "4h", "1d"):
-            interval_ms_tf = TIMEFRAME_TO_MS.get(tf_key)
-            if interval_ms_tf is None or interval_ms_tf <= MINUTE_INTERVAL_MS:
-                continue
-            resampled_tf = resample_ohlcv(frames["1m"], interval_ms_tf)
-            start_clip = window_start_ms
-            end_clip = window_end_ms
-            if tf_key == "1d":
-                start_clip = daily_start_ms
-            resampled_tf = _clip_candles_to_window(
-                resampled_tf,
-                start_ms=start_clip,
-                end_ms=end_clip,
-            )
-            frames[tf_key] = resampled_tf
-            refreshed_state = _compute_coverage_state(
-                tf_key,
-                resampled_tf,
-                start_ms=start_clip,
-                end_ms=end_clip,
-            )
-            if tf_key == "1d" and resampled_tf:
-                refreshed_state.expected_bars = len(resampled_tf)
-                refreshed_state.present_bars = len(resampled_tf)
-                refreshed_state.missing_spans = []
-            previous = coverage_states.get(tf_key)
-            if previous:
-                refreshed_state.backfill_requests = previous.backfill_requests
-                refreshed_state.backfill_written = previous.backfill_written
-                refreshed_state.retry_passes = previous.retry_passes
-            coverage_states[tf_key] = refreshed_state
-
-    for critical_tf in ("1m", "5m", "15m", "1h"):
-        state = coverage_states.get(critical_tf)
-        if state is None:
-            continue
-        if state.coverage_pct >= 99.0:
-            continue
-        if any(entry.get("tf") == critical_tf for entry in degraded_reasons):
-            continue
-        degraded_mode = True
-        reason_entry = {
-            "tf": critical_tf,
-            "spans_unfilled": [
-                {"start_ms": span["from"], "end_ms": span["to"], "bars": span["count"]}
-                for span in state.missing_spans
-            ],
-            "provider_reason": "coverage_below_target",
-        }
-        degraded_reasons.append(reason_entry)
-        if trace_ctx is not None:
-            trace_ctx.warn(
-                "gaps.degraded_mode",
-                scope=f"ohlcv.{critical_tf}",
-                coverage_pct=state.coverage_pct,
-                remaining=state.gap_count,
-                window={"from": state.start_ms, "to": state.end_ms},
-            )
-        notes.append(
-            f"Degraded mode: {critical_tf} coverage {state.coverage_pct:.2f}%"
-        )
-
-    day_state = coverage_states.get("1d")
-    day_frames = frames.get("1d")
-    if day_state is not None and isinstance(day_frames, Sequence):
-        bars = sum(1 for entry in day_frames if isinstance(entry, Mapping))
-        if bars > 0 and day_state.present_bars < bars:
-            day_state.present_bars = bars
-            day_state.expected_bars = max(day_state.expected_bars, bars)
-            day_state.missing_spans = []
-            coverage_states["1d"] = day_state
+    frames["1m"] = [minute_index_all[ts] for ts in sorted(minute_index_all)]
+    minute_candles = frames["1m"]
 
     try:
         budget.raise_if_exceeded("zones_preparation")
@@ -6393,7 +5764,6 @@ async def build_check_all_datas(
                     blocking_gaps,
                     budget=budget,
                     allow_network=network_backfill,
-                    api_diag=api_diagnostics,
                 )
             except BinanceDownloadError as exc:
                 detail = {
@@ -6548,7 +5918,10 @@ async def build_check_all_datas(
     zone_cfg.zones_window_start_ms = zones_window_start_ms
     zone_cfg.window_end_ms_prev_closed = window_end_ms
     zone_cfg.allow_base_fallback = True
-    liquidity_equal_levels = build_equal_liquidity_levels(zone_frames_full)
+    liquidity_equal_levels = build_equal_liquidity_levels(
+        zone_frames_full,
+        max_levels=zone_top_n,
+    )
 
     base_index_all = {candle["t"]: candle for candle in base_candles}
 
@@ -6732,9 +6105,6 @@ async def build_check_all_datas(
     }
 
     tick_size_value = profile_config.get("tick_size") if isinstance(profile_config, Mapping) else None
-    normalized_symbol = normalise_symbol_for_tick(symbol)
-    if normalized_symbol == "BTCUSDT":
-        tick_size_value = 0.5
     tick_size_numeric: float | None = None
     if isinstance(tick_size_value, (int, float)) and tick_size_value > 0:
         tick_size_numeric = float(tick_size_value)
@@ -6758,7 +6128,7 @@ async def build_check_all_datas(
             if cleaned:
                 liquidity_frames[tf_key] = {"candles": cleaned, "source": "htf"}
 
-    for tf_key in ("3m", "5m", "15m", "1h", "4h"):
+    for tf_key in ("15m", "1h"):
         if tf_key in liquidity_frames:
             continue
         if not minute_full:
@@ -6776,36 +6146,6 @@ async def build_check_all_datas(
         if daily_series:
             liquidity_frames["1d"] = {"candles": daily_series, "source": "short_window"}
 
-    for tf_key, payload in liquidity_frames.items():
-        if not isinstance(payload, Mapping):
-            continue
-        raw_series = payload.get("candles")
-        series = _clip_candles_to_window(
-            raw_series if isinstance(raw_series, Sequence) else [],
-            start_ms=window_start_ms,
-            end_ms=window_end_ms,
-        )
-        payload["candles"] = series
-        if tf_key == "1m":
-            coverage_state = minute_state
-        else:
-            coverage_state = _compute_coverage_state(
-                tf_key,
-                series,
-                start_ms=window_start_ms,
-                end_ms=window_end_ms,
-            )
-        coverage_states[tf_key] = coverage_state
-        coverage_traces.append(
-            {
-                "tf": tf_key,
-                "stage": "final",
-                "in": coverage_state.expected_bars,
-                "out": coverage_state.present_bars,
-                "top_reason": "ok" if coverage_state.gap_count == 0 else "missing",
-            }
-        )
-
     tick_inference_frames: Dict[str, Sequence[Mapping[str, Any]]] = {}
     for tf_key, payload in liquidity_frames.items():
         candles = payload.get("candles") if isinstance(payload, Mapping) else None
@@ -6819,12 +6159,6 @@ async def build_check_all_datas(
         meta=raw_meta,
         logger=logging.getLogger(__name__),
     )
-
-    tick_meta = {
-        "source": tick_size_source,
-        "tick_size": tick_size_numeric,
-        "unresolved": 0 if tick_size_numeric and tick_size_numeric > 0 else 1,
-    }
 
     logging.getLogger(__name__).debug(
         "Liquidity tick size resolved for check-all",  # contextual debug entry
@@ -7085,41 +6419,6 @@ async def build_check_all_datas(
         if gating_diag:
             zones_diag["gating"] = gating_diag
 
-<<<<<<< Updated upstream
-    def _inject_liquidity_defaults(payload: Dict[str, Any]) -> Dict[str, Any]:
-        result = dict(payload)
-        tolerance_section = dict(result.get("tolerance", {}))
-        tolerance_section.setdefault("mode", "percent")
-        tolerance_section.setdefault("percent", 0.0004)
-        result["tolerance"] = tolerance_section
-        cluster_section = dict(result.get("cluster", {}))
-        cluster_section.setdefault("price_window_pct", 0.0002)
-        cluster_section.setdefault("time_window_bars", 10)
-        result["cluster"] = cluster_section
-        result.setdefault("lookback", 20)
-        result.setdefault("swing_window", 3)
-        result.setdefault("min_distance_bars", 3)
-        result.setdefault("min_points_dynamic", False)
-        result.setdefault("min_points_floor", 2)
-        return result
-
-    liquidity_config_for_call: Mapping[str, Any] | None
-    if degraded_mode:
-        base_config: Dict[str, Any] = {}
-        if isinstance(liquidity_config, Mapping):
-            base_config.update(liquidity_config)
-        feature_section = dict(base_config.get("feature", {}))
-        feature_section.setdefault("eql_relaxed_clustering", True)
-        feature_section.setdefault("extended_resample", True)
-        feature_section["strict_legacy_mode"] = False
-        base_config["feature"] = feature_section
-        liquidity_config_for_call = _inject_liquidity_defaults(base_config)
-    else:
-        if isinstance(liquidity_config, Mapping):
-            liquidity_config_for_call = _inject_liquidity_defaults(dict(liquidity_config))
-        else:
-            liquidity_config_for_call = _inject_liquidity_defaults({})
-=======
     if "active_session_atr" not in locals():
         active_session_atr = None  # type: ignore[assignment]
     if "active_session_name" not in locals():
@@ -7128,6 +6427,40 @@ async def build_check_all_datas(
     liquidity_config_overrides: Dict[str, Any] = {}
     if isinstance(liquidity_config, Mapping):
         liquidity_config_overrides.update(liquidity_config)
+
+    eq_settings = get_settings().eql_settings
+    eq_ratios: List[float] = []
+    if isinstance(getattr(eq_settings, "tolerance_bps_by_tf", None), Mapping):
+        for value in eq_settings.tolerance_bps_by_tf.values():
+            ratio = _bps_to_ratio(value, default=0.0)
+            if ratio > 0:
+                eq_ratios.append(ratio)
+    base_ratio = _bps_to_ratio(getattr(eq_settings, "tolerance_bps", 0.0), default=0.0)
+    if base_ratio > 0:
+        eq_ratios.append(base_ratio)
+    if eq_ratios:
+        resolved_ratio = min(eq_ratios)
+        if resolved_ratio > 0 and "tolerance_percent" not in liquidity_config_overrides:
+            liquidity_config_overrides.setdefault("tolerance_mode", "percent")
+            liquidity_config_overrides["tolerance_percent"] = resolved_ratio
+    min_separations: List[int] = []
+    if isinstance(getattr(eq_settings, "min_separation_bars_by_tf", None), Mapping):
+        for value in eq_settings.min_separation_bars_by_tf.values():
+            try:
+                numeric = int(value)
+            except (TypeError, ValueError):
+                continue
+            if numeric > 0:
+                min_separations.append(numeric)
+    try:
+        base_separation = int(eq_settings.min_separation_bars)
+    except (TypeError, ValueError):
+        base_separation = 0
+    if base_separation > 0:
+        min_separations.append(base_separation)
+    if min_separations:
+        resolved_min_sep = max(1, min(min_separations))
+        liquidity_config_overrides.setdefault("min_distance_bars", resolved_min_sep)
 
     session_atr_pct: float | None = None
     if active_session_atr is not None:
@@ -7174,7 +6507,6 @@ async def build_check_all_datas(
         liquidity_config_overrides["sweep_atr_multiplier"] = sweep_mult
         liquidity_config_overrides["sweep_min_move_atr"] = min_move_atr
         liquidity_config_overrides["sweep_epsilon_pct"] = epsilon_pct
->>>>>>> Stashed changes
 
     liquidity_payload = await asyncio.to_thread(
         build_liquidity_snapshot,
@@ -7184,11 +6516,7 @@ async def build_check_all_datas(
         tick_source_hint=tick_size_source,
         meta=raw_meta,
         selection=selection_payload,
-<<<<<<< Updated upstream
-        config=liquidity_config_for_call,
-=======
         config=liquidity_config_overrides,
->>>>>>> Stashed changes
     )
 
     liquidity_diagnostics = (
@@ -7278,7 +6606,7 @@ async def build_check_all_datas(
                 orderflow_end_ms=orderflow_end_ms,
                 config=orderflow_config,
                 symbol=symbol,
-                allow_network=network_backfill,
+                allow_network=(network_backfill or orderflow_allow_network),
                 trace_ctx=trace_ctx,
                 budget=budget,
                 orderflow_source=snapshot.get("orderflow"),
@@ -7323,10 +6651,7 @@ async def build_check_all_datas(
     if rollup_payload:
         ohlcv_block = rollup_payload
     else:
-        ohlcv_block = build_multi_timeframe_ohlcv(
-            minute_htf_source,
-            symbol=symbol if minute_ready else None,
-        )
+        ohlcv_block = build_multi_timeframe_ohlcv(minute_htf_source, symbol=symbol)
     if trace_ctx is not None:
         trace_ctx.info(
             "compute.rollups",
@@ -7356,29 +6681,16 @@ async def build_check_all_datas(
         liquidity_source = liquidity_payload
     elif isinstance(snapshot.get("liquidity"), Mapping):
         liquidity_source = snapshot.get("liquidity")  # type: ignore[assignment]
-    smc_stats: Dict[str, Any] | None = None
-    if minute_ready and not degraded_mode:
-        smc_blocks_list, smc_stats = await asyncio.to_thread(
-            detect_smc_blocks,
-            hourly_htf,
-            timeframe="1h",
-            structure_flags=structure_events,
-            ob_zones=ob_candidates,
-            liquidity_levels=liquidity_source,
-            config=smc_config,
-        )
-        smc_blocks = smc_blocks_list
-    else:
-        smc_stats = {
-            "skipped": True,
-            "reason": "minute_not_ready" if not minute_ready else "degraded_mode",
-        }
-        if trace_ctx is not None:
-            trace_ctx.warn(
-                "smc.skipped",
-                scope="smc",
-                reason=smc_stats["reason"],
-            )
+    smc_blocks_list, smc_stats = await asyncio.to_thread(
+        detect_smc_blocks,
+        hourly_htf,
+        timeframe="1h",
+        structure_flags=structure_events,
+        ob_zones=ob_candidates,
+        liquidity_levels=liquidity_source,
+        config=smc_config,
+    )
+    smc_blocks = smc_blocks_list
     if smc_blocks and isinstance(zones_payload, MutableMapping):
         existing_ob = zones_payload.get("ob")
         merged = [dict(item) for item in existing_ob] if isinstance(existing_ob, list) else []
@@ -7947,6 +7259,17 @@ async def build_check_all_datas(
                 continue
             if not requested:
                 continue
+            details = []
+            for tf_name in requested:
+                info = zone_availability.get(tf_name, {})
+                available = int(info.get("available", len(zone_frames_window.get(tf_name, []))))
+                required = int(info.get("adjusted_required", info.get("required", 0)))
+                details.append(f"{tf_name}: {available}/{required}")
+            message = (
+                f"?? ?????????????????? ???????????? ???????????? ?????? {zone_key.upper()} ?????? "
+                f"(???????????????? {', '.join(details)})."
+            )
+            zones_public[zone_key] = [{"message": message, "period": "topup"}]
 
     if trace_ctx is not None:
         trace_ctx.info(
@@ -7996,97 +7319,6 @@ async def build_check_all_datas(
         "openOppositeZones": bool(raw_open_opposite) if isinstance(raw_open_opposite, bool) else False,
     }
 
-<<<<<<< Updated upstream
-    session_flag_template = {
-        session_name: bool(ordered_sessions.get(session_name, {}).get("vwap"))
-        for session_name, _, _ in sessions
-    }
-
-    eqh_levels = liquidity_payload.get("eqh", []) if isinstance(liquidity_payload, Mapping) else []
-    eql_levels = liquidity_payload.get("eql", []) if isinstance(liquidity_payload, Mapping) else []
-    sweeps_events = liquidity_payload.get("sweeps", []) if isinstance(liquidity_payload, Mapping) else []
-
-    eqh_counts: Dict[str, int] = defaultdict(int)
-    for level in eqh_levels:
-        tf_value = str(level.get("tf") or "")
-        if tf_value:
-            eqh_counts[tf_value] += 1
-
-    eql_counts: Dict[str, int] = defaultdict(int)
-    for level in eql_levels:
-        tf_value = str(level.get("tf") or "")
-        if tf_value:
-            eql_counts[tf_value] += 1
-
-    sweep_counts: Dict[str, int] = defaultdict(int)
-    for event in sweeps_events:
-        tf_value = str(event.get("tf") or "")
-        if tf_value:
-            sweep_counts[tf_value] += 1
-
-    zone_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: {"fvg": 0, "ob": 0})
-    if isinstance(zones_public, Mapping):
-        for zone_key, target_key in (("fvg", "fvg"), ("ob", "ob")):
-            series = zones_public.get(zone_key)
-            if not isinstance(series, Sequence):
-                continue
-            for item in series:
-                if not isinstance(item, Mapping):
-                    continue
-                tf_value = str(item.get("tf") or item.get("timeframe") or "")
-                if not tf_value:
-                    continue
-                zone_counts[tf_value][target_key] = zone_counts[tf_value].get(target_key, 0) + 1
-
-    atr_stats = {}
-    sweeps_diag = liquidity_diagnostics.get("sweeps") if isinstance(liquidity_diagnostics, Mapping) else {}
-    if isinstance(sweeps_diag, Mapping):
-        for tf_key, diag in sweeps_diag.items():
-            if not isinstance(diag, Mapping):
-                continue
-            atr_info = diag.get("atr_stats")
-            if isinstance(atr_info, Mapping):
-                atr_mean_value = atr_info.get("atr_mean")
-                if atr_mean_value is not None:
-                    try:
-                        atr_stats[str(tf_key)] = float(atr_mean_value)
-                    except (TypeError, ValueError):
-                        atr_stats[str(tf_key)] = None
-
-    target_timeframes: Tuple[str, ...] = ("1m", "5m", "15m", "1h", "4h", "1d")
-    timeframe_summary: Dict[str, Dict[str, Any]] = {}
-    for tf_key in target_timeframes:
-        tf_summary = {
-            "zones": {
-                "eqh": int(eqh_counts.get(tf_key, 0)),
-                "eql": int(eql_counts.get(tf_key, 0)),
-                "fvg": int(zone_counts.get(tf_key, {}).get("fvg", 0)),
-                "ob": int(zone_counts.get(tf_key, {}).get("ob", 0)),
-            },
-            "sweeps": int(sweep_counts.get(tf_key, 0)),
-            "atr": (round(float(atr_stats.get(tf_key)), 6) if atr_stats.get(tf_key) is not None else None),
-            "vwap_sessions": {session: bool(flag) for session, flag in session_flag_template.items()},
-        }
-        timeframe_summary[tf_key] = tf_summary
-
-    data_payload = {
-        "symbol": symbol,
-        "timeframes": timeframe_summary,
-    }
-
-    availability: Dict[str, Any] = {
-        "timeframes": {
-            tf: {
-                "zones": timeframe_summary.get(tf, {}).get("zones", {}),
-                "sweeps": timeframe_summary.get(tf, {}).get("sweeps", 0),
-                "atr": timeframe_summary.get(tf, {}).get("atr"),
-                "vwap_sessions": timeframe_summary.get(tf, {}).get("vwap_sessions", {}),
-            }
-            for tf in timeframe_summary
-        }
-    }
-    missing_fields_list: List[str] = []
-=======
     timeframe_order: Tuple[str, ...] = ("1m", "5m", "15m", "1h", "4h", "1d")
     zone_keys_summary: Tuple[str, ...] = ("eqh", "eql", "fvg", "ob")
 
@@ -8173,6 +7405,41 @@ async def build_check_all_datas(
             "vwap_sessions": dict(session_presence_template),
         }
 
+    smc_summary_lines: List[str] = []
+    smc_blocks_public: List[Dict[str, Any]] = []
+    if smc_blocks:
+        for block in smc_blocks:
+            if not isinstance(block, Mapping):
+                continue
+            public_block = {key: value for key, value in block.items() if key != "_created_idx"}
+            smc_blocks_public.append(public_block)
+            created_at_ms = _safe_int(block.get("created_at"))
+            created_iso = _isoformat_utc(created_at_ms) if created_at_ms is not None else ""
+            tf_label = str(block.get("tf") or "").lower()
+            direction_label = str(block.get("type") or "").lower()
+            kind_label = str(block.get("kind") or "").upper()
+            price_range = block.get("range")
+            low_value = _safe_float(price_range[0]) if isinstance(price_range, Sequence) and price_range else None
+            high_value = _safe_float(price_range[1]) if isinstance(price_range, Sequence) and len(price_range) > 1 else None
+            low_text = f"{low_value:.4f}" if low_value is not None else "n/a"
+            high_text = f"{high_value:.4f}" if high_value is not None else "n/a"
+            status_label = str(block.get("status") or "").lower() or "unknown"
+            parts = [
+                created_iso,
+                tf_label,
+                direction_label,
+                kind_label,
+                f"{low_text}-{high_text}",
+                f"status={status_label}",
+            ]
+            score_value = block.get("score")
+            if isinstance(score_value, (int, float)):
+                parts.append(f"score={float(score_value):.2f}")
+            confidence_value = block.get("confidence")
+            if isinstance(confidence_value, (int, float)):
+                parts.append(f"conf={float(confidence_value):.2f}")
+            smc_summary_lines.append(" | ".join(part for part in parts if part))
+
     data_payload = {
         "symbol": symbol,
         "ohlcv": ohlcv_public,
@@ -8187,6 +7454,11 @@ async def build_check_all_datas(
         "context": context_public,
         "timeframes": timeframes_summary,
     }
+    if smc_summary_lines or smc_blocks_public:
+        data_payload["smc"] = {
+            "summary": smc_summary_lines,
+            "blocks": smc_blocks_public,
+        }
 
     showcase_window = ZONE_FOCUS_WINDOW_HOURS
     if isinstance(zones_recent_focus, Mapping):
@@ -8335,7 +7607,6 @@ async def build_check_all_datas(
     missing_fields_list = sorted(missing_fields)
     if missing_fields_list:
         LOGGER.info("Missing fields detected", extra={"missing_fields": missing_fields_list})
->>>>>>> Stashed changes
 
     meta_block: Dict[str, Any] = {
         "symbol": symbol,
@@ -8350,6 +7621,14 @@ async def build_check_all_datas(
     meta_block["window_hours"] = int(base_window_hours)
     meta_block["strict_window"] = bool(strict_window)
     meta_block["strict_three_day"] = bool(strict_three_day)
+    if vision_ingest_summary is not None:
+        ingest_snapshot = dict(vision_ingest_summary)
+        if vision_required_hours is not None:
+            ingest_snapshot["required_hours"] = int(vision_required_hours)
+        window_payload = ingest_snapshot.get("window")
+        if isinstance(window_payload, Mapping):
+            ingest_snapshot["window"] = dict(window_payload)
+        meta_block["vision_ingest"] = ingest_snapshot
     if snapshot_age_sec is not None:
         meta_block["snapshot_age_sec"] = snapshot_age_sec
     if insufficient_reason:
@@ -8368,23 +7647,6 @@ async def build_check_all_datas(
     meta_block["invalid_ohlc_count"] = invalid_ohlc_total
     meta_block["sanitized"] = sanitized_applied
     meta_block["sessions_empty"] = sessions_empty_flag
-    if three_day_anchors:
-        meta_block["three_day_window"] = three_day_anchors
-    meta_block["minute_ready"] = bool(minute_ready)
-    if minute_ready_ts is not None:
-        meta_block["minute_ready_ts"] = int(minute_ready_ts)
-    meta_block["degraded_mode"] = bool(degraded_mode)
-    if degraded_reasons:
-        meta_block["degraded_reasons"] = degraded_reasons
-    if coverage_states:
-        meta_block["coverage"] = {
-            tf: state.to_payload() for tf, state in coverage_states.items()
-        }
-    if coverage_traces:
-        meta_block["coverage_trace"] = coverage_traces
-    meta_block["fallback_ohlcv_minute"] = 0
-    meta_block["liquidity_map_year_out_of_range"] = 0
-    meta_block["derivatives_fallback_minute"] = 0
 
     stage_breakdown: Dict[str, Dict[str, int]] = {}
     for stage, counts in sorted(invalid_candle_stages.items()):
@@ -8392,43 +7654,6 @@ async def build_check_all_datas(
         if filtered_counts:
             stage_breakdown[stage] = filtered_counts
     meta_block["invalid_candle_stages"] = stage_breakdown
-    diagnostics_block = {
-        "coverage": {tf: state.to_payload() for tf, state in coverage_states.items()},
-        "coverage_trace": coverage_traces,
-        "liquidity": liquidity_diagnostics,
-        "sweeps": sweeps_events,
-        "zones": zones_diag,
-        "liquidity_levels": liquidity_equal_levels,
-        "vwap_tpo": vwap_tpo_public,
-        "orderflow": orderflow_public,
-        "context": context_public,
-        "api": _normalise_api_diagnostics(api_diagnostics),
-    }
-    daily_state = coverage_states.get("1d")
-    day_frames_seq = frames.get("1d")
-    daily_available = bool(daily_state and daily_state.present_bars > 0)
-    if not daily_available and isinstance(day_frames_seq, Sequence):
-        daily_available = any(isinstance(entry, Mapping) for entry in day_frames_seq)
-    diagnostics_block["daily"] = {
-        "available": daily_available,
-        "coverage": daily_state.to_payload() if daily_state else None,
-    }
-    diagnostics_block["sessions"] = ordered_sessions
-    if isinstance(zones_diag, Mapping):
-        confirmations_payload: Mapping[str, Any] | None = None
-        direct_conf = zones_diag.get("confirmations")
-        if isinstance(direct_conf, Mapping):
-            confirmations_payload = direct_conf
-        else:
-            summary_conf = zones_diag.get("summary") if isinstance(zones_diag.get("summary"), Mapping) else None
-            if isinstance(summary_conf, Mapping):
-                nested_conf = summary_conf.get("confirmations")
-                if isinstance(nested_conf, Mapping):
-                    confirmations_payload = nested_conf
-        if confirmations_payload:
-            diagnostics_block["confirmations"] = dict(confirmations_payload)
-    meta_block["diagnostics"] = diagnostics_block
-    meta_block["tick_meta"] = tick_meta
 
     if invalid_ts_total:
         if stage_breakdown:
