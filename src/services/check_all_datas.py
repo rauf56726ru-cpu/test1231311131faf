@@ -10,6 +10,7 @@ import math
 import numbers
 import inspect
 import time
+import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, time as dtime
 from typing import (
@@ -321,7 +322,13 @@ ORDERFLOW_REQUIRED_HOURS = PIPELINE_PRESET_DEFAULT.orderflow.window_hours
 ORDERFLOW_WINDOW_MS = ORDERFLOW_REQUIRED_HOURS * MS_IN_HOUR
 _AGG_TRADES_PAGE_MS = ORDERFLOW_WINDOW_MS  # default page span; overridden by preset
 _AGG_TRADES_LIMIT = 1000
+_AGG_TRADES_EXPORT_LIMIT = 500
 BINANCE_FAPI_AGG_TRADES = "https://fapi.binance.com/fapi/v1/aggTrades"
+_AGG_TRADES_RETRYABLE_STATUSES: Set[int] = {429, 500, 502, 503, 504}
+_AGG_TRADES_MAX_ATTEMPTS = 5
+_AGG_TRADES_BACKOFF_SECONDS = 0.5
+_AGG_TRADES_BACKOFF_JITTER = 0.3
+_AGG_TRADES_BATCH_MAX_MS = 60 * MINUTE_INTERVAL_MS
 
 
 
@@ -550,7 +557,32 @@ async def build_check_all_datas_async(
                 "network_backfill": build_kwargs.get("network_backfill"),
             },
         )
-        return _insufficient_from_context(context)
+        fallback_kwargs = dict(build_kwargs)
+        fallback_kwargs["time_budget_seconds"] = None
+        try:
+            fallback_result = await build_check_all_datas(snapshot, **fallback_kwargs)
+        except Exception:
+            LOGGER.exception(
+                "Check-all fallback build failed",
+                extra={
+                    "symbol": context.symbol,
+                    "hours": build_kwargs.get("hours"),
+                    "window_hours": build_kwargs.get("window_hours"),
+                    "strict_window": build_kwargs.get("strict_window"),
+                },
+            )
+            return _insufficient_from_context(context)
+        if isinstance(fallback_result, MutableMapping):
+            notes_block = fallback_result.get("notes")
+            fallback_note = (
+                "Primary build exceeded async timeout; completed via extended fallback pipeline."
+            )
+            if isinstance(notes_block, list):
+                if fallback_note not in notes_block:
+                    notes_block.append(fallback_note)
+            else:
+                fallback_result["notes"] = [fallback_note]
+        return fallback_result
 
 
 def _isoformat_utc(timestamp_ms: int) -> str:
@@ -2353,6 +2385,40 @@ def _bucket_trades_by_minute(
     return buckets
 
 
+def _compute_trade_coverage(
+    start_ms: int, end_ms: int, trades: Sequence[Mapping[str, Any]]
+) -> Tuple[int, List[List[int]]]:
+    """Compute hourly coverage for downloaded agg trades."""
+
+    if start_ms >= end_ms:
+        return 0, []
+
+    total_hours = max(0, math.ceil((end_ms - start_ms) / MS_IN_HOUR))
+    if total_hours <= 0:
+        return 0, []
+
+    covered_hours: Set[int] = set()
+    for record in trades:
+        ts = _safe_int(record.get("t"))
+        if ts is None or ts < start_ms or ts >= end_ms:
+            continue
+        hour_index = (ts - start_ms) // MS_IN_HOUR
+        if 0 <= hour_index < total_hours:
+            covered_hours.add(int(hour_index))
+
+    hours_ok = 0
+    missing_windows: List[List[int]] = []
+    for hour_index in range(total_hours):
+        hour_start = start_ms + hour_index * MS_IN_HOUR
+        hour_end = min(end_ms, hour_start + MS_IN_HOUR)
+        if hour_index in covered_hours:
+            hours_ok += 1
+        else:
+            missing_windows.append([hour_start, hour_end])
+
+    return hours_ok, missing_windows
+
+
 async def _download_agg_trades_async(
     symbol: str,
     start_ms: int,
@@ -2368,9 +2434,36 @@ async def _download_agg_trades_async(
         "downloaded": 0,
         "status": None,
         "batches": 0,
+        "hours_ok": 0,
+        "missing_windows": [],
+        "requests_count": 0,
     }
+
+    def _finalise(records: List[Dict[str, Any]], *, status_override: Any | None = None):
+        ordered = sorted(records, key=lambda item: int(item.get("t", 0)))
+        hours_ok, missing_windows = _compute_trade_coverage(start_ms, end_ms, ordered)
+        diag["hours_ok"] = hours_ok
+        diag["missing_windows"] = missing_windows
+        diag["downloaded"] = len(ordered)
+        if status_override is not None:
+            diag["status"] = status_override
+        elif diag.get("status") is None:
+            diag["status"] = 200 if ordered else 204
+        LOGGER.info(
+            "Binance aggTrades coverage",
+            extra={
+                "symbol": symbol,
+                "hours_ok": diag["hours_ok"],
+                "missing_windows": diag["missing_windows"],
+                "requests_count": diag["requests_count"],
+                "window_start": start_ms,
+                "window_end": end_ms,
+            },
+        )
+        return ordered, diag
+
     if start_ms >= end_ms:
-        return [], diag
+        return _finalise([], status_override=204)
 
     store = get_store()
     store_rows = await asyncio.to_thread(
@@ -2381,57 +2474,40 @@ async def _download_agg_trades_async(
     )
     if store_rows:
         normalised = _extract_trades(store_rows, source="vision_store")
-        diag.update(
-            {
-                "downloaded": len(normalised),
-                "status": "vision_store",
-                "attempted": False,
-                "batches": 1,
-            }
-        )
-        return normalised, diag
+        records = [record for record in normalised if start_ms <= record.get("t", 0) < end_ms]
+        diag.update({"status": "vision_store", "attempted": False, "batches": 1})
+        return _finalise(records)
 
     if not allow_network:
-        return [], diag
+        return _finalise([])
 
     if callable(_fetch_binance_agg_trades):
         result = _fetch_binance_agg_trades(symbol, start_ms, end_ms, _AGG_TRADES_LIMIT)
         rows = await result if inspect.isawaitable(result) else result  # type: ignore[arg-type]
         normalised = _extract_trades(rows, source="download")
-        diag["downloaded"] = len(normalised)
-        diag["status"] = 200 if normalised else None
-        if diag["status"] is None and not normalised:
-            diag["status"] = 204
-        return normalised, diag
+        records = [record for record in normalised if start_ms <= record.get("t", 0) < end_ms]
+        status = 200 if records else 204
+        return _finalise(records, status_override=status)
 
-    trades: List[Dict[str, Any]] = []
     scope = "orderflow.aggTrades"
-    cursor = start_ms
     timeout = httpx.Timeout(15.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        while cursor < end_ms:
+    batch_span_ms = max(MINUTE_INTERVAL_MS, min(page_span_ms, _AGG_TRADES_BATCH_MAX_MS))
+    seen_trade_ids: Set[int] = set()
+    raw_rows: List[Dict[str, Any]] = []
+    exhausted = False
+
+    async def _request_page(
+        client: httpx.AsyncClient,
+        params: Dict[str, str],
+        window: Tuple[int, int],
+    ) -> httpx.Response:
+        last_exc: Exception | None = None
+        for attempt in range(_AGG_TRADES_MAX_ATTEMPTS):
             try:
                 budget.raise_if_exceeded("orderflow_trades_download")
-            except _TimeBudgetExceeded as exc:
-                LOGGER.warning(
-                    "Orderflow trade download hit budget",
-                    extra={
-                        "symbol": symbol,
-                        "stage": exc.stage,
-                        "cursor": cursor,
-                        "window_start": start_ms,
-                        "window_end": end_ms,
-                    },
-                )
-                diag["status"] = "budget_exceeded"
-                break
-            page_end = min(end_ms, cursor + page_span_ms)
-            params = {
-                "symbol": symbol.upper(),
-                "startTime": str(cursor),
-                "endTime": str(page_end),
-                "limit": str(_AGG_TRADES_LIMIT),
-            }
+            except _TimeBudgetExceeded:
+                raise
+            diag["requests_count"] += 1
             try:
                 response = await http_request(
                     "GET",
@@ -2441,47 +2517,160 @@ async def _download_agg_trades_async(
                     params=params,
                     client=client,
                     symbol=symbol,
-                    window=(cursor, page_end),
+                    window=window,
                     details=f"limit={_AGG_TRADES_LIMIT}",
-                    max_retries=2,
-                    retry_statuses=TRANSIENT_STATUSES,
+                    max_retries=0,
+                    retry_statuses=(),
                     rate_limit_statuses=RATE_LIMIT_STATUSES,
                 )
             except Exception as exc:  # pragma: no cover - network guard
-                LOGGER.debug(
-                    "Failed to download agg trades",
-                    exc_info=exc,
-                    extra={"symbol": symbol, "cursor": cursor, "page_end": page_end},
-                )
-                diag["status"] = "request_failed"
-                break
+                last_exc = exc
+                if attempt == _AGG_TRADES_MAX_ATTEMPTS - 1:
+                    raise
+            else:
+                status_code = response.status_code
+                if (
+                    status_code in _AGG_TRADES_RETRYABLE_STATUSES
+                    and attempt < _AGG_TRADES_MAX_ATTEMPTS - 1
+                ):
+                    delay = _AGG_TRADES_BACKOFF_SECONDS * (2 ** attempt)
+                    jitter = random.uniform(0.0, delay * _AGG_TRADES_BACKOFF_JITTER)
+                    await asyncio.sleep(delay + jitter)
+                    continue
+                return response
 
-            status = response.status_code
+            delay = _AGG_TRADES_BACKOFF_SECONDS * (2 ** attempt)
+            jitter = random.uniform(0.0, delay * _AGG_TRADES_BACKOFF_JITTER)
+            await asyncio.sleep(delay + jitter)
+
+        assert last_exc is not None  # pragma: no cover - defensive
+        raise last_exc
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        batch_start = start_ms
+        while batch_start < end_ms and not exhausted:
+            batch_end = min(end_ms, batch_start + batch_span_ms)
             diag["batches"] += 1
+            from_id: int | None = None
+            while True:
+                params: Dict[str, str] = {"symbol": symbol.upper(), "limit": str(_AGG_TRADES_LIMIT)}
+                if from_id is None:
+                    params.update({"startTime": str(batch_start), "endTime": str(batch_end)})
+                else:
+                    params["fromId"] = str(from_id)
 
-            if status != 200:
-                diag["status"] = status
-                if status in RATE_LIMIT_STATUSES or status >= 500:
+                try:
+                    response = await _request_page(client, params, (batch_start, batch_end))
+                except _TimeBudgetExceeded as exc:
+                    LOGGER.warning(
+                        "Orderflow trade download hit budget",
+                        extra={
+                            "symbol": symbol,
+                            "stage": exc.stage,
+                            "window_start": start_ms,
+                            "window_end": end_ms,
+                            "batch_start": batch_start,
+                            "batch_end": batch_end,
+                        },
+                    )
+                    diag["status"] = "budget_exceeded"
+                    exhausted = True
                     break
-                # For client errors (e.g., synthetic symbols), stop without raising.
-                break
+                except Exception as exc:  # pragma: no cover - network guard
+                    LOGGER.debug(
+                        "Failed to download agg trades",
+                        exc_info=exc,
+                        extra={"symbol": symbol, "batch_start": batch_start, "batch_end": batch_end},
+                    )
+                    diag["status"] = "request_failed"
+                    exhausted = True
+                    break
 
-            payload = response.json()
-            if not isinstance(payload, list):
-                diag["status"] = "invalid_payload"
-                break
-            if not payload:
-                cursor = page_end + 1
-                continue
+                status_code = response.status_code
+                if status_code != 200:
+                    diag["status"] = status_code
+                    if status_code in _AGG_TRADES_RETRYABLE_STATUSES:
+                        exhausted = True
+                    else:
+                        exhausted = True
+                    break
 
-            trades.extend(_extract_trades(payload, source="download"))
-            diag["downloaded"] = len(trades)
-            diag["status"] = status
+                payload = response.json()
+                if not isinstance(payload, list):
+                    diag["status"] = "invalid_payload"
+                    exhausted = True
+                    break
+                if not payload:
+                    break
 
-            last_trade_time = max(int(row.get("t", row.get("T", cursor))) for row in payload)
-            cursor = max(last_trade_time + 1, page_end + 1)
+                batch_overflow = False
+                last_kept_id: int | None = None
+                last_kept_time: int | None = None
+                last_payload_id: int | None = None
+                last_payload_time: int | None = None
+                kept_entries: List[Dict[str, Any]] = []
+                for entry in payload:
+                    trade_time = _safe_int(entry.get("T") or entry.get("t"))
+                    trade_id = _safe_int(entry.get("a") or entry.get("A"))
+                    if trade_time is not None:
+                        last_payload_time = trade_time
+                    if trade_id is not None:
+                        last_payload_id = trade_id
+                    if trade_time is None:
+                        continue
+                    if trade_time < batch_start or trade_time >= end_ms:
+                        continue
+                    if trade_time >= batch_end:
+                        batch_overflow = True
+                        continue
+                    if trade_id is not None and trade_id in seen_trade_ids:
+                        continue
+                    if trade_id is not None:
+                        seen_trade_ids.add(trade_id)
+                    kept_entries.append(dict(entry))
+                    last_kept_id = trade_id if trade_id is not None else last_kept_id
+                    last_kept_time = trade_time if trade_time is not None else last_kept_time
 
-    return trades, diag
+                if kept_entries:
+                    raw_rows.extend(kept_entries)
+                    diag["downloaded"] = len(raw_rows)
+                    diag["status"] = status_code
+
+                if batch_overflow and (kept_entries or (last_payload_time and last_payload_time >= batch_end)):
+                    break
+
+                if not kept_entries and len(payload) < _AGG_TRADES_LIMIT:
+                    break
+
+                if not kept_entries and last_payload_id is not None and from_id is not None:
+                    if last_payload_id + 1 == from_id:
+                        break
+                    from_id = last_payload_id + 1
+                    continue
+
+                if not kept_entries:
+                    break
+
+                if last_kept_time is not None and last_kept_time >= batch_end - 1:
+                    break
+
+                if len(payload) < _AGG_TRADES_LIMIT:
+                    break
+
+                if last_kept_id is None:
+                    break
+
+                from_id = last_kept_id + 1
+
+            batch_start = batch_end
+
+    records = _extract_trades(raw_rows, source="download")
+    filtered_records = [record for record in records if start_ms <= record.get("t", 0) < end_ms]
+    if diag.get("status") is None and filtered_records:
+        diag["status"] = 200
+    elif diag.get("status") is None:
+        diag["status"] = 204
+    return _finalise(filtered_records)
 
 
 async def _load_orderflow_trades(
@@ -2991,7 +3180,39 @@ async def _build_orderflow_block(
         budget=budget,
         page_span_ms=page_span_ms,
     )
-    diag["trades"] = trades_diag
+    export_trades: List[Dict[str, Any]] = []
+    for trade in trades:
+        if not isinstance(trade, Mapping):
+            continue
+        ts_value = _safe_int(trade.get("t"))
+        qty_value = _coerce_float(trade.get("qty"))
+        if ts_value is None or qty_value is None:
+            continue
+        export_trades.append(
+            {
+                "t": ts_value,
+                "q": qty_value,
+                "side": trade.get("side"),
+                "p": _coerce_float(trade.get("price")),
+            }
+        )
+    export_trades.sort(key=lambda entry: entry["t"])
+    truncated_trades = 0
+    if len(export_trades) > _AGG_TRADES_EXPORT_LIMIT:
+        truncated_trades = len(export_trades) - _AGG_TRADES_EXPORT_LIMIT
+        export_trades = export_trades[-_AGG_TRADES_EXPORT_LIMIT :]
+    summary_total = {
+        "count": len(export_trades) + truncated_trades,
+        "buy": sum(1 for trade in trades if str(trade.get("side")).lower() == "buy"),
+        "sell": sum(1 for trade in trades if str(trade.get("side")).lower() == "sell"),
+        "volume": sum(float(trade.get("qty", 0.0)) for trade in trades),
+    }
+    diag_trades = dict(trades_diag)
+    diag_trades["records"] = export_trades
+    diag_trades["summary"] = summary_total
+    if truncated_trades:
+        diag_trades["truncated"] = truncated_trades
+    diag["trades"] = diag_trades
 
     trades_by_minute = _bucket_trades_by_minute(
         trades,
@@ -4615,6 +4836,7 @@ async def build_check_all_datas(
     network_backfill: bool = True,
     trace: TraceContext | None = None,
     progress: ProgressReporter | None = None,
+    time_budget_seconds: float | None = _BUILD_TIMEOUT_SECONDS,
 ) -> Dict[str, Any] | None:
     """Create an enriched payload for the snapshot health endpoint."""
 
@@ -4705,7 +4927,7 @@ async def build_check_all_datas(
     def _register_invalid_candle(_ts: int, stage: str) -> None:
         _record_invalid(stage, invalid_ts=1)
 
-    budget = _TimeBudget(_BUILD_TIMEOUT_SECONDS)
+    budget = _TimeBudget(time_budget_seconds)
 
     context = _prepare_snapshot_context(snapshot, now_utc)
     frames = context.frames
@@ -4821,8 +5043,6 @@ async def build_check_all_datas(
         )
 
     strict_three_day = bool(strict_window and base_window_hours >= 72)
-    if strict_three_day and network_backfill:
-        network_backfill = False
 
     window_end_guess = _resolve_window_end_ms(
         frames,
@@ -7209,6 +7429,94 @@ async def build_check_all_datas(
             if isinstance(summary_source, Mapping):
                 summary_payload = dict(summary_source)
         orderflow_public[tf] = {"per_bar": per_bar, "summary": summary_payload}
+
+    snapshot_window = _filter_agg_trades(
+        snapshot.get("agg_trades"),
+        start_ms=window_start_ms,
+        end_ms=window_end_ms,
+        include_trades=True,
+    )
+    agg_trades_window: Dict[str, Any] | None = None
+    trades_diag = orderflow_diag.get("trades") if isinstance(orderflow_diag, Mapping) else None
+    if isinstance(trades_diag, Mapping):
+        symbol_override: str | None = None
+        agg_payload = snapshot.get("agg_trades")
+        if isinstance(agg_payload, Mapping):
+            symbol_value = agg_payload.get("symbol")
+            if isinstance(symbol_value, str):
+                symbol_override = symbol_value
+        if not symbol_override and isinstance(snapshot.get("symbol"), str):
+            symbol_override = str(snapshot.get("symbol"))
+        records_payload = trades_diag.get("records") if isinstance(trades_diag, Mapping) else None
+        if isinstance(records_payload, Sequence):
+            filtered_payload = {
+                "symbol": symbol_override,
+                "agg": [dict(record) for record in records_payload if isinstance(record, Mapping)],
+            }
+            agg_trades_window = _filter_agg_trades(
+                filtered_payload,
+                start_ms=None,
+                end_ms=None,
+                include_trades=True,
+            )
+        summary_override = trades_diag.get("summary") if isinstance(trades_diag, Mapping) else None
+        if agg_trades_window is None:
+            agg_trades_window = {
+                "symbol": symbol_override,
+                "summary": {"count": 0, "buy": 0, "sell": 0, "volume": 0.0},
+                "trades": [],
+            }
+        if isinstance(summary_override, Mapping):
+            resolved_count = summary_override.get("count")
+            if resolved_count:
+                agg_trades_window["summary"] = {
+                    "count": int(resolved_count),
+                    "buy": int(summary_override.get("buy", agg_trades_window["summary"].get("buy", 0))),
+                    "sell": int(summary_override.get("sell", agg_trades_window["summary"].get("sell", 0))),
+                    "volume": float(summary_override.get("volume", agg_trades_window["summary"].get("volume", 0.0))),
+                }
+        truncated_value = trades_diag.get("truncated")
+        if isinstance(truncated_value, (int, float)) and truncated_value > 0:
+            agg_trades_window["truncated"] = int(truncated_value)
+        summary_count = int(agg_trades_window["summary"].get("count", 0))
+        counts_snapshot = trades_diag.get("snapshot_trades")
+        if counts_snapshot in (None, 0) and summary_count:
+            counts_snapshot = summary_count
+        counts_resolved = trades_diag.get("resolved_trades")
+        if counts_resolved in (None, 0) and summary_count:
+            counts_resolved = summary_count
+        counts_block = {
+            "snapshot": int(counts_snapshot or 0),
+            "downloaded": int(trades_diag.get("downloaded_trades", 0)),
+            "resolved": int(counts_resolved or 0),
+        }
+        agg_trades_window["counts"] = counts_block
+        sources_block = trades_diag.get("sources")
+        if isinstance(sources_block, Sequence) and sources_block:
+            agg_trades_window["sources"] = [str(source) for source in sources_block]
+        elif summary_count:
+            agg_trades_window["sources"] = ["snapshot"]
+        download_block = trades_diag.get("download")
+        if isinstance(download_block, Mapping):
+            agg_trades_window["download"] = dict(download_block)
+    if agg_trades_window is None:
+        agg_trades_window = snapshot_window
+    elif snapshot_window is not None:
+        if (not agg_trades_window.get("trades")) and snapshot_window.get("trades"):
+            agg_trades_window["trades"] = snapshot_window.get("trades", [])
+        existing_summary = agg_trades_window.get("summary", {})
+        if not existing_summary or not existing_summary.get("count"):
+            agg_trades_window["summary"] = snapshot_window.get("summary", existing_summary)
+        if agg_trades_window.get("symbol") is None:
+            agg_trades_window["symbol"] = snapshot_window.get("symbol")
+    if agg_trades_window is not None:
+        agg_trades_window["range"] = {
+            "start_ms": window_start_ms,
+            "end_ms": window_end_ms,
+            "start_utc": _isoformat_utc(window_start_ms),
+            "end_utc": _isoformat_utc(window_end_ms),
+        }
+        orderflow_public["agg_trades"] = agg_trades_window
 
     orderflow_public["diag"] = orderflow_diag
 

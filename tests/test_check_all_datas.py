@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 import asyncio
 import json
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Dict, List, Mapping, Sequence
 import time
 
 import pytest
@@ -668,6 +668,106 @@ def test_orderflow_block_matches_spec(client: TestClient) -> None:
         if tf in {"15m", "1h"}:
             assert series, f"Expected aggregated series for {tf} to be non-empty"
 
+    orderflow_data = body["data"]["orderflow"]
+    agg_trades_block = orderflow_data.get("agg_trades")
+    assert isinstance(agg_trades_block, dict)
+    assert agg_trades_block.get("symbol") == "BTCUSDT"
+    window_block = agg_trades_block.get("range")
+    assert isinstance(window_block, dict)
+    assert window_block["end_ms"] >= window_block["start_ms"]
+    summary = agg_trades_block.get("summary", {})
+    assert isinstance(summary.get("count"), int)
+    assert isinstance(summary.get("buy"), int)
+    assert isinstance(summary.get("sell"), int)
+    assert isinstance(summary.get("volume"), (int, float))
+    counts_block = agg_trades_block.get("counts")
+    assert isinstance(counts_block, dict)
+    assert counts_block.get("resolved") == summary.get("count")
+    assert counts_block.get("snapshot") >= 0
+    assert counts_block.get("downloaded") >= 0
+    exported_trades = agg_trades_block.get("trades")
+    assert isinstance(exported_trades, list)
+    if summary.get("count"):
+        assert exported_trades
+    else:
+        assert exported_trades == []
+
+
+@pytest.mark.anyio
+async def test_download_agg_trades_paginates_full_window(monkeypatch) -> None:
+    class _DummyStore:
+        def fetch_agg_trades(self, *_, **__):
+            return []
+
+    monkeypatch.setattr(check_all_datas, "get_store", lambda: _DummyStore())
+
+    base_ts = 1_700_000_000_000
+    step_ms = 500
+    hours = 3
+    per_hour = check_all_datas.MS_IN_HOUR // step_ms
+    trades: List[Dict[str, Any]] = []
+    trade_id = 0
+    for hour_index in range(hours):
+        hour_start = base_ts + hour_index * check_all_datas.MS_IN_HOUR
+        for offset in range(per_hour):
+            trades.append(
+                {
+                    "t": hour_start + offset * step_ms,
+                    "p": 100.0 + trade_id * 0.0001,
+                    "q": 1.0 + (trade_id % 5) * 0.01,
+                    "m": bool(trade_id % 2),
+                    "a": trade_id,
+                }
+            )
+            trade_id += 1
+    total = len(trades)
+
+    monkeypatch.setattr(check_all_datas, "_fetch_binance_agg_trades", None)
+
+    class _DummyResponse:
+        def __init__(self, payload):
+            self.status_code = 200
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    async def fake_http_request(method, url, *, params=None, **_):
+        assert method == "GET"
+        assert params is not None
+        limit = int(params["limit"])
+        if "fromId" in params:
+            from_id = int(params["fromId"])
+            window = [row for row in trades if row["a"] >= from_id]
+        else:
+            start_ms = int(params["startTime"])
+            end_ms = int(params["endTime"])
+            window = [row for row in trades if start_ms <= row["t"] < end_ms]
+        payload = [dict(row) for row in window[:limit]]
+        return _DummyResponse(payload)
+
+    monkeypatch.setattr(check_all_datas, "http_request", fake_http_request)
+
+    records, diag = await check_all_datas._download_agg_trades_async(
+        "BTCUSDT",
+        base_ts,
+        base_ts + hours * check_all_datas.MS_IN_HOUR,
+        allow_network=True,
+        trace_ctx=None,
+        budget=check_all_datas._TimeBudget(None),
+        page_span_ms=12 * 60 * 60 * 1000,
+    )
+
+    assert len(records) == total
+    assert records[0]["t"] == trades[0]["t"]
+    assert records[-1]["t"] == trades[-1]["t"]
+    assert diag["downloaded"] == total
+    assert diag["batches"] >= hours
+    assert diag["status"] == 200
+    assert diag["hours_ok"] == hours
+    assert diag["missing_windows"] == []
+    assert diag["requests_count"] > diag["batches"]
+
 
 def test_vwap_tpo_sessions_include_aliases(client: TestClient) -> None:
     base = datetime(2024, 4, 1, 0, 0, tzinfo=UTC)
@@ -959,8 +1059,11 @@ async def test_async_builder_timeout_returns_insufficient(monkeypatch):
     result = await check_all_datas.build_check_all_datas_async(snapshot, timeout=0.05)
 
     assert result is not None
-    assert result["status"] == "insufficient_data"
-    assert result["meta"]["insufficient_reason"] == "stale_or_unseeded_buffers"
+    assert result["status"] == "ok"
+    notes = result.get("notes", [])
+    assert any(
+        "extended fallback" in str(note) for note in notes
+    ), "Expected fallback note in response notes"
 
 def test_build_inspection_error_payload_sets_reason() -> None:
     now = datetime(2024, 1, 1, tzinfo=UTC)
