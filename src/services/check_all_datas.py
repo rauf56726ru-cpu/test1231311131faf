@@ -10,6 +10,7 @@ import math
 import numbers
 import inspect
 import time
+import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, time as dtime
 from typing import (
@@ -323,6 +324,11 @@ _AGG_TRADES_PAGE_MS = ORDERFLOW_WINDOW_MS  # default page span; overridden by pr
 _AGG_TRADES_LIMIT = 1000
 _AGG_TRADES_EXPORT_LIMIT = 500
 BINANCE_FAPI_AGG_TRADES = "https://fapi.binance.com/fapi/v1/aggTrades"
+_AGG_TRADES_RETRYABLE_STATUSES: Set[int] = {429, 500, 502, 503, 504}
+_AGG_TRADES_MAX_ATTEMPTS = 5
+_AGG_TRADES_BACKOFF_SECONDS = 0.5
+_AGG_TRADES_BACKOFF_JITTER = 0.3
+_AGG_TRADES_BATCH_MAX_MS = 60 * MINUTE_INTERVAL_MS
 
 
 
@@ -2379,6 +2385,40 @@ def _bucket_trades_by_minute(
     return buckets
 
 
+def _compute_trade_coverage(
+    start_ms: int, end_ms: int, trades: Sequence[Mapping[str, Any]]
+) -> Tuple[int, List[List[int]]]:
+    """Compute hourly coverage for downloaded agg trades."""
+
+    if start_ms >= end_ms:
+        return 0, []
+
+    total_hours = max(0, math.ceil((end_ms - start_ms) / MS_IN_HOUR))
+    if total_hours <= 0:
+        return 0, []
+
+    covered_hours: Set[int] = set()
+    for record in trades:
+        ts = _safe_int(record.get("t"))
+        if ts is None or ts < start_ms or ts >= end_ms:
+            continue
+        hour_index = (ts - start_ms) // MS_IN_HOUR
+        if 0 <= hour_index < total_hours:
+            covered_hours.add(int(hour_index))
+
+    hours_ok = 0
+    missing_windows: List[List[int]] = []
+    for hour_index in range(total_hours):
+        hour_start = start_ms + hour_index * MS_IN_HOUR
+        hour_end = min(end_ms, hour_start + MS_IN_HOUR)
+        if hour_index in covered_hours:
+            hours_ok += 1
+        else:
+            missing_windows.append([hour_start, hour_end])
+
+    return hours_ok, missing_windows
+
+
 async def _download_agg_trades_async(
     symbol: str,
     start_ms: int,
@@ -2394,9 +2434,36 @@ async def _download_agg_trades_async(
         "downloaded": 0,
         "status": None,
         "batches": 0,
+        "hours_ok": 0,
+        "missing_windows": [],
+        "requests_count": 0,
     }
+
+    def _finalise(records: List[Dict[str, Any]], *, status_override: Any | None = None):
+        ordered = sorted(records, key=lambda item: int(item.get("t", 0)))
+        hours_ok, missing_windows = _compute_trade_coverage(start_ms, end_ms, ordered)
+        diag["hours_ok"] = hours_ok
+        diag["missing_windows"] = missing_windows
+        diag["downloaded"] = len(ordered)
+        if status_override is not None:
+            diag["status"] = status_override
+        elif diag.get("status") is None:
+            diag["status"] = 200 if ordered else 204
+        LOGGER.info(
+            "Binance aggTrades coverage",
+            extra={
+                "symbol": symbol,
+                "hours_ok": diag["hours_ok"],
+                "missing_windows": diag["missing_windows"],
+                "requests_count": diag["requests_count"],
+                "window_start": start_ms,
+                "window_end": end_ms,
+            },
+        )
+        return ordered, diag
+
     if start_ms >= end_ms:
-        return [], diag
+        return _finalise([], status_override=204)
 
     store = get_store()
     store_rows = await asyncio.to_thread(
@@ -2407,58 +2474,40 @@ async def _download_agg_trades_async(
     )
     if store_rows:
         normalised = _extract_trades(store_rows, source="vision_store")
-        diag.update(
-            {
-                "downloaded": len(normalised),
-                "status": "vision_store",
-                "attempted": False,
-                "batches": 1,
-            }
-        )
-        return normalised, diag
+        records = [record for record in normalised if start_ms <= record.get("t", 0) < end_ms]
+        diag.update({"status": "vision_store", "attempted": False, "batches": 1})
+        return _finalise(records)
 
     if not allow_network:
-        return [], diag
+        return _finalise([])
 
     if callable(_fetch_binance_agg_trades):
         result = _fetch_binance_agg_trades(symbol, start_ms, end_ms, _AGG_TRADES_LIMIT)
         rows = await result if inspect.isawaitable(result) else result  # type: ignore[arg-type]
         normalised = _extract_trades(rows, source="download")
-        diag["downloaded"] = len(normalised)
-        diag["status"] = 200 if normalised else None
-        if diag["status"] is None and not normalised:
-            diag["status"] = 204
-        return normalised, diag
+        records = [record for record in normalised if start_ms <= record.get("t", 0) < end_ms]
+        status = 200 if records else 204
+        return _finalise(records, status_override=status)
 
-    trades: List[Dict[str, Any]] = []
     scope = "orderflow.aggTrades"
-    cursor = start_ms
     timeout = httpx.Timeout(15.0)
-    min_advance = max(MINUTE_INTERVAL_MS, 1)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        while cursor < end_ms:
+    batch_span_ms = max(MINUTE_INTERVAL_MS, min(page_span_ms, _AGG_TRADES_BATCH_MAX_MS))
+    seen_trade_ids: Set[int] = set()
+    raw_rows: List[Dict[str, Any]] = []
+    exhausted = False
+
+    async def _request_page(
+        client: httpx.AsyncClient,
+        params: Dict[str, str],
+        window: Tuple[int, int],
+    ) -> httpx.Response:
+        last_exc: Exception | None = None
+        for attempt in range(_AGG_TRADES_MAX_ATTEMPTS):
             try:
                 budget.raise_if_exceeded("orderflow_trades_download")
-            except _TimeBudgetExceeded as exc:
-                LOGGER.warning(
-                    "Orderflow trade download hit budget",
-                    extra={
-                        "symbol": symbol,
-                        "stage": exc.stage,
-                        "cursor": cursor,
-                        "window_start": start_ms,
-                        "window_end": end_ms,
-                    },
-                )
-                diag["status"] = "budget_exceeded"
-                break
-            page_end = min(end_ms, cursor + page_span_ms)
-            params = {
-                "symbol": symbol.upper(),
-                "startTime": str(cursor),
-                "endTime": str(page_end),
-                "limit": str(_AGG_TRADES_LIMIT),
-            }
+            except _TimeBudgetExceeded:
+                raise
+            diag["requests_count"] += 1
             try:
                 response = await http_request(
                     "GET",
@@ -2468,50 +2517,160 @@ async def _download_agg_trades_async(
                     params=params,
                     client=client,
                     symbol=symbol,
-                    window=(cursor, page_end),
+                    window=window,
                     details=f"limit={_AGG_TRADES_LIMIT}",
-                    max_retries=2,
-                    retry_statuses=TRANSIENT_STATUSES,
+                    max_retries=0,
+                    retry_statuses=(),
                     rate_limit_statuses=RATE_LIMIT_STATUSES,
                 )
             except Exception as exc:  # pragma: no cover - network guard
-                LOGGER.debug(
-                    "Failed to download agg trades",
-                    exc_info=exc,
-                    extra={"symbol": symbol, "cursor": cursor, "page_end": page_end},
-                )
-                diag["status"] = "request_failed"
-                break
+                last_exc = exc
+                if attempt == _AGG_TRADES_MAX_ATTEMPTS - 1:
+                    raise
+            else:
+                status_code = response.status_code
+                if (
+                    status_code in _AGG_TRADES_RETRYABLE_STATUSES
+                    and attempt < _AGG_TRADES_MAX_ATTEMPTS - 1
+                ):
+                    delay = _AGG_TRADES_BACKOFF_SECONDS * (2 ** attempt)
+                    jitter = random.uniform(0.0, delay * _AGG_TRADES_BACKOFF_JITTER)
+                    await asyncio.sleep(delay + jitter)
+                    continue
+                return response
 
-            status = response.status_code
+            delay = _AGG_TRADES_BACKOFF_SECONDS * (2 ** attempt)
+            jitter = random.uniform(0.0, delay * _AGG_TRADES_BACKOFF_JITTER)
+            await asyncio.sleep(delay + jitter)
+
+        assert last_exc is not None  # pragma: no cover - defensive
+        raise last_exc
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        batch_start = start_ms
+        while batch_start < end_ms and not exhausted:
+            batch_end = min(end_ms, batch_start + batch_span_ms)
             diag["batches"] += 1
+            from_id: int | None = None
+            while True:
+                params: Dict[str, str] = {"symbol": symbol.upper(), "limit": str(_AGG_TRADES_LIMIT)}
+                if from_id is None:
+                    params.update({"startTime": str(batch_start), "endTime": str(batch_end)})
+                else:
+                    params["fromId"] = str(from_id)
 
-            if status != 200:
-                diag["status"] = status
-                if status in RATE_LIMIT_STATUSES or status >= 500:
+                try:
+                    response = await _request_page(client, params, (batch_start, batch_end))
+                except _TimeBudgetExceeded as exc:
+                    LOGGER.warning(
+                        "Orderflow trade download hit budget",
+                        extra={
+                            "symbol": symbol,
+                            "stage": exc.stage,
+                            "window_start": start_ms,
+                            "window_end": end_ms,
+                            "batch_start": batch_start,
+                            "batch_end": batch_end,
+                        },
+                    )
+                    diag["status"] = "budget_exceeded"
+                    exhausted = True
                     break
-                # For client errors (e.g., synthetic symbols), stop without raising.
-                break
+                except Exception as exc:  # pragma: no cover - network guard
+                    LOGGER.debug(
+                        "Failed to download agg trades",
+                        exc_info=exc,
+                        extra={"symbol": symbol, "batch_start": batch_start, "batch_end": batch_end},
+                    )
+                    diag["status"] = "request_failed"
+                    exhausted = True
+                    break
 
-            payload = response.json()
-            if not isinstance(payload, list):
-                diag["status"] = "invalid_payload"
-                break
-            if not payload:
-                cursor = max(page_end, cursor + min_advance)
-                continue
+                status_code = response.status_code
+                if status_code != 200:
+                    diag["status"] = status_code
+                    if status_code in _AGG_TRADES_RETRYABLE_STATUSES:
+                        exhausted = True
+                    else:
+                        exhausted = True
+                    break
 
-            trades.extend(_extract_trades(payload, source="download"))
-            diag["downloaded"] = len(trades)
-            diag["status"] = status
+                payload = response.json()
+                if not isinstance(payload, list):
+                    diag["status"] = "invalid_payload"
+                    exhausted = True
+                    break
+                if not payload:
+                    break
 
-            last_trade_time = max(int(row.get("t", row.get("T", cursor))) for row in payload)
-            next_cursor = max(last_trade_time + 1, cursor + min_advance)
-            if next_cursor <= cursor:
-                next_cursor = cursor + min_advance
-            cursor = min(next_cursor, end_ms)
+                batch_overflow = False
+                last_kept_id: int | None = None
+                last_kept_time: int | None = None
+                last_payload_id: int | None = None
+                last_payload_time: int | None = None
+                kept_entries: List[Dict[str, Any]] = []
+                for entry in payload:
+                    trade_time = _safe_int(entry.get("T") or entry.get("t"))
+                    trade_id = _safe_int(entry.get("a") or entry.get("A"))
+                    if trade_time is not None:
+                        last_payload_time = trade_time
+                    if trade_id is not None:
+                        last_payload_id = trade_id
+                    if trade_time is None:
+                        continue
+                    if trade_time < batch_start or trade_time >= end_ms:
+                        continue
+                    if trade_time >= batch_end:
+                        batch_overflow = True
+                        continue
+                    if trade_id is not None and trade_id in seen_trade_ids:
+                        continue
+                    if trade_id is not None:
+                        seen_trade_ids.add(trade_id)
+                    kept_entries.append(dict(entry))
+                    last_kept_id = trade_id if trade_id is not None else last_kept_id
+                    last_kept_time = trade_time if trade_time is not None else last_kept_time
 
-    return trades, diag
+                if kept_entries:
+                    raw_rows.extend(kept_entries)
+                    diag["downloaded"] = len(raw_rows)
+                    diag["status"] = status_code
+
+                if batch_overflow and (kept_entries or (last_payload_time and last_payload_time >= batch_end)):
+                    break
+
+                if not kept_entries and len(payload) < _AGG_TRADES_LIMIT:
+                    break
+
+                if not kept_entries and last_payload_id is not None and from_id is not None:
+                    if last_payload_id + 1 == from_id:
+                        break
+                    from_id = last_payload_id + 1
+                    continue
+
+                if not kept_entries:
+                    break
+
+                if last_kept_time is not None and last_kept_time >= batch_end - 1:
+                    break
+
+                if len(payload) < _AGG_TRADES_LIMIT:
+                    break
+
+                if last_kept_id is None:
+                    break
+
+                from_id = last_kept_id + 1
+
+            batch_start = batch_end
+
+    records = _extract_trades(raw_rows, source="download")
+    filtered_records = [record for record in records if start_ms <= record.get("t", 0) < end_ms]
+    if diag.get("status") is None and filtered_records:
+        diag["status"] = 200
+    elif diag.get("status") is None:
+        diag["status"] = 204
+    return _finalise(filtered_records)
 
 
 async def _load_orderflow_trades(

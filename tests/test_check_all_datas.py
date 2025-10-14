@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 import asyncio
 import json
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Dict, List, Mapping, Sequence
 import time
 
 import pytest
@@ -702,17 +702,25 @@ async def test_download_agg_trades_paginates_full_window(monkeypatch) -> None:
     monkeypatch.setattr(check_all_datas, "get_store", lambda: _DummyStore())
 
     base_ts = 1_700_000_000_000
-    step_ms = 60_000
-    total = check_all_datas._AGG_TRADES_LIMIT * 2 + 500
-    trades = [
-        {
-            "t": base_ts + index * step_ms,
-            "p": 100.0 + index * 0.01,
-            "q": 1.0 + (index % 5) * 0.25,
-            "m": bool(index % 2),
-        }
-        for index in range(total)
-    ]
+    step_ms = 500
+    hours = 3
+    per_hour = check_all_datas.MS_IN_HOUR // step_ms
+    trades: List[Dict[str, Any]] = []
+    trade_id = 0
+    for hour_index in range(hours):
+        hour_start = base_ts + hour_index * check_all_datas.MS_IN_HOUR
+        for offset in range(per_hour):
+            trades.append(
+                {
+                    "t": hour_start + offset * step_ms,
+                    "p": 100.0 + trade_id * 0.0001,
+                    "q": 1.0 + (trade_id % 5) * 0.01,
+                    "m": bool(trade_id % 2),
+                    "a": trade_id,
+                }
+            )
+            trade_id += 1
+    total = len(trades)
 
     monkeypatch.setattr(check_all_datas, "_fetch_binance_agg_trades", None)
 
@@ -727,10 +735,14 @@ async def test_download_agg_trades_paginates_full_window(monkeypatch) -> None:
     async def fake_http_request(method, url, *, params=None, **_):
         assert method == "GET"
         assert params is not None
-        start_ms = int(params["startTime"])
-        end_ms = int(params["endTime"])
         limit = int(params["limit"])
-        window = [row for row in trades if start_ms <= row["t"] < end_ms]
+        if "fromId" in params:
+            from_id = int(params["fromId"])
+            window = [row for row in trades if row["a"] >= from_id]
+        else:
+            start_ms = int(params["startTime"])
+            end_ms = int(params["endTime"])
+            window = [row for row in trades if start_ms <= row["t"] < end_ms]
         payload = [dict(row) for row in window[:limit]]
         return _DummyResponse(payload)
 
@@ -739,7 +751,7 @@ async def test_download_agg_trades_paginates_full_window(monkeypatch) -> None:
     records, diag = await check_all_datas._download_agg_trades_async(
         "BTCUSDT",
         base_ts,
-        trades[-1]["t"] + step_ms,
+        base_ts + hours * check_all_datas.MS_IN_HOUR,
         allow_network=True,
         trace_ctx=None,
         budget=check_all_datas._TimeBudget(None),
@@ -750,8 +762,11 @@ async def test_download_agg_trades_paginates_full_window(monkeypatch) -> None:
     assert records[0]["t"] == trades[0]["t"]
     assert records[-1]["t"] == trades[-1]["t"]
     assert diag["downloaded"] == total
-    assert diag["batches"] >= 3
+    assert diag["batches"] >= hours
     assert diag["status"] == 200
+    assert diag["hours_ok"] == hours
+    assert diag["missing_windows"] == []
+    assert diag["requests_count"] > diag["batches"]
 
 
 def test_vwap_tpo_sessions_include_aliases(client: TestClient) -> None:
