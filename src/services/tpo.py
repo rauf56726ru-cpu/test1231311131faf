@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
-from math import isfinite, sqrt
-from typing import Dict, List, Mapping, MutableMapping, Sequence, Tuple
+from math import floor, isfinite, sqrt
+from typing import Any, Dict, List, Mapping, MutableMapping, Sequence, Tuple
 
 import httpx
 
@@ -379,3 +379,231 @@ def calculate_session_tpo(
         "IBH": ibh,
         "IBL": ibl,
     }
+
+
+# ---------------------------------------------------------------------------
+# Incremental value-area helpers for the strict three-day workflow
+# ---------------------------------------------------------------------------
+
+
+def _safe_int(value: Any) -> int | None:
+    try:
+        numeric = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return numeric
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        numeric = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if not isfinite(numeric):
+        return None
+    return numeric
+
+
+def _typical_price(candle: Mapping[str, Any]) -> float | None:
+    high = _safe_float(candle.get("h") or candle.get("high"))
+    low = _safe_float(candle.get("l") or candle.get("low"))
+    close = _safe_float(candle.get("c") or candle.get("close"))
+    if high is None or low is None or close is None:
+        return None
+    return (high + low + close) / 3.0
+
+
+@dataclass(slots=True)
+class ValueAreaState:
+    """Incremental histogram-based accumulator for compact profiles."""
+
+    start_ms: int
+    end_ms: int
+    tick_size: float | None
+    value_area_pct: float
+    ib_minutes: int = 60
+    bin_size: float | None = None
+    base_price: float | None = None
+    bin_volume: Dict[int, float] = field(default_factory=dict)
+    total_volume: float = 0.0
+    processed_bars: int = 0
+    last_timestamp: int | None = None
+    session_high: float | None = None
+    session_low: float | None = None
+    ib_high: float | None = None
+    ib_low: float | None = None
+
+    def ensure_bounds(
+        self,
+        *,
+        start_ms: int,
+        end_ms: int,
+        tick_size: float | None,
+        value_area_pct: float,
+        ib_minutes: int,
+    ) -> None:
+        bounds_changed = self.start_ms != start_ms or self.end_ms != end_ms
+        if bounds_changed:
+            self.start_ms = start_ms
+            self.end_ms = end_ms
+            self.bin_volume.clear()
+            self.total_volume = 0.0
+            self.processed_bars = 0
+            self.last_timestamp = None
+            self.session_high = None
+            self.session_low = None
+            self.ib_high = None
+            self.ib_low = None
+            self.bin_size = None
+            self.base_price = None
+        self.tick_size = tick_size
+        self.value_area_pct = value_area_pct
+        self.ib_minutes = ib_minutes
+
+    def _ensure_bins(self, price: float) -> None:
+        if self.bin_size is not None and self.base_price is not None:
+            return
+        tick = self.tick_size if self.tick_size and self.tick_size > 0 else None
+        adaptive = abs(price) * 1e-4
+        if adaptive <= 0:
+            adaptive = 1e-6
+        if tick is not None and adaptive is not None:
+            bin_size = max(tick, adaptive)
+        else:
+            bin_size = tick or adaptive or 1e-6
+        self.bin_size = bin_size
+        self.base_price = floor(price / bin_size) * bin_size
+
+    def _bin_index(self, price: float) -> int:
+        self._ensure_bins(price)
+        assert self.bin_size is not None
+        assert self.base_price is not None
+        relative = (price - self.base_price) / self.bin_size
+        if relative >= 0:
+            return int(relative + 1e-9)
+        return int(relative - 1e-9)
+
+    def update(self, candles: Sequence[Mapping[str, Any]]) -> int:
+        if self.end_ms < self.start_ms:
+            return 0
+        ib_cutoff = self.start_ms + max(0, self.ib_minutes) * 60_000
+        new_bars = 0
+        last_ts = self.last_timestamp
+        for candle in candles:
+            if not isinstance(candle, Mapping):
+                continue
+            ts: int | None = None
+            for key in ("t", "time", "openTime", "timestamp"):
+                ts = _safe_int(candle.get(key))
+                if ts is not None:
+                    break
+            if ts is None or ts < self.start_ms or ts > self.end_ms:
+                continue
+            if last_ts is not None and ts <= last_ts:
+                continue
+            high = _safe_float(candle.get("h") or candle.get("high"))
+            low = _safe_float(candle.get("l") or candle.get("low"))
+            if high is not None:
+                self.session_high = (
+                    high if self.session_high is None else max(self.session_high, high)
+                )
+                if ts < ib_cutoff:
+                    self.ib_high = high if self.ib_high is None else max(self.ib_high, high)
+            if low is not None:
+                self.session_low = (
+                    low if self.session_low is None else min(self.session_low, low)
+                )
+                if ts < ib_cutoff:
+                    self.ib_low = low if self.ib_low is None else min(self.ib_low, low)
+            volume = _safe_float(candle.get("v") or candle.get("volume"))
+            if volume is None or volume <= 0:
+                last_ts = ts
+                continue
+            price = _typical_price(candle)
+            if price is None:
+                last_ts = ts
+                continue
+            index = self._bin_index(price)
+            self.bin_volume[index] = self.bin_volume.get(index, 0.0) + volume
+            self.total_volume += volume
+            self.processed_bars += 1
+            last_ts = ts
+            new_bars += 1
+        if last_ts is not None:
+            self.last_timestamp = last_ts
+        return new_bars
+
+    def value_area(self) -> Tuple[float | None, float | None, float | None]:
+        if not self.bin_volume or self.bin_size is None or self.base_price is None:
+            return None, None, None
+        ordered = sorted(self.bin_volume.items())
+        prices = [self.base_price + idx * self.bin_size for idx, _ in ordered]
+        volumes = [vol for _, vol in ordered]
+        total = sum(volumes)
+        if total <= 0:
+            return None, None, None
+        poc_index = max(range(len(volumes)), key=lambda idx: volumes[idx])
+        poc_price = prices[poc_index]
+        threshold = total * max(0.0, min(1.0, self.value_area_pct))
+        order = sorted(
+            range(len(volumes)),
+            key=lambda idx: (-volumes[idx], abs(prices[idx] - poc_price), prices[idx]),
+        )
+        covered = 0.0
+        selected: set[int] = set()
+        for idx in order:
+            selected.add(idx)
+            covered += max(0.0, volumes[idx])
+            if covered >= threshold:
+                break
+        if not selected:
+            selected = {poc_index}
+        vah = max(prices[idx] for idx in selected)
+        val = min(prices[idx] for idx in selected)
+        return poc_price, vah, val
+
+
+def compute_compact_value_area(
+    candles: Sequence[Mapping[str, Any]],
+    *,
+    start_ms: int,
+    end_ms: int,
+    tick_size: float | None,
+    value_area_pct: float = VALUE_AREA_RATIO,
+    ib_minutes: int = 60,
+    state: ValueAreaState | None = None,
+) -> Tuple[Dict[str, Any], ValueAreaState, int]:
+    """Return compact volume-profile metrics for the provided window."""
+
+    if state is None:
+        state = ValueAreaState(
+            start_ms=start_ms,
+            end_ms=end_ms,
+            tick_size=tick_size,
+            value_area_pct=value_area_pct,
+            ib_minutes=ib_minutes,
+        )
+    else:
+        state.ensure_bounds(
+            start_ms=start_ms,
+            end_ms=end_ms,
+            tick_size=tick_size,
+            value_area_pct=value_area_pct,
+            ib_minutes=ib_minutes,
+        )
+
+    incremental = state.update(candles)
+    poc, vah, val = state.value_area()
+    payload = {
+        "poc": poc,
+        "vah": vah,
+        "val": val,
+        "session_high": state.session_high,
+        "session_low": state.session_low,
+        "ib_high": state.ib_high,
+        "ib_low": state.ib_low,
+        "total_volume": state.total_volume,
+        "bars": state.processed_bars,
+        "incremental_bars": incremental,
+    }
+    return payload, state, incremental
