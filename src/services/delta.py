@@ -4,13 +4,16 @@ from __future__ import annotations
 import asyncio
 import math
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, Iterable, List, Mapping, Sequence
 
-import httpx
+import aiohttp
 
+from .binance import (
+    BinanceAPIException,
+    BinanceRequestException,
+    fetch_um_agg_trades,
+)
 from .ohlc import TIMEFRAME_TO_MS, TIMEFRAME_WINDOWS, fetch_ohlcv
-
-BINANCE_FAPI_AGG_TRADES = "https://fapi.binance.com/fapi/v1/aggTrades"
 
 
 @dataclass(slots=True)
@@ -66,35 +69,48 @@ async def _fetch_trades(symbol: str, start_ms: int, end_ms: int) -> List[AggTrad
     trades: List[AggTrade] = []
     cursor = start_ms
     limit = 1000
-    params = {"symbol": symbol.upper(), "limit": str(limit), "endTime": str(end_ms)}
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        while cursor < end_ms:
-            params["startTime"] = str(cursor)
-            response = await client.get(BINANCE_FAPI_AGG_TRADES, params=params)
-            response.raise_for_status()
-            data = response.json()
-            if not isinstance(data, list):  # pragma: no cover - network guard
+    while cursor < end_ms:
+        try:
+            rows = await fetch_um_agg_trades(
+                symbol,
+                start_time=cursor,
+                end_time=end_ms,
+                limit=limit,
+            )
+        except (BinanceAPIException, BinanceRequestException, aiohttp.ClientError, asyncio.TimeoutError):
+            # Propagate to caller for consistent error handling.
+            raise
+
+        if not rows:
+            break
+
+        batch_added = 0
+        last_time: int | None = None
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            trade = _normalise_trade(dict(row))
+            if trade is None:
+                continue
+            if trade.time < start_ms or trade.time > end_ms:
+                continue
+            trades.append(trade)
+            batch_added += 1
+            last_time = trade.time
+
+        if batch_added == 0:
+            cursor += 1000
+        else:
+            if last_time is None:
                 break
-            batch_added = 0
-            for row in data:
-                trade = _normalise_trade(row)
-                if trade is None:
-                    continue
-                if trade.time < start_ms or trade.time > end_ms:
-                    continue
-                trades.append(trade)
-                batch_added += 1
-            if not data or batch_added == 0:
-                # Advance cursor cautiously to avoid tight loop.
-                cursor += 1000
-            else:
-                last_time = trades[-1].time
-                if last_time >= end_ms:
-                    break
-                cursor = last_time + 1
-            if len(data) < limit:
+            if last_time >= end_ms:
                 break
+            cursor = last_time + 1
+
+        if len(rows) < limit:
+            break
+
     trades.sort(key=lambda trade: trade.time)
     return trades
 

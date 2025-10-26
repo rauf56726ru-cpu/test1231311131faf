@@ -1,6 +1,8 @@
 ﻿"""Minimal FastAPI app that exposes OHLCV history for the chart."""
 from __future__ import annotations
 
+import asyncio
+import os
 import json
 import logging
 import math
@@ -10,8 +12,9 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone, time as dtime
 from math import ceil
+from contextlib import asynccontextmanager
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
@@ -19,8 +22,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 
+from src.common.logging_setup import install_root_logging
 from ..services import (
     DataQualityError,
     build_check_all_datas,
@@ -51,10 +55,23 @@ from ..services import (
     collect_recent_summary,
     collect_last_session_detailed,
     SessionCollectionResult,
+    collect_zones_72h,
+    collect_last_sessions,
 )
+from src.common.ts import ensure_epoch_ms
+from src.storage.ensure_window import ensure_window_real, InsufficientCoverageError
+from src.services.session_analysis import build_smc_session_v1
+from src.services.zones_ctx72 import build_smc_72h_ctx_v1
 from ..services import tracing as tracing_utils
 from ..services.zones import Config as ZonesConfig, detect_zones
 from ..services.progress import ProgressReporter, emit_progress
+from ..services.inspection_cache_service import (
+    ensure_inspection_daily_cache,
+    schedule_cache_backfill,
+    build_cache_seed_from_payloads,
+)
+from ..storage.parquet import ParquetStorage
+from ..analysis.session_last import last_closed_session_bounds
 
 from ..services.book import fetch_orderbook
 from ..services.derivatives import fetch_derivatives
@@ -74,15 +91,54 @@ from ..services.orderflow import (
 )
 from ..services.tracing import TraceContext
 from ..services.tpo import calculate_session_tpo, calculate_tpo
+from ..services.binance_vision import (
+    DATASET_AGG_TRADES,
+    DATASET_BOOK_DEPTH,
+    DATASET_EXCHANGE_INFO,
+    DATASET_FUNDING_RATE,
+    DATASET_KLINES,
+    DATASET_LIQ_ORDERS,
+    DATASET_OPEN_INTEREST,
+)
+from ..services.vision_ingest import ingest_binance_vision
 from ..meta import Meta
 from ..static_version import STATIC_VERSION
 from ..version import APP_VERSION
+
+install_root_logging()
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 LOGGER = logging.getLogger(__name__)
 TRACE_LOGGER = tracing_utils.LOGGER.getChild("api.inspection")
 _SUMMARY_FETCH_HISTORY: Dict[str, float] = {}
-CHECK_ALL_BUILD_TIMEOUT = 12.0
+CHECK_ALL_BUILD_TIMEOUT = 180.0
+SESSION_ANALYSIS_TIMEOUT = 12.0
+CONTEXT_ANALYSIS_TIMEOUT = 18.0
+VISION_DATASETS = {
+    DATASET_AGG_TRADES,
+    DATASET_KLINES,
+    DATASET_FUNDING_RATE,
+    DATASET_OPEN_INTEREST,
+    DATASET_LIQ_ORDERS,
+    DATASET_BOOK_DEPTH,
+    DATASET_EXCHANGE_INFO,
+}
+SESSION_PAYLOAD_LIMIT_BYTES = 300_000
+CONTEXT_TOP_N_LIMIT = 200
+CONTEXT_PAYLOAD_LIMIT_BYTES = 300_000
+MINUTE_MS = 60_000
+DAY_MS = 86_400_000
+
+
+def _utc_now_ms() -> int:
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+
+def _utc_midnight_ms(ts_ms: int) -> int:
+    normalised = ensure_epoch_ms(ts_ms)
+    dt = datetime.fromtimestamp(normalised / 1000, tz=timezone.utc)
+    midnight = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    return int(midnight.timestamp() * 1000)
 
 
 
@@ -96,7 +152,8 @@ class CandleIn(BaseModel):
     c: float
     v: float
 
-    @validator("v")
+    @field_validator("v")
+    @classmethod
     def _validate_volume(cls, value: float) -> float:
         if value <= 0:
             raise ValueError("Volume must be positive")
@@ -114,10 +171,12 @@ class OrderflowFootprintIn(BaseModel):
     imbalance: Optional[float] = None
     absorption: Optional[bool] = None
 
-    @validator("delta", always=True)
-    def _validate_delta(cls, value: Optional[float], values: Dict[str, Any]) -> float:
-        bid = values.get("bid", 0.0)
-        ask = values.get("ask", 0.0)
+    @field_validator("delta")
+    @classmethod
+    def _validate_delta(cls, value: Optional[float], info: ValidationInfo) -> float:
+        data = info.data
+        bid = data.get("bid", 0.0)
+        ask = data.get("ask", 0.0)
         delta_value = value if value is not None else ask - bid
         if abs(delta_value - (ask - bid)) > 1e-3:
             raise ValueError("delta must equal ask - bid")
@@ -146,24 +205,123 @@ class SnapshotIn(BaseModel):
     meta: Optional[Dict[str, Any]] = None
     lookback_days: int = Field(7, ge=1, le=30)
 
-    @validator("symbol")
-    def _validate_symbol(cls, value: str) -> str:
-        if not value or not value.strip():
-            raise ValueError("symbol is required")
-        return value.upper().strip()
-
-    @validator("tf")
-    def _validate_tf(cls, value: str) -> str:
-        if not value or not value.strip():
-            raise ValueError("tf is required")
-        return value.strip().lower()
-
-    @validator("candles")
+    @field_validator("candles")
+    @classmethod
     def _limit_candles(cls, value: List[CandleIn]) -> List[CandleIn]:
         if len(value) > 5000:
             raise ValueError("candles limit exceeded (max 5000)")
         return value
 
+
+class SummaryCollectionRequest(BaseModel):
+    """Incoming request to run a summary collection without snapshots."""
+
+    symbol: str = Field(..., min_length=1)
+    days: int = Field(3, ge=1, le=14)
+    now: datetime | None = None
+
+    @field_validator("symbol")
+    @classmethod
+    def _normalise_symbol(cls, value: str) -> str:
+        cleaned = (value or "").strip().upper()
+        if not cleaned:
+            raise ValueError("symbol cannot be empty")
+        return cleaned
+
+
+class SessionCollectionRequest(BaseModel):
+    """Request body for detailed last-session collection."""
+
+    symbol: str = Field(..., min_length=1)
+    now: datetime | None = None
+
+    @field_validator("symbol")
+    @classmethod
+    def _normalise_symbol(cls, value: str) -> str:
+        cleaned = (value or "").strip().upper()
+        if not cleaned:
+            raise ValueError("symbol cannot be empty")
+        return cleaned
+
+
+class TopupCollectionRequest(BaseModel):
+    """Request payload for incremental top-up collection."""
+
+    symbol: str = Field(..., min_length=1)
+    hours: int | None = Field(None, ge=1, le=4)
+    now: datetime | None = None
+
+    @field_validator("symbol")
+    @classmethod
+    def _normalise_symbol(cls, value: str) -> str:
+        if not value or not value.strip():
+            raise ValueError("symbol is required")
+        return value.upper().strip()
+
+    @field_validator("hours")
+    @classmethod
+    def _validate_hours(cls, value: int | None) -> int | None:
+        if value is None:
+            return None
+        return max(1, min(4, int(value)))
+
+
+class BinanceVisionIngestRequest(BaseModel):
+    """Request payload for Binance Vision ingestion."""
+
+    symbol: str
+    start_utc: datetime = Field(..., alias="startUtc")
+    end_utc: datetime = Field(..., alias="endUtc")
+    market_source: str = Field("futures_um", alias="marketSource")
+    datasets: Optional[List[str]] = None
+    klines_intervals: Optional[List[str]] = Field(default=None, alias="klinesIntervals")
+    include_exchange_info: bool = Field(True, alias="includeExchangeInfo")
+
+    @field_validator("symbol")
+    @classmethod
+    def _validate_symbol(cls, value: str) -> str:
+        if not value or not value.strip():
+            raise ValueError("symbol is required")
+        return value.upper().strip()
+
+    @field_validator("datasets")
+    @classmethod
+    def _validate_datasets(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        if value is None:
+            return None
+        cleaned: List[str] = []
+        for dataset in value:
+            if not dataset:
+                continue
+            name = dataset.strip()
+            if name not in VISION_DATASETS:
+                raise ValueError(f"Unsupported dataset {dataset}")
+            cleaned.append(name)
+        return cleaned or None
+
+    @field_validator("klines_intervals")
+    @classmethod
+    def _validate_intervals(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        if value is None:
+            return None
+        cleaned = [item.strip() for item in value if item and item.strip()]
+        return cleaned or None
+
+    @model_validator(mode="after")
+    def _validate_range(self) -> "BinanceVisionIngestRequest":
+        if self.start_utc >= self.end_utc:
+            raise ValueError("startUtc must be before endUtc")
+        return self
+
+    def range_ms(self) -> Tuple[int, int]:
+        def _to_ms(value: datetime) -> int:
+            if value.tzinfo is None:
+                ref = value.replace(tzinfo=timezone.utc)
+            else:
+                ref = value.astimezone(timezone.utc)
+            return int(ref.timestamp() * 1000)
+
+        return _to_ms(self.start_utc), _to_ms(self.end_utc)
 
 
 
@@ -255,6 +413,27 @@ def _fallback_footprint(candles: Sequence[CandleIn]) -> Dict[str, Any]:
     return {"per_bar": per_bar, "aggregates": aggregates}
 
 
+def _build_ephemeral_snapshot(symbol: str, *, lookback_days: int, mode: str = "summary") -> Dict[str, Any]:
+    lookback_value = max(1, int(lookback_days))
+    captured_iso = datetime.now(timezone.utc).isoformat()
+    return {
+        "symbol": symbol,
+        "frames": {},
+        "meta": {
+            "source": {
+                "kind": "direct",
+                "mode": mode,
+                "captured_at": captured_iso,
+                "lookback_days": lookback_value,
+            },
+            "requested": {
+                "frames": ["1m"],
+                "lookback_days": lookback_value,
+            },
+        },
+    }
+
+
 async def _run_summary_workflow(
     target_snapshot: Mapping[str, Any],
     *,
@@ -263,6 +442,7 @@ async def _run_summary_workflow(
     now_override: datetime | None,
     branch_log: Dict[str, Any],
     progress: ProgressReporter | None = None,
+    offline_mode: bool = False,
 ) -> Tuple[Dict[str, Any] | None, Dict[str, Any] | None, TraceContext]:
     symbol = target_snapshot.get("symbol") if isinstance(target_snapshot, Mapping) else None
     if not symbol:
@@ -280,9 +460,71 @@ async def _run_summary_workflow(
             mode="summary",
         )
 
+    cache_payloads: Dict[date, dict] = {}
+    seed_frames: Dict[str, List[Dict[str, Any]]] = {}
+    seed_stats: Dict[str, Any] | None = None
+    if symbol_upper:
+        try:
+            cache_payloads = await ensure_inspection_daily_cache(
+                symbol_upper,
+                days=days,
+                now_utc=now_override,
+                network_backfill=not offline_mode,
+            )
+        except Exception as exc:  # pragma: no cover - cache warmup failure falls back to network
+            TRACE_LOGGER.debug(
+                "inspection.summary_cache:failed",
+                extra={"symbol": symbol_upper, "error": str(exc)},
+            )
+            cache_payloads = {}
 
+    if cache_payloads:
+        seed_frames, seed_stats = build_cache_seed_from_payloads(
+            cache_payloads,
+            days=days,
+            now_utc=now_override,
+        )
+        if seed_frames.get("1m"):
+            snapshot_mutable = dict(target_snapshot)
+            existing_frames = snapshot_mutable.get("frames")
+            if isinstance(existing_frames, Mapping):
+                merged_frames = dict(existing_frames)
+            else:
+                merged_frames = {}
+            for tf_key, candles in seed_frames.items():
+                if candles:
+                    merged_frames[tf_key] = candles
+            snapshot_mutable["frames"] = merged_frames
+            meta_section = snapshot_mutable.get("meta")
+            if isinstance(meta_section, MutableMapping):
+                meta_section.setdefault("cache_seed", seed_stats or {})
+            else:
+                snapshot_mutable["meta"] = {"cache_seed": seed_stats or {}}
+            target_snapshot = snapshot_mutable
+            seed_minutes_count = len(seed_frames["1m"])
+            seed_coverage = (seed_stats or {}).get("coverage_pct")
+            branch_log["cache_seed_minutes"] = seed_minutes_count
+            branch_log["cache_seed_coverage"] = seed_coverage
+            TRACE_LOGGER.debug(
+                "inspection.summary_cache:seed_ready",
+                extra={
+                    "symbol": symbol_upper,
+                    "minutes": seed_minutes_count,
+                    "coverage_pct": seed_coverage,
+                },
+            )
+            await emit_progress(
+                progress,
+                "inspection.summary_cache:seed_ready",
+                symbol=symbol_upper,
+                minutes=seed_minutes_count,
+                coverage_pct=seed_coverage,
+            )
+
+    allow_network = not offline_mode
     collection_summary_payload: Dict[str, Any] | None = None
-    if isinstance(symbol, str) and symbol:
+    fetch_ms = 0.0
+    if isinstance(symbol, str) and symbol and allow_network:
         TRACE_LOGGER.debug(
             "inspection.summary_collection:starting",
             extra={**branch_log, "symbol": symbol, "days": days},
@@ -365,9 +607,10 @@ async def _run_summary_workflow(
         now_utc=now_override,
         window_hours=window_hours,
         timeout=CHECK_ALL_BUILD_TIMEOUT,
-        network_backfill=False,
-        strict_window=True,
+        network_backfill=allow_network,
+        strict_window=offline_mode,
         trace=trace_ctx.child(stage="pipeline") if trace_ctx is not None else None,
+        progress=progress,
     )
     compute_ms = (time.perf_counter() - compute_start) * 1000.0
     TRACE_LOGGER.debug(
@@ -388,6 +631,43 @@ async def _run_summary_workflow(
         timing_block["compute_ms"] = round(compute_ms, 2)
         timing_block.setdefault("db_ms", 0.0)
     return payload, collection_summary_payload, trace_ctx
+
+
+async def _collect_summary_for_symbol(
+    symbol: str,
+    *,
+    days: int,
+    now_override: datetime | None = None,
+    progress: ProgressReporter | None = None,
+    allow_network: bool = True,
+) -> Tuple[Dict[str, Any] | None, Dict[str, Any] | None, TraceContext]:
+    symbol_clean = (symbol or "").strip().upper()
+    if not symbol_clean:
+        raise ValueError("symbol is required")
+    if now_override is None:
+        today = datetime.now(timezone.utc).date()
+        now_override = datetime.combine(today, dtime.min, tzinfo=timezone.utc)
+    window_hours = max(1, int(days) * 24)
+    snapshot = _build_ephemeral_snapshot(symbol_clean, lookback_days=days, mode="summary")
+    branch_log = {
+        "snapshot_id": None,
+        "mode": "summary",
+        "selection_start": None,
+        "selection_end": None,
+        "hours": None,
+        "has_now_override": now_override is not None,
+        "window_hours": window_hours,
+        "summary_days": days,
+    }
+    return await _run_summary_workflow(
+        snapshot,
+        days=days,
+        window_hours=window_hours,
+        now_override=now_override,
+        branch_log=branch_log,
+        progress=progress,
+        offline_mode=not allow_network,
+    )
 
 
 async def _run_session_workflow(
@@ -538,13 +818,15 @@ class AnalysisRequest(BaseModel):
     snapshot_id: str
     analysis_type: str
 
-    @validator("snapshot_id")
+    @field_validator("snapshot_id")
+    @classmethod
     def _validate_snapshot_id(cls, value: str) -> str:
         if not value or not value.strip():
             raise ValueError("snapshot_id is required")
         return value
 
-    @validator("analysis_type")
+    @field_validator("analysis_type")
+    @classmethod
     def _validate_analysis_type(cls, value: str) -> str:
         allowed = {"tpo", "zones", "liquidity"}
         if value not in allowed:
@@ -554,7 +836,151 @@ class AnalysisRequest(BaseModel):
 PUBLIC_DIR = PROJECT_ROOT / "public"
 TEMPLATES_DIR = PROJECT_ROOT / "templates"
 
-app = FastAPI(title="Chart OHLC API")
+
+async def _ingest_bootstrap_minutes(symbol: str, days: int) -> Dict[str, Any]:
+    lookback_days = max(1, int(days))
+    now_ms = _utc_now_ms()
+    start_ms = max(0, now_ms - lookback_days * DAY_MS)
+    LOGGER.info(
+        "app.bootstrap.vision_ingest.start",
+        extra={"symbol": symbol, "days": lookback_days, "start_ms": start_ms, "end_ms": now_ms},
+    )
+    summary = await ingest_binance_vision(
+        symbol=symbol,
+        start_ms=start_ms,
+        end_ms=now_ms,
+        datasets=(DATASET_KLINES,),
+        klines_intervals=("1m",),
+        include_exchange_info=False,
+    )
+    LOGGER.info(
+        "app.bootstrap.vision_ingest.complete",
+        extra={
+            "symbol": symbol,
+            "status": summary.get("status"),
+            "days": lookback_days,
+            "inserted": summary.get("ingested", {}).get(DATASET_KLINES, {}).get("inserted"),
+        },
+    )
+    return summary
+
+
+async def _run_bootstrap(app: FastAPI) -> None:
+    enabled, symbols, days, timeout = _load_bootstrap_settings()
+    if not enabled:
+        app.state.bootstrap_ready = True
+        completed_at = datetime.now(timezone.utc).isoformat()
+        app.state.bootstrap_meta = {
+            "status": "disabled",
+            "reason": "INSPECTION_BOOTSTRAP=off",
+            "completed_at": completed_at,
+        }
+        LOGGER.info("app.bootstrap.skip", extra={"reason": "disabled"})
+        return
+
+    app.state.bootstrap_ready = False
+    app.state.bootstrap_meta = None
+    started = time.perf_counter()
+    LOGGER.info(
+        "app.bootstrap.begin",
+        extra={"symbols": list(symbols), "days": days, "timeout": timeout},
+    )
+    summaries: Dict[str, Dict[str, Any] | None] = {}
+    ingest_reports: Dict[str, Dict[str, Any] | None] = {}
+    try:
+        for symbol in symbols:
+            try:
+                ingest_reports[symbol] = await _ingest_bootstrap_minutes(symbol, days)
+            except Exception as exc:  # pragma: no cover - ingestion is best-effort
+                ingest_reports[symbol] = {"status": "error", "error": str(exc)}
+                LOGGER.exception(
+                    "app.bootstrap.vision_ingest.failed",
+                    extra={"symbol": symbol, "days": days},
+                )
+            await ensure_inspection_daily_cache(
+                symbol,
+                days=days,
+                network_backfill=True,
+                collection_timeout=timeout,
+            )
+            try:
+                summary_payload, _, _ = await _collect_summary_for_symbol(
+                    symbol,
+                    days=days,
+                    now_override=None,
+                    progress=None,
+                    allow_network=False,
+                )
+            except Exception as exc:  # pragma: no cover - defensive logging
+                LOGGER.exception(
+                    "app.bootstrap.summary_failed",
+                    extra={"symbol": symbol, "days": days},
+                )
+                summaries[symbol] = None
+                raise
+            else:
+                summaries[symbol] = summary_payload
+    except Exception as exc:
+        LOGGER.exception(
+            "app.bootstrap.failed",
+            extra={"symbols": list(symbols), "days": days},
+        )
+        app.state.bootstrap_ready = False
+        app.state.bootstrap_vision_ingest = ingest_reports
+        app.state.bootstrap_meta = {
+            "status": "error",
+            "symbols": list(symbols),
+            "days": days,
+            "error": str(exc),
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "summaries": {k: bool(v) for k, v in summaries.items()},
+            "vision_ingest": {
+                k: (v.get("status") if isinstance(v, Mapping) else None)
+                for k, v in ingest_reports.items()
+            },
+        }
+        raise
+    else:
+        elapsed = time.perf_counter() - started
+        completed_at = datetime.now(timezone.utc).isoformat()
+        app.state.bootstrap_ready = True
+        app.state.bootstrap_vision_ingest = ingest_reports
+        app.state.bootstrap_meta = {
+            "symbols": list(symbols),
+            "days": days,
+            "seconds": round(elapsed, 2),
+            "completed_at": completed_at,
+            "timeout": timeout,
+            "summaries": {k: bool(v) for k, v in summaries.items()},
+            "vision_ingest": {
+                k: (v.get("status") if isinstance(v, Mapping) else None)
+                for k, v in ingest_reports.items()
+            },
+        }
+        LOGGER.info(
+            "app.bootstrap.complete",
+            extra={
+                "symbols": list(symbols),
+                "days": days,
+                "seconds": round(elapsed, 2),
+            },
+        )
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    if not hasattr(app.state, "ohlcv_cache"):
+        app.state.ohlcv_cache = {}
+    if not hasattr(app.state, "snapshots"):
+        app.state.snapshots = {}
+    app.state.bootstrap_ready = False
+    app.state.bootstrap_meta = None
+    app.state.bootstrap_vision_ingest = {}
+    await _run_bootstrap(app)
+    yield
+
+
+app = FastAPI(title="Chart OHLC API", lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -577,13 +1003,6 @@ async def add_no_store_header(request: Request, call_next):
         response.headers["Cache-Control"] = "no-store"
     return response
 
-
-@app.on_event("startup")
-async def _startup() -> None:
-    if not hasattr(app.state, "ohlcv_cache"):
-        app.state.ohlcv_cache = {}
-    if not hasattr(app.state, "snapshots"):
-        app.state.snapshots = {}
 
 def _parse_iso8601(value: Any) -> datetime | None:
     if not value or not isinstance(value, str):
@@ -1713,7 +2132,7 @@ def _prepare_summary_payload(
         else:
             trace_ctx.warn("compute.poi.empty", reason="filtered_out", **log_fields)
 
-    liquidity_marks: list[Dict[str, Any]] = []
+    marks_by_type: Dict[str, List[Dict[str, Any]]] = {}
     for mark_type, entries in liquidity_source.items():
         if not isinstance(entries, Sequence):
             continue
@@ -1736,8 +2155,28 @@ def _prepare_summary_payload(
             strength_numeric = _float_or_none(strength_value)
             if strength_numeric is not None:
                 mark["strength"] = strength_numeric
-            liquidity_marks.append(mark)
-    liquidity_marks = liquidity_marks[:16]
+            marks_by_type.setdefault(mark_type, []).append(mark)
+
+    eqh_marks = marks_by_type.pop("eqh", [])
+    eql_marks = marks_by_type.pop("eql", [])
+    remaining_marks: List[Dict[str, Any]] = []
+    for marks in marks_by_type.values():
+        remaining_marks.extend(marks)
+
+    liquidity_marks: List[Dict[str, Any]] = []
+    interleave_limit = 16
+    while (eqh_marks or eql_marks) and len(liquidity_marks) < interleave_limit:
+        if eqh_marks:
+            liquidity_marks.append(eqh_marks.pop(0))
+        if len(liquidity_marks) >= interleave_limit:
+            break
+        if eql_marks:
+            liquidity_marks.append(eql_marks.pop(0))
+
+    for mark in eqh_marks + eql_marks + remaining_marks:
+        if len(liquidity_marks) >= interleave_limit:
+            break
+        liquidity_marks.append(mark)
 
     expected_counts = {
         "1m": 72 * 60,
@@ -2126,6 +2565,33 @@ def _prepare_summary_payload(
 
 
 
+@app.post("/ingest/binance-vision")
+async def ingest_binance_vision_endpoint(
+    payload: BinanceVisionIngestRequest,
+) -> Dict[str, Any]:
+    start_ms, end_ms = payload.range_ms()
+    datasets = list(payload.datasets) if payload.datasets else None
+    if datasets is not None:
+        if payload.include_exchange_info and DATASET_EXCHANGE_INFO not in datasets:
+            datasets.append(DATASET_EXCHANGE_INFO)
+        if not payload.include_exchange_info:
+            datasets = [ds for ds in datasets if ds != DATASET_EXCHANGE_INFO]
+        if not datasets:
+            datasets = None
+
+    trace_ctx = TraceContext(stage="vision.ingest", symbol=payload.symbol)
+    summary = await ingest_binance_vision(
+        symbol=payload.symbol,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        datasets=datasets,
+        klines_intervals=payload.klines_intervals or None,
+        include_exchange_info=payload.include_exchange_info,
+        trace=trace_ctx,
+    )
+    return summary
+
+
 @app.post("/inspection/snapshot")
 async def register_inspection_snapshot(payload: SnapshotIn) -> Dict[str, str]:
     symbol = payload.symbol
@@ -2203,6 +2669,9 @@ async def register_inspection_snapshot(payload: SnapshotIn) -> Dict[str, str]:
         last_candle = source_candles[-1] if source_candles else CandleIn(t=0, o=0, h=0, l=0, c=0, v=1)
         book_state = _fallback_book(symbol, last_candle)
 
+    if isinstance(book_state, MutableMapping) and not isinstance(book_state.get("top_levels"), Sequence):
+        book_state["top_levels"] = []
+
     orderflow_payload["footprint"] = (
         footprint_snapshot.get("per_bar", [])
         if isinstance(footprint_snapshot, Mapping)
@@ -2221,7 +2690,7 @@ async def register_inspection_snapshot(payload: SnapshotIn) -> Dict[str, str]:
     if isinstance(cvd_snapshot, Mapping):
         orderflow_payload["cvd_aggregates"] = cvd_snapshot.get("aggregates", {})
 
-    snapshot = payload.dict(exclude_none=True)
+    snapshot = payload.model_dump(exclude_none=True)
     if not snapshot.get("candles") and source_candles:
         snapshot["candles"] = [c.dict() for c in source_candles]
     original_candles: list[dict[str, object]] = []
@@ -2464,6 +2933,15 @@ async def inspection(
         )
         return HTMLResponse(content=html)
 
+    symbol_value = str(target_snapshot.get("symbol") or DEFAULT_SYMBOL).upper()
+    try:
+        await schedule_cache_backfill(symbol_value, now_utc=datetime.now(timezone.utc))
+    except Exception as exc:  # pragma: no cover - background warmup errors are non-fatal
+        logging.getLogger(__name__).debug(
+            "inspection.cache_warmup_failed",
+            extra={"symbol": symbol_value, "error": str(exc)},
+        )
+
     payload = build_inspection_payload(target_snapshot)
 
     stored_snapshots = getattr(app.state, "snapshots", {})
@@ -2501,6 +2979,210 @@ async def inspection(
         snapshots=snapshots,
     )
     return HTMLResponse(content=html)
+
+
+@app.get("/analyze/session")
+async def analyze_session_endpoint(
+    symbol: str = Query(..., min_length=1, max_length=32),
+) -> JSONResponse:
+    symbol_clean = symbol.strip().upper()
+    if not symbol_clean:
+        raise HTTPException(status_code=400, detail="symbol is required")
+
+    now_ms = _utc_now_ms()
+    end_ms = (now_ms // MINUTE_MS) * MINUTE_MS
+    today_ms = _utc_midnight_ms(end_ms)
+    bars_today = (end_ms - today_ms) // MINUTE_MS
+    session_start_ms = today_ms if bars_today >= 60 else today_ms - 24 * 60 * 60 * 1000
+    session_used = "today" if bars_today >= 60 else "today+prev"
+
+    try:
+        ensure_result = await ensure_window_real(symbol_clean, session_start_ms, end_ms, "1m")
+    except InsufficientCoverageError as exc:
+        return JSONResponse(
+            {
+                "schema": "SMC_session_v1",
+                "symbol": symbol_clean,
+                "status": "retry",
+                "reason": "coverage<0.99",
+                "minutes_found": exc.found,
+                "minutes_expected": exc.expected,
+                "coverage_pct": getattr(exc, "coverage_pct", None),
+            }
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        LOGGER.exception("analyze_session.ensure_failed", extra={"symbol": symbol_clean})
+        return JSONResponse(
+            {
+                "schema": "SMC_session_v1",
+                "symbol": symbol_clean,
+                "status": "error",
+                "error": str(exc),
+                "stage": "ensure_window",
+            },
+            status_code=500,
+        )
+
+    df = ensure_result.frame.copy()
+    df.attrs["ensure"] = {
+        "coverage": ensure_result.coverage,
+        "source_sequence": ensure_result.source_sequence,
+    }
+    meta = {
+        "coverage": ensure_result.coverage,
+        "source_sequence": ensure_result.source_sequence,
+    }
+
+    try:
+        session_payload = build_smc_session_v1(
+            symbol_clean,
+            df,
+            meta,
+            session_start_ms=ensure_result.start_ms,
+            session_end_ms=ensure_result.end_ms,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        LOGGER.exception("analyze_session.build_failed", extra={"symbol": symbol_clean})
+        return JSONResponse(
+            {
+                "schema": "SMC_session_v1",
+                "symbol": symbol_clean,
+                "status": "error",
+                "error": str(exc),
+                "stage": "metrics",
+            },
+            status_code=500,
+        )
+
+    window_block = dict(session_payload.get("window", {}))
+    window_block["minutes_found"] = ensure_result.minutes_found
+    window_block["minutes_expected"] = ensure_result.minutes_expected
+
+    response_payload = {
+        "schema": "SMC_session_v1",
+        "symbol": symbol_clean,
+        "window": window_block,
+        "session_used": session_used,
+        "metrics": session_payload.get("metrics", {}),
+        "status": "ok",
+    }
+    if "latency_ms" in session_payload:
+        response_payload["latency_ms"] = session_payload["latency_ms"]
+    payload_bytes = len(json.dumps(response_payload, ensure_ascii=False).encode("utf-8"))
+    if payload_bytes > SESSION_PAYLOAD_LIMIT_BYTES:
+        LOGGER.error(
+            "analyze_session.payload_limit_exceeded",
+            extra={"bytes": payload_bytes, "limit": SESSION_PAYLOAD_LIMIT_BYTES},
+        )
+        return JSONResponse(
+            {
+                "schema": "SMC_session_v1",
+                "symbol": symbol_clean,
+                "status": "error",
+                "error": "payload_exceeds_limit",
+                "stage": "response",
+            },
+            status_code=500,
+        )
+
+    return JSONResponse(response_payload)
+
+
+@app.get("/context/72h")
+async def analyze_context_endpoint(
+    symbol: str = Query(..., min_length=1, max_length=32),
+    top_n: int = Query(20, ge=1, le=CONTEXT_TOP_N_LIMIT, description="Maximum number of zones to return"),
+) -> JSONResponse:
+    symbol_clean = symbol.strip().upper()
+    if not symbol_clean:
+        raise HTTPException(status_code=400, detail="symbol is required")
+
+    now_ms = _utc_now_ms()
+    end_ms = (now_ms // MINUTE_MS) * MINUTE_MS
+    start_ms = end_ms - 72 * 60 * 60 * 1000
+    try:
+        ensure_result = await ensure_window_real(symbol_clean, start_ms, end_ms, "1m")
+    except InsufficientCoverageError as exc:
+        return JSONResponse(
+            {
+                "schema": "SMC_72h_ctx_v1",
+                "symbol": symbol_clean,
+                "status": "retry",
+                "reason": "coverage<0.99",
+                "minutes_found": exc.found,
+                "minutes_expected": exc.expected,
+                "coverage_pct": getattr(exc, "coverage_pct", None),
+            }
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        LOGGER.exception("context72.ensure_failed", extra={"symbol": symbol_clean})
+        return JSONResponse(
+            {
+                "schema": "SMC_72h_ctx_v1",
+                "symbol": symbol_clean,
+                "status": "error",
+                "error": str(exc),
+                "stage": "ensure_window",
+            },
+            status_code=500,
+        )
+
+    df = ensure_result.frame.copy()
+    try:
+        ctx_payload = build_smc_72h_ctx_v1(
+            symbol_clean,
+            df,
+            session_split_ts=_utc_midnight_ms(end_ms),
+            top_n=top_n,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        LOGGER.exception("context72.build_failed", extra={"symbol": symbol_clean})
+        return JSONResponse(
+            {
+                "schema": "SMC_72h_ctx_v1",
+                "symbol": symbol_clean,
+                "status": "error",
+                "error": str(exc),
+                "stage": "metrics",
+            },
+            status_code=500,
+        )
+
+    window_block = dict(ctx_payload.get("window", {}))
+    window_block["minutes_found"] = ensure_result.minutes_found
+    window_block["minutes_expected"] = ensure_result.minutes_expected
+
+    response_payload = {
+        "schema": "SMC_72h_ctx_v1",
+        "symbol": symbol_clean,
+        "window": window_block,
+        "zones_top": ctx_payload.get("zones_top", []),
+        "counts": ctx_payload.get("counts", {}),
+        "status": "ok",
+    }
+    if "aggregates" in ctx_payload:
+        response_payload["aggregates"] = ctx_payload["aggregates"]
+    if "latency_ms" in ctx_payload:
+        response_payload["latency_ms"] = ctx_payload["latency_ms"]
+
+    payload_bytes = len(json.dumps(response_payload, ensure_ascii=False).encode("utf-8"))
+    if payload_bytes > CONTEXT_PAYLOAD_LIMIT_BYTES:
+        LOGGER.error(
+            "context72.payload_limit_exceeded",
+            extra={"bytes": payload_bytes, "limit": CONTEXT_PAYLOAD_LIMIT_BYTES},
+        )
+        return JSONResponse(
+            {
+                "schema": "SMC_72h_ctx_v1",
+                "symbol": symbol_clean,
+                "status": "error",
+                "error": "payload_exceeds_limit",
+                "stage": "response",
+            },
+            status_code=500,
+        )
+
+    return JSONResponse(response_payload)
 
 
 @app.post("/inspection/analyze")
@@ -2591,6 +3273,16 @@ async def inspection_snapshots() -> JSONResponse:
     return JSONResponse(list_snapshots())
 
 
+@app.get("/inspection/status")
+async def inspection_status() -> JSONResponse:
+    ready = bool(getattr(app.state, "bootstrap_ready", False))
+    meta = getattr(app.state, "bootstrap_meta", None)
+    payload = {"ready": ready}
+    if isinstance(meta, Mapping):
+        payload["meta"] = dict(meta)
+    return JSONResponse(payload)
+
+
 @app.get("/inspection/check-all")
 async def inspection_check_all(
     snapshot: str | None = Query(None, description="Snapshot identifier"),
@@ -2650,6 +3342,26 @@ async def inspection_check_all(
 
     collection_reference = now_override or datetime.now(timezone.utc)
     has_now_override = now_override is not None
+    symbol_for_cache = target_snapshot.get("symbol") if isinstance(target_snapshot, Mapping) else None
+    if not symbol_for_cache:
+        meta_block = target_snapshot.get("meta") if isinstance(target_snapshot, Mapping) else None
+        if isinstance(meta_block, Mapping):
+            symbol_for_cache = meta_block.get("symbol")
+    symbol_for_cache = str(symbol_for_cache or DEFAULT_SYMBOL).upper()
+    selection_prewarmed = False
+    if mode_value not in {"summary", "session_detailed", "topup"}:
+        try:
+            await ensure_inspection_daily_cache(
+                symbol_for_cache,
+                days=3,
+                now_utc=collection_reference,
+            )
+            selection_prewarmed = True
+        except Exception as exc:  # pragma: no cover - falls back to network backfill
+            LOGGER.debug(
+                "inspection.cache.ensure_failed",
+                extra={"symbol": symbol_for_cache, "error": str(exc)},
+            )
     log_extra: Dict[str, Any] = {
         "snapshot_id": target_snapshot.get("id"),
         "mode": mode_value,
@@ -2823,6 +3535,7 @@ async def inspection_check_all(
             selection_end_ms=selection_end,
             hours=hours,
             timeout=CHECK_ALL_BUILD_TIMEOUT,
+            network_backfill=not selection_prewarmed,
         )
     except DataQualityError as exc:
         LOGGER.warning(
@@ -2855,6 +3568,142 @@ async def inspection_check_all(
         extra={**branch_log, "status": status_value},
     )
 
+    return JSONResponse(payload)
+
+
+@app.post("/collection/summary")
+async def collection_summary_endpoint(request_body: SummaryCollectionRequest) -> Response:
+    symbol = request_body.symbol
+    days = request_body.days
+    now_override = request_body.now
+    collection_reference = now_override or datetime.now(timezone.utc)
+    try:
+        payload, _, _ = await _collect_summary_for_symbol(
+            symbol,
+            days=days,
+            now_override=now_override,
+            progress=None,
+            allow_network=False,
+        )
+    except DataQualityError as exc:
+        LOGGER.warning(
+            "summary_collection:data_quality_error",
+            extra={"symbol": symbol, "error": str(exc)},
+        )
+        raise HTTPException(
+            status_code=400,
+            detail={"message": str(exc), "data_quality": exc.detail},
+        ) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        LOGGER.exception(
+            "summary_collection:unexpected_error",
+            extra={"symbol": symbol, "error": str(exc)},
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Summary collection failed",
+        ) from exc
+
+    if payload is None:
+        return Response(status_code=204)
+
+    set_last_collection_time(collection_reference)
+    return JSONResponse(payload)
+
+
+@app.post("/collection/session-detailed")
+async def collection_session_detailed_endpoint(
+    request_body: SessionCollectionRequest,
+) -> Response:
+    symbol = request_body.symbol
+    now_override = request_body.now
+    try:
+        session_result = await _run_session_workflow(
+            symbol,
+            now_override=now_override,
+            progress=None,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        LOGGER.exception(
+            "session_collection:unexpected_error",
+            extra={"symbol": symbol, "error": str(exc)},
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Session collection failed",
+        ) from exc
+
+    return JSONResponse(session_result.as_dict())
+
+
+@app.post("/collection/topup")
+async def collection_topup_endpoint(
+    request_body: TopupCollectionRequest,
+) -> Response:
+    symbol = request_body.symbol
+    now_override = request_body.now
+    hours_override = request_body.hours
+
+    collection_reference = now_override or datetime.now(timezone.utc)
+    window_hours = hours_override if hours_override is not None else 4
+    window_start_override_ms: int | None = None
+
+    last_collection = get_last_collection_time()
+    if last_collection is not None:
+        delta_seconds = max((collection_reference - last_collection).total_seconds(), 0.0)
+        delta_hours = delta_seconds / 3600 if delta_seconds else 0.0
+        if hours_override is None:
+            if delta_hours < 1:
+                window_hours = 1
+            elif delta_hours > 4:
+                window_hours = 4
+            else:
+                window_hours = max(1, int(ceil(delta_hours)))
+        last_collection_utc = last_collection.astimezone(timezone.utc)
+        last_collection_ms = int(last_collection_utc.timestamp() * 1000)
+        aligned_ms = (last_collection_ms // 60_000) * 60_000
+        window_start_override_ms = max(0, aligned_ms + 60_000)
+
+    snapshot = _build_ephemeral_snapshot(symbol, lookback_days=1, mode="topup")
+
+    try:
+        payload = await build_check_all_datas_async(
+            snapshot,
+            now_utc=now_override,
+            window_hours=window_hours,
+            window_start_override_ms=window_start_override_ms,
+            strict_window=True,
+            timeout=CHECK_ALL_BUILD_TIMEOUT,
+        )
+    except DataQualityError as exc:
+        LOGGER.warning(
+            "topup_collection:data_quality_error",
+            extra={"symbol": symbol, "error": str(exc)},
+        )
+        raise HTTPException(
+            status_code=400,
+            detail={"message": str(exc), "data_quality": exc.detail},
+        ) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        LOGGER.exception(
+            "topup_collection:unexpected_error",
+            extra={"symbol": symbol, "error": str(exc)},
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Top-up collection failed",
+        ) from exc
+
+    if payload is None:
+        return Response(status_code=204)
+
+    set_last_collection_time(collection_reference)
     return JSONResponse(payload)
 
 
@@ -3403,6 +4252,254 @@ def _tick_size_from_price(price: float | None) -> float | None:
     exponent = decimal_price.as_tuple().exponent
     decimals = max(0, -exponent)
     return float(10 ** (-decimals))
+
+
+def _normalise_symbols(values: Sequence[str | None]) -> List[str]:
+    seen: set[str] = set()
+    cleaned: List[str] = []
+    for entry in values:
+        if entry is None:
+            continue
+        candidate = str(entry).strip().upper()
+        if not candidate or candidate in seen:
+            continue
+        cleaned.append(candidate)
+        seen.add(candidate)
+    return cleaned
+
+
+def _load_bootstrap_settings() -> Tuple[bool, Tuple[str, ...], int, float]:
+    raw_enabled = os.getenv("INSPECTION_BOOTSTRAP", "on").strip().lower()
+    enabled = raw_enabled not in {"0", "off", "false", "no"}
+    raw_symbols = os.getenv("INSPECTION_BOOTSTRAP_SYMBOLS")
+    if raw_symbols:
+        candidates = [part.strip() for part in raw_symbols.split(",")]
+    else:
+        candidates = [DEFAULT_SYMBOL]
+    symbols = tuple(_normalise_symbols(candidates) or [DEFAULT_SYMBOL])
+    try:
+        days = max(1, int(os.getenv("INSPECTION_BOOTSTRAP_DAYS", "3")))
+    except ValueError:
+        days = 3
+    try:
+        timeout = float(os.getenv("INSPECTION_BOOTSTRAP_TIMEOUT", "600"))
+    except ValueError:
+        timeout = 180.0
+    return enabled, symbols, days, timeout
+
+
+def _parse_timestamp_param(value: str | None) -> int:
+    if value is None:
+        return int(datetime.now(timezone.utc).timestamp() * 1000)
+    candidate = value.strip()
+    if not candidate:
+        return int(datetime.now(timezone.utc).timestamp() * 1000)
+    lowered = candidate.lower()
+    if lowered == "now":
+        return int(datetime.now(timezone.utc).timestamp() * 1000)
+    if candidate.isdigit():
+        return int(candidate)
+    try:
+        parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Invalid timestamp format") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.astimezone(timezone.utc).timestamp() * 1000)
+
+
+@app.get("/zones/72h")
+async def zones_72h_endpoint(
+    symbol: str | None = Query(None, description="Symbol to analyse (shorthand)"),
+    symbols: List[str] | None = Query(None, description="Repeat to analyse multiple symbols"),
+    hours: int = Query(72, ge=1, le=240, description="Window length in hours"),
+    end: str | None = Query(None, description="Window end timestamp (ms or ISO8601, defaults to now)"),
+    tick_size: float | None = Query(None, gt=0, description="Override tick size for all symbols"),
+    market: str | None = Query(None, description="Override storage market when loading candles"),
+    export: bool = Query(False, description="Export JSON Lines to disk"),
+    export_path: str | None = Query(None, description="Custom export path (requires export=true)"),
+) -> JSONResponse:
+    symbol_inputs: List[str] = []
+    if symbol:
+        symbol_inputs.append(symbol)
+    if symbols:
+        symbol_inputs.extend(symbols)
+
+    resolved_symbols = _normalise_symbols(symbol_inputs)
+    if not resolved_symbols:
+        resolved_symbols = _normalise_symbols([DEFAULT_SYMBOL]) or [DEFAULT_SYMBOL]
+
+    hours_window = max(1, min(int(hours), 240))
+    end_ms = _parse_timestamp_param(end)
+    start_ms = end_ms - hours_window * 60 * 60_000
+
+    storage_instance: ParquetStorage | None = None
+    if market:
+        app_config = AppConfig.load()
+        storage_instance = ParquetStorage(
+            root=app_config.data_dir,
+            market=market,
+            index_path=app_config.duckdb_path,
+        )
+
+    if export_path and not export:
+        raise HTTPException(status_code=400, detail="export_path requires export=true")
+
+    export_dest: Path | None = None
+    if export:
+        if export_path:
+            export_dest = Path(export_path)
+        else:
+            export_dest = Path(AppConfig.load().data_dir) / "zones_72h.json"
+
+    tick_overrides = None
+    if tick_size is not None:
+        tick_overrides = {symbol_entry: float(tick_size) for symbol_entry in resolved_symbols}
+
+    start_time = time.perf_counter()
+    try:
+        zones = await asyncio.to_thread(
+            collect_zones_72h,
+            resolved_symbols,
+            end_ms=end_ms,
+            hours=hours_window,
+            storage=storage_instance,
+            tick_size_overrides=tick_overrides,
+            export_path=export_dest,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:  # pragma: no cover - defensive guard
+        LOGGER.exception("zones.72h.endpoint.error %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to collect 72h zones") from exc
+
+    zones_by_symbol: Dict[str, List[Dict[str, Any]]] = {symbol_entry: [] for symbol_entry in resolved_symbols}
+    for zone in zones:
+        zones_by_symbol.setdefault(zone.symbol, []).append(zone.to_dict())
+
+    counts = {symbol_entry: len(entries) for symbol_entry, entries in zones_by_symbol.items()}
+    total = sum(counts.values())
+    elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+
+    response_payload = {
+        "symbols": resolved_symbols,
+        "start_ms": start_ms,
+        "end_ms": end_ms,
+        "hours": hours_window,
+        "generated_utc": datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z"),
+        "counts": counts,
+        "total": total,
+        "zones": zones_by_symbol,
+        "latency_ms": elapsed_ms,
+        "exported": bool(export_dest),
+    }
+    if export_dest is not None:
+        response_payload["export_path"] = str(export_dest)
+
+    return JSONResponse(response_payload)
+
+
+@app.get("/sessions/last")
+async def sessions_last_endpoint(
+    symbol: str | None = Query(None, description="Symbol to analyse"),
+    symbols: List[str] | None = Query(None, description="Repeat to analyse multiple symbols"),
+    end: str | None = Query(None, description="Reference timestamp (ms or ISO8601). Defaults to now."),
+    tick_size: float | None = Query(None, gt=0, description="Override tick size for zone detection"),
+    market: str | None = Query(None, description="Override storage market"),
+    zone_hours: int = Query(72, ge=24, le=240, description="Lookback in hours for zone detection"),
+    export_sessions: bool = Query(False, description="Write session_last.json"),
+    session_export_path: str | None = Query(None, description="Custom session export path"),
+    export_zones: bool = Query(False, description="Write zones JSON when computing sessions"),
+    zone_export_path: str | None = Query(None, description="Custom zones export path"),
+) -> JSONResponse:
+    symbol_inputs: List[str] = []
+    if symbol:
+        symbol_inputs.append(symbol)
+    if symbols:
+        symbol_inputs.extend(symbols)
+
+    resolved_symbols = _normalise_symbols(symbol_inputs)
+    if not resolved_symbols:
+        resolved_symbols = _normalise_symbols([DEFAULT_SYMBOL]) or [DEFAULT_SYMBOL]
+
+    end_ms = _parse_timestamp_param(end)
+    zone_hours_window = max(24, min(int(zone_hours), 240))
+
+    storage_instance: ParquetStorage | None = None
+    if market:
+        app_config = AppConfig.load()
+        storage_instance = ParquetStorage(
+            root=app_config.data_dir,
+            market=market,
+            index_path=app_config.duckdb_path,
+        )
+
+    if session_export_path and not export_sessions:
+        raise HTTPException(status_code=400, detail="session_export_path requires export_sessions=true")
+    if zone_export_path and not export_zones:
+        raise HTTPException(status_code=400, detail="zone_export_path requires export_zones=true")
+
+    tick_overrides = None
+    if tick_size is not None:
+        tick_overrides = {symbol_entry: float(tick_size) for symbol_entry in resolved_symbols}
+
+    zone_export_dest: Path | None = None
+    if export_zones:
+        zone_export_dest = Path(zone_export_path) if zone_export_path else Path(AppConfig.load().data_dir) / "zones_72h.json"
+
+    session_export_dest: Path | None = None
+    if export_sessions:
+        session_export_dest = (
+            Path(session_export_path)
+            if session_export_path
+            else Path(AppConfig.load().data_dir) / "session_last.json"
+        )
+
+    zones = await asyncio.to_thread(
+        collect_zones_72h,
+        resolved_symbols,
+        end_ms=end_ms,
+        hours=zone_hours_window,
+        storage=storage_instance,
+        tick_size_overrides=tick_overrides,
+        export_path=zone_export_dest,
+    )
+
+    sessions = await asyncio.to_thread(
+        collect_last_sessions,
+        resolved_symbols,
+        end_ms=end_ms,
+        storage=storage_instance,
+        zones=zones,
+        export_path=session_export_dest,
+    )
+
+    zones_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+    for zone in zones:
+        zones_by_symbol.setdefault(zone.symbol, []).append(zone.to_dict())
+
+    session_payload = [entry.to_dict() for entry in sessions]
+    zone_counts = {symbol_entry: len(zones_by_symbol.get(symbol_entry, [])) for symbol_entry in resolved_symbols}
+    session_start_ms, session_end_ms = last_closed_session_bounds(end_ms)
+
+    response = {
+        "symbols": resolved_symbols,
+        "zone_hours": zone_hours_window,
+        "end_ms": end_ms,
+        "session_start_ms": session_start_ms,
+        "session_end_ms": session_end_ms,
+        "zones": zones_by_symbol,
+        "zone_counts": zone_counts,
+        "sessions": session_payload,
+        "exported": {
+            "zones": str(zone_export_dest) if zone_export_dest else None,
+            "sessions": str(session_export_dest) if session_export_dest else None,
+        },
+    }
+    return JSONResponse(response)
 
 
 @app.get("/zones")
@@ -4013,4 +5110,3 @@ async def index() -> HTMLResponse:
     except FileNotFoundError as exc:  # pragma: no cover - deployment guard
         raise HTTPException(status_code=500, detail="Index template is missing") from exc
     return HTMLResponse(content=html.replace("__STATIC_VERSION__", STATIC_VERSION))
-

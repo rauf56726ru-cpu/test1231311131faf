@@ -1,0 +1,361 @@
+{
+  "status": "insufficient_data",
+  "meta": {
+    "symbol": "BTCUSDT",
+    "tz": "Europe/Berlin",
+    "last_price": null,
+    "last_ts_utc": null,
+    "last_tf": null,
+    "last_price_source": "ohlcv",
+    "insufficient_reason": "stale_or_unseeded_buffers",
+    "stale": true,
+    "diagnostics": {
+      "liquidity": {},
+      "zones": {},
+      "liquidity_levels": {},
+      "orderflow": {},
+      "vwap_tpo": {},
+      "movement": {},
+      "coverage": {},
+      "api": {
+        "requests": 0,
+        "retries": 0,
+        "rate_limit_hits": 0,
+        "backoffs": 0
+      },
+      "sessions": {
+        "asia": {
+          "present": false
+        },
+        "london": {
+          "present": false
+        },
+        "ny": {
+          "present": false
+        }
+      }
+    }
+  },
+  "data": {
+    "symbol": "BTCUSDT",
+    "ohlcv": {
+      "1m": {
+        "candles": []
+      },
+      "3m": {
+        "candles": []
+      },
+      "5m": {
+        "candles": []
+      },
+      "15m": {
+        "candles": []
+      },
+      "1h": {
+        "candles": []
+      },
+      "4h": {
+        "candles": []
+      },
+      "1d": {
+        "candles": []
+      }
+    },
+    "orderflow": {
+      "1m": {
+        "per_bar": []
+      },
+      "3m": {
+        "per_bar": []
+      },
+      "5m": {
+        "per_bar": []
+      },
+      "15m": {
+        "per_bar": []
+      },
+      "1h": {
+        "per_bar": []
+      }
+    },
+    "vwap_tpo": {
+      "daily": {},
+      "sessions": {
+        "asia": {},
+        "london": {},
+        "ny": {}
+      }
+    },
+    "tpo": {
+      "composite_day": {}
+    },
+    "prev_day": {},
+    "zones": {
+      "fvg": [],
+      "fvl": [],
+      "ob": [],
+      "mb": [],
+      "bb": [],
+      "rb": [],
+      "pb": [],
+      "sr": [],
+      "profile_levels": []
+    },
+    "liquidity": {
+      "eqh": [],
+      "eql": []
+    },
+    "risk_prefs": {
+      "rr_min": 2.5,
+      "risk_per_trade_pct": 1
+    },
+    "context": {
+      "globalBias": "neutral",
+      "narrative": "",
+      "openOppositeZones": false
+    },
+    "timeframes": {
+      "1m": {
+        "zones": {
+          "eqh": 0,
+          "eql": 0,
+          "fvg": 0,
+          "ob": 0
+        },
+        "sweeps": 0,
+        "atr": null,
+        "vwap_sessions": {
+          "asia": false,
+          "london": false,
+          "ny": false
+        }
+      },
+      "5m": {
+        "zones": {
+          "eqh": 0,
+          "eql": 0,
+          "fvg": 0,
+          "ob": 0
+        },
+        "sweeps": 0,
+        "atr": null,
+        "vwap_sessions": {
+          "asia": false,
+          "london": false,
+          "ny": false
+        }
+      },
+      "15m": {
+        "zones": {
+          "eqh": 0,
+          "eql": 0,
+          "fvg": 0,
+          "ob": 0
+        },
+        "sweeps": 0,
+        "atr": null,
+        "vwap_sessions": {
+          "asia": false,
+          "london": false,
+          "ny": false
+        }
+      },
+      "1h": {
+        "zones": {
+          "eqh": 0,
+          "eql": 0,
+          "fvg": 0,
+          "ob": 0
+        },
+        "sweeps": 0,
+        "atr": null,
+        "vwap_sessions": {
+          "asia": false,
+          "london": false,
+          "ny": false
+        }
+      },
+      "4h": {
+        "zones": {
+          "eqh": 0,
+          "eql": 0,
+          "fvg": 0,
+          "ob": 0
+        },
+        "sweeps": 0,
+        "atr": null,
+        "vwap_sessions": {
+          "asia": false,
+          "london": false,
+          "ny": false
+        }
+      },
+      "1d": {
+        "zones": {
+          "eqh": 0,
+          "eql": 0,
+          "fvg": 0,
+          "ob": 0
+        },
+        "sweeps": 0,
+        "atr": null,
+        "vwap_sessions": {
+          "asia": false,
+          "london": false,
+          "ny": false
+        }
+      }
+    }
+  },
+  "availability": {
+    "timeframes": {
+      "1m": {
+        "zones": {
+          "eqh": false,
+          "eql": false,
+          "fvg": false,
+          "ob": false
+        },
+        "sweeps": 0,
+        "atr": false,
+        "vwap_sessions": {
+          "asia": false,
+          "london": false,
+          "ny": false
+        }
+      },
+      "5m": {
+        "zones": {
+          "eqh": false,
+          "eql": false,
+          "fvg": false,
+          "ob": false
+        },
+        "sweeps": 0,
+        "atr": false,
+        "vwap_sessions": {
+          "asia": false,
+          "london": false,
+          "ny": false
+        }
+      },
+      "15m": {
+        "zones": {
+          "eqh": false,
+          "eql": false,
+          "fvg": false,
+          "ob": false
+        },
+        "sweeps": 0,
+        "atr": false,
+        "vwap_sessions": {
+          "asia": false,
+          "london": false,
+          "ny": false
+        }
+      },
+      "1h": {
+        "zones": {
+          "eqh": false,
+          "eql": false,
+          "fvg": false,
+          "ob": false
+        },
+        "sweeps": 0,
+        "atr": false,
+        "vwap_sessions": {
+          "asia": false,
+          "london": false,
+          "ny": false
+        }
+      },
+      "4h": {
+        "zones": {
+          "eqh": false,
+          "eql": false,
+          "fvg": false,
+          "ob": false
+        },
+        "sweeps": 0,
+        "atr": false,
+        "vwap_sessions": {
+          "asia": false,
+          "london": false,
+          "ny": false
+        }
+      },
+      "1d": {
+        "zones": {
+          "eqh": false,
+          "eql": false,
+          "fvg": false,
+          "ob": false
+        },
+        "sweeps": 0,
+        "atr": false,
+        "vwap_sessions": {
+          "asia": false,
+          "london": false,
+          "ny": false
+        }
+      }
+    }
+  },
+  "missing_fields": [
+    "ohlcv.15m",
+    "ohlcv.1d",
+    "ohlcv.1h",
+    "ohlcv.1m",
+    "ohlcv.3m",
+    "ohlcv.4h",
+    "ohlcv.5m",
+    "orderflow.15m",
+    "orderflow.1h",
+    "orderflow.1m",
+    "orderflow.3m",
+    "orderflow.5m",
+    "orderflow.cvd",
+    "orderflow.delta",
+    "orderflow.footprint",
+    "vwap_tpo.sessions.asia",
+    "vwap_tpo.sessions.asia.ib_high",
+    "vwap_tpo.sessions.asia.ib_low",
+    "vwap_tpo.sessions.asia.poc",
+    "vwap_tpo.sessions.asia.vah",
+    "vwap_tpo.sessions.asia.val",
+    "vwap_tpo.sessions.london",
+    "vwap_tpo.sessions.london.ib_high",
+    "vwap_tpo.sessions.london.ib_low",
+    "vwap_tpo.sessions.london.poc",
+    "vwap_tpo.sessions.london.vah",
+    "vwap_tpo.sessions.london.val",
+    "vwap_tpo.sessions.ny",
+    "vwap_tpo.sessions.ny.ib_high",
+    "vwap_tpo.sessions.ny.ib_low",
+    "vwap_tpo.sessions.ny.poc",
+    "vwap_tpo.sessions.ny.vah",
+    "vwap_tpo.sessions.ny.val",
+    "zones.bb",
+    "zones.fvg",
+    "zones.fvl",
+    "zones.mb",
+    "zones.ob",
+    "zones.pb",
+    "zones.profile_levels",
+    "zones.rb",
+    "zones.sr"
+  ],
+  "notes": [],
+  "timing": {
+    "fetch_ms": 0,
+    "db_ms": 0,
+    "compute_ms": 0,
+    "serialize_ms": 0,
+    "size_bytes": 0
+  },
+  "_timing": {
+    "fetch_ms": 539.51,
+    "compute_ms": 30000.82,
+    "db_ms": 0
+  }
+}

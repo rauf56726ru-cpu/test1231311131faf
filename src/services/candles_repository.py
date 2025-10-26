@@ -5,7 +5,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
-from typing import Dict, List, Mapping, Sequence
+from typing import Dict, List, Mapping, MutableMapping, Sequence
 
 from .ohlc_sanitizer import sanitize_candles
 
@@ -46,6 +46,33 @@ CREATE TABLE IF NOT EXISTS gap_progress (
 
 _LOCK = RLock()
 _DEFAULT_REPOSITORY: "CandleRepository | None" = None
+
+_TIMEFRAME_TO_MS: Dict[str, int] = {
+    "1m": 60_000,
+    "3m": 180_000,
+    "5m": 300_000,
+    "15m": 900_000,
+    "1h": 3_600_000,
+    "4h": 14_400_000,
+    "1d": 86_400_000,
+}
+
+
+def _resolve_interval_ms(interval: str) -> int:
+    key = (interval or "").strip().lower()
+    return _TIMEFRAME_TO_MS.get(key, 60_000)
+
+
+def _bucket_timestamp(timestamp_ms: int, interval_ms: int) -> int:
+    if interval_ms <= 0:
+        return timestamp_ms
+    return (timestamp_ms // interval_ms) * interval_ms
+
+
+def _normalise_ts_fields(entry: MutableMapping[str, object], aligned_ms: int) -> None:
+    for key in ("t", "time", "openTime", "open_time", "timestamp", "ts"):
+        if key in entry:
+            entry[key] = aligned_ms
 
 
 @dataclass(slots=True)
@@ -97,6 +124,9 @@ class CandleRepository:
         """Return sorted open timestamps for the requested window."""
 
         self._ensure_schema()
+        interval_clean = interval.lower()
+        interval_ms = _resolve_interval_ms(interval_clean)
+        end_bound = end_ms + max(interval_ms - 1, 0)
         query = """
             SELECT open_ms
             FROM candles
@@ -107,9 +137,14 @@ class CandleRepository:
         with self._connect() as conn:
             rows = conn.execute(
                 query,
-                (symbol.upper(), interval.lower(), start_ms, end_ms),
+                (symbol.upper(), interval_clean, start_ms, end_bound),
             ).fetchall()
-        return [int(row["open_ms"]) for row in rows]
+        buckets = {
+            _bucket_timestamp(int(row["open_ms"]), interval_ms)
+            for row in rows
+            if row["open_ms"] is not None
+        }
+        return sorted(buckets)
 
     def fetch_candles(
         self,
@@ -121,6 +156,9 @@ class CandleRepository:
         """Return normalised candles for the requested window."""
 
         self._ensure_schema()
+        interval_clean = interval.lower()
+        interval_ms = _resolve_interval_ms(interval_clean)
+        end_bound = end_ms + max(interval_ms - 1, 0)
         query = """
             SELECT open_ms, open, high, low, close, volume
             FROM candles
@@ -131,14 +169,16 @@ class CandleRepository:
         with self._connect() as conn:
             rows = conn.execute(
                 query,
-                (symbol.upper(), interval.lower(), start_ms, end_ms),
+                (symbol.upper(), interval_clean, start_ms, end_bound),
             ).fetchall()
 
         candles: List[Dict[str, float | int]] = []
         for row in rows:
+            raw_ts = int(row["open_ms"])
+            aligned_ts = _bucket_timestamp(raw_ts, interval_ms)
             candles.append(
                 {
-                    "t": int(row["open_ms"]),
+                    "t": aligned_ts,
                     "o": float(row["open"]),
                     "h": float(row["high"]),
                     "l": float(row["low"]),
@@ -163,19 +203,49 @@ class CandleRepository:
         if not sanitized.candles:
             return UpsertStats(written=0, dropped_ts=sanitized.invalid_ts, dropped_ohlc=sanitized.invalid_ohlc)
 
-        payload = [
-            (
-                symbol.upper(),
-                interval.lower(),
-                int(item["t"]),
-                float(item["o"]),
-                float(item["h"]),
-                float(item["l"]),
-                float(item["c"]),
-                float(item.get("v", 0.0)),
+        interval_clean = interval.lower()
+        interval_ms = _resolve_interval_ms(interval_clean)
+        symbol_clean = symbol.upper()
+
+        payload: List[tuple[object, ...]] = []
+        legacy_ts: List[int] = []
+        for item in sanitized.candles:
+            if not isinstance(item, MutableMapping):
+                continue
+            try:
+                raw_ts = int(item.get("t"))
+            except (TypeError, ValueError):
+                sanitized.invalid_ts += 1
+                continue
+            aligned_ts = _bucket_timestamp(raw_ts, interval_ms)
+            if aligned_ts != raw_ts:
+                legacy_ts.append(raw_ts)
+            _normalise_ts_fields(item, aligned_ts)
+            try:
+                open_price = float(item.get("o"))
+                high_price = float(item.get("h"))
+                low_price = float(item.get("l"))
+                close_price = float(item.get("c"))
+            except (TypeError, ValueError):
+                sanitized.invalid_ohlc += 1
+                continue
+            volume_value = item.get("v", 0.0)
+            try:
+                volume = float(volume_value)
+            except (TypeError, ValueError):
+                volume = 0.0
+            payload.append(
+                (
+                    symbol_clean,
+                    interval_clean,
+                    aligned_ts,
+                    open_price,
+                    high_price,
+                    low_price,
+                    close_price,
+                    volume,
+                )
             )
-            for item in sanitized.candles
-        ]
 
         statement = """
             INSERT INTO candles (symbol, interval, open_ms, open, high, low, close, volume)
@@ -188,7 +258,18 @@ class CandleRepository:
                 volume = excluded.volume
         """
         with self._connect() as conn:
-            conn.executemany(statement, payload)
+            if legacy_ts:
+                deletions = [
+                    (symbol_clean, interval_clean, ts)
+                    for ts in {ts for ts in legacy_ts if ts >= 0}
+                ]
+                if deletions:
+                    conn.executemany(
+                        "DELETE FROM candles WHERE symbol = ? AND interval = ? AND open_ms = ?",
+                        deletions,
+                    )
+            if payload:
+                conn.executemany(statement, payload)
 
         return UpsertStats(
             written=len(payload),
@@ -200,14 +281,25 @@ class CandleRepository:
         """Return the last filled timestamp for the tracked gap if present."""
 
         self._ensure_schema()
+        interval_clean = interval.lower()
+        interval_ms = _resolve_interval_ms(interval_clean)
         query = """
             SELECT last_open_ms
             FROM gap_progress
             WHERE symbol = ? AND interval = ? AND gap_start_ms = ?
         """
         with self._connect() as conn:
-            row = conn.execute(query, (symbol.upper(), interval.lower(), gap_start_ms)).fetchone()
-        return int(row["last_open_ms"]) if row else None
+            row = conn.execute(query, (symbol.upper(), interval_clean, gap_start_ms)).fetchone()
+            if not row:
+                return None
+            stored_ms = int(row["last_open_ms"])
+            aligned_ms = _bucket_timestamp(stored_ms, interval_ms)
+            if aligned_ms != stored_ms:
+                conn.execute(
+                    "UPDATE gap_progress SET last_open_ms = ? WHERE symbol = ? AND interval = ? AND gap_start_ms = ?",
+                    (aligned_ms, symbol.upper(), interval_clean, gap_start_ms),
+                )
+            return aligned_ms
 
     def update_gap_progress(
         self, symbol: str, interval: str, gap_start_ms: int, last_open_ms: int
@@ -215,13 +307,15 @@ class CandleRepository:
         """Persist progress for an active gap."""
 
         self._ensure_schema()
+        interval_clean = interval.lower()
+        aligned_last = _bucket_timestamp(last_open_ms, _resolve_interval_ms(interval_clean))
         statement = """
             INSERT INTO gap_progress(symbol, interval, gap_start_ms, last_open_ms)
             VALUES(?, ?, ?, ?)
             ON CONFLICT(symbol, interval, gap_start_ms) DO UPDATE SET last_open_ms = excluded.last_open_ms
         """
         with self._connect() as conn:
-            conn.execute(statement, (symbol.upper(), interval.lower(), gap_start_ms, last_open_ms))
+            conn.execute(statement, (symbol.upper(), interval_clean, gap_start_ms, aligned_last))
 
     def clear_gap_progress(self, symbol: str, interval: str, gap_start_ms: int) -> None:
         """Remove persisted progress for a completed gap."""

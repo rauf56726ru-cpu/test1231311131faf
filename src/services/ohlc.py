@@ -19,9 +19,8 @@ from typing import (
     Tuple,
 )
 
-import httpx
-
-from .binance import BINANCE_FAPI_REST
+from .binance import fetch_um_klines
+from .vision_store import get_store
 
 # Mapping of supported timeframes to their window sizes.
 TIMEFRAME_WINDOWS: Dict[str, timedelta] = {
@@ -594,22 +593,24 @@ async def _fetch_binance_klines(
     end_ms: int | None,
     limit: int | None,
 ) -> Sequence[Sequence[object]]:
-    params = {
-        "symbol": symbol.upper(),
-        "interval": timeframe,
-    }
-    if start_ms is not None:
-        params["startTime"] = str(start_ms)
-    if end_ms is not None:
-        params["endTime"] = str(end_ms)
-    if limit is not None:
-        params["limit"] = str(limit)
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        response = await client.get(BINANCE_FAPI_REST, params=params)
-        response.raise_for_status()
-        data = response.json()
-    if not isinstance(data, Sequence):
-        return []
+    store_rows: List[List[float | int | None]] = await asyncio.to_thread(
+        get_store().fetch_klines,
+        symbol,
+        timeframe,
+        start_ms,
+        end_ms,
+        limit,
+    )
+    if store_rows:
+        return store_rows
+
+    data = await fetch_um_klines(
+        symbol,
+        timeframe,
+        start_time=start_ms,
+        end_time=end_ms,
+        limit=limit,
+    )
     return data  # type: ignore[return-value]
 
 
@@ -882,4 +883,3 @@ class CandleCache:
 
 
 _CANDLE_CACHE: Dict[Tuple[str, str], CandleCache] = {}
-

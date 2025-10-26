@@ -22,8 +22,20 @@
   const rangeEl = document.getElementById("last-range");
   const versionEl = document.getElementById("app-version");
   const inspectionBtn = document.getElementById("inspection-btn") || document.getElementById("show-inspection");
-  const analyzeBtn = document.getElementById("analyze-btn");
+  const analyzeBtn = document.getElementById("run-session-analysis");
+  const collectBtn = document.getElementById("collect-context");
   const exportBtn = document.getElementById("export-zones");
+  const analysisPanel = document.getElementById("analysis-panel");
+  const sessionContentEl = document.getElementById("session-content");
+  const contextSectionEl = document.getElementById("context-analysis");
+  const contextContentEl = document.getElementById("context-content");
+  const analysisStatusEl = document.getElementById("analysis-status");
+  const copyAnalysisBtn = document.getElementById("copy-analysis");
+  const downloadAnalysisBtn = document.getElementById("download-analysis");
+  const sessionCoverageBadge = document.getElementById("session-coverage-badge");
+  const sessionSourceBadge = document.getElementById("session-source-badge");
+  const ctxCoverageBadge = document.getElementById("ctx-coverage-badge");
+  const ctxSourceBadge = document.getElementById("ctx-source-badge");
   const toastContainer = document.getElementById("toast-container");
   const modalEl = document.getElementById("modal-confirm");
   const modalConfirmBtn = modalEl ? modalEl.querySelector("[data-action='confirm']") : null;
@@ -52,6 +64,8 @@
     valSeries: null,
     inspectProgressTimer: null,
     lastSnapshotId: null,
+    sessionPayload: null,
+    contextPayload: null,
   };
 
   const marketStore =
@@ -220,18 +234,6 @@
       }
     } catch (error) {
       console.warn("SharedCandles merge failed", error);
-    }
-  }
-
-  async function flushSharedCandles({ force = false } = {}) {
-    if (!SharedCandles || typeof SharedCandles.flush !== "function") {
-      return Promise.resolve();
-    }
-    try {
-      return await SharedCandles.flush(state.symbol, state.interval, { force });
-    } catch (error) {
-      console.warn("SharedCandles flush failed", error);
-      return Promise.resolve();
     }
   }
 
@@ -671,199 +673,35 @@
     dashboardEl.innerHTML = sections.join("");
   }
 
-  function buildInspectionSnapshot() {
-    const createdAt = Date.now();
-    const id = `snap-${createdAt}-${Math.random().toString(36).slice(2, 8)}`;
-    const candles = state.candles.map((bar) => {
-      const timeMs = Number(bar.ts_ms_utc || bar.t || bar.time * 1000 || 0);
-      const open = Number(bar.open ?? bar.o ?? 0);
-      const high = Number(bar.high ?? bar.h ?? open);
-      const low = Number(bar.low ?? bar.l ?? open);
-      const close = Number(bar.close ?? bar.c ?? open);
-      const volume = Number(bar.volume ?? bar.v ?? 0);
-      return {
-        t: Number.isFinite(timeMs) ? timeMs : 0,
-        o: Number.isFinite(open) ? open : close,
-        h: Number.isFinite(high) ? high : close,
-        l: Number.isFinite(low) ? low : close,
-        c: Number.isFinite(close) ? close : open,
-        v: Math.max(0, Number.isFinite(volume) ? volume : 0),
-      };
-    });
-    return {
-      id,
-      symbol: state.symbol,
-      tf: state.interval,
-      candles,
-      lookback_days: 7,
-      meta: {
-        source: "chart-ui",
-        generated_at: new Date(createdAt).toISOString(),
-        candle_count: candles.length,
-      },
-    };
-  }
-
-  function toggleInspectionProgress(active) {
-    if (!progressBar) return;
-    if (active) {
+  function toggleInspectionProgress() {
+    clearInterval(state.inspectProgressTimer);
+    state.inspectProgressTimer = null;
+    if (progressBar) {
       progressBar.value = 0;
-      progressBar.classList.remove("hidden");
-      let current = 0;
-      clearInterval(state.inspectProgressTimer);
-      state.inspectProgressTimer = setInterval(() => {
-        current = Math.min(95, current + Math.random() * 7);
-        progressBar.value = current;
-      }, 250);
-    } else {
-      clearInterval(state.inspectProgressTimer);
-      state.inspectProgressTimer = null;
-      progressBar.value = 100;
-      setTimeout(() => progressBar.classList.add("hidden"), 300);
+      progressBar.classList.add("hidden");
     }
   }
 
   async function submitInspectionSnapshot() {
-    await flushSharedCandles({ force: true });
-    const snapshot = buildInspectionSnapshot();
-    toggleInspectionProgress(true);
-    if (inspectionBtn) inspectionBtn.disabled = true;
-    try {
-      const response = await fetch("/inspection/snapshot", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        cache: "no-store",
-        body: JSON.stringify(snapshot),
-      });
-      if (!response.ok) {
-        const errorPayload = await response.json().catch(() => ({}));
-        throw new Error(errorPayload?.error || JSON.stringify(errorPayload));
-      }
-      const data = await response.json();
-      const snapshotId = typeof data.snapshot_id === "string" ? data.snapshot_id : snapshot.id;
-      state.lastSnapshotId = snapshotId;
-      showToast("Snapshot создан", "success");
-      await refreshDashboard(snapshotId);
-    } catch (error) {
-      console.error("Inspection snapshot failed", error);
-      showToast(`Ошибка инспекции: ${error.message || error}`, "error", 6000);
-    } finally {
-      toggleInspectionProgress(false);
-      if (inspectionBtn) inspectionBtn.disabled = false;
-    }
+    toggleInspectionProgress(false);
+    showToast("Инспекции отключены в этой версии", "warn");
   }
 
-  async function refreshDashboard(snapshotId) {
-    try {
-      const url = new URL("/inspection", window.location.origin);
-      url.searchParams.set("snapshot", snapshotId);
-      const response = await fetch(url.toString(), {
-        headers: { accept: "application/json" },
-        cache: "no-store",
-      });
-      if (!response.ok) throw new Error("Inspection payload unavailable");
-      const payload = await response.json();
-      const data = payload?.DATA || {};
-      const snapshotData = {
-        ohlcv_multi: data.ohlcv ?? null,
-        orderflow: data.orderflow ?? null,
-        derivatives: data.derivatives ?? null,
-        liquidity_map: data.liquidity_map ?? null,
-      };
-      renderDashboard(snapshotData);
-      const tpo = data?.tpo?.sessions || [];
-      const pocEntry = data?.tpo?.daily?.[0];
-      if (pocEntry) {
-        updateOverlayLevels({ POC: pocEntry.POC, VAH: pocEntry.VAH, VAL: pocEntry.VAL });
-      }
-    } catch (error) {
-      console.warn("Failed to refresh dashboard", error);
-      renderDashboard(null);
-    }
+  async function refreshDashboard() {
+    renderDashboard(null);
   }
 
-  async function analyzeSnapshot(type) {
-    if (!state.lastSnapshotId) {
-      showToast("Сначала создайте snapshot", "warning");
-      return;
-    }
-    try {
-      const response = await fetch("/inspection/analyze", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        cache: "no-store",
-        body: JSON.stringify({ snapshot_id: state.lastSnapshotId, analysis_type: type }),
-      });
-      if (!response.ok) {
-        const payload = await response.json().catch(() => ({}));
-        throw new Error(payload?.error || "Analyze failed");
-      }
-      const data = await response.json();
-      if (type === "tpo" && data?.tpo?.daily?.length) {
-        const last = data.tpo.daily[data.tpo.daily.length - 1];
-        updateOverlayLevels({ POC: last.POC, VAH: last.VAH, VAL: last.VAL });
-      }
-      renderDashboard({
-        ohlcv_multi: null,
-        orderflow: null,
-        derivatives: null,
-        liquidity_map: type === "liquidity" ? data?.liquidity_map : null,
-      });
-      showToast("Анализ завершен", "success");
-    } catch (error) {
-      console.error("Analyze request failed", error);
-      showToast(`Ошибка анализа: ${error.message || error}`, "error", 6000);
-    }
+  async function analyzeSnapshot() {
+    showToast("Инспекции отключены в этой версии", "warn");
   }
 
   async function exportZones() {
-    if (!state.lastSnapshotId) {
-      showToast("Нет данных для экспорта", "warning");
-      return;
-    }
-    try {
-      const url = new URL("/profile", window.location.origin);
-      url.searchParams.set("snapshot", state.lastSnapshotId);
-      url.searchParams.set("tf", state.interval);
-      const response = await fetch(url.toString(), { cache: "no-store" });
-      if (!response.ok) throw new Error("Profile export failed");
-      const data = await response.json();
-      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
-      const downloadUrl = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = downloadUrl;
-      link.download = `${state.symbol}_${state.interval}_profile.json`;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      URL.revokeObjectURL(downloadUrl);
-      showToast("Профиль экспортирован", "success");
-    } catch (error) {
-      console.error("Export failed", error);
-      showToast(`Экспорт не удался: ${error.message || error}`, "error", 6000);
-    }
+    showToast("Экспорт профиля недоступен", "warn");
   }
 
   function openModal() {
-    if (!modalEl) return Promise.resolve(false);
-    modalEl.classList.remove("hidden");
-    return new Promise((resolve) => {
-      const cleanup = () => {
-        modalEl.classList.add("hidden");
-        modalConfirmBtn?.removeEventListener("click", onConfirm);
-        modalCancelBtn?.removeEventListener("click", onCancel);
-      };
-      const onConfirm = () => {
-        cleanup();
-        resolve(true);
-      };
-      const onCancel = () => {
-        cleanup();
-        resolve(false);
-      };
-      modalConfirmBtn?.addEventListener("click", onConfirm, { once: true });
-      modalCancelBtn?.addEventListener("click", onCancel, { once: true });
-    });
+    showToast("Инспекции отключены в этой версии", "warn");
+    return Promise.resolve(false);
   }
 
   form.addEventListener("submit", (event) => {
@@ -903,13 +741,6 @@
     });
   }
 
-  if (analyzeBtn) {
-    analyzeBtn.addEventListener("click", (event) => {
-      event.preventDefault();
-      analyzeSnapshot("tpo");
-    });
-  }
-
   if (exportBtn) {
     exportBtn.addEventListener("click", (event) => {
       event.preventDefault();
@@ -922,3 +753,282 @@
   setActiveSymbolButton(state.symbol);
   loadSymbol(state.symbol, state.interval);
 })();
+  function showAnalysisPanel() {
+    if (!analysisPanel) return;
+    analysisPanel.hidden = false;
+  }
+
+  const ANALYSIS_RETRY_LIMIT = 1;
+  const ANALYSIS_RETRY_DELAY_MS = 2500;
+
+  function renderCoverageBadge(badgeEl, coverage, label = "coverage") {
+    if (!badgeEl) return;
+    const pct = Number(coverage);
+    if (!Number.isFinite(pct)) {
+      badgeEl.textContent = `${label}: —`;
+      badgeEl.classList.remove("badge--warn");
+      return;
+    }
+    const normalized = pct > 1 ? pct / 100 : pct;
+    const valuePct = (normalized * 100).toFixed(2);
+    badgeEl.textContent = `${label}: ${valuePct}%`;
+    badgeEl.classList.toggle("badge--warn", normalized < 0.99);
+  }
+
+  function renderSourceBadge(badgeEl, source) {
+    if (!badgeEl) return;
+    badgeEl.textContent = source || "live";
+  }
+
+  function renderSessionPayload(payload) {
+    if (!sessionContentEl) return;
+    if (!payload || typeof payload !== "object" || payload.status !== "ok") {
+      sessionContentEl.innerHTML = '<p class="error">Нет данных по сессии.</p>';
+      return;
+    }
+
+    const metrics = payload.metrics || {};
+    const delta = metrics.delta || {};
+    const micro = metrics.microstructure || {};
+    const levels = metrics.levels || {};
+
+    const rows = [];
+    rows.push(`<div><span class="metric-label">Сессия:</span> <span>${payload.session_used || "—"}</span></div>`);
+    rows.push(`<div><span class="metric-label">Диапазон:</span> <span>${formatNumber(metrics.range)}</span></div>`);
+    rows.push(`<div><span class="metric-label">ATR(14):</span> <span>${formatNumber(metrics.ATR)}</span></div>`);
+    rows.push(`<div><span class="metric-label">VWAP:</span> <span>${formatNumber(metrics.VWAP)}</span></div>`);
+    rows.push(`<div><span class="metric-label">RVOL:</span> <span>${formatNumber(metrics.RVOL)}</span></div>`);
+    rows.push(`<div><span class="metric-label">Delta Σ:</span> <span>${formatNumber(delta.sum)}</span></div>`);
+    rows.push(`<div><span class="metric-label">CVD:</span> <span>${formatNumber(delta.cvd)}</span></div>`);
+    if (levels.ib_high != null && levels.ib_low != null) {
+      rows.push(
+        `<div><span class="metric-label">IB диапазон:</span> <span>${formatNumber(levels.ib_low)} → ${formatNumber(
+          levels.ib_high
+        )}</span></div>`
+      );
+    }
+    if (levels.pdh != null || levels.pdl != null) {
+      rows.push(
+        `<div><span class="metric-label">PDH / PDL:</span> <span>${formatNumber(levels.pdl)} → ${formatNumber(
+          levels.pdh
+        )}</span></div>`
+      );
+    }
+    rows.push(
+      `<div><span class="metric-label">Импульсы:</span> <span>${Array.isArray(delta.impulses) ? delta.impulses.length : 0
+      }</span></div>`
+    );
+    rows.push(
+      `<div><span class="metric-label">Basis p50:</span> <span>${formatNumber(micro.basis_p50)}</span></div>`
+    );
+    rows.push(
+      `<div><span class="metric-label">Funding:</span> <span>${formatNumber(micro.funding_hint)}</span></div>`
+    );
+
+    sessionContentEl.innerHTML = `<div class="metrics-grid">${rows.join("")}</div>`;
+
+    const coverageValue = payload.window?.coverage_pct;
+    renderCoverageBadge(sessionCoverageBadge, coverageValue);
+    const sources = Array.isArray(payload.window?.source_seq) ? payload.window.source_seq : [];
+    renderSourceBadge(sessionSourceBadge, sources.length ? sources.join(" → ") : "live");
+  }
+
+  function renderContextPayload(payload) {
+    if (!contextContentEl || !contextSectionEl) return;
+    contextSectionEl.hidden = false;
+    if (!payload || typeof payload !== "object" || payload.status !== "ok") {
+      contextContentEl.innerHTML = '<p class="error">Контекст недоступен.</p>';
+      return;
+    }
+
+    const zones = Array.isArray(payload.zones_top) ? payload.zones_top : [];
+    const zonesMarkup = zones
+      .map((zone) => {
+        const strength = typeof zone.strength === "number" ? zone.strength.toFixed(2) : "—";
+        const priceLo = formatNumber(zone.price_lo);
+        const priceHi = formatNumber(zone.price_hi);
+        return `<li><span class="badge badge--muted">${zone.type}</span> <strong>${priceLo} → ${priceHi}</strong> <span class="badge">S=${strength}</span> <span class="badge badge--outline">${zone.status}</span></li>`;
+      })
+      .join("");
+
+    const touches = zones.flatMap((zone) =>
+      Array.isArray(zone.touches)
+        ? zone.touches.map((touch) => ({
+            id: zone.id,
+            ...touch,
+          }))
+        : []
+    );
+    const touchesMarkup = touches
+      .map((touch) => {
+        const depthPct = touch.depth != null ? (Number(touch.depth) * 100).toFixed(1) : "—";
+        return `<li><code>${touch.id}</code> — ${touch.kind} (${depthPct}%)</li>`;
+      })
+      .join("");
+
+    const counts = payload.counts || {};
+
+    contextContentEl.innerHTML = `
+      <div class="grid-two">
+        <section>
+          <h4>Top зоны</h4>
+          <p class="counts">FVG: ${counts.fvg ?? 0} · OB: ${counts.ob ?? 0} · Others: ${counts.others ?? 0}</p>
+          <ol class="list-tight">${zonesMarkup || '<li>Нет активных зон</li>'}</ol>
+        </section>
+        <section>
+          <h4>Касания</h4>
+          <ol class="list-tight">${touchesMarkup || '<li>Нет касаний в последней сессии</li>'}</ol>
+        </section>
+      </div>
+    `;
+
+    renderCoverageBadge(ctxCoverageBadge, payload.window?.coverage_pct);
+    const sources = Array.isArray(payload.window?.source_seq) ? payload.window.source_seq : [];
+    renderSourceBadge(ctxSourceBadge, sources.length ? sources.join(" → ") : "live");
+  }
+
+  function updateAnalysisStatus(message, variant = "info") {
+    if (!analysisStatusEl) return;
+    analysisStatusEl.textContent = message || "";
+    analysisStatusEl.dataset.variant = variant;
+  }
+
+  function serializeAnalysis() {
+    return JSON.stringify(
+      {
+        session: state.sessionPayload,
+        context: state.contextPayload,
+      },
+      null,
+      2
+    );
+  }
+
+  async function copyAnalysis() {
+    if (!state.sessionPayload && !state.contextPayload) {
+      showToast("Нет данных для копирования", "warn");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(serializeAnalysis());
+      showToast("JSON скопирован", "success");
+    } catch (error) {
+      console.warn("copy failed", error);
+      showToast("Не удалось скопировать", "error");
+    }
+  }
+
+  function downloadAnalysis() {
+    if (!state.sessionPayload && !state.contextPayload) {
+      showToast("Нет данных для скачивания", "warn");
+      return;
+    }
+    const blob = new Blob([serializeAnalysis()], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `${state.symbol}_analysis.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function runSessionAnalysis(retry = 0) {
+    const symbol = state.symbol;
+    showAnalysisPanel();
+    const hadPrevious = Boolean(state.sessionPayload);
+    if (!hadPrevious && sessionContentEl) {
+      sessionContentEl.innerHTML = '<p class="placeholder">Загружаем сессию…</p>';
+    }
+    if (retry === 0) {
+      updateAnalysisStatus("Получаем данные сессии…", "info");
+    }
+    try {
+      const response = await fetch(`/analyze/session?symbol=${encodeURIComponent(symbol)}`, { cache: "no-store" });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      const payload = await response.json();
+      if (payload?.status === "retry" && retry < ANALYSIS_RETRY_LIMIT) {
+        updateAnalysisStatus("Еще секундочку…", "info");
+        setTimeout(() => {
+          void runSessionAnalysis(retry + 1);
+        }, ANALYSIS_RETRY_DELAY_MS);
+        return;
+      }
+      if (!payload || payload.status !== "ok") {
+        throw new Error(payload?.error || payload?.reason || "session_unavailable");
+      }
+      state.sessionPayload = payload;
+      renderSessionPayload(payload);
+      updateAnalysisStatus("Сессия готова", "success");
+    } catch (error) {
+      console.error("session analysis failed", error);
+      if (!hadPrevious) {
+        state.sessionPayload = null;
+        if (sessionContentEl) {
+          sessionContentEl.innerHTML = `<p class="error">Ошибка анализа сессии: ${error.message || error}</p>`;
+        }
+      }
+      updateAnalysisStatus("Ошибка анализа сессии", "error");
+    }
+  }
+
+  async function runContextAnalysis(retry = 0) {
+    const symbol = state.symbol;
+    showAnalysisPanel();
+    const hadPrevious = Boolean(state.contextPayload);
+    if (!hadPrevious && contextContentEl) {
+      contextContentEl.innerHTML = '<p class="placeholder">Контекст загружается…</p>';
+    }
+    if (retry === 0) {
+      updateAnalysisStatus("Собираем контекст 72 ч…", "info");
+    }
+    try {
+      const response = await fetch(`/context/72h?symbol=${encodeURIComponent(symbol)}`, { cache: "no-store" });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      const payload = await response.json();
+      if (payload?.status === "retry" && retry < ANALYSIS_RETRY_LIMIT) {
+        updateAnalysisStatus("Еще секундочку…", "info");
+        setTimeout(() => {
+          void runContextAnalysis(retry + 1);
+        }, ANALYSIS_RETRY_DELAY_MS);
+        return;
+      }
+      if (!payload || payload.status !== "ok") {
+        throw new Error(payload?.error || payload?.reason || "context_unavailable");
+      }
+      state.contextPayload = payload;
+      renderContextPayload(payload);
+      updateAnalysisStatus("Контекст обновлён", "success");
+    } catch (error) {
+      console.error("context analysis failed", error);
+      if (!hadPrevious) {
+        state.contextPayload = null;
+        if (contextContentEl) {
+          contextContentEl.innerHTML = `<p class="error">Ошибка загрузки контекста: ${error.message || error}</p>`;
+        }
+      }
+      updateAnalysisStatus("Контекст недоступен", "warn");
+    }
+  }
+  if (analyzeBtn) {
+    analyzeBtn.addEventListener("click", () => {
+      void runSessionAnalysis();
+    });
+  }
+
+  if (collectBtn) {
+    collectBtn.addEventListener("click", () => {
+      void runContextAnalysis();
+    });
+  }
+
+  if (copyAnalysisBtn) {
+    copyAnalysisBtn.addEventListener("click", copyAnalysis);
+  }
+
+  if (downloadAnalysisBtn) {
+    downloadAnalysisBtn.addEventListener("click", downloadAnalysis);
+  }

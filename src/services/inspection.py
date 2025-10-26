@@ -23,11 +23,9 @@ from typing import (
     Tuple,
 )
 
-import httpx
-
 LOGGER = logging.getLogger(__name__)
 
-from .binance import BINANCE_FAPI_REST
+from .binance import fetch_um_klines_sync
 from .liquidity import (
     build_liquidity_snapshot,
     normalise_symbol_for_tick,
@@ -60,6 +58,7 @@ _DEFAULT_STORAGE_ROOT = Path(__file__).resolve().parents[2] / "var" / "snapshots
 SNAPSHOT_STORAGE_DIR = Path(
     os.environ.get("INSPECTION_SNAPSHOT_DIR", str(_DEFAULT_STORAGE_ROOT))
 ).expanduser()
+
 _SNAPSHOT_ID_SANITISER = re.compile(r"[^A-Za-z0-9._-]")
 
 MS_IN_DAY = 86_400_000
@@ -520,20 +519,13 @@ def _fetch_binance_minutes(
     end_ms: int,
     limit: int,
 ) -> Sequence[Sequence[object]]:
-    params = {
-        "symbol": symbol.upper(),
-        "interval": "1m",
-        "startTime": str(start_ms),
-        "endTime": str(end_ms),
-        "limit": str(limit),
-    }
-    with httpx.Client(timeout=15.0) as client:
-        response = client.get(BINANCE_FAPI_REST, params=params)
-        response.raise_for_status()
-        data = response.json()
-    if isinstance(data, Sequence):
-        return data  # type: ignore[return-value]
-    return []
+    return fetch_um_klines_sync(
+        symbol,
+        "1m",
+        start_time=start_ms,
+        end_time=end_ms,
+        limit=limit,
+    )
 
 
 MinuteFetcher = Callable[[str, int, int, int], Sequence[Mapping[str, object] | Sequence[object]]]
@@ -864,7 +856,7 @@ def _persist_snapshot(snapshot: Snapshot) -> None:
             pass
 
 
-def _normalise_candle_entry(entry: Any) -> tuple[Any, bool]:
+def _normalise_candle_entry(entry: Any) -> tuple[Any | None, bool]:
     """Return a copy of the candle with normalised timestamp."""
 
     changed = False
@@ -873,23 +865,38 @@ def _normalise_candle_entry(entry: Any) -> tuple[Any, bool]:
         candle = dict(entry)
         timestamp_keys = ("t", "time", "openTime", "open_time")
         normalised_ts: int | None = None
+        last_raw_value: Any = None
         for key in timestamp_keys:
             if key not in candle:
                 continue
-            normalised_ts = ensure_ms_epoch(candle.get(key))
+            raw_value = candle.get(key)
+            last_raw_value = raw_value
+            normalised_ts = ensure_ms_epoch(raw_value)
             if normalised_ts is not None:
                 break
-        if normalised_ts is not None:
-            if candle.get("t") != normalised_ts:
-                changed = True
-            candle["t"] = normalised_ts
+        if normalised_ts is None:
+            LOGGER.warning(
+                "Discarding snapshot candle with invalid timestamp",
+                extra={"value": last_raw_value},
+            )
+            return None, True
+        if candle.get("t") != normalised_ts:
+            changed = True
+        candle["t"] = normalised_ts
         return candle, changed
 
     if isinstance(entry, Sequence) and not isinstance(entry, (str, bytes, bytearray)):
         row = list(entry)
         if row:
-            normalised_ts = ensure_ms_epoch(row[0])
-            if normalised_ts is not None and normalised_ts != row[0]:
+            raw_value = row[0]
+            normalised_ts = ensure_ms_epoch(raw_value)
+            if normalised_ts is None:
+                LOGGER.warning(
+                    "Discarding snapshot candle row with invalid timestamp",
+                    extra={"value": raw_value},
+                )
+                return None, True
+            if normalised_ts != row[0]:
                 row[0] = normalised_ts
                 changed = True
         return row, changed
@@ -905,6 +912,9 @@ def _normalise_frame_candles(candles: Sequence[Any]) -> tuple[list[Any], bool]:
     changed = False
     for candle in candles:
         converted, mutated = _normalise_candle_entry(candle)
+        if converted is None:
+            changed = True
+            continue
         normalised.append(converted)
         changed = changed or mutated
     return normalised, changed
@@ -2003,6 +2013,7 @@ def build_inspection_payload(snapshot: Snapshot) -> Dict[str, Any]:
         liquidity_frames,
         symbol=symbol,
         tick_size=tick_size,
+        tick_source_hint=tick_size_source,
         meta=raw_meta,
         selection=selection,
         config=liquidity_config if isinstance(liquidity_config, Mapping) else None,
@@ -2189,6 +2200,30 @@ def render_inspection_page(
       display: flex;
       flex-direction: column;
       gap: 1.2rem;
+    }
+    .ready-indicator {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.6rem;
+      margin: 0.5rem 0 0;
+      padding: 0.55rem 0.9rem;
+      border-radius: 12px;
+      border: 1px solid rgba(34, 197, 94, 0.24);
+      background: rgba(34, 197, 94, 0.15);
+      color: #4ade80;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      transition: background 0.2s ease, color 0.2s ease, border-color 0.2s ease;
+    }
+    .ready-indicator[data-state="warming"] {
+      border-color: rgba(56, 189, 248, 0.24);
+      background: rgba(56, 189, 248, 0.14);
+      color: #38bdf8;
+    }
+    .ready-indicator[data-state="error"] {
+      border-color: rgba(248, 113, 113, 0.32);
+      background: rgba(248, 113, 113, 0.14);
+      color: #f87171;
     }
     .panel--collection {
       grid-column: 1;
@@ -3188,8 +3223,11 @@ def render_inspection_page(
     const liveAgeEl = document.getElementById("live-age-sec");
     const liveStateEl = document.getElementById("live-stale-flag");
     const mismatchBanner = document.getElementById("stream-mismatch");
+    const readyIndicator = document.getElementById("inspection-ready-indicator");
+    let readyStatusTimer = null;
 
     initCollapsibles();
+    void refreshBootstrapStatus();
 
     const resolveHours = (value) => {
       const parsed = Number(value);
@@ -3443,6 +3481,46 @@ def render_inspection_page(
     if (priceStore) {
       priceStore.subscribe(handlePriceStoreEvent);
       priceStore.start();
+    }
+
+    async function refreshBootstrapStatus() {
+      if (!readyIndicator) return;
+      if (readyStatusTimer) {
+        clearTimeout(readyStatusTimer);
+        readyStatusTimer = null;
+      }
+      try {
+        const response = await fetch("/inspection/status", { cache: "no-store" });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const body = await response.json();
+        const meta = body?.meta || {};
+        if (meta && typeof meta === "object" && meta.status === "disabled") {
+          readyIndicator.dataset.state = "ready";
+          readyIndicator.textContent = "Прогрев данных отключён (сбор выполняется по запросу)";
+          readyIndicator.hidden = false;
+          return;
+        }
+        if (meta && typeof meta === "object" && meta.status === "error") {
+          readyIndicator.dataset.state = "error";
+          readyIndicator.textContent = "Ошибка прогрева данных — проверьте логи сервера";
+          readyIndicator.hidden = false;
+          return;
+        }
+        const ready = Boolean(body?.ready);
+        readyIndicator.dataset.state = ready ? "ready" : "warming";
+        readyIndicator.textContent = ready ? "Данные к выдаче готовы" : "Готовим данные к выдаче…";
+        readyIndicator.hidden = false;
+        if (!ready) {
+          readyStatusTimer = setTimeout(refreshBootstrapStatus, 5000);
+        }
+      } catch (error) {
+        console.warn("Unable to fetch bootstrap status", error);
+        readyIndicator.dataset.state = "error";
+        readyIndicator.textContent = "Не удалось проверить готовность данных";
+        readyIndicator.hidden = false;
+      }
     }
 
     if (chartStore || priceStore) {
@@ -4404,78 +4482,61 @@ def render_inspection_page(
         summaryButton.disabled = true;
       }
 
-      let createdSnapshotId = null;
-      let channel = null;
-
-      const closeChannel = (code = 1000) => {
-        if (!channel) return;
-        try {
-          channel.close(code);
-        } catch (error) {
-          console.debug("ws close error", error);
-        }
-        channel = null;
-      };
-
       try {
-        updateStatus("Собираем лайв-данные за последние 3 дня...", "info");
         resetProgressLog();
-        channel = await openCollectionChannel({ mode: "summary", summaryDays: 3 });
-        const report = (eventName, data = {}) => {
-          appendProgress(eventName, data);
-          if (channel) {
-            channel.sendProgress(eventName, data);
-          }
-        };
-        report("client.flow:channel_ready", { mode: "summary" });
-        report("client.flow:capture_snapshot", { mode: "summary" });
-        const { snapshotId } = await captureLiveSnapshot({
-          lookbackDays: 3,
-          mode: "summary",
-          progress: report,
+        appendProgress("client.flow:started", { mode: "summary" });
+        updateStatus("Собираем лайв-данные за последние 3 дня...", "info");
+
+        const symbol = activeSymbol();
+        if (!symbol) {
+          throw new Error("symbol_required");
+        }
+
+        const response = await fetch("/collection/summary", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ symbol, days: 3 }),
         });
-        createdSnapshotId = snapshotId;
-        state.snapshotId = snapshotId;
-        updateCheckAllState();
-        if (summaryButton) {
-          summaryButton.disabled = true;
-        }
-        if (snapshotSelect) {
-          snapshotSelect.value = snapshotId;
-        }
-        report("client.flow:server_start", { snapshot: snapshotId, summary_days: 3 });
-        const payload = await channel.start({ snapshotId, summaryDays: 3 });
-        if (!payload) {
+
+        if (response.status === 204) {
           state.checkAll = null;
           setJson(checkAllPre, null);
+          appendProgress("client.flow:empty", { mode: "summary" });
           updateStatus("Не удалось собрать 3-дневный контекст", "warning");
-          report("client.flow:server_empty", { snapshot: snapshotId });
           return;
         }
+
+        if (!response.ok) {
+          let detail = "";
+          try {
+            const errorPayload = await response.json();
+            detail = errorPayload?.message ? `: ${errorPayload.message}` : "";
+          } catch (error) {
+            detail = "";
+          }
+          throw new Error(`HTTP ${response.status}${detail}`);
+        }
+
+        const payload = await response.json();
         state.checkAll = payload;
         setJson(checkAllPre, payload);
+        appendProgress("client.flow:completed", { status: payload?.status ?? null });
         updateStatus("3-дневный контекст готов", "success");
-        report("client.flow:completed", { status: payload?.status ?? null });
       } catch (error) {
         console.error(error);
-        if (channel) {
-          channel.sendProgress("client.flow:error", {
-            message: error?.message || String(error),
-          });
-        }
         state.checkAll = null;
         setJson(checkAllPre, null);
-        const detail = error && typeof error.detail !== "undefined" ? `: ${JSON.stringify(error.detail)}` : "";
+        const detail =
+          error && typeof error.detail !== "undefined" ? `: ${JSON.stringify(error.detail)}` : "";
         updateStatus(`Ошибка при сборе 3-дневного контекста${detail}`, "error");
+        appendProgress("client.flow:error", {
+          message: error?.message || String(error),
+        });
       } finally {
-        closeChannel();
         if (summaryButton) {
           summaryButton.disabled = false;
-        }
-        if (createdSnapshotId) {
-          refreshSnapshots({ quiet: true }).catch((err) => {
-            console.warn("Не удалось обновить список снэпшотов", err);
-          });
         }
         updateCheckAllState();
       }
@@ -4486,78 +4547,53 @@ def render_inspection_page(
         sessionDetailedButton.disabled = true;
       }
 
-      let createdSnapshotId = null;
-      let channel = null;
-
-      const closeChannel = (code = 1000) => {
-        if (!channel) return;
-        try {
-          channel.close(code);
-        } catch (error) {
-          console.debug("ws close error", error);
-        }
-        channel = null;
-      };
-
       try {
-        updateStatus("Собираем подробные данные по последней сессии...", "info");
         resetProgressLog();
-        channel = await openCollectionChannel({ mode: "session_detailed" });
-        const report = (eventName, data = {}) => {
-          appendProgress(eventName, data);
-          if (channel) {
-            channel.sendProgress(eventName, data);
-          }
-        };
-        report("client.flow:channel_ready", { mode: "session_detailed" });
-        report("client.flow:capture_snapshot", { mode: "session_detailed" });
-        const { snapshotId } = await captureLiveSnapshot({
-          lookbackDays: 1,
-          mode: "session_detailed",
-          progress: report,
+        appendProgress("client.flow:started", { mode: "session_detailed" });
+        updateStatus("Собираем подробные данные по последней сессии...", "info");
+
+        const symbol = activeSymbol();
+        if (!symbol) {
+          throw new Error("symbol_required");
+        }
+
+        const response = await fetch("/collection/session-detailed", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ symbol }),
         });
-        createdSnapshotId = snapshotId;
-        state.snapshotId = snapshotId;
-        updateCheckAllState();
-        if (sessionDetailedButton) {
-          sessionDetailedButton.disabled = true;
+
+        if (!response.ok) {
+          let detail = "";
+          try {
+            const info = await response.json();
+            detail = info?.message ? `: ${info.message}` : "";
+          } catch (error) {
+            detail = "";
+          }
+          throw new Error(`HTTP ${response.status}${detail}`);
         }
-        if (snapshotSelect) {
-          snapshotSelect.value = snapshotId;
-        }
-        report("client.flow:server_start", { snapshot: snapshotId, mode: "session_detailed" });
-        const payload = await channel.start({ snapshotId });
-        if (!payload) {
-          state.checkAll = null;
-          setJson(checkAllPre, null);
-          updateStatus("Не удалось собрать данные по последней сессии", "warning");
-          report("client.flow:server_empty", { snapshot: snapshotId });
-          return;
-        }
+
+        const payload = await response.json();
         state.checkAll = payload;
         setJson(checkAllPre, payload);
+        appendProgress("client.flow:completed", { status: payload?.status ?? null });
         updateStatus("Сессионный отчёт готов", "success");
-        report("client.flow:completed", { status: payload?.status ?? null });
       } catch (error) {
         console.error(error);
-        if (channel) {
-          channel.sendProgress("client.flow:error", {
-            message: error?.message || String(error),
-          });
-        }
         state.checkAll = null;
         setJson(checkAllPre, null);
-        const detail = error && typeof error.detail !== "undefined" ? `: ${JSON.stringify(error.detail)}` : "";
+        const detail =
+          error && typeof error.detail !== "undefined" ? `: ${JSON.stringify(error.detail)}` : "";
         updateStatus(`Ошибка при сборе данных по последней сессии${detail}`, "error");
+        appendProgress("client.flow:error", {
+          message: error?.message || String(error),
+        });
       } finally {
-        closeChannel();
         if (sessionDetailedButton) {
           sessionDetailedButton.disabled = false;
-        }
-        if (createdSnapshotId) {
-          refreshSnapshots({ quiet: true }).catch((err) => {
-            console.warn("Не удалось обновить список снэпшотов", err);
-          });
         }
         updateCheckAllState();
       }
@@ -4568,56 +4604,57 @@ def render_inspection_page(
         topupButton.disabled = true;
       }
 
-      let createdSnapshotId = null;
-
       try {
-        updateStatus("Дособираем свежие лайв-данные...", "info");
         resetProgressLog();
-        appendProgress("client.capture_snapshot", { mode: "topup" });
-        const { snapshotId } = await captureLiveSnapshot({ lookbackDays: 1, mode: "topup" });
-        createdSnapshotId = snapshotId;
-        state.snapshotId = snapshotId;
-        updateCheckAllState();
-        if (topupButton) {
-          topupButton.disabled = true;
+        appendProgress("client.flow:started", { mode: "topup" });
+        updateStatus("Дособираем свежие лайв-данные...", "info");
+
+        const symbol = activeSymbol();
+        if (!symbol) {
+          throw new Error("symbol_required");
         }
-        if (snapshotSelect) {
-          snapshotSelect.value = snapshotId;
-        }
-        appendProgress("client.http_request", { mode: "topup" });
-        const url = new URL("/inspection/check-all", window.location.origin);
-        url.searchParams.set("snapshot", snapshotId);
-        url.searchParams.set("mode", "topup");
-        const response = await fetch(url.toString(), {
-          headers: { Accept: "application/json" },
-          cache: "no-store",
+
+        const response = await fetch("/collection/topup", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ symbol }),
         });
+
         if (response.status === 204) {
           state.checkAll = null;
           setJson(checkAllPre, null);
+          appendProgress("client.flow:completed", { status: null });
           updateStatus("Свежие данные отсутствуют", "warning");
           return;
         }
         if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
+          let detail = "";
+          try {
+            const info = await response.json();
+            detail = info?.message ? `: ${info.message}` : "";
+          } catch (error) {
+            detail = "";
+          }
+          throw new Error(`HTTP ${response.status}${detail}`);
         }
         const payload = await response.json();
         state.checkAll = payload;
         setJson(checkAllPre, payload);
+        appendProgress("client.flow:completed", { status: payload?.status ?? null });
         updateStatus("Данные успешно дособраны", "success");
       } catch (error) {
         console.error(error);
         state.checkAll = null;
         setJson(checkAllPre, null);
         updateStatus("Ошибка при досборе данных", "error");
+        appendProgress("client.flow:error", {
+          message: error?.message || String(error),
+        });
       } finally {
         if (topupButton) {
           topupButton.disabled = false;
-        }
-        if (createdSnapshotId) {
-          refreshSnapshots({ quiet: true }).catch((err) => {
-            console.warn("Не удалось обновить список снэпшотов", err);
-          });
         }
         updateCheckAllState();
       }
@@ -5410,6 +5447,9 @@ def render_inspection_page(
           <section class=\"panel panel--collection\">
             <h2>Сбор данных</h2>
             <p class=\"panel-lead\">Собирайте актуальную информацию без сохранения снэпшотов на сервере.</p>
+            <div class=\"ready-indicator\" id=\"inspection-ready-indicator\" hidden data-state=\"warming\">
+              Готовим данные к выдаче…
+            </div>
             <div class=\"collection-actions\">
               <button id=\"collect-summary\" class=\"primary\" type=\"button\">Собрать информацию за последние 3 дня</button>
               <button id=\"btn_collect_last_session_detailed\" class=\"secondary\" type=\"button\" title=\"Последняя завершённая или текущая активная сессия с полнотой ≥90%\">Собрать информацию за последнюю сессию подробно</button>
@@ -5672,10 +5712,12 @@ def validate_enhanced_snapshot(snapshot: Mapping[str, Any]) -> tuple[bool, List[
                 break
             oi = _coerce_float(item.get("oi"))
             funding = _coerce_float(item.get("funding"))
-            if oi is None or oi <= 0:
-                errors.append("Open interest must be positive")
+            if oi is None:
+                errors.append("Open interest missing")
+            elif oi < 0:
+                errors.append("Open interest must be non-negative")
             if funding is None:
-                errors.append("Funding rate missing")
+                continue
 
     book = snapshot.get("book")
     if isinstance(book, Mapping):

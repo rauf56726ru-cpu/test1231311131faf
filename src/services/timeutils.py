@@ -1,16 +1,49 @@
 """Utilities for working with market-data timestamps."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timezone
+import inspect
 import logging
 import math
 from typing import Any
 
+from src.common.ts import ensure_epoch_ms
+
 
 LOGGER = logging.getLogger(__name__)
 
-_FUTURE_DRIFT = timedelta(days=1)
 _UTC = timezone.utc
+_INVALID_TOTAL = 0
+_INVALID_LOGGED = 0
+_INVALID_THRESHOLD = 20
+
+
+def _record_invalid(value: Any) -> None:
+    global _INVALID_TOTAL, _INVALID_LOGGED
+    _INVALID_TOTAL += 1
+    if _INVALID_LOGGED < _INVALID_THRESHOLD:
+        caller = "<unknown>"
+        try:
+            frame = inspect.stack()[2]
+            caller = f"{frame.filename}:{frame.lineno}"
+        except Exception:  # pragma: no cover - defensive
+            pass
+        LOGGER.warning(
+            "timestamp_invalid %s type=%s value=%r",
+            caller,
+            type(value).__name__,
+            value,
+        )
+        _INVALID_LOGGED += 1
+    elif _INVALID_LOGGED == _INVALID_THRESHOLD:
+        LOGGER.warning(
+            "timestamp_invalid.suppressed",
+            extra={"suppressed": _INVALID_TOTAL - _INVALID_THRESHOLD, "last_value": value},
+        )
+        _INVALID_LOGGED += 1
+    else:
+        # Suppress further logs to avoid flooding output.
+        _INVALID_LOGGED += 1
 
 
 def _coerce_int(value: Any) -> int | None:
@@ -51,27 +84,26 @@ def _coerce_int(value: Any) -> int | None:
 
 
 def ensure_ms_epoch(value: Any) -> int | None:
-    """Normalise timestamps to milliseconds since the Unix epoch."""
+    """Normalise mixed timestamp units to milliseconds since Unix epoch."""
 
-    numeric = _coerce_int(value)
-    if numeric is None:
+    numeric: int | None
+    if isinstance(value, datetime):
+        dt = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        numeric = int(dt.timestamp() * 1000)
+    elif isinstance(value, date):
+        dt = datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+        numeric = int(dt.timestamp() * 1000)
+    else:
+        numeric = _coerce_int(value)
+        if numeric is None:
+            return None
+
+    try:
+        return ensure_epoch_ms(numeric)
+    except ValueError:
+        if numeric >= 1_000_000_000:
+            _record_invalid(value)
         return None
-
-    abs_value = abs(numeric)
-    if abs_value >= 10**14:
-        numeric //= 1000
-    elif abs_value < 10**10:
-        numeric *= 1000
-
-    if numeric <= 0:
-        return None
-
-    now = datetime.now(_UTC)
-    max_allowed = int((now + _FUTURE_DRIFT).timestamp() * 1000)
-    if numeric > max_allowed:
-        return None
-
-    return numeric
 
 
 def safe_datetime_from_ms(ms: int, tz: timezone) -> datetime | None:
@@ -82,4 +114,3 @@ def safe_datetime_from_ms(ms: int, tz: timezone) -> datetime | None:
     except (OverflowError, OSError, ValueError):
         LOGGER.warning("Failed to convert timestamp to datetime", extra={"ms": ms})
         return None
-

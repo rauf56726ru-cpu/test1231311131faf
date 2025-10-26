@@ -2,5 +2,9 @@ fastapi
 uvicorn[standard]
 httpx
 pytest
-python-binance
+binance-connector
 pydantic-settings
+pyarrow
+duckdb
+pandas
+uvloop

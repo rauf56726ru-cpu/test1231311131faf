@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
-import httpx
+import aiohttp
 
 from . import tracing
 from .tracing import TraceContext
@@ -17,7 +17,12 @@ from .ohlc import TIMEFRAME_TO_MS, resample_ohlcv
 from .timeutils import ensure_ms_epoch
 from .check_all_datas import _normalise_binance_row
 from .progress import ProgressReporter, emit_progress
-from .http_client import RATE_LIMIT_STATUSES, TRANSIENT_STATUSES, request as http_request
+from .http_client import RATE_LIMIT_STATUSES
+from .binance import (
+    BinanceAPIException,
+    BinanceRequestException,
+    fetch_um_klines,
+)
 
 LOGGER = logging.getLogger(__name__)
 TRACE_LOGGER = tracing.LOGGER.getChild("summary_collector")
@@ -98,7 +103,6 @@ class CollectionSummary:
 
 
 async def _request_klines(
-    client: httpx.AsyncClient,
     *,
     symbol: str,
     interval: str,
@@ -107,41 +111,33 @@ async def _request_klines(
     limit: int,
     trace: TraceContext | None = None,
 ) -> List[Sequence[Any]]:
-    params = {
-        "symbol": symbol.upper(),
-        "interval": interval,
-        "startTime": str(start_ms),
-        "endTime": str(end_ms),
-        "limit": str(limit),
-    }
     scope = f"summary.{interval}"
     try:
-        response = await http_request(
-            "GET",
-            BINANCE_ENDPOINT,
-            scope=scope,
-            trace=trace,
-            client=client,
-            params=params,
-            symbol=symbol,
-            window=(start_ms, end_ms),
-            details=f"interval={interval},limit={limit}",
-            max_retries=1,
-            retry_statuses=TRANSIENT_STATUSES,
-            rate_limit_statuses=RATE_LIMIT_STATUSES,
+        payload = await fetch_um_klines(
+            symbol,
+            interval,
+            start_time=start_ms,
+            end_time=end_ms,
+            limit=limit,
         )
-    except httpx.RequestError as exc:  # pragma: no cover - network failure
+    except BinanceAPIException as exc:
+        status = getattr(exc, "status_code", None)
+        if status in RATE_LIMIT_STATUSES or (isinstance(status, int) and status >= 500):
+            return []
+        raise GapCollectionError(f"Binance error: {exc}") from exc
+    except (BinanceRequestException, aiohttp.ClientError, asyncio.TimeoutError) as exc:
         raise GapCollectionError(f"Request failure: {exc}") from exc
 
-    if response.status_code == 200:
-        payload = response.json()
-        return payload if isinstance(payload, list) else []
+    if trace is not None:
+        trace.info(
+            "fetch.batch",
+            scope=scope,
+            symbol=symbol,
+            window={"from": start_ms, "to": end_ms},
+            details=f"interval={interval},limit={limit}",
+        )
 
-    if response.status_code in RATE_LIMIT_STATUSES or response.status_code >= 500:
-        return []
-
-    response.raise_for_status()
-    return []
+    return payload if isinstance(payload, list) else []
 
 
 def _align_to_interval(timestamp_ms: int, interval_ms: int) -> int:
@@ -332,7 +328,6 @@ async def _fill_gap(
     interval: str,
     gap: Mapping[str, int],
     interval_ms: int,
-    client: httpx.AsyncClient,
     progress: Optional[ProgressReporter] = None,
     trace: TraceContext | None = None,
 ) -> IntervalSummary:
@@ -405,10 +400,7 @@ async def _fill_gap(
         }
         if trace is not None:
             request_kwargs["trace"] = trace
-        raw_rows = await _request_klines(
-            client,
-            **request_kwargs,
-        )
+        raw_rows = await _request_klines(**request_kwargs)
         requests += 1
         if trace is not None:
             trace.info(
@@ -724,8 +716,7 @@ async def collect_recent_summary(
 
     pending: List[Dict[str, Any]] = []
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(25.0, connect=10.0)) as client:
-        for interval in target_intervals:
+    for interval in target_intervals:
             interval_ms = TIMEFRAME_TO_MS.get(interval)
             if not interval_ms:
                 continue
@@ -900,7 +891,6 @@ async def collect_recent_summary(
                         interval=interval,
                         gap=gap,
                         interval_ms=interval_ms,
-                        client=client,
                         progress=progress,
                         trace=trace_ctx,
                     )
@@ -1134,14 +1124,6 @@ async def collect_recent_summary(
     return summary
 
 __all__ = ["collect_recent_summary", "CollectionSummary"]
-
-
-
-
-
-
-
-
 
 
 

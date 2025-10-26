@@ -1,6 +1,14 @@
 """Service layer exports for the chart backend."""
 
-from .binance import BINANCE_FAPI_REST
+from .binance import (
+    BINANCE_FAPI_BASE_URL,
+    BINANCE_FAPI_REST,
+    fetch_fapi_endpoint,
+)
+from .binance_ingest import ingest_agg_trades, ingest_klines, BinanceIngestError, BinanceAccessDenied, fetch_premium_index_series
+from .coverage import compute_coverage
+from .depth_checks import capture_depth_series
+from .smc72_pipeline import collect_data as collect_smc72_data, write_outputs as write_smc72_outputs, PipelineDiagnostics
 from .check_all_datas import (
     build_check_all_datas,
     build_check_all_datas_async,
@@ -39,6 +47,8 @@ from .liquidity import build_liquidity_snapshot
 from .zones import Config as ZonesConfig, detect_zones
 from .enrichment import apply_enrichment_to_payload, enrich_inspection_snapshot
 from .collection_state import get_last_collection_time, set_last_collection_time
+from .zones_72h_service import collect_open_zones as collect_zones_72h
+from .session_last_service import collect_last_sessions
 from .shared_candles_store import (
     clear_shared_candles,
     get_shared_candles,
@@ -46,6 +56,10 @@ from .shared_candles_store import (
 )
 from .summary_collector import collect_recent_summary, CollectionSummary
 from .session_collector import collect_last_session_detailed, SessionCollectionResult
+from .session_analysis import ZoneDetectionConfig, build_session_snapshot, build_72h_context, build_smc_session_v1
+from .session_fast import analyze_session_fast, SessionDataUnavailable
+from .zones_context import build_zones_context, ZoneCache, ZoneDetectionError
+from .zones_ctx72 import build_smc_72h_ctx_v1
 from .ohlc import (
     TIMEFRAME_WINDOWS,
     fetch_ohlcv,
@@ -57,9 +71,22 @@ from .ohlc import (
 )
 from .vwap import fetch_daily_vwap, fetch_daily_vwap_sync
 from .trades import AggTradeCollector
+from .um_ingest import UMIngestConfig, UMIngestService, MinuteRecord
 
 __all__ = [
+    "BINANCE_FAPI_BASE_URL",
     "BINANCE_FAPI_REST",
+    "fetch_fapi_endpoint",
+    "ingest_klines",
+    "ingest_agg_trades",
+    "fetch_premium_index_series",
+    "BinanceIngestError",
+    "BinanceAccessDenied",
+    "compute_coverage",
+    "capture_depth_series",
+    "collect_smc72_data",
+    "write_smc72_outputs",
+    "PipelineDiagnostics",
     "build_inspection_payload",
     "build_liquidity_snapshot",
     "build_check_all_datas",
@@ -106,8 +133,23 @@ __all__ = [
     "clear_shared_candles",
     "enrich_inspection_snapshot",
     "apply_enrichment_to_payload",
+    "collect_zones_72h",
+    "collect_last_sessions",
     "collect_recent_summary",
     "CollectionSummary",
     "collect_last_session_detailed",
     "SessionCollectionResult",
+    "build_session_snapshot",
+    "build_72h_context",
+    "build_smc_session_v1",
+    "build_smc_72h_ctx_v1",
+    "ZoneDetectionConfig",
+    "UMIngestConfig",
+    "UMIngestService",
+    "MinuteRecord",
+    "analyze_session_fast",
+    "SessionDataUnavailable",
+    "build_zones_context",
+    "ZoneCache",
+    "ZoneDetectionError",
 ]

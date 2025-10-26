@@ -1,17 +1,21 @@
 """Session-based TPO and volume profile calculation."""
 from __future__ import annotations
 
+import asyncio
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from math import floor, isfinite, sqrt
 from typing import Any, Dict, List, Mapping, MutableMapping, Sequence, Tuple
 
-import httpx
+import aiohttp
 
 from ..meta import Meta
-
-BINANCE_FAPI_AGG_TRADES = "https://fapi.binance.com/fapi/v1/aggTrades"
+from .binance import (
+    BinanceAPIException,
+    BinanceRequestException,
+    fetch_um_agg_trades,
+)
 VALUE_AREA_RATIO = 0.7
 MIN_SESSIONS = 2
 MAX_SESSIONS = 5
@@ -80,41 +84,48 @@ async def _accumulate_session_profile(
     limit = 1000
     start_ms = int(window.start.timestamp() * 1000)
     end_ms = int(window.end.timestamp() * 1000)
-    params = {"symbol": symbol.upper(), "limit": str(limit), "endTime": str(end_ms)}
     cursor = start_ms
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        while cursor < end_ms:
-            params["startTime"] = str(cursor)
-            response = await client.get(BINANCE_FAPI_AGG_TRADES, params=params)
-            response.raise_for_status()
-            data = response.json()
-            if not isinstance(data, list) or not data:
+    while cursor < end_ms:
+        try:
+            rows = await fetch_um_agg_trades(
+                symbol,
+                start_time=cursor,
+                end_time=end_ms,
+                limit=limit,
+            )
+        except (BinanceAPIException, BinanceRequestException, aiohttp.ClientError, asyncio.TimeoutError):
+            raise
+
+        if not rows:
+            break
+
+        last_time = None
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            try:
+                trade_time = int(row["T"])
+                price_key = _normalise_price_key(str(row["p"]))
+                quantity = float(row["q"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if quantity <= 0 or not isfinite(quantity):
+                continue
+            if trade_time < start_ms or trade_time >= end_ms:
+                continue
+            volume_by_price[price_key] += quantity
+            last_time = trade_time
+
+        if last_time is None:
+            cursor += 1000
+        else:
+            if last_time >= end_ms:
                 break
-
-            last_time = None
-            for row in data:
-                try:
-                    trade_time = int(row["T"])
-                    price_key = _normalise_price_key(str(row["p"]))
-                    quantity = float(row["q"])
-                except (KeyError, TypeError, ValueError):
-                    continue
-                if quantity <= 0 or not isfinite(quantity):
-                    continue
-                if trade_time < start_ms:
-                    continue
-                if trade_time >= end_ms:
-                    continue
-                volume_by_price[price_key] += quantity
-                last_time = trade_time
-
-            if last_time is None:
-                break
-
             cursor = last_time + 1
-            if len(data) < limit:
-                break
+
+        if len(rows) < limit:
+            break
 
     return volume_by_price
 

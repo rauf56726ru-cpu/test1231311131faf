@@ -4,3 +4,7 @@ dist/
 __pycache__/
 *.pyc
 var/
+.venv/
+binance-connector-python-master/
+meta/
+tests/

@@ -20,10 +20,16 @@ from typing import (
     Tuple,
 )
 
+import aiohttp
 import httpx
 
 from ..meta import Meta
-from .binance import BINANCE_FAPI_REST
+from .binance import (
+    BINANCE_FAPI_REST,
+    BinanceAPIException,
+    BinanceRequestException,
+    fetch_um_klines,
+)
 from .ohlc import TIMEFRAME_TO_MS
 
 VWAP_INTERVAL = "1m"
@@ -69,38 +75,35 @@ async def _fetch_minute_bars(symbol: str, start_ms: int, end_ms: int) -> List[Mi
     cursor = start_ms
     limit = 1000
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        while cursor < end_ms:
-            params = {
-                "symbol": symbol.upper(),
-                "interval": VWAP_INTERVAL,
-                "startTime": str(cursor),
-                "endTime": str(end_ms),
-                "limit": str(limit),
-            }
-            response = await client.get(BINANCE_FAPI_REST, params=params)
-            response.raise_for_status()
-            data = response.json()
-            if not isinstance(data, list):  # pragma: no cover
-                break
-            if not data:
-                break
+    while cursor < end_ms:
+        try:
+            data = await fetch_um_klines(
+                symbol,
+                VWAP_INTERVAL,
+                start_time=cursor,
+                end_time=end_ms,
+                limit=limit,
+            )
+        except (BinanceAPIException, BinanceRequestException, aiohttp.ClientError, asyncio.TimeoutError):
+            break
+        if not isinstance(data, list) or not data:
+            break
 
-            last_open = None
-            for row in data:
-                bar = _normalise_row(row)
-                if bar is None:
-                    continue
-                if bar.open_ms < start_ms or bar.open_ms >= end_ms:
-                    continue
-                bars[bar.open_ms] = bar
-                last_open = bar.open_ms
+        last_open = None
+        for row in data:
+            bar = _normalise_row(row)
+            if bar is None:
+                continue
+            if bar.open_ms < start_ms or bar.open_ms >= end_ms:
+                continue
+            bars[bar.open_ms] = bar
+            last_open = bar.open_ms
 
-            if last_open is None:
-                break
-            cursor = max(last_open + INTERVAL_MS, cursor + INTERVAL_MS)
-            if len(data) < limit:
-                break
+        if last_open is None:
+            break
+        cursor = max(last_open + INTERVAL_MS, cursor + INTERVAL_MS)
+        if len(data) < limit:
+            break
 
     ordered_times = sorted(bars)
     return [bars[ts] for ts in ordered_times]

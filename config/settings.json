@@ -1,0 +1,37 @@
+{
+  "binance_vision": {
+    "base_url": "https://data.binance.vision",
+    "market_source": "futures_um",
+    "ingest_hours": 72,
+    "default_intervals": ["1m", "3m", "5m", "15m", "1h", "4h", "1d"],
+    "max_parallel_downloads": 4,
+    "request_timeout_seconds": 30.0,
+    "allow_partial_results": false
+  },
+  "zone_thresholds": {
+    "tolerance_bps": 2.0,
+    "min_separation_bars": 1,
+    "max_fill_percent": 60.0,
+    "min_displacement": 0.25
+  },
+  "eql_settings": {
+    "tolerance_bps": 5.0,
+    "min_separation_bars": 5,
+    "symmetry": true,
+    "tolerance_bps_by_tf": {
+      "15m": 5.0,
+      "1h": 3.0,
+      "4h": 2.0
+    },
+    "min_separation_bars_by_tf": {
+      "15m": 5,
+      "1h": 6,
+      "4h": 6
+    },
+    "pivot_radius_by_tf": {
+      "15m": 2,
+      "1h": 3,
+      "4h": 4
+    }
+  }
+}

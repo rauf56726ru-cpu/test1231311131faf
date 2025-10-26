@@ -21,6 +21,8 @@
             <span class="app-meta__label">Версия:</span>
             <span id="app-version" class="app-meta__value">—</span>
           </div>
+          <button id="run-session-analysis" class="btn-secondary" type="button">Быстрый анализ сессии</button>
+          <button id="collect-context" class="btn-secondary" type="button">Собрать 72 ч</button>
           <button id="show-inspection" class="btn-secondary" type="button">Inspection</button>
         </div>
       </div>
@@ -72,6 +74,40 @@
           </div>
         </aside>
         <div id="status-message" class="status-banner" hidden></div>
+      </section>
+      <section class="analysis-panel" id="analysis-panel" hidden>
+        <header class="analysis-header">
+          <h2>Быстрый анализ</h2>
+          <div class="analysis-actions">
+            <button type="button" class="btn-tertiary" id="copy-analysis" data-tooltip="Копировать JSON">📋</button>
+            <button type="button" class="btn-terтиary" id="download-analysis" data-tooltip="Скачать JSON">⬇</button>
+          </div>
+        </header>
+        <div class="analysis-body">
+          <section class="analysis-section" id="session-analysis">
+            <header>
+              <h3>Сессия (SMC_session_v1)</h3>
+              <span class="badge" id="session-coverage-badge">—</span>
+              <span class="badge badge--source" id="session-source-badge">live</span>
+            </header>
+            <div class="analysis-content" id="session-content">
+              <p class="placeholder">Запустите анализ для отображения данных.</p>
+            </div>
+          </section>
+          <section class="analysis-section" id="context-analysis" hidden>
+            <header>
+              <h3>Контекст 72 ч (SMC_72h_ctx_v1)</h3>
+              <span class="badge" id="ctx-coverage-badge">—</span>
+              <span class="badge badge--source" id="ctx-source-badge">live</span>
+            </header>
+            <div class="analysis-content" id="context-content">
+              <p class="placeholder">Контекст загружается…</p>
+            </div>
+          </section>
+        </div>
+        <footer class="analysis-footer">
+          <div class="analysis-status" id="analysis-status" role="status" aria-live="polite"></div>
+        </footer>
       </section>
     </main>
   </body>

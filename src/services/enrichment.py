@@ -5,10 +5,16 @@ import asyncio
 import statistics
 from collections import defaultdict
 from datetime import datetime, timezone
+import asyncio
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
 
-import httpx
-BINANCE_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
+import aiohttp
+
+from .binance import (
+    BinanceAPIException,
+    BinanceRequestException,
+    fetch_um_klines,
+)
 MAX_DELTA_BARS = 50
 MAX_FOOTPRINT_ROWS = 10
 
@@ -53,11 +59,13 @@ def _map_minutes(rows: Iterable[Mapping[str, Any]]) -> Dict[int, Dict[str, float
 
 
 async def _fetch_recent(symbol: str, interval: str, limit: int) -> List[Dict[str, float]]:
-    params = {"symbol": symbol.upper(), "interval": interval, "limit": str(min(max(limit, 1), 1000))}
-    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
-        response = await client.get(BINANCE_KLINES_URL, params=params)
-        response.raise_for_status()
-        payload = response.json()
+    limit_value = min(max(limit, 1), 1000)
+    try:
+        payload = await fetch_um_klines(symbol, interval, limit=limit_value)
+    except (BinanceAPIException, BinanceRequestException, aiohttp.ClientError, asyncio.TimeoutError):
+        return []
+    except Exception:  # pragma: no cover - defensive guard for unexpected errors
+        return []
     candles: List[Dict[str, float]] = []
     if isinstance(payload, Sequence):
         for row in payload:

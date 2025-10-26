@@ -7,10 +7,16 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence
 
-import httpx
+import aiohttp
 
-from .http_client import RATE_LIMIT_STATUSES, TRANSIENT_STATUSES, request as http_request
+from .binance import (
+    BinanceAPIException,
+    BinanceRequestException,
+    fetch_um_agg_trades,
+)
+from .http_client import RATE_LIMIT_STATUSES
 from .tracing import TraceContext
+from .vision_store import get_store
 
 __all__ = [
     "fetch_footprint",
@@ -18,7 +24,6 @@ __all__ = [
     "compute_orderflow_aggregates",
 ]
 
-BINANCE_FUTURES_AGG_TRADES = "https://fapi.binance.com/fapi/v1/aggTrades"
 LOGGER = logging.getLogger(__name__)
 _FOOTPRINT_LOCK = asyncio.Lock()
 _MAX_WINDOW_HOURS = 4
@@ -41,6 +46,50 @@ class OrderflowSnapshot:
 
     def as_dict(self) -> Dict[str, Any]:
         return {"per_bar": self.per_bar, "aggregates": self.aggregates}
+
+
+async def _load_trades_from_store(
+    symbol: str,
+    start_ms: int,
+    end_ms: int,
+    *,
+    window_minutes: int,
+) -> List[Dict[str, Any]]:
+    store = get_store()
+    rows = await asyncio.to_thread(
+        store.fetch_agg_trades,
+        symbol,
+        start_ms,
+        end_ms,
+    )
+    if not rows:
+        fallback_limit = max(window_minutes * 120, _PER_BAR_MINUTES)
+        recent = await asyncio.to_thread(
+            store.fetch_agg_trades,
+            symbol,
+            None,
+            None,
+            fallback_limit,
+            ascending=False,
+        )
+        if recent:
+            recent_sorted = sorted(recent, key=lambda row: int(row["t"]))
+            cutoff_ms = int(recent_sorted[-1]["t"]) - window_minutes * 60_000
+            rows = [row for row in recent_sorted if int(row["t"]) >= cutoff_ms]
+    if not rows:
+        return []
+    trades: List[Dict[str, Any]] = []
+    for row in rows:
+        trades.append(
+            {
+                "T": int(row["t"]),
+                "p": float(row["p"]),
+                "q": float(row["q"]),
+                "m": bool(row.get("m")),
+                "side": row.get("side"),
+            }
+        )
+    return trades
 
 
 def _isoformat(ms: int) -> str:
@@ -133,49 +182,40 @@ def _compute_aggregates(rows: Sequence[Mapping[str, Any]]) -> Dict[str, List[Dic
 
 
 async def _fetch_trades(
-    client: httpx.AsyncClient,
     symbol: str,
     start_ms: int,
     end_ms: int,
     *,
     trace: TraceContext | None = None,
 ) -> tuple[List[Mapping[str, object]] | None, int | None]:
-    params = {
-        "symbol": symbol.upper(),
-        "startTime": str(start_ms),
-        "endTime": str(end_ms),
-        "limit": "1000",
-    }
     scope = "orderflow.aggTrades"
     try:
-        response = await http_request(
-            "GET",
-            BINANCE_FUTURES_AGG_TRADES,
-            scope=scope,
-            trace=trace,
-            client=client,
-            params=params,
-            symbol=symbol,
-            window=(start_ms, end_ms),
-            details="limit=1000",
-            max_retries=0,
-            retry_statuses=TRANSIENT_STATUSES,
-            rate_limit_statuses=RATE_LIMIT_STATUSES,
+        payload = await fetch_um_agg_trades(
+            symbol,
+            start_time=start_ms,
+            end_time=end_ms,
+            limit=1000,
         )
-    except httpx.RequestError:  # pragma: no cover - network failure
+    except BinanceAPIException as exc:
+        status = getattr(exc, "status_code", None)
+        if status in RATE_LIMIT_STATUSES or (isinstance(status, int) and status >= 500):
+            return None, status
+        raise OrderflowError(str(exc)) from exc
+    except (BinanceRequestException, aiohttp.ClientError, asyncio.TimeoutError):  # pragma: no cover - transient
         return None, None
 
-    if response.status_code == 200:
-        payload = response.json()
-        if not isinstance(payload, list):
-            raise OrderflowError("Invalid trade payload structure")
-        return payload, 200
+    if trace is not None:
+        trace.info(
+            "fetch.page",
+            scope=scope,
+            symbol=symbol,
+            window={"from": start_ms, "to": end_ms},
+            details="limit=1000",
+        )
 
-    if response.status_code in RATE_LIMIT_STATUSES or response.status_code >= 500:
-        return None, response.status_code
-
-    response.raise_for_status()
-    return None, response.status_code
+    if not isinstance(payload, list):
+        raise OrderflowError("Invalid trade payload structure")
+    return payload, 200
 
 
 def _build_minute_rows(trades: Iterable[Mapping[str, Any]]) -> List[Dict[str, Any]]:
@@ -260,21 +300,39 @@ async def fetch_footprint(
     start_time = end_time - timedelta(hours=lookback_hours)
     start_ms = int(start_time.timestamp() * 1000)
     end_ms = int(end_time.timestamp() * 1000)
+    window_minutes = max(lookback_hours * 60, 1)
 
     trace_ctx = trace.child(stage="footprint") if trace is not None else None
 
-    async with _FOOTPRINT_LOCK:
-        cursor = start_ms
-        batches = 0
-        trades: List[Mapping[str, Any]] = []
-        fallback_status: int | None = None
-        last_window_end: int | None = None
-        fallback_triggered = False
-        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+    batches = 0
+    fallback_status: int | None = None
+    last_window_end: int | None = None
+    fallback_triggered = False
+    trades: List[Mapping[str, Any]] = []
+
+    store_rows = await _load_trades_from_store(
+        symbol_clean,
+        start_ms,
+        end_ms,
+        window_minutes=window_minutes,
+    )
+    if store_rows:
+        trades = store_rows
+        if trace_ctx is not None:
+            trace_ctx.info(
+                "orderflow.data_source",
+                scope="orderflow.aggTrades",
+                symbol=symbol_clean,
+                source="vision_store",
+                rows=len(trades),
+            )
+    else:
+        async with _FOOTPRINT_LOCK:
+            cursor = start_ms
             while cursor < end_ms and batches < _MAX_BATCHES:
                 page_end = min(end_ms, cursor + _PAGE_WINDOW_MS)
                 rows, status = await _fetch_trades(
-                    client, symbol_clean, cursor, page_end, trace=trace_ctx
+                    symbol_clean, cursor, page_end, trace=trace_ctx
                 )
                 batches += 1
                 last_window_end = page_end
