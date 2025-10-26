@@ -15,6 +15,7 @@ from typing import Any, Callable, Dict, List, Mapping, MutableMapping, Optional,
 from datetime import date, datetime, timedelta, timezone, time as dtime
 from math import ceil
 from contextlib import asynccontextmanager
+from copy import deepcopy
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
@@ -58,6 +59,7 @@ from ..services import (
     collect_zones_72h,
     collect_last_sessions,
 )
+from ..services.vision_store import get_store
 from src.common.ts import ensure_epoch_ms
 from src.storage.ensure_window import ensure_window_real, InsufficientCoverageError
 from src.services.session_analysis import build_smc_session_v1
@@ -108,6 +110,7 @@ from ..version import APP_VERSION
 install_root_logging()
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+CHECK_ALL_DIAGNOSTICS_PATH = PROJECT_ROOT / "logs" / "check_all_diagnostics.log"
 LOGGER = logging.getLogger(__name__)
 TRACE_LOGGER = tracing_utils.LOGGER.getChild("api.inspection")
 _SUMMARY_FETCH_HISTORY: Dict[str, float] = {}
@@ -139,6 +142,30 @@ def _utc_midnight_ms(ts_ms: int) -> int:
     dt = datetime.fromtimestamp(normalised / 1000, tz=timezone.utc)
     midnight = dt.replace(hour=0, minute=0, second=0, microsecond=0)
     return int(midnight.timestamp() * 1000)
+
+
+def _append_check_all_diagnostics(
+    payload: Mapping[str, Any],
+    *,
+    mode: str,
+    snapshot_id: Any,
+) -> None:
+    """Persist a raw check-all payload for offline inspection."""
+
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "mode": mode,
+        "snapshot_id": snapshot_id,
+        "status": payload.get("status"),
+        "payload": payload,
+    }
+    try:
+        CHECK_ALL_DIAGNOSTICS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with CHECK_ALL_DIAGNOSTICS_PATH.open("a", encoding="utf-8") as fp:
+            fp.write(json.dumps(record, ensure_ascii=False))
+            fp.write("\n")
+    except Exception:
+        LOGGER.exception("inspection_check_all:diagnostics_write_failed")
 
 
 
@@ -845,13 +872,133 @@ async def _ingest_bootstrap_minutes(symbol: str, days: int) -> Dict[str, Any]:
         "app.bootstrap.vision_ingest.start",
         extra={"symbol": symbol, "days": lookback_days, "start_ms": start_ms, "end_ms": now_ms},
     )
+
+    store = get_store()
+    datasets: List[str] = []
+    days_span: List[date] = []
+    start_day = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).date()
+    end_day = datetime.fromtimestamp((now_ms - MINUTE_MS) / 1000, tz=timezone.utc).date()
+    cursor = start_day
+    while cursor <= end_day:
+        days_span.append(cursor)
+        cursor += timedelta(days=1)
+    last_closed_day = datetime.now(timezone.utc).date() - timedelta(days=1)
+    days_span = [day for day in days_span if day <= last_closed_day]
+
+    if not days_span:
+        LOGGER.info(
+            "app.bootstrap.vision_ingest.skipped",
+            extra={"symbol": symbol, "reason": "no_closed_days"},
+        )
+        return {
+            "status": "cached",
+            "symbol": symbol,
+            "range": {"start": start_ms, "end": now_ms},
+            "ingested": {},
+            "errors": [],
+            "missing": [],
+        }
+
+    async def _present_days(dataset: str, interval: str | None = None) -> set[str]:
+        try:
+            metrics = await asyncio.to_thread(
+                store.fetch_ingestion_metrics,
+                dataset,
+                symbol=symbol,
+                interval=interval,
+                limit=50,
+            )
+        except Exception:
+            return set()
+        seen: set[str] = set()
+        for entry in metrics:
+            day_value = entry.get("day")
+            count_value = entry.get("count")
+            try:
+                numeric = int(count_value)
+            except (TypeError, ValueError):
+                numeric = 0
+            if isinstance(day_value, str) and numeric > 0:
+                seen.add(day_value)
+        return seen
+
+    # Check 1m candles coverage
+    klines_missing = True
+    try:
+        present = await _present_days(DATASET_KLINES, "1m")
+        klines_missing = any(day.isoformat() not in present for day in days_span)
+        if klines_missing:
+            klines_missing = False
+            for day in days_span:
+                if day.isoformat() in present:
+                    continue
+                day_start = int(datetime.combine(day, dtime.min, tzinfo=timezone.utc).timestamp() * 1000)
+                day_end = day_start + DAY_MS
+                sample = await asyncio.to_thread(
+                    store.fetch_klines,
+                    symbol,
+                    "1m",
+                    day_start,
+                    day_end,
+                    1,
+                )
+                if not sample:
+                    klines_missing = True
+                    break
+    except Exception:
+        klines_missing = True
+    if klines_missing:
+        datasets.append(DATASET_KLINES)
+
+    # Check agg trades coverage
+    agg_missing = True
+    try:
+        present = await _present_days(DATASET_AGG_TRADES, None)
+        agg_missing = any(day.isoformat() not in present for day in days_span)
+        if agg_missing:
+            agg_missing = False
+            for day in days_span:
+                if day.isoformat() in present:
+                    continue
+                day_start = int(datetime.combine(day, dtime.min, tzinfo=timezone.utc).timestamp() * 1000)
+                day_end = day_start + DAY_MS
+                trade_sample = await asyncio.to_thread(
+                    store.fetch_agg_trades,
+                    symbol,
+                    day_start,
+                    day_end,
+                    1,
+                )
+                if not trade_sample:
+                    agg_missing = True
+                    break
+    except Exception:
+        agg_missing = True
+    if agg_missing:
+        datasets.append(DATASET_AGG_TRADES)
+
+    if not datasets:
+        LOGGER.info(
+            "app.bootstrap.vision_ingest.skipped",
+            extra={"symbol": symbol, "reason": "already_cached"},
+        )
+        return {
+            "status": "cached",
+            "symbol": symbol,
+            "range": {"start": start_ms, "end": now_ms},
+            "ingested": {},
+            "errors": [],
+            "missing": [],
+        }
+
     summary = await ingest_binance_vision(
         symbol=symbol,
         start_ms=start_ms,
         end_ms=now_ms,
-        datasets=(DATASET_KLINES,),
-        klines_intervals=("1m",),
+        datasets=tuple(datasets),
+        klines_intervals=("1m",) if DATASET_KLINES in datasets else (),
         include_exchange_info=False,
+        source="bootstrap",
     )
     LOGGER.info(
         "app.bootstrap.vision_ingest.complete",
@@ -859,7 +1006,7 @@ async def _ingest_bootstrap_minutes(symbol: str, days: int) -> Dict[str, Any]:
             "symbol": symbol,
             "status": summary.get("status"),
             "days": lookback_days,
-            "inserted": summary.get("ingested", {}).get(DATASET_KLINES, {}).get("inserted"),
+            "datasets": datasets,
         },
     )
     return summary
@@ -887,6 +1034,9 @@ async def _run_bootstrap(app: FastAPI) -> None:
     )
     summaries: Dict[str, Dict[str, Any] | None] = {}
     ingest_reports: Dict[str, Dict[str, Any] | None] = {}
+    prebuilt_reports: Dict[str, Dict[str, Any] | None] = {}
+    app.state.prebuilt_payloads = {}
+    bootstrap_midnight = datetime.combine(datetime.now(timezone.utc).date(), dtime.min, tzinfo=timezone.utc)
     try:
         for symbol in symbols:
             try:
@@ -920,6 +1070,33 @@ async def _run_bootstrap(app: FastAPI) -> None:
                 raise
             else:
                 summaries[symbol] = summary_payload
+
+            symbol_key = symbol.upper()
+            try:
+                placeholder_snapshot = _build_ephemeral_snapshot(symbol_key, lookback_days=days, mode="prebuilt")
+                payload = await build_check_all_datas_async(
+                    placeholder_snapshot,
+                    now_utc=bootstrap_midnight,
+                    window_hours=days * 24,
+                    strict_window=True,
+                    network_backfill=True,
+                )
+            except Exception as exc:  # pragma: no cover - defensive logging
+                LOGGER.exception(
+                    "app.bootstrap.prebuild_failed",
+                    extra={"symbol": symbol_key, "days": days},
+                )
+                prebuilt_reports[symbol_key] = {"status": "error", "error": str(exc)}
+            else:
+                if payload:
+                    app.state.prebuilt_payloads[symbol_key] = payload
+                    prebuilt_reports[symbol_key] = {"status": payload.get("status")}
+                    LOGGER.info(
+                        "app.bootstrap.prebuild.complete",
+                        extra={"symbol": symbol_key, "status": payload.get("status")},
+                    )
+                else:
+                    prebuilt_reports[symbol_key] = {"status": None}
     except Exception as exc:
         LOGGER.exception(
             "app.bootstrap.failed",
@@ -927,6 +1104,7 @@ async def _run_bootstrap(app: FastAPI) -> None:
         )
         app.state.bootstrap_ready = False
         app.state.bootstrap_vision_ingest = ingest_reports
+        app.state.bootstrap_prebuilt = prebuilt_reports
         app.state.bootstrap_meta = {
             "status": "error",
             "symbols": list(symbols),
@@ -938,6 +1116,10 @@ async def _run_bootstrap(app: FastAPI) -> None:
                 k: (v.get("status") if isinstance(v, Mapping) else None)
                 for k, v in ingest_reports.items()
             },
+            "prebuilt_payloads": {
+                k: (v.get("status") if isinstance(v, Mapping) else None)
+                for k, v in prebuilt_reports.items()
+            },
         }
         raise
     else:
@@ -945,6 +1127,7 @@ async def _run_bootstrap(app: FastAPI) -> None:
         completed_at = datetime.now(timezone.utc).isoformat()
         app.state.bootstrap_ready = True
         app.state.bootstrap_vision_ingest = ingest_reports
+        app.state.bootstrap_prebuilt = prebuilt_reports
         app.state.bootstrap_meta = {
             "symbols": list(symbols),
             "days": days,
@@ -955,6 +1138,10 @@ async def _run_bootstrap(app: FastAPI) -> None:
             "vision_ingest": {
                 k: (v.get("status") if isinstance(v, Mapping) else None)
                 for k, v in ingest_reports.items()
+            },
+            "prebuilt_payloads": {
+                k: (v.get("status") if isinstance(v, Mapping) else None)
+                for k, v in prebuilt_reports.items()
             },
         }
         LOGGER.info(
@@ -975,7 +1162,9 @@ async def _lifespan(app: FastAPI):
         app.state.snapshots = {}
     app.state.bootstrap_ready = False
     app.state.bootstrap_meta = None
+    app.state.prebuilt_payloads = {}
     app.state.bootstrap_vision_ingest = {}
+    app.state.bootstrap_prebuilt = {}
     await _run_bootstrap(app)
     yield
 
@@ -2588,6 +2777,7 @@ async def ingest_binance_vision_endpoint(
         klines_intervals=payload.klines_intervals or None,
         include_exchange_info=payload.include_exchange_info,
         trace=trace_ctx,
+        source="api.ingest_endpoint",
     )
     return summary
 
@@ -3348,6 +3538,27 @@ async def inspection_check_all(
         if isinstance(meta_block, Mapping):
             symbol_for_cache = meta_block.get("symbol")
     symbol_for_cache = str(symbol_for_cache or DEFAULT_SYMBOL).upper()
+
+    prebuilt_payload = {}
+    try:
+        prebuilt_payload = getattr(app.state, "prebuilt_payloads", {}).get(symbol_for_cache, {})
+    except AttributeError:
+        prebuilt_payload = {}
+    if (
+        mode_value == "selection"
+        and not has_now_override
+        and selection_start is None
+        and selection_end is None
+        and hours is None
+        and prebuilt_payload
+    ):
+        LOGGER.info(
+            "inspection_check_all:prebuilt_hit",
+            extra={"symbol": symbol_for_cache, "snapshot_id": target_snapshot.get("id")},
+        )
+        set_last_collection_time(collection_reference)
+        return JSONResponse(deepcopy(prebuilt_payload))
+
     selection_prewarmed = False
     if mode_value not in {"summary", "session_detailed", "topup"}:
         try:
@@ -3418,6 +3629,12 @@ async def inspection_check_all(
             dict(payload),
             trace=trace_ctx.child(stage="payload") if trace_ctx is not None else None,
         )
+        if isinstance(payload, Mapping):
+            _append_check_all_diagnostics(
+                payload,
+                mode=mode_value,
+                snapshot_id=target_snapshot.get("id"),
+            )
         if collection_summary_payload:
             meta_block = payload.get("meta")
             if isinstance(meta_block, MutableMapping):
@@ -3608,6 +3825,13 @@ async def collection_summary_endpoint(request_body: SummaryCollectionRequest) ->
 
     if payload is None:
         return Response(status_code=204)
+
+    if isinstance(payload, Mapping):
+        _append_check_all_diagnostics(
+            payload,
+            mode="collection.summary",
+            snapshot_id=symbol,
+        )
 
     set_last_collection_time(collection_reference)
     return JSONResponse(payload)

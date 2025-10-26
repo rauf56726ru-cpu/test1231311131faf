@@ -101,6 +101,7 @@ async def _run_ingest(
         datasets=datasets,
         klines_intervals=intervals,
         include_exchange_info=include_exchange_info,
+        source="cli.binance_ingest",
     )
 
 

@@ -11,7 +11,7 @@ import numbers
 import inspect
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone, time as dtime
+from datetime import datetime, timedelta, timezone, time as dtime, date
 from typing import (
     Any,
     Awaitable,
@@ -62,7 +62,7 @@ from .pipeline_utils import (
 )
 from .timeutils import safe_datetime_from_ms
 from .progress import ProgressReporter, emit_progress
-from .vision_ingest import ingest_binance_vision
+from .vision_ingest import ingest_binance_vision, DATASET_KLINES
 from .vision_store import get_store
 from .session_analysis import ZoneDetectionConfig, build_session_snapshot, build_72h_context
 from src.common.config import AppConfig
@@ -680,21 +680,49 @@ async def _maybe_ingest_vision_data(
 
     store = get_store()
 
-    def _fetch_sample() -> List[List[float | int | None]]:
-        return store.fetch_klines(symbol, "1m", start_ms, end_ms, limit=10)
+    start_day = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).date()
+    end_day = datetime.fromtimestamp(max(start_ms, end_ms - MINUTE_INTERVAL_MS) / 1000, tz=timezone.utc).date()
+    today = datetime.now(timezone.utc).date()
+    last_closed_day = today - timedelta(days=1)
+    required_days: set[str] = set()
+    cursor = start_day
+    while cursor <= end_day and cursor <= last_closed_day:
+        required_days.add(cursor.isoformat())
+        cursor += timedelta(days=1)
+
+    def _fetch_metrics() -> List[Dict[str, Any]]:
+        return store.fetch_ingestion_metrics("klines", symbol=symbol, interval="1m", limit=100)
 
     coverage_ok = False
-    try:
-        sample = await asyncio.to_thread(_fetch_sample)
-        if sample:
-            first_open = int(sample[0][0])
-            last_open = int(sample[-1][0])
-            coverage_ok = (
-                first_open <= start_ms + 5 * MINUTE_INTERVAL_MS
-                and last_open >= end_ms - 5 * MINUTE_INTERVAL_MS
-            )
-    except Exception:
-        coverage_ok = False
+    if not required_days:
+        coverage_ok = True
+    else:
+        try:
+            metrics = await asyncio.to_thread(_fetch_metrics)
+            present_days = {entry.get("day") for entry in metrics if int(entry.get("count", 0)) > 0}
+            coverage_ok = required_days.issubset(present_days)
+            if not coverage_ok:
+                for day in required_days:
+                    if day in present_days:
+                        continue
+                    day_obj = date.fromisoformat(day)
+                    day_start = int(datetime.combine(day_obj, dtime.min, tzinfo=timezone.utc).timestamp() * 1000)
+                    day_end = day_start + MS_IN_DAY
+                    sample = await asyncio.to_thread(
+                        store.fetch_klines,
+                        symbol,
+                        "1m",
+                        day_start,
+                        day_end,
+                        1,
+                    )
+                    if sample:
+                        continue
+                    break
+                else:
+                    coverage_ok = True
+        except Exception:
+            coverage_ok = False
 
     if coverage_ok:
         return {"status": "cached", "symbol": symbol, "window": {"start": start_ms, "end": end_ms}}
@@ -704,8 +732,10 @@ async def _maybe_ingest_vision_data(
         symbol=symbol,
         start_ms=start_ms,
         end_ms=end_ms,
+        datasets=(DATASET_KLINES,),
         klines_intervals=preset.rollup_timeframes,
         trace=ingest_trace,
+        source="pipeline.check_all",
     )
     return summary
 
@@ -2891,6 +2921,27 @@ def _session_window(
     return start_ms, end_ms, close_ms
 
 
+def _session_window_for_day(
+    session_day: date,
+    start_time: dtime,
+    end_time: dtime,
+    *,
+    session_tz: timezone = VWAP_SESSION_TZ,
+) -> tuple[int, int, int]:
+    tz = session_tz or UTC
+    session_start_local = datetime.combine(session_day, start_time, tzinfo=tz)
+    session_end_local = datetime.combine(session_day, end_time, tzinfo=tz)
+    if end_time <= start_time:
+        session_end_local += timedelta(days=1)
+
+    session_start_utc = session_start_local.astimezone(UTC)
+    session_end_utc = session_end_local.astimezone(UTC)
+    start_ms = int(session_start_utc.timestamp() * 1000)
+    close_ms = int(session_end_utc.timestamp() * 1000)
+    end_ms = max(start_ms, close_ms - MINUTE_INTERVAL_MS)
+    return start_ms, end_ms, close_ms
+
+
 def _compute_initial_balance_extrema(
     candles: Sequence[Mapping[str, Any]],
     *,
@@ -4286,6 +4337,7 @@ async def build_check_all_datas(
     base_window_hours = int(base_window_hours)
 
     strict_three_day = bool(strict_window and base_window_hours >= 72)
+    strict_last_closed_day: date | None = None
 
     window_end_guess = _resolve_window_end_ms(
         frames,
@@ -4294,11 +4346,24 @@ async def build_check_all_datas(
         stream_ts=stream_ts,
     )
 
+    interval_ms = MINUTE_INTERVAL_MS
     if strict_three_day:
-        aligned_end = _align_to_interval(window_end_guess, MINUTE_INTERVAL_MS)
-        if aligned_end > window_end_guess:
-            aligned_end -= MINUTE_INTERVAL_MS
-        window_end_guess = max(aligned_end, MINUTE_INTERVAL_MS)
+        reference_dt = now_dt
+        last_closed_day = reference_dt.date() - timedelta(days=1)
+        strict_last_closed_day = last_closed_day
+        closed_end_dt = datetime.combine(last_closed_day + timedelta(days=1), dtime.min, tzinfo=timezone.utc) - timedelta(minutes=1)
+        closed_end_ms = int(closed_end_dt.timestamp() * 1000)
+        window_end_guess = min(window_end_guess, closed_end_ms)
+        window_end_guess = max(_align_to_interval(window_end_guess, interval_ms), interval_ms)
+        minutes_expected = max(int(round(base_window_hours * 60)), 1)
+        window_start_candidate = window_end_guess - (minutes_expected - 1) * interval_ms
+        window_start_ms = max(0, _align_to_interval(window_start_candidate, interval_ms))
+    else:
+        window_start_ms = max(
+            0,
+            _align_to_interval(window_end_guess - base_window_hours * MS_IN_HOUR, interval_ms),
+        )
+        minutes_expected = _expected_minutes(interval_ms, window_start_ms, window_end_guess)
 
     if trace_ctx is not None:
         trace_ctx.info(
@@ -4308,14 +4373,6 @@ async def build_check_all_datas(
             strict_three_day=strict_three_day,
             window_end_ms=window_end_guess,
         )
-
-    window_start_ms = max(
-        0,
-        _align_to_interval(window_end_guess - base_window_hours * MS_IN_HOUR, MINUTE_INTERVAL_MS),
-    )
-
-    interval_ms = MINUTE_INTERVAL_MS
-    minutes_expected = _expected_minutes(interval_ms, window_start_ms, window_end_guess)
     existing_minutes = frames.get("1m")
     existing_count = len(existing_minutes) if isinstance(existing_minutes, Sequence) else 0
 
@@ -4419,6 +4476,8 @@ async def build_check_all_datas(
 
     vision_missing_datasets: Set[str] = set()
     metrics_fallback_used = False
+    offline_orderflow_start_ms: int | None = None
+    offline_orderflow_end_ms: int | None = None
     if vision_ingest_summary is not None:
         missing_entries = vision_ingest_summary.get("missing", [])
         if isinstance(missing_entries, Sequence):
@@ -4440,23 +4499,23 @@ async def build_check_all_datas(
                     notes.append(fallback_note)
 
     if strict_three_day and not network_backfill:
-        trimmed_orderflow_hours = min(orderflow_required_hours, ORDERFLOW_STRICT_MAX_HOURS)
-        if trimmed_orderflow_hours < orderflow_required_hours:
-            orderflow_required_hours = trimmed_orderflow_hours
-            orderflow_window_ms = max(MINUTE_INTERVAL_MS, trimmed_orderflow_hours * MS_IN_HOUR)
-            orderflow_window_minutes = max(trimmed_orderflow_hours * 60, 1)
-            trim_note = (
-                f"Orderflow window trimmed to last {int(trimmed_orderflow_hours)}h for offline strict run."
-            )
-            if trim_note not in notes:
-                notes.append(trim_note)
         orderflow_allow_network = False
-        if liquidity_enabled:
-            liquidity_enabled = False
-            modules_enabled["liquidity"] = False
-            skip_note = "Liquidity module disabled for strict offline pipeline."
-            if skip_note not in notes:
-                notes.append(skip_note)
+        reference_dt = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc)
+        last_closed_day = reference_dt.date() - timedelta(days=1)
+        start_day = last_closed_day - timedelta(days=2)
+        start_dt = datetime.combine(start_day, dtime.min, tzinfo=timezone.utc)
+        end_dt = datetime.combine(last_closed_day + timedelta(days=1), dtime.min, tzinfo=timezone.utc) - timedelta(minutes=1)
+        offline_orderflow_start_ms = int(start_dt.timestamp() * 1000)
+        offline_orderflow_end_ms = int(end_dt.timestamp() * 1000)
+        orderflow_window_ms = max(
+            MINUTE_INTERVAL_MS,
+            offline_orderflow_end_ms - offline_orderflow_start_ms + MINUTE_INTERVAL_MS,
+        )
+        orderflow_window_minutes = max(offline_orderflow_end_ms - offline_orderflow_start_ms, 0) // MINUTE_INTERVAL_MS + 1
+        orderflow_required_hours = max(1, orderflow_window_minutes // 60)
+        offline_note = "Orderflow window set to last three closed days (snapshot)."
+        if offline_note not in notes:
+            notes.append(offline_note)
     elif vision_missing_datasets and "bookDepth" in vision_missing_datasets and liquidity_enabled:
         liquidity_enabled = False
         modules_enabled["liquidity"] = False
@@ -5811,18 +5870,6 @@ async def build_check_all_datas(
     if liquidity_enabled:
         minute_full = _clean_series(frames.get("1m"))
         liquidity_minutes = minute_full
-        if minute_full and strict_three_day and not network_backfill:
-            trim_hours = min(zone_focus_window_hours, LIQUIDITY_STRICT_MAX_HOURS)
-            trim_minutes = max(1, int(trim_hours * 60))
-            if len(minute_full) > trim_minutes:
-                liquidity_minutes = minute_full[-trim_minutes:]
-                liquidity_trim_meta = {
-                    "window_hours": trim_hours,
-                    "trimmed_from": len(minute_full),
-                    "trimmed_to": len(liquidity_minutes),
-                }
-        else:
-            liquidity_minutes = minute_full
 
         if liquidity_minutes:
             liquidity_frames["1m"] = {"candles": liquidity_minutes, "source": "minute"}
@@ -6367,6 +6414,10 @@ async def build_check_all_datas(
     orderflow_config = _resolve_orderflow_config(raw_meta)
     orderflow_end_ms = window_end_ms
     orderflow_start_ms = max(0, orderflow_end_ms - orderflow_window_ms + MINUTE_INTERVAL_MS)
+    if offline_orderflow_start_ms is not None:
+        orderflow_start_ms = max(orderflow_start_ms, offline_orderflow_start_ms)
+    if offline_orderflow_end_ms is not None:
+        orderflow_end_ms = min(orderflow_end_ms, offline_orderflow_end_ms)
     if base_window_hours >= 24:
         orderflow_start_ms = max(orderflow_start_ms, window_start_ms)
     if minute_window_index:
@@ -6544,20 +6595,38 @@ async def build_check_all_datas(
             session_series = fallback_three_min
             session_source_tf = "3m"
             session_interval_ms = TIMEFRAME_TO_MS.get("3m", MINUTE_INTERVAL_MS * 3)
-    daily_start_ms = _start_of_day_ms(window_end_ms)
+    if strict_three_day and strict_last_closed_day is not None:
+        daily_start_ms = int(
+            datetime.combine(strict_last_closed_day, dtime.min, tzinfo=timezone.utc).timestamp() * 1000
+        )
+    else:
+        daily_start_ms = _start_of_day_ms(window_end_ms)
     composite_day_end_ms = daily_start_ms + MS_IN_DAY - MINUTE_INTERVAL_MS
     if composite_day_end_ms < daily_start_ms:
         composite_day_end_ms = daily_start_ms
+    effective_daily_end_ms = min(window_end_ms, composite_day_end_ms)
     session_profiles: Dict[str, Dict[str, Any]] = {}
     session_sigma_blocks: Dict[str, Dict[str, Any]] = {}
     session_boundaries: Dict[str, Dict[str, Any]] = {}
 
     if strict_three_day:
         session_window_map: Dict[str, Tuple[int, int, int]] = {}
+        session_day = strict_last_closed_day or (
+            safe_datetime_from_ms(window_end_ms, UTC).date()
+            if safe_datetime_from_ms(window_end_ms, UTC) is not None
+            else datetime.fromtimestamp(window_end_ms / 1000, timezone.utc).date()
+        )
+        session_tz = VWAP_SESSION_TZ or timezone.utc
         for session_name, session_start, session_end in sessions:
-            session_start_ms, session_end_ms, session_close_ms = _session_window(
-                window_end_ms, session_start, session_end
+            session_start_ms, session_end_ms, session_close_ms = _session_window_for_day(
+                session_day,
+                session_start,
+                session_end,
+                session_tz=session_tz,
             )
+            session_start_ms = max(session_start_ms, window_start_ms)
+            session_end_ms = min(session_end_ms, window_end_ms)
+            session_close_ms = min(session_close_ms, window_end_ms + MINUTE_INTERVAL_MS)
             session_window_map[session_name] = (
                 session_start_ms,
                 session_end_ms,
@@ -6565,8 +6634,8 @@ async def build_check_all_datas(
             )
         compact_result = build_compact_vwap_profiles(
             session_series,
-            daily_window=(daily_start_ms, window_end_ms),
-            composite_window=(daily_start_ms, min(window_end_ms, composite_day_end_ms)),
+            daily_window=(daily_start_ms, effective_daily_end_ms),
+            composite_window=(daily_start_ms, min(effective_daily_end_ms, composite_day_end_ms)),
             session_windows=session_window_map,
             tick_size=tick_size_numeric,
             value_area_pct=VALUE_AREA_PCT,
@@ -6581,7 +6650,7 @@ async def build_check_all_datas(
         }
         if isinstance(daily_vwap_profile, MutableMapping):
             daily_vwap_profile.setdefault("open_utc", _isoformat_utc(daily_start_ms))
-            daily_vwap_profile.setdefault("close_utc", _isoformat_utc(window_end_ms))
+            daily_vwap_profile.setdefault("close_utc", _isoformat_utc(effective_daily_end_ms))
         composite_day_profile = compact_result.composite or {}
         session_profiles = {
             name: dict(payload) for name, payload in compact_result.sessions.items()

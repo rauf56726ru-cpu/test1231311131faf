@@ -144,6 +144,46 @@ def build_cache_seed_from_payloads(
     return frames, stats
 
 
+def _minutes_in_payload(payload: Mapping[str, Any] | None) -> int:
+    """Detect the number of 1m candles stored inside a pipeline payload."""
+
+    if not isinstance(payload, Mapping):
+        return 0
+
+    def _count_from_orderflow(orderflow_payload: Mapping[str, Any]) -> int:
+        # Support the legacy shape where per_bar is a dict of lists by TF.
+        per_bar = orderflow_payload.get("per_bar")
+        if isinstance(per_bar, Mapping):
+            series = per_bar.get("1m")
+            if isinstance(series, Sequence) and not isinstance(series, (str, bytes)):
+                return len(series)
+        # Support the modern shape where the timeframe is a nested dict.
+        one_minute_block = orderflow_payload.get("1m")
+        if isinstance(one_minute_block, Mapping):
+            series = one_minute_block.get("per_bar")
+            if isinstance(series, Sequence) and not isinstance(series, (str, bytes)):
+                return len(series)
+        return 0
+
+    # Prefer the top-level orderflow section when present.
+    orderflow = payload.get("orderflow")
+    if isinstance(orderflow, Mapping):
+        count = _count_from_orderflow(orderflow)
+        if count:
+            return count
+
+    # Fallback to the new layout under data.orderflow.
+    data_section = payload.get("data")
+    if isinstance(data_section, Mapping):
+        data_orderflow = data_section.get("orderflow")
+        if isinstance(data_orderflow, Mapping):
+            count = _count_from_orderflow(data_orderflow)
+            if count:
+                return count
+
+    return 0
+
+
 async def ensure_inspection_daily_cache(
     symbol: str,
     *,
@@ -177,13 +217,30 @@ async def ensure_inspection_daily_cache(
         except Exception:
             payload = None
         if payload is not None:
+            hydrated_minutes = _minutes_in_payload(payload)
+            record_minutes = record.minutes_found
+            if hydrated_minutes and hydrated_minutes != record_minutes:
+                record_minutes = hydrated_minutes
+                try:
+                    store.upsert_day(
+                        symbol_clean,
+                        cached_day,
+                        payload=payload,
+                        window_start_ms=record.window_start_ms,
+                        window_end_ms=record.window_end_ms,
+                        minutes_expected=record.minutes_expected or 24 * 60,
+                        minutes_found=hydrated_minutes,
+                    )
+                except Exception:
+                    # Best effort; the next run can attempt again.
+                    record_minutes = record.minutes_found
             collected[cached_day] = payload
             LOGGER.info(
                 "inspection.cache.ensure.hit",
                 extra={
                     "symbol": symbol_clean,
                     "day": cached_day.isoformat(),
-                    "minutes_found": record.minutes_found,
+                    "minutes_found": record_minutes,
                     "minutes_expected": record.minutes_expected,
                 },
             )
@@ -227,15 +284,8 @@ async def ensure_inspection_daily_cache(
                 extra={"symbol": symbol_clean, "day": day.isoformat(), "reason": "pipeline_returned_none"},
             )
             continue
-        minutes_found = 0
+        minutes_found = _minutes_in_payload(payload)
         minutes_expected = 24 * 60
-        orderflow_section = payload.get("orderflow") if isinstance(payload, dict) else None
-        if isinstance(orderflow_section, dict):
-            per_bar = orderflow_section.get("per_bar")
-            if isinstance(per_bar, dict):
-                one_minute = per_bar.get("1m")
-                if isinstance(one_minute, list):
-                    minutes_found = len(one_minute)
         store.upsert_day(
             symbol_clean,
             day,

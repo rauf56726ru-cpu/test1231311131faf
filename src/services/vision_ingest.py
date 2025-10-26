@@ -176,6 +176,7 @@ async def ingest_binance_vision(
     settings: BinanceVisionSettings | None = None,
     trace: TraceContext | None = None,
     include_exchange_info: bool = True,
+    source: str | None = None,
 ) -> Dict[str, object]:
     """Download and persist the requested Binance Vision datasets."""
 
@@ -194,14 +195,16 @@ async def ingest_binance_vision(
     tasks = _make_tasks(days, dataset_order, intervals)
     semaphore = asyncio.Semaphore(max(1, int(app_settings.max_parallel_downloads)))
 
+    source_label = source or "unspecified"
     LOGGER.info(
-        "vision.ingest.start | symbol=%s | start_ms=%s | end_ms=%s | datasets=%s | intervals=%s | days=%s",
+        "vision.ingest.start | symbol=%s | start_ms=%s | end_ms=%s | datasets=%s | intervals=%s | days=%s | source=%s",
         symbol,
         start_ms,
         end_ms,
         dataset_order,
         intervals,
         [day.isoformat() for day in days],
+        source_label,
     )
 
     summary = {
@@ -216,11 +219,12 @@ async def ingest_binance_vision(
     async def run_task(task: IngestionTask, client: httpx.AsyncClient) -> None:
         day_label = task.day.isoformat()
         LOGGER.info(
-            "vision.ingest.task.start | symbol=%s | dataset=%s | day=%s | interval=%s",
+            "vision.ingest.task.start | symbol=%s | dataset=%s | day=%s | interval=%s | source=%s",
             symbol,
             task.dataset,
             day_label,
             task.interval,
+            source_label,
         )
         try:
             async with semaphore:
@@ -244,11 +248,12 @@ async def ingest_binance_vision(
                 }
             )
             LOGGER.warning(
-                "vision.ingest.task.error | symbol=%s | dataset=%s | day=%s | interval=%s | error=%s",
+                "vision.ingest.task.error | symbol=%s | dataset=%s | day=%s | interval=%s | source=%s | error=%s",
                 symbol,
                 task.dataset,
                 day_label,
                 task.interval,
+                source_label,
                 exc,
             )
             return
@@ -265,11 +270,12 @@ async def ingest_binance_vision(
                     "days", {}
                 )[day_label] = {"status": "missing"}
             LOGGER.warning(
-                "vision.ingest.task.missing | symbol=%s | dataset=%s | day=%s | interval=%s",
+                "vision.ingest.task.missing | symbol=%s | dataset=%s | day=%s | interval=%s | source=%s",
                 symbol,
                 task.dataset,
                 day_label,
                 task.interval,
+                source_label,
             )
             return
 
@@ -295,13 +301,14 @@ async def ingest_binance_vision(
                 "status": "ok" if inserted else "skipped",
             }
         LOGGER.info(
-            "vision.ingest.task.complete | symbol=%s | dataset=%s | day=%s | interval=%s | records=%s | inserted=%s",
+            "vision.ingest.task.complete | symbol=%s | dataset=%s | day=%s | interval=%s | records=%s | inserted=%s | source=%s",
             symbol,
             task.dataset,
             day_label,
             task.interval,
             batch.count,
             stats.inserted if stats else batch.count,
+            source_label,
         )
 
     async with httpx.AsyncClient(timeout=app_settings.request_timeout_seconds or 30.0) as client:
