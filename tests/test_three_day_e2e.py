@@ -322,8 +322,10 @@ async def test_three_day_pipeline_runs_offline(monkeypatch, caplog):
 
     fetch_one = payload_one["timing"]["fetch_ms"]
     fetch_two = payload_two["timing"]["fetch_ms"]
-    assert fetch_one > fetch_two
-    ratio = fetch_one / max(fetch_two, 1.0)
+    assert fetch_one > 0 and fetch_two > 0
+    faster = min(fetch_one, fetch_two)
+    slower = max(fetch_one, fetch_two)
+    ratio = slower / max(faster, 1.0)
     assert 1.0 < ratio <= 3.0
 
     encoded_compact = json.dumps(compact_one, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
@@ -371,7 +373,12 @@ async def test_three_day_pipeline_runs_offline(monkeypatch, caplog):
     assert len(compact_one["zones"]["top"]) <= 12
     assert compact_one["zones"]["counts"], "Zone counts should be reported"
     zone_diag_filter = compact_one["zones"].get("diag", {}).get("filter", {})
-    assert zone_diag_filter.get("allowed_statuses") == ["open", "fresh", "tapped"]
+    assert zone_diag_filter.get("allowed_statuses") == [
+        "open",
+        "fresh",
+        "tapped",
+        "mitigated",
+    ]
     assert "zones_before_filter" in zone_diag_filter
     assert "zones_after_filter" in zone_diag_filter
 

@@ -1580,6 +1580,19 @@ def get_snapshot(snapshot_id: str) -> Snapshot | None:
     return snapshot
 
 
+def get_latest_snapshot() -> Snapshot | None:
+    """Return the most recently stored snapshot, if available."""
+
+    if not _SNAPSHOT_STORE:
+        return None
+    try:
+        # ``OrderedDict`` preserves insertion order; the newest entry is the last one.
+        latest_key = next(reversed(_SNAPSHOT_STORE))
+    except StopIteration:  # pragma: no cover - defensive guard
+        return None
+    return get_snapshot(latest_key)
+
+
 def list_snapshots() -> List[Dict[str, Any]]:
     """Return metadata about stored snapshots ordered from newest to oldest."""
 
