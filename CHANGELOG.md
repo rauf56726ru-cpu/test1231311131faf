@@ -15,3 +15,13 @@
 - Added a minimal asyncio bridge for integration tests so they run without `pytest-asyncio`; documented the offline execution flow and ignored `.venv/` in git.
 - Added rotating file logging (`var/logs/pipeline.log` by default) so console traces are mirrored on disk; configurable via `PIPELINE_LOG_DIR`.
 - Derivatives now backfill funding/liquidation/open interest из Binance Vision `metrics` и кэшируются в стор; инспекционный валидатор допускает нулевые значения.
+## [Unreleased]
+- Added contribution workflow guidelines (`agents.md`) clarifying the plan → implement → update sequence.
+- Replaced legacy `alert()` calls in auto/manual exchange flows with `react-toastify` errors and aligned localisation handling.
+- Refactored `PaymentModal` to use shared validation/formatting helpers (`paymentRules.js`), reducing inline business logic.
+- Migrated support tooltip, hint button, and header dropdown to hook-based outside-click handling to avoid manual DOM listeners.
+- Centralised exchange service endpoints and introduced typed error handling via `safeRequest`, updating callers to consume response data directly.
+- Added shared `validatePaymentForm` helper for PaymentModal, consolidating amount and wallet validation logic.
+- Introduced `src/shared/config/navigation.js` and updated header, dropdown, and support widget to consume shared navigation/support link definitions.
+- Replaced direct `localStorage` usage in auth/theme/language/http/profile flows with `safeStorage` helpers for SSR-safe persistence.
+- Removed obsolete commented debounce logic from `AutoExchange.jsx` to simplify maintenance.

@@ -74,6 +74,55 @@ def _expected_minutes(interval_ms: int, start_ts: int, end_ts: int) -> int:
         return 0
     return int((end_ts - start_ts) // interval_ms + 1)
 
+
+def _evaluate_acceptance(
+    zones_focus: Mapping[str, Any] | None,
+    liquidity_public: Mapping[str, Any] | None,
+    sessions: Mapping[str, Mapping[str, Any]] | None,
+) -> Tuple[List[str], Dict[str, Any]]:
+    """Assess whether key focus/flow components meet acceptance thresholds."""
+
+    failures: List[str] = []
+
+    counts = {}
+    if isinstance(zones_focus, Mapping):
+        meta = zones_focus.get("meta")
+        if isinstance(meta, Mapping):
+            counts = meta.get("counts", {}) if isinstance(meta.get("counts"), Mapping) else {}
+    if not isinstance(counts, Mapping):
+        counts = {}
+    zones_recent_total = sum(
+        int(counts.get(key, 0) or 0)
+        for key in ("fvg", "ob")
+    )
+    if zones_recent_total <= 0:
+        failures.append("acceptance.zones_recent")
+
+    sweeps_total = 0
+    if isinstance(liquidity_public, Mapping):
+        sweeps = liquidity_public.get("sweeps")
+        if isinstance(sweeps, Sequence) and not isinstance(sweeps, (str, bytes)):
+            sweeps_total = len(sweeps)
+    if sweeps_total <= 0:
+        failures.append("acceptance.liquidity_sweeps")
+
+    sessions_incomplete: List[str] = []
+    if isinstance(sessions, Mapping):
+        for name, payload in sessions.items():
+            completeness = payload.get("completeness") if isinstance(payload, Mapping) else None
+            status = completeness.get("status") if isinstance(completeness, Mapping) else None
+            if status != "complete":
+                sessions_incomplete.append(str(name))
+    if sessions_incomplete:
+        failures.append("acceptance.sessions")
+
+    details = {
+        "zones_recent_total": zones_recent_total,
+        "sweeps_total": sweeps_total,
+        "sessions_incomplete": sessions_incomplete,
+    }
+    return failures, details
+
 if TYPE_CHECKING:  # pragma: no cover - typing helper
     from .summary_collector import CollectionSummary
 UTC = timezone.utc
@@ -97,6 +146,36 @@ PIPELINE_PRESET_DEFAULT = SUMMARY_72H_PRESET
 DEFAULT_ALL_OHLCV_TFS: Tuple[str, ...] = tuple(
     dict.fromkeys(("1m",) + PIPELINE_PRESET_DEFAULT.rollup_timeframes)
 )
+SESSION_MIN_COVERAGE_RATIO = 0.85
+STRICT_MINUTE_GAP_TOLERANCE = 3
+
+
+def _shorten_float(value: float) -> float:
+    if not math.isfinite(value):
+        return value
+    abs_value = abs(value)
+    if abs_value >= 1:
+        decimals = 2 if abs_value >= 100 else 3
+    elif abs_value >= 0.01:
+        decimals = 3
+    else:
+        decimals = 6
+    shortened = round(value, decimals)
+    if shortened == 0:
+        return 0.0
+    return shortened
+
+
+def _shorten_numbers(value: Any) -> Any:
+    if isinstance(value, float):
+        return _shorten_float(value)
+    if isinstance(value, list):
+        return [_shorten_numbers(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_shorten_numbers(item) for item in value)
+    if isinstance(value, dict):
+        return {key: _shorten_numbers(item) for key, item in value.items()}
+    return value
 DEFAULT_TIMEFRAME_SUMMARY_ORDER: Tuple[str, ...] = tuple(
     tf for tf in ("1m", "5m", "15m", "1h", "4h", "1d") if tf in DEFAULT_ALL_OHLCV_TFS
 )
@@ -4225,6 +4304,90 @@ async def build_check_all_datas(
         _record_invalid(stage, invalid_ts=result.invalid_ts, invalid_ohlc=result.invalid_ohlc)
         return result.candles
 
+    async def _backfill_session_windows(
+        session_windows_to_fill: Sequence[Tuple[str, int, int]]
+    ) -> bool:
+        """Fetch and merge missing minute candles for specific session windows."""
+
+        nonlocal frames, minute_index_all, minute_window_index
+
+        if not minute_backfill_enabled or not session_windows_to_fill:
+            return False
+
+        fetched_any = False
+        for session_name, start_ms, end_ms in session_windows_to_fill:
+            if start_ms >= end_ms:
+                continue
+            try:
+                raw_minutes = await _call_download_missing_minutes_async(
+                    symbol,
+                    start_ms,
+                    end_ms,
+                    [{"from": start_ms, "to": end_ms}],
+                    budget=budget,
+                    allow_network=minute_backfill_enabled,
+                )
+            except BinanceDownloadError as exc:
+                LOGGER.warning(
+                    "Session minute backfill failed",
+                    extra={
+                        "symbol": symbol,
+                        "session": session_name,
+                        "downloaded": exc.downloaded,
+                        "start_ms": start_ms,
+                        "end_ms": end_ms,
+                    },
+                )
+                continue
+            except _TimeBudgetExceeded as exc:
+                LOGGER.warning(
+                    "Session minute backfill aborted due to budget",
+                    extra={
+                        "symbol": symbol,
+                        "session": session_name,
+                        "stage": exc.stage,
+                        "start_ms": start_ms,
+                        "end_ms": end_ms,
+                    },
+                )
+                continue
+
+            sanitized = _apply_sanitizer(f"rest.1m.session.{session_name}", raw_minutes)
+            if not sanitized:
+                continue
+
+            unique = 0
+            for candle in sanitized:
+                ts = candle.get("t")
+                if ts is None:
+                    continue
+                ts = int(ts)
+                if ts not in minute_index_all:
+                    unique += 1
+                minute_index_all[ts] = candle
+                if window_start_ms <= ts <= window_end_ms:
+                    minute_window_index[ts] = candle
+
+            if unique > 0:
+                fetched_any = True
+                note_text = f"Backfilled {unique} missing 1m candles for {session_name} session."
+                if note_text not in notes:
+                    notes.append(note_text)
+                LOGGER.info(
+                    "Session minute backfill applied",
+                    extra={
+                        "symbol": symbol,
+                        "session": session_name,
+                        "unique_minutes": unique,
+                        "start_ms": start_ms,
+                        "end_ms": end_ms,
+                    },
+                )
+
+        if fetched_any:
+            frames["1m"] = [minute_index_all[ts] for ts in sorted(minute_index_all)]
+        return fetched_any
+
     def _register_invalid_candle(_ts: int, stage: str) -> None:
         _record_invalid(stage, invalid_ts=1)
 
@@ -4353,7 +4516,8 @@ async def build_check_all_datas(
         strict_last_closed_day = last_closed_day
         closed_end_dt = datetime.combine(last_closed_day + timedelta(days=1), dtime.min, tzinfo=timezone.utc) - timedelta(minutes=1)
         closed_end_ms = int(closed_end_dt.timestamp() * 1000)
-        window_end_guess = min(window_end_guess, closed_end_ms)
+        closed_adjusted_ms = max(interval_ms, closed_end_ms - MINUTE_INTERVAL_MS)
+        window_end_guess = min(window_end_guess, closed_adjusted_ms)
         window_end_guess = max(_align_to_interval(window_end_guess, interval_ms), interval_ms)
         minutes_expected = max(int(round(base_window_hours * 60)), 1)
         window_start_candidate = window_end_guess - (minutes_expected - 1) * interval_ms
@@ -5088,56 +5252,75 @@ async def build_check_all_datas(
                 if expected_count
                 else 100.0
             )
-            missing = MinuteDataUnavailable(
-                symbol=symbol,
-                start_ms=window_start_ms,
-                end_ms=window_end_ms,
-                missing_count=minute_missing_before,
-                expected_count=expected_count,
-                coverage_pct=round(coverage_pct, 3),
-                gaps=[(int(gap.get("from", window_start_ms)), int(gap.get("to", window_start_ms))) for gap in time_gaps],
-            )
-            if trace_ctx is not None:
-                trace_ctx.warn(
-                    "availability.checked",
-                    scope="ohlcv.1m",
-                    missing_minutes=minute_missing_before,
+            if minute_missing_before <= STRICT_MINUTE_GAP_TOLERANCE:
+                relaxed_minute_gap = True
+                tolerance_note = (
+                    f"Strict coverage tolerance applied: missing {minute_missing_before} "
+                    f"minute candle{'s' if minute_missing_before != 1 else ''} "
+                    f"across ~{round(window_span_hours, 2)}h window."
+                )
+                LOGGER.warning(
+                    "Strict coverage tolerance applied",
+                    extra={
+                        "symbol": symbol,
+                        "missing_minutes": minute_missing_before,
+                        "window_hours": round(window_span_hours, 2),
+                        "tolerance_limit": STRICT_MINUTE_GAP_TOLERANCE,
+                    },
+                )
+                if tolerance_note not in notes:
+                    notes.append(tolerance_note)
+            else:
+                missing = MinuteDataUnavailable(
+                    symbol=symbol,
+                    start_ms=window_start_ms,
+                    end_ms=window_end_ms,
+                    missing_count=minute_missing_before,
+                    expected_count=expected_count,
                     coverage_pct=round(coverage_pct, 3),
-                    window={"from": window_start_ms, "to": window_end_ms},
+                    gaps=[(int(gap.get("from", window_start_ms)), int(gap.get("to", window_start_ms))) for gap in time_gaps],
                 )
-            minute_payload = _build_minute_missing_payload(
-                context,
-                now=now_dt,
-                missing=missing,
-            )
-            fail_bar_counts, fail_agg_counts, fail_completeness = _build_gap_metrics(
-                minute_missing_before,
-                0,
-                False,
-            )
-            await progress_tracker.fail(
-                "gaps",
-                bar_counts=fail_bar_counts,
-                agg_counts=fail_agg_counts,
-                completeness=fail_completeness,
-            )
-            if trace_ctx is not None:
-                trace_ctx.info(
-                    "output.prepare_payload",
-                    scope="output",
-                    status="minute_missing",
-                    missing_fields=0,
+                if trace_ctx is not None:
+                    trace_ctx.warn(
+                        "availability.checked",
+                        scope="ohlcv.1m",
+                        missing_minutes=minute_missing_before,
+                        coverage_pct=round(coverage_pct, 3),
+                        window={"from": window_start_ms, "to": window_end_ms},
+                    )
+                minute_payload = _build_minute_missing_payload(
+                    context,
+                    now=now_dt,
+                    missing=missing,
                 )
-            return await _finish(
-                _finalise_payload(
-                    minute_payload,
-                    status="minute_missing",
-                    pipeline_start=pipeline_start,
-                    fetch_ms=fetch_ms,
-                    db_ms=db_ms,
-                    trace_ctx=trace_ctx,
+                fail_bar_counts, fail_agg_counts, fail_completeness = _build_gap_metrics(
+                    minute_missing_before,
+                    0,
+                    False,
                 )
-            )
+                await progress_tracker.fail(
+                    "gaps",
+                    bar_counts=fail_bar_counts,
+                    agg_counts=fail_agg_counts,
+                    completeness=fail_completeness,
+                )
+                if trace_ctx is not None:
+                    trace_ctx.info(
+                        "output.prepare_payload",
+                        scope="output",
+                        status="minute_missing",
+                        missing_fields=0,
+                    )
+                return await _finish(
+                    _finalise_payload(
+                        minute_payload,
+                        status="minute_missing",
+                        pipeline_start=pipeline_start,
+                        fetch_ms=fetch_ms,
+                        db_ms=db_ms,
+                        trace_ctx=trace_ctx,
+                    )
+                )
         if not minute_backfill_enabled:
             data_quality = {
                 "tf": target_tf_key,
@@ -5161,6 +5344,7 @@ async def build_check_all_datas(
                     agg_counts=fail_agg_counts,
                     completeness=fail_completeness,
                 )
+                await progress_tracker.shutdown()
                 raise DataQualityError(data_quality)
             relaxed_minute_gap = True
             LOGGER.info(
@@ -5209,6 +5393,7 @@ async def build_check_all_datas(
                         agg_counts=fail_agg_counts,
                         completeness=fail_completeness,
                     )
+                    await progress_tracker.shutdown()
                     raise DataQualityError(detail) from exc
                 relaxed_minute_gap = True
                 LOGGER.info(
@@ -5267,12 +5452,32 @@ async def build_check_all_datas(
         "time_gaps": time_gaps,
     }
 
+    if strict_three_day and minute_missing_after <= STRICT_MINUTE_GAP_TOLERANCE:
+        if minute_missing_after > 0 and not relaxed_minute_gap:
+            relaxed_minute_gap = True
+            tolerance_note = (
+                f"Strict coverage tolerance applied post-fill: missing {minute_missing_after} "
+                f"minute candle{'s' if minute_missing_after != 1 else ''} across ~{round(window_span_hours, 2)}h window."
+            )
+            if tolerance_note not in notes:
+                notes.append(tolerance_note)
+            LOGGER.warning(
+                "Strict coverage tolerance applied",
+                extra={
+                    "symbol": symbol,
+                    "missing_minutes": minute_missing_after,
+                    "window_hours": round(window_span_hours, 2),
+                    "tolerance_limit": STRICT_MINUTE_GAP_TOLERANCE,
+                },
+            )
+
     if minute_missing_before and not relaxed_minute_gap and not enforce_minute_coverage:
         relaxed_minute_gap = True
 
     if minute_missing_after > 0:
         data_quality["downloaded"] = fetched_unique
-        if enforce_minute_coverage:
+        if enforce_minute_coverage and not relaxed_minute_gap:
+            await progress_tracker.shutdown()
             raise DataQualityError(data_quality)
         LOGGER.info(
             "Proceeding with relaxed minute coverage",
@@ -5496,6 +5701,7 @@ async def build_check_all_datas(
                         "fetched_1m_count": exc.downloaded,
                         "time_gaps": blocking_gaps,
                     }
+                    await progress_tracker.shutdown()
                     raise DataQualityError(detail) from exc
                 except _TimeBudgetExceeded as exc:
                     LOGGER.warning(
@@ -5693,6 +5899,7 @@ async def build_check_all_datas(
     if tf_missing_after > 0:
         data_quality["downloaded"] = fetched_unique
         if target_interval_ms > MINUTE_INTERVAL_MS:
+            await progress_tracker.shutdown()
             raise DataQualityError(data_quality)
 
     frames[target_tf_key] = [base_index_all[ts] for ts in sorted(base_index_all)]
@@ -6585,201 +6792,245 @@ async def build_check_all_datas(
         _inject_smc_blocks(detailed_section.get("indicators"), smc_blocks)
         _inject_smc_blocks(movement_section.get("indicators"), smc_blocks)
 
-    minute_series = frames.get("1m", [])
-    session_series = minute_series
-    session_source_tf = "1m"
-    session_interval_ms = MINUTE_INTERVAL_MS
-    if not session_series:
-        fallback_three_min = _deduplicate_sorted(frames.get("3m", []))
-        if fallback_three_min:
-            session_series = fallback_three_min
-            session_source_tf = "3m"
-            session_interval_ms = TIMEFRAME_TO_MS.get("3m", MINUTE_INTERVAL_MS * 3)
-    if strict_three_day and strict_last_closed_day is not None:
-        daily_start_ms = int(
-            datetime.combine(strict_last_closed_day, dtime.min, tzinfo=timezone.utc).timestamp() * 1000
-        )
-    else:
-        daily_start_ms = _start_of_day_ms(window_end_ms)
-    composite_day_end_ms = daily_start_ms + MS_IN_DAY - MINUTE_INTERVAL_MS
-    if composite_day_end_ms < daily_start_ms:
-        composite_day_end_ms = daily_start_ms
-    effective_daily_end_ms = min(window_end_ms, composite_day_end_ms)
     session_profiles: Dict[str, Dict[str, Any]] = {}
     session_sigma_blocks: Dict[str, Dict[str, Any]] = {}
     session_boundaries: Dict[str, Dict[str, Any]] = {}
+    session_completeness: Dict[str, Dict[str, Any]] = {}
+    daily_vwap_profile: Dict[str, Any] | None = None
+    composite_day_profile: Dict[str, Any] | None = None
+    vwap_sigma_payload: Dict[str, Any] = {"daily": {}, "sessions": {}}
+    session_series: Sequence[Mapping[str, Any]] = ()
+    session_source_tf = "1m"
+    session_interval_ms = MINUTE_INTERVAL_MS
+    session_backfill_attempted = False
 
-    if strict_three_day:
-        session_window_map: Dict[str, Tuple[int, int, int]] = {}
-        session_day = strict_last_closed_day or (
-            safe_datetime_from_ms(window_end_ms, UTC).date()
-            if safe_datetime_from_ms(window_end_ms, UTC) is not None
-            else datetime.fromtimestamp(window_end_ms / 1000, timezone.utc).date()
-        )
-        session_tz = VWAP_SESSION_TZ or timezone.utc
-        for session_name, session_start, session_end in sessions:
-            session_start_ms, session_end_ms, session_close_ms = _session_window_for_day(
-                session_day,
-                session_start,
-                session_end,
-                session_tz=session_tz,
+    for attempt in range(2):
+        minute_series = frames.get("1m", [])
+        session_series = minute_series
+        session_source_tf = "1m"
+        session_interval_ms = MINUTE_INTERVAL_MS
+        if not session_series:
+            fallback_three_min = _deduplicate_sorted(frames.get("3m", []))
+            if fallback_three_min:
+                session_series = fallback_three_min
+                session_source_tf = "3m"
+                session_interval_ms = TIMEFRAME_TO_MS.get("3m", MINUTE_INTERVAL_MS * 3)
+
+        if strict_three_day and strict_last_closed_day is not None:
+            daily_start_ms = int(
+                datetime.combine(strict_last_closed_day, dtime.min, tzinfo=timezone.utc).timestamp() * 1000
             )
-            session_start_ms = max(session_start_ms, window_start_ms)
-            session_end_ms = min(session_end_ms, window_end_ms)
-            session_close_ms = min(session_close_ms, window_end_ms + MINUTE_INTERVAL_MS)
-            session_window_map[session_name] = (
-                session_start_ms,
-                session_end_ms,
-                session_close_ms,
+        else:
+            daily_start_ms = _start_of_day_ms(window_end_ms)
+        composite_day_end_ms = daily_start_ms + MS_IN_DAY - MINUTE_INTERVAL_MS
+        if composite_day_end_ms < daily_start_ms:
+            composite_day_end_ms = daily_start_ms
+        effective_daily_end_ms = min(window_end_ms, composite_day_end_ms)
+
+        if strict_three_day:
+            session_window_map: Dict[str, Tuple[int, int, int]] = {}
+            session_day = strict_last_closed_day or (
+                safe_datetime_from_ms(window_end_ms, UTC).date()
+                if safe_datetime_from_ms(window_end_ms, UTC) is not None
+                else datetime.fromtimestamp(window_end_ms / 1000, timezone.utc).date()
             )
-        compact_result = build_compact_vwap_profiles(
-            session_series,
-            daily_window=(daily_start_ms, effective_daily_end_ms),
-            composite_window=(daily_start_ms, min(effective_daily_end_ms, composite_day_end_ms)),
-            session_windows=session_window_map,
-            tick_size=tick_size_numeric,
-            value_area_pct=VALUE_AREA_PCT,
-            cache_token=("compact_vwap", symbol),
-            ib_minutes=60,
-            trace_ctx=trace_ctx,
-        )
-        daily_vwap_profile = compact_result.daily or {
-            "vwap": 0.0,
-            "sd1": {"minus": None, "plus": None},
-            "sd2": {"minus": None, "plus": None},
-        }
-        if isinstance(daily_vwap_profile, MutableMapping):
-            daily_vwap_profile.setdefault("open_utc", _isoformat_utc(daily_start_ms))
-            daily_vwap_profile.setdefault("close_utc", _isoformat_utc(effective_daily_end_ms))
-        composite_day_profile = compact_result.composite or {}
-        session_profiles = {
-            name: dict(payload) for name, payload in compact_result.sessions.items()
-        }
-        session_sigma_blocks = compact_result.session_sigma
-        session_boundaries = compact_result.session_boundaries
-        for session_name, profile_entry in session_profiles.items():
-            boundary = session_boundaries.get(session_name, {})
-            start_ms = boundary.get("start_ms")
-            close_ms = boundary.get("close_ms")
-            if isinstance(profile_entry, MutableMapping):
-                profile_entry.setdefault("open_utc", _isoformat_utc(start_ms))
-                profile_entry.setdefault("close_utc", _isoformat_utc(close_ms))
-            start_ms_int = _safe_int(boundary.get("start_ms"))
-            end_ms_int = _safe_int(boundary.get("end_ms"))
-            if start_ms_int is not None and end_ms_int is not None:
-                session_atr = _session_atr_value(
-                    session_series,
-                    start_ms=start_ms_int,
-                    end_ms=end_ms_int,
-                    period=max(1, int(zone_cfg.atr_period or 14)),
+            session_tz = VWAP_SESSION_TZ or timezone.utc
+            for session_name, session_start, session_end in sessions:
+                session_start_ms, session_end_ms, session_close_ms = _session_window_for_day(
+                    session_day,
+                    session_start,
+                    session_end,
+                    session_tz=session_tz,
                 )
-                if session_atr is not None:
-                    boundary["atr"] = session_atr
-                    if isinstance(profile_entry, MutableMapping):
-                        profile_entry.setdefault("session_atr", session_atr)
-        vwap_sigma_payload = {
-            "daily": compact_result.daily_sigma,
-            "sessions": session_sigma_blocks,
-        }
-    else:
-        daily_filtered_minutes = _filter_candles(
-            session_series, start_ms=daily_start_ms, end_ms=window_end_ms
-        )
-        daily_vwap_profile = _build_volume_profile_stats(
-            session_series,
-            start_ms=daily_start_ms,
-            end_ms=window_end_ms,
-            tick_size=tick_size_numeric,
-            value_area_pct=VALUE_AREA_PCT,
-        )
-        composite_day_profile = _build_volume_profile_stats(
-            session_series,
-            start_ms=daily_start_ms,
-            end_ms=min(window_end_ms, composite_day_end_ms),
-            tick_size=tick_size_numeric,
-            value_area_pct=VALUE_AREA_PCT,
-        )
-        for session_name, session_start, session_end in sessions:
-            session_start_ms, session_end_ms, session_close_ms = _session_window(
-                window_end_ms, session_start, session_end
-            )
-            session_filtered = _filter_candles(
-                session_series, start_ms=session_start_ms, end_ms=session_end_ms
-            )
-            ib_high, ib_low = _compute_initial_balance_extrema(
-                session_filtered, session_start_ms=session_start_ms
-            )
-            profile_entry = _build_volume_profile_stats(
+                session_start_ms = max(session_start_ms, window_start_ms)
+                session_end_ms = min(session_end_ms, window_end_ms)
+                session_close_ms = min(session_close_ms, window_end_ms + MINUTE_INTERVAL_MS)
+                session_window_map[session_name] = (
+                    session_start_ms,
+                    session_end_ms,
+                    session_close_ms,
+                )
+            compact_result = build_compact_vwap_profiles(
                 session_series,
-                start_ms=session_start_ms,
-                end_ms=session_end_ms,
+                daily_window=(daily_start_ms, effective_daily_end_ms),
+                composite_window=(daily_start_ms, min(effective_daily_end_ms, composite_day_end_ms)),
+                session_windows=session_window_map,
+                tick_size=tick_size_numeric,
+                value_area_pct=VALUE_AREA_PCT,
+                cache_token=("compact_vwap", symbol),
+                ib_minutes=60,
+                trace_ctx=trace_ctx,
+            )
+            daily_vwap_profile = compact_result.daily or {
+                "vwap": 0.0,
+                "sd1": {"minus": None, "plus": None},
+                "sd2": {"minus": None, "plus": None},
+            }
+            if isinstance(daily_vwap_profile, MutableMapping):
+                daily_vwap_profile.setdefault("open_utc", _isoformat_utc(daily_start_ms))
+                daily_vwap_profile.setdefault("close_utc", _isoformat_utc(effective_daily_end_ms))
+            composite_day_profile = compact_result.composite or {}
+            session_profiles = {
+                name: dict(payload) for name, payload in compact_result.sessions.items()
+            }
+            session_sigma_blocks = compact_result.session_sigma
+            session_boundaries = compact_result.session_boundaries
+            for session_name, profile_entry in session_profiles.items():
+                boundary = session_boundaries.get(session_name, {})
+                start_ms = boundary.get("start_ms")
+                close_ms = boundary.get("close_ms")
+                if isinstance(profile_entry, MutableMapping):
+                    profile_entry.setdefault("open_utc", _isoformat_utc(start_ms))
+                    profile_entry.setdefault("close_utc", _isoformat_utc(close_ms))
+                start_ms_int = _safe_int(boundary.get("start_ms"))
+                end_ms_int = _safe_int(boundary.get("end_ms"))
+                if start_ms_int is not None and end_ms_int is not None:
+                    session_atr = _session_atr_value(
+                        session_series,
+                        start_ms=start_ms_int,
+                        end_ms=end_ms_int,
+                        period=max(1, int(zone_cfg.atr_period or 14)),
+                    )
+                    if session_atr is not None:
+                        boundary["atr"] = session_atr
+                        if isinstance(profile_entry, MutableMapping):
+                            profile_entry.setdefault("session_atr", session_atr)
+            vwap_sigma_payload = {
+                "daily": compact_result.daily_sigma,
+                "sessions": session_sigma_blocks,
+            }
+        else:
+            daily_filtered_minutes = _filter_candles(
+                session_series, start_ms=daily_start_ms, end_ms=window_end_ms
+            )
+            daily_vwap_profile = _build_volume_profile_stats(
+                session_series,
+                start_ms=daily_start_ms,
+                end_ms=window_end_ms,
                 tick_size=tick_size_numeric,
                 value_area_pct=VALUE_AREA_PCT,
             )
-            if isinstance(profile_entry, MutableMapping):
-                if "session_high" in profile_entry and "high" not in profile_entry:
-                    profile_entry["high"] = profile_entry.get("session_high")
-                if "session_low" in profile_entry and "low" not in profile_entry:
-                    profile_entry["low"] = profile_entry.get("session_low")
-                profile_entry["open_utc"] = _isoformat_utc(session_start_ms)
-                profile_entry["close_utc"] = _isoformat_utc(session_close_ms)
-                profile_entry["ib_high"] = ib_high
-                profile_entry["ib_low"] = ib_low
-            session_atr = _session_atr_value(
+            composite_day_profile = _build_volume_profile_stats(
                 session_series,
-                start_ms=session_start_ms,
-                end_ms=session_end_ms,
-                period=max(1, int(zone_cfg.atr_period or 14)),
+                start_ms=daily_start_ms,
+                end_ms=min(window_end_ms, composite_day_end_ms),
+                tick_size=tick_size_numeric,
+                value_area_pct=VALUE_AREA_PCT,
             )
-            if session_atr is not None:
+            session_profiles = {}
+            session_sigma_blocks = {}
+            session_boundaries = {}
+            for session_name, session_start, session_end in sessions:
+                session_start_ms, session_end_ms, session_close_ms = _session_window(
+                    window_end_ms, session_start, session_end
+                )
+                session_filtered = _filter_candles(
+                    session_series, start_ms=session_start_ms, end_ms=session_end_ms
+                )
+                ib_high, ib_low = _compute_initial_balance_extrema(
+                    session_filtered, session_start_ms=session_start_ms
+                )
+                profile_entry = _build_volume_profile_stats(
+                    session_series,
+                    start_ms=session_start_ms,
+                    end_ms=session_end_ms,
+                    tick_size=tick_size_numeric,
+                    value_area_pct=VALUE_AREA_PCT,
+                )
                 if isinstance(profile_entry, MutableMapping):
+                    if "session_high" in profile_entry and "high" not in profile_entry:
+                        profile_entry["high"] = profile_entry.get("session_high")
+                    if "session_low" in profile_entry and "low" not in profile_entry:
+                        profile_entry["low"] = profile_entry.get("session_low")
+                    profile_entry["open_utc"] = _isoformat_utc(session_start_ms)
+                    profile_entry["close_utc"] = _isoformat_utc(session_close_ms)
+                    profile_entry["ib_high"] = ib_high
+                    profile_entry["ib_low"] = ib_low
+                session_atr = _session_atr_value(
+                    session_series,
+                    start_ms=session_start_ms,
+                    end_ms=session_end_ms,
+                    period=max(1, int(zone_cfg.atr_period or 14)),
+                )
+                if session_atr is not None and isinstance(profile_entry, MutableMapping):
                     profile_entry["session_atr"] = session_atr
-            session_profiles[session_name] = profile_entry
-            session_sigma_blocks[session_name] = _build_vwap_sigma_block(
-                session_filtered, basis="session"
-            )
-            session_boundaries[session_name] = {
-                "start_ms": session_start_ms,
-                "end_ms": session_end_ms,
-                "close_ms": session_close_ms,
-                "ib_high": ib_high,
-                "ib_low": ib_low,
+                session_profiles[session_name] = profile_entry
+                session_sigma_blocks[session_name] = _build_vwap_sigma_block(
+                    session_filtered, basis="session"
+                )
+                session_boundaries[session_name] = {
+                    "start_ms": session_start_ms,
+                    "end_ms": session_end_ms,
+                    "close_ms": session_close_ms,
+                    "ib_high": ib_high,
+                    "ib_low": ib_low,
+                }
+                if session_atr is not None:
+                    session_boundaries[session_name]["atr"] = session_atr
+            vwap_sigma_payload = {
+                "daily": _build_vwap_sigma_block(daily_filtered_minutes, basis="daily"),
+                "sessions": session_sigma_blocks,
             }
-            if session_atr is not None:
-                session_boundaries[session_name]["atr"] = session_atr
-        vwap_sigma_payload = {
-            "daily": _build_vwap_sigma_block(daily_filtered_minutes, basis="daily"),
-            "sessions": session_sigma_blocks,
-        }
+
+        session_completeness = {}
+        for session_name, boundary in session_boundaries.items():
+            if not isinstance(boundary, Mapping):
+                continue
+            start_ms = _safe_int(boundary.get("start_ms"))
+            end_ms = _safe_int(boundary.get("end_ms"))
+            close_ms = _safe_int(boundary.get("close_ms"))
+            if start_ms is None or end_ms is None or close_ms is None:
+                continue
+            session_filtered = _filter_candles(
+                session_series,
+                start_ms=start_ms,
+                end_ms=end_ms,
+            )
+            completeness = _compute_session_completeness(
+                session_filtered,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                close_ms=close_ms,
+                interval_ms=session_interval_ms,
+                timeframe=session_source_tf,
+            )
+            if isinstance(boundary, MutableMapping):
+                boundary["completeness"] = completeness
+            session_completeness[session_name] = completeness
+
+        if not session_backfill_attempted and minute_backfill_enabled:
+            missing_session_windows: List[Tuple[str, int, int]] = []
+            for session_name, completeness in session_completeness.items():
+                boundary = session_boundaries.get(session_name, {})
+                start_ms = _safe_int(boundary.get("start_ms"))
+                end_ms = _safe_int(boundary.get("end_ms"))
+                close_ms = _safe_int(boundary.get("close_ms"))
+                if (
+                    start_ms is None
+                    or end_ms is None
+                    or close_ms is None
+                    or start_ms >= end_ms
+                ):
+                    continue
+                # Skip sessions that are still unfolding within the selected window.
+                if window_end_ms < end_ms:
+                    continue
+                coverage = float(completeness.get("coverage_ratio") or 0.0)
+                status = str(completeness.get("status") or "")
+                if status == "complete" or coverage >= SESSION_MIN_COVERAGE_RATIO:
+                    continue
+                missing_session_windows.append((session_name, start_ms, end_ms))
+
+            if missing_session_windows:
+                session_backfill_attempted = True
+                fetched_any = await _backfill_session_windows(missing_session_windows)
+                if fetched_any:
+                    # Recompute session metrics with the enriched minute window.
+                    continue
+        break
 
     active_session_name: str | None = None
     active_session_atr: float | None = None
-
-    session_completeness: Dict[str, Dict[str, Any]] = {}
-    for session_name, boundary in session_boundaries.items():
-        if not isinstance(boundary, Mapping):
-            continue
-        start_ms = _safe_int(boundary.get("start_ms"))
-        end_ms = _safe_int(boundary.get("end_ms"))
-        close_ms = _safe_int(boundary.get("close_ms"))
-        if start_ms is None or end_ms is None or close_ms is None:
-            continue
-        session_filtered = _filter_candles(
-            session_series,
-            start_ms=start_ms,
-            end_ms=end_ms,
-        )
-        completeness = _compute_session_completeness(
-            session_filtered,
-            start_ms=start_ms,
-            end_ms=end_ms,
-            close_ms=close_ms,
-            interval_ms=session_interval_ms,
-            timeframe=session_source_tf,
-        )
-        if isinstance(boundary, MutableMapping):
-            boundary["completeness"] = completeness
-        session_completeness[session_name] = completeness
 
     vwap_payload = {
         "daily": daily_vwap_profile,
@@ -7817,6 +8068,10 @@ async def build_check_all_datas(
             status=status,
             missing_fields=len(missing_fields_list),
         )
+
+    data_payload = _shorten_numbers(data_payload)
+    meta_block = _shorten_numbers(meta_block)
+    availability = _shorten_numbers(availability)
 
     final_payload = {
         "status": status,

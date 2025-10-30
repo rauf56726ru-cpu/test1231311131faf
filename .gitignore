@@ -8,3 +8,6 @@ var/
 binance-connector-python-master/
 meta/
 tests/
+/logs
+/logs
+*.zip

@@ -18,6 +18,7 @@ import aiohttp
 
 from src.services.binance import (
     BinanceAPIException,
+    BinanceRateLimitBudgetExceeded,
     BinanceRequestException,
     fetch_um_klines,
 )
@@ -118,6 +119,19 @@ async def _page_binance_klines(
             end_time=end_ms - 1,
             limit=limit,
         )
+    except BinanceRateLimitBudgetExceeded as exc:
+        LOGGER.warning(
+            "ensure_window.rate_limit_pending",
+            extra={
+                "symbol": symbol,
+                "interval": interval,
+                "retry_after": round(exc.retry_after, 3),
+                "start": start_ms,
+                "end": end_ms,
+            },
+        )
+        await asyncio.sleep(max(exc.retry_after, 0.0) + 0.25)
+        return []
     except BinanceAPIException as exc:
         status = getattr(exc, "status_code", None)
         if status in {418, 429}:

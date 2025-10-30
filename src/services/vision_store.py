@@ -90,6 +90,18 @@ CREATE TABLE IF NOT EXISTS depth_snapshots (
     meta_json TEXT,
     PRIMARY KEY(symbol, ts)
 );
+CREATE TABLE IF NOT EXISTS session_payloads (
+    symbol TEXT NOT NULL,
+    session_name TEXT NOT NULL,
+    start_ms INTEGER NOT NULL,
+    end_ms INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    coverage_pct REAL,
+    payload_json TEXT NOT NULL,
+    fetched_at INTEGER NOT NULL,
+    PRIMARY KEY(symbol, session_name, start_ms)
+);
+CREATE INDEX IF NOT EXISTS idx_session_payloads_symbol_start ON session_payloads(symbol, start_ms);
 CREATE TABLE IF NOT EXISTS exchange_info (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     payload TEXT NOT NULL,
@@ -534,6 +546,68 @@ class VisionStore:
             )
         return metrics
 
+    def fetch_session_payload(
+        self,
+        symbol: str,
+        start_ms: int,
+        session_name: str | None = None,
+    ) -> Dict[str, object] | None:
+        self._ensure_schema()
+        symbol_clean = _canonicalise_symbol(symbol)
+        query = [
+            "SELECT session_name, start_ms, end_ms, status, coverage_pct, payload_json, fetched_at",
+            "FROM session_payloads",
+            "WHERE symbol = ? AND start_ms = ?",
+        ]
+        params: List[object] = [symbol_clean, int(start_ms)]
+        if session_name is not None:
+            query.append("AND session_name = ?")
+            params.append(session_name)
+        query.append("ORDER BY fetched_at DESC")
+        query.append("LIMIT 1")
+        sql = " ".join(query)
+        with _connect(self._path) as conn:
+            row = conn.execute(sql, params).fetchone()
+        if row is None:
+            return None
+        payload = json.loads(row["payload_json"]) if row["payload_json"] else None
+        return {
+            "symbol": symbol_clean,
+            "session_name": row["session_name"],
+            "start_ms": int(row["start_ms"]),
+            "end_ms": int(row["end_ms"]),
+            "status": row["status"],
+            "coverage_pct": _normalise_float(row["coverage_pct"]),
+            "payload": payload,
+            "fetched_at": int(row["fetched_at"]),
+        }
+
+    def fetch_latest_session_payload(self, symbol: str) -> Dict[str, object] | None:
+        self._ensure_schema()
+        symbol_clean = _canonicalise_symbol(symbol)
+        query = """
+            SELECT session_name, start_ms, end_ms, status, coverage_pct, payload_json, fetched_at
+            FROM session_payloads
+            WHERE symbol = ?
+            ORDER BY start_ms DESC, fetched_at DESC
+            LIMIT 1
+        """
+        with _connect(self._path) as conn:
+            row = conn.execute(query, (symbol_clean,)).fetchone()
+        if row is None:
+            return None
+        payload = json.loads(row["payload_json"]) if row["payload_json"] else None
+        return {
+            "symbol": symbol_clean,
+            "session_name": row["session_name"],
+            "start_ms": int(row["start_ms"]),
+            "end_ms": int(row["end_ms"]),
+            "status": row["status"],
+            "coverage_pct": _normalise_float(row["coverage_pct"]),
+            "payload": payload,
+            "fetched_at": int(row["fetched_at"]),
+        }
+
     # ------------------------------------------------------------------
     # Public insert APIs
     # ------------------------------------------------------------------
@@ -658,6 +732,47 @@ class VisionStore:
             bytes_downloaded=bytes_downloaded,
         )
         return IngestionStats("klines", symbol_clean, interval_clean, day, len(rows), inserted)
+
+    def upsert_session_payload(
+        self,
+        symbol: str,
+        session_name: str,
+        start_ms: int,
+        end_ms: int,
+        status: str,
+        coverage_pct: float | None,
+        payload: Mapping[str, object],
+        *,
+        fetched_at: int | None = None,
+    ) -> None:
+        self._ensure_schema()
+        symbol_clean = _canonicalise_symbol(symbol)
+        session_key = (session_name or "").strip().lower() or "unknown"
+        payload_json = json.dumps(payload, ensure_ascii=False)
+        fetched_value = int(fetched_at if fetched_at is not None else time() * 1000)
+        with _connect(self._path) as conn:
+            conn.execute(
+                """
+                INSERT INTO session_payloads(symbol, session_name, start_ms, end_ms, status, coverage_pct, payload_json, fetched_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol, session_name, start_ms) DO UPDATE SET
+                    end_ms=excluded.end_ms,
+                    status=excluded.status,
+                    coverage_pct=excluded.coverage_pct,
+                    payload_json=excluded.payload_json,
+                    fetched_at=excluded.fetched_at
+                """,
+                (
+                    symbol_clean,
+                    session_key,
+                    int(start_ms),
+                    int(end_ms),
+                    status,
+                    _normalise_float(coverage_pct),
+                    payload_json,
+                    fetched_value,
+                ),
+            )
 
     def upsert_funding_rates(
         self,

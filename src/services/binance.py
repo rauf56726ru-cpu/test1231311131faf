@@ -9,11 +9,14 @@ on the same helpers and exception hierarchy.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
 import sys
 import threading
+import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
@@ -64,6 +67,7 @@ __all__ = [
     "MAX_TIME_RANGE_MS",
     "BinanceAPIException",
     "BinanceRequestException",
+    "BinanceRateLimitBudgetExceeded",
     "fetch_um_klines",
     "fetch_um_mark_price_klines",
     "fetch_um_index_price_klines",
@@ -94,6 +98,61 @@ _RETRY_BACKOFF_INITIAL = 0.5
 _RETRY_BACKOFF_MAX = 5.0
 _RETRY_MAX_ATTEMPTS = 5
 LOGGER = logging.getLogger(__name__)
+
+
+def _resolve_rest_caller() -> str:
+    """Return the first stack frame outside this module for logging context."""
+
+    try:
+        stack = inspect.stack()
+    except RuntimeError:
+        return "unknown"
+    for frame_info in stack[2:]:
+        module = frame_info.frame.f_globals.get("__name__", "")
+        if not module.startswith(__name__):
+            filename = Path(frame_info.filename).name
+            return f"{module or filename}:{frame_info.lineno}:{frame_info.function}"
+    return "unknown"
+
+
+def _summarise_rest_params(params: Mapping[str, Any]) -> Dict[str, Any]:
+    """Trim REST parameters to the fields that help identify the window."""
+
+    allowed_keys = (
+        "symbol",
+        "interval",
+        "startTime",
+        "endTime",
+        "limit",
+        "fromId",
+        "toId",
+        "page",
+    )
+    summary: Dict[str, Any] = {}
+    for key in allowed_keys:
+        if key in params:
+            summary[key] = params[key]
+    return summary
+
+
+REST_WEIGHT_LIMIT = max(1, int(os.getenv("BINANCE_WEIGHT_LIMIT", "2400")))
+REST_WEIGHT_MARGIN = max(0, int(os.getenv("BINANCE_WEIGHT_MARGIN", "10")))
+REST_WEIGHT_WINDOW = float(os.getenv("BINANCE_WEIGHT_WINDOW", "60"))
+REST_WEIGHT_WAIT_THRESHOLD = float(os.getenv("BINANCE_WEIGHT_WAIT_THRESHOLD", "0.5"))
+_REST_WEIGHT_DEFAULT = max(1, int(os.getenv("BINANCE_WEIGHT_DEFAULT", "1")))
+_REST_WEIGHT_MAP: Dict[str, int] = {
+    "/fapi/v1/aggTrades": int(os.getenv("BINANCE_WEIGHT_AGGTRADES", "20")),
+    "/fapi/v1/klines": int(os.getenv("BINANCE_WEIGHT_KLINES", "2")),
+    "/fapi/v1/trades": int(os.getenv("BINANCE_WEIGHT_TRADES", "2")),
+    "/fapi/v1/historicalTrades": int(os.getenv("BINANCE_WEIGHT_HIST_TRADES", "5")),
+    "/fapi/v1/exchangeInfo": int(os.getenv("BINANCE_WEIGHT_EXCHANGE_INFO", "10")),
+}
+_RAISE_ON_LIMIT_CALLERS = tuple(
+    filter(
+        None,
+        (part.strip() for part in os.getenv("BINANCE_WEIGHT_RAISE_CALLERS", "session_collector").split(",")),
+    )
+)
 
 
 class BinanceRequestException(Exception):
@@ -200,6 +259,99 @@ def _custom_headers() -> Dict[str, str]:
         for key, value in decoded.items()
         if isinstance(key, str) and value is not None
     }
+
+
+class BinanceRateLimitBudgetExceeded(BinanceRequestException):
+    """Raised when the shared REST weight budget cannot accommodate a request."""
+
+    def __init__(self, *, path: str, weight: int, retry_after: float, caller: str) -> None:
+        message = (
+            f"REST weight budget exhausted for {path} (weight={weight}); "
+            f"retry after {max(retry_after, 0.0):.2f}s"
+        )
+        super().__init__(message=message, status_code=429, request_params={"path": path, "weight": weight})
+        self.path = path
+        self.weight = weight
+        self.retry_after = max(retry_after, 0.0)
+        self.caller = caller
+
+
+class _RestWeightLimiter:
+    """Sliding-window limiter that tracks aggregate request weights."""
+
+    def __init__(
+        self,
+        *,
+        limit: int,
+        margin: int,
+        window: float,
+        wait_threshold: float,
+        raise_callers: tuple[str, ...],
+    ) -> None:
+        self.limit = max(limit, 1)
+        self.margin = max(margin, 0)
+        self.window = max(window, 0.1)
+        self.wait_threshold = max(wait_threshold, 0.0)
+        self.raise_callers = raise_callers
+        self._events: deque[tuple[float, int]] = deque()
+        self._weight: int = 0
+        self._lock = asyncio.Lock()
+
+    def _trim(self, now: float) -> None:
+        window = self.window
+        while self._events and now - self._events[0][0] >= window:
+            _, weight = self._events.popleft()
+            self._weight = max(0, self._weight - weight)
+
+    def _budget(self) -> int:
+        effective_limit = max(self.limit - self.margin, 0)
+        return effective_limit
+
+    async def acquire(self, path: str, caller: str, weight: int) -> None:
+        request_weight = max(weight, 1)
+        budget = self._budget()
+        if budget == 0:
+            raise BinanceRateLimitBudgetExceeded(path=path, weight=request_weight, retry_after=self.window, caller=caller)
+        request_weight = min(request_weight, budget)
+
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                self._trim(now)
+                available = budget - self._weight
+                if request_weight <= max(available, 0):
+                    self._events.append((now, request_weight))
+                    self._weight += request_weight
+                    return
+
+                wait_for = self.window
+                if self._events:
+                    wait_for = (self._events[0][0] + self.window) - now
+                wait_for = max(wait_for, 0.0)
+
+            if wait_for <= self.wait_threshold:
+                await asyncio.sleep(wait_for)
+                continue
+
+            if caller not in self.raise_callers:
+                await asyncio.sleep(wait_for)
+                continue
+
+            raise BinanceRateLimitBudgetExceeded(
+                path=path,
+                weight=request_weight,
+                retry_after=wait_for,
+                caller=caller,
+            )
+
+
+_REST_WEIGHT_LIMITER = _RestWeightLimiter(
+    limit=REST_WEIGHT_LIMIT,
+    margin=REST_WEIGHT_MARGIN,
+    window=REST_WEIGHT_WINDOW,
+    wait_threshold=REST_WEIGHT_WAIT_THRESHOLD,
+    raise_callers=_RAISE_ON_LIMIT_CALLERS,
+)
 
 
 def _create_rest_client() -> tuple[ConfigurationRestAPI, requests.Session]:
@@ -349,6 +501,32 @@ async def _rest_get(path: str, params: Mapping[str, Any]) -> Any:
 
     config, session = await _get_rest_client()
     request_params = dict(params)
+    caller_context = _resolve_rest_caller()
+    params_snapshot = _summarise_rest_params(request_params)
+    weight = _REST_WEIGHT_MAP.get(path, _REST_WEIGHT_DEFAULT)
+    try:
+        await _REST_WEIGHT_LIMITER.acquire(path, caller_context, weight)
+    except BinanceRateLimitBudgetExceeded as exc:
+        LOGGER.warning(
+            "binance.rest.defer",
+            extra={
+                "path": exc.path,
+                "caller": caller_context,
+                "retry_after": round(exc.retry_after, 3),
+                "weight": exc.weight,
+            },
+        )
+        raise
+
+    LOGGER.info(
+        "binance.rest.call",
+        extra={
+            "path": path,
+            "caller": caller_context,
+            "params": params_snapshot,
+            "weight": weight,
+        },
+    )
 
     attempt = 0
     backoff = _RETRY_BACKOFF_INITIAL
@@ -381,6 +559,7 @@ async def _rest_get(path: str, params: Mapping[str, Any]) -> Any:
                             "binance.rest.retry",
                             extra={
                                 "path": path,
+                                "caller": caller_context,
                                 "attempt": attempt,
                                 "status": status,
                                 "delay": round(delay, 3),

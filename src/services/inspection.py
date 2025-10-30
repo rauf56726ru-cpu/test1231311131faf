@@ -2607,6 +2607,15 @@ def render_inspection_page(
       border-color: rgba(250, 204, 21, 0.6);
       background: rgba(113, 63, 18, 0.35);
     }
+    #rate-limit-banner {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+    }
+    #rate-limit-timer {
+      font-weight: 600;
+    }
     .progress-log {
       font-family: "JetBrains Mono", "SFMono-Regular", ui-monospace, monospace;
       background: rgba(15, 23, 42, 0.68);
@@ -3224,7 +3233,11 @@ def render_inspection_page(
     const liveStateEl = document.getElementById("live-stale-flag");
     const mismatchBanner = document.getElementById("stream-mismatch");
     const readyIndicator = document.getElementById("inspection-ready-indicator");
+    const rateLimitBanner = document.getElementById("rate-limit-banner");
+    const rateLimitTextEl = document.getElementById("rate-limit-text");
+    const rateLimitTimerEl = document.getElementById("rate-limit-timer");
     let readyStatusTimer = null;
+    let rateLimitCountdownHandle = null;
 
     initCollapsibles();
     void refreshBootstrapStatus();
@@ -3318,6 +3331,7 @@ def render_inspection_page(
       liveFrames: {},
       liveMeta: null,
       liveMismatch: false,
+      rateLimitInfo: null,
       progressEvents: [],
       frameMeta: (() => {
         const meta = initial.payload?.DATA?.meta?.timeframes;
@@ -3829,6 +3843,68 @@ def render_inspection_page(
       statusEl.hidden = !message;
     }
 
+    function clearRateLimitCountdown() {
+      if (rateLimitCountdownHandle) {
+        window.clearInterval(rateLimitCountdownHandle);
+        rateLimitCountdownHandle = null;
+      }
+    }
+
+    function renderRateLimitNotice(payload) {
+      if (!rateLimitBanner) return;
+      clearRateLimitCountdown();
+      state.rateLimitInfo = null;
+      rateLimitBanner.hidden = true;
+      if (rateLimitTextEl) rateLimitTextEl.textContent = "";
+      if (rateLimitTimerEl) rateLimitTimerEl.textContent = "";
+
+      const meta = payload?.DATA?.meta;
+      if (!meta) return;
+      const entries = Array.isArray(meta.rate_limit) ? meta.rate_limit : [];
+      const entry = entries.find((item) => item && typeof item === "object");
+      const isPending = Boolean(meta.rate_limit_pending || (entry && entry.pending_start_ms));
+      if (!isPending) return;
+
+      state.rateLimitInfo = entry || {};
+      const scope = entry?.scope || "orderflow";
+      const retryAfter = Number(entry?.retry_after);
+      const weight = entry?.weight;
+      const messageBase =
+        scope === "orderflow"
+          ? "Данные по ордерфлоу пока не полные: Binance ограничил частоту запросов."
+          : "Часть данных собирается не полностью: Binance ограничил частоту запросов.";
+
+      if (rateLimitTextEl) {
+        if (typeof weight === "number") {
+          rateLimitTextEl.textContent = `${messageBase} (вес запроса ${weight}).`;
+        } else {
+          rateLimitTextEl.textContent = `${messageBase}`;
+        }
+      }
+
+      if (rateLimitTimerEl) {
+        if (Number.isFinite(retryAfter) && retryAfter > 0) {
+          const targetTs = Date.now() + Math.max(retryAfter, 0) * 1000;
+          const updateTimer = () => {
+            const remaining = Math.max(0, Math.ceil((targetTs - Date.now()) / 1000));
+            const text = remaining > 0
+              ? `Повторим запрос через ${remaining} с`
+              : "Повторный запрос уже выполнен";
+            rateLimitTimerEl.textContent = text;
+            if (remaining <= 0) {
+              clearRateLimitCountdown();
+            }
+          };
+          updateTimer();
+          rateLimitCountdownHandle = window.setInterval(updateTimer, 1000);
+        } else {
+          rateLimitTimerEl.textContent = "Повторная попытка выполняется автоматически.";
+        }
+      }
+
+      rateLimitBanner.hidden = false;
+    }
+
     function resetProgressLog() {
       if (!state) return;
       state.progressEvents = [];
@@ -4065,6 +4141,7 @@ def render_inspection_page(
           state.checkAll = null;
           setJson(checkAllPre, null);
           updateStatus("Check-all данные отсутствуют", "warning");
+          renderRateLimitNotice(state.payload);
           return;
         }
         if (!response.ok) {
@@ -4074,11 +4151,13 @@ def render_inspection_page(
         state.checkAll = payload;
         setJson(checkAllPre, payload);
         updateStatus("Check-all данные обновлены", "success");
+        renderRateLimitNotice(state.checkAll || state.payload);
       } catch (error) {
         console.error(error);
         state.checkAll = null;
         setJson(checkAllPre, null);
         updateStatus("Ошибка запроса check-all данных", "error");
+        renderRateLimitNotice(state.payload);
       } finally {
         updateCheckAllState();
       }
@@ -4505,6 +4584,7 @@ def render_inspection_page(
           setJson(checkAllPre, null);
           appendProgress("client.flow:empty", { mode: "summary" });
           updateStatus("Не удалось собрать 3-дневный контекст", "warning");
+          renderRateLimitNotice(state.payload);
           return;
         }
 
@@ -4524,6 +4604,7 @@ def render_inspection_page(
         setJson(checkAllPre, payload);
         appendProgress("client.flow:completed", { status: payload?.status ?? null });
         updateStatus("3-дневный контекст готов", "success");
+        renderRateLimitNotice(state.checkAll || state.payload);
       } catch (error) {
         console.error(error);
         state.checkAll = null;
@@ -4534,6 +4615,7 @@ def render_inspection_page(
         appendProgress("client.flow:error", {
           message: error?.message || String(error),
         });
+        renderRateLimitNotice(state.payload);
       } finally {
         if (summaryButton) {
           summaryButton.disabled = false;
@@ -4581,6 +4663,7 @@ def render_inspection_page(
         setJson(checkAllPre, payload);
         appendProgress("client.flow:completed", { status: payload?.status ?? null });
         updateStatus("Сессионный отчёт готов", "success");
+        renderRateLimitNotice(state.checkAll || state.payload);
       } catch (error) {
         console.error(error);
         state.checkAll = null;
@@ -4591,6 +4674,7 @@ def render_inspection_page(
         appendProgress("client.flow:error", {
           message: error?.message || String(error),
         });
+        renderRateLimitNotice(state.payload);
       } finally {
         if (sessionDetailedButton) {
           sessionDetailedButton.disabled = false;
@@ -4627,6 +4711,7 @@ def render_inspection_page(
           setJson(checkAllPre, null);
           appendProgress("client.flow:completed", { status: null });
           updateStatus("Свежие данные отсутствуют", "warning");
+          renderRateLimitNotice(state.payload);
           return;
         }
         if (!response.ok) {
@@ -4644,6 +4729,7 @@ def render_inspection_page(
         setJson(checkAllPre, payload);
         appendProgress("client.flow:completed", { status: payload?.status ?? null });
         updateStatus("Данные успешно дособраны", "success");
+        renderRateLimitNotice(state.checkAll || state.payload);
       } catch (error) {
         console.error(error);
         state.checkAll = null;
@@ -4652,6 +4738,7 @@ def render_inspection_page(
         appendProgress("client.flow:error", {
           message: error?.message || String(error),
         });
+        renderRateLimitNotice(state.payload);
       } finally {
         if (topupButton) {
           topupButton.disabled = false;
@@ -5180,6 +5267,7 @@ def render_inspection_page(
         syncLiveStores({ force: true });
         renderJson(payload);
         renderMeta(payload);
+        renderRateLimitNotice(payload);
         renderChart({ resetRequestedKeys: true, fitContent: true });
         updateStatus("Снэпшот загружен", "success");
       } catch (error) {
@@ -5420,6 +5508,7 @@ def render_inspection_page(
     populateFrames(state.payload);
     populateSnapshots(initial.snapshots || []);
     renderMeta(state.payload);
+    renderRateLimitNotice(state.payload);
     renderChart({ fitContent: true });
     await refreshSnapshots();
     if (state.snapshotId && snapshotSelect) {
@@ -5457,6 +5546,10 @@ def render_inspection_page(
               <button id=\"collect-selection\" class=\"secondary\" type=\"button\" disabled>Собрать информацию за выбранный период</button>
             </div>
             <div class=\"status-banner\" id=\"inspection-status\" hidden data-tone=\"info\"></div>
+            <div class=\"status-banner\" id=\"rate-limit-banner\" hidden data-tone=\"warning\">
+              <span id=\"rate-limit-text\">Данные собираются не полностью.</span>
+              <span id=\"rate-limit-timer\" aria-live=\"polite\"></span>
+            </div>
             <div class=\"progress-log\" id=\"inspection-progress-log\" aria-live=\"polite\"></div>
             <div class=\"preset-chip-bar\">
               <span id=\"preset-chip\" class=\"preset-chip\" hidden></span>

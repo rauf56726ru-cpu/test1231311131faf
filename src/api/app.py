@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, List, Mapping, MutableMapping, Optional,
 
 from datetime import date, datetime, timedelta, timezone, time as dtime
 from math import ceil
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from copy import deepcopy
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
@@ -103,6 +103,8 @@ from ..services.binance_vision import (
     DATASET_OPEN_INTEREST,
 )
 from ..services.vision_ingest import ingest_binance_vision
+from ..services.binance_stream import BinanceStreamManager
+from ..services import session_collector as session_collector_module
 from ..meta import Meta
 from ..static_version import STATIC_VERSION
 from ..version import APP_VERSION
@@ -443,7 +445,7 @@ def _fallback_footprint(candles: Sequence[CandleIn]) -> Dict[str, Any]:
 def _build_ephemeral_snapshot(symbol: str, *, lookback_days: int, mode: str = "summary") -> Dict[str, Any]:
     lookback_value = max(1, int(lookback_days))
     captured_iso = datetime.now(timezone.utc).isoformat()
-    return {
+    snapshot: Dict[str, Any] = {
         "symbol": symbol,
         "frames": {},
         "meta": {
@@ -459,6 +461,13 @@ def _build_ephemeral_snapshot(symbol: str, *, lookback_days: int, mode: str = "s
             },
         },
     }
+    stream_sample = _latest_stream_sample(symbol)
+    if stream_sample:
+        snapshot["stream"] = dict(stream_sample)
+        meta_block = snapshot["meta"]
+        meta_block.setdefault("stream", dict(stream_sample))
+        meta_block.setdefault("live", dict(stream_sample))
+    return snapshot
 
 
 async def _run_summary_workflow(
@@ -703,21 +712,39 @@ async def _run_session_workflow(
     now_override: datetime | None,
     progress: ProgressReporter | None = None,
 ) -> SessionCollectionResult:
+    branch_log = {
+        "symbol": symbol,
+        "mode": "session_detailed",
+        "has_now_override": now_override is not None,
+        "now_override": now_override.isoformat() if isinstance(now_override, datetime) else None,
+    }
     TRACE_LOGGER.debug(
         "inspection.session_collection:starting",
-        extra={"symbol": symbol},
+        extra=branch_log,
+    )
+    LOGGER.info(
+        "inspection.session_collection:starting",
+        extra=branch_log,
     )
     await emit_progress(
         progress,
         "inspection.session_collection:starting",
         symbol=symbol,
+        mode="session_detailed",
+        now_override=branch_log["now_override"],
     )
+    fetch_start = time.perf_counter()
     try:
         result = await collect_last_session_detailed(symbol, now_override, progress=progress)
     except Exception as exc:
+        branch_log = {**branch_log, "error": str(exc)}
         TRACE_LOGGER.debug(
             "inspection.session_collection:failed",
-            extra={"symbol": symbol, "error": str(exc)},
+            extra=branch_log,
+        )
+        LOGGER.warning(
+            "inspection.session_collection:failed",
+            extra=branch_log,
         )
         await emit_progress(
             progress,
@@ -726,14 +753,29 @@ async def _run_session_workflow(
             error=str(exc),
         )
         raise
+    fetch_ms = (time.perf_counter() - fetch_start) * 1000.0
     result_payload = result.as_dict()
+    session_block = result_payload.get("session") or {}
+    missing_fields = tuple(result_payload.get("missing_fields") or ())
+    branch_log = {
+        **branch_log,
+        "status": result_payload.get("status"),
+        "session_name": session_block.get("name"),
+        "session_active": session_block.get("active"),
+        "session_open_utc": session_block.get("open_utc"),
+        "session_close_utc": session_block.get("close_utc"),
+        "coverage_pct": result.coverage_pct,
+        "missing_fields": list(missing_fields),
+        "missing_fields_count": len(missing_fields),
+        "collection_ms": round(fetch_ms, 2),
+    }
     TRACE_LOGGER.debug(
         "inspection.session_collection:completed",
-        extra={
-            "symbol": symbol,
-            "status": result_payload.get("status"),
-            "coverage_pct": result_payload.get("session", {}).get("coverage_pct"),
-        },
+        extra=branch_log,
+    )
+    LOGGER.info(
+        "inspection.session_collection:completed",
+        extra=branch_log,
     )
     await emit_progress(
         progress,
@@ -741,6 +783,47 @@ async def _run_session_workflow(
         symbol=symbol,
         status=result.status,
         coverage_pct=result.coverage_pct,
+        session_name=session_block.get("name"),
+        session_active=session_block.get("active"),
+        open_utc=session_block.get("open_utc"),
+        close_utc=session_block.get("close_utc"),
+        missing_fields=list(missing_fields),
+        collection_ms=round(fetch_ms, 2),
+    )
+    payload_bytes = len(
+        json.dumps(result_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    )
+    TRACE_LOGGER.debug(
+        "inspection.session_collection:payload_ready",
+        extra={
+            "symbol": symbol,
+            "status": result_payload.get("status"),
+            "coverage_pct": result.coverage_pct,
+            "missing_fields_count": len(missing_fields),
+            "payload_bytes": payload_bytes,
+            "collection_ms": round(fetch_ms, 2),
+        },
+    )
+    await emit_progress(
+        progress,
+        "inspection.session_collection:payload_ready",
+        symbol=symbol,
+        status=result.status,
+        coverage_pct=result.coverage_pct,
+        missing_fields_count=len(missing_fields),
+        payload_bytes=payload_bytes,
+        collection_ms=round(fetch_ms, 2),
+    )
+    LOGGER.info(
+        "inspection.session_collection:payload_ready",
+        extra={
+            "symbol": symbol,
+            "status": result.status,
+            "coverage_pct": result.coverage_pct,
+            "missing_fields_count": len(missing_fields),
+            "payload_bytes": payload_bytes,
+            "collection_ms": round(fetch_ms, 2),
+        },
     )
     return result
 
@@ -864,40 +947,49 @@ PUBLIC_DIR = PROJECT_ROOT / "public"
 TEMPLATES_DIR = PROJECT_ROOT / "templates"
 
 
-async def _ingest_bootstrap_minutes(symbol: str, days: int) -> Dict[str, Any]:
-    lookback_days = max(1, int(days))
-    now_ms = _utc_now_ms()
-    start_ms = max(0, now_ms - lookback_days * DAY_MS)
-    LOGGER.info(
-        "app.bootstrap.vision_ingest.start",
-        extra={"symbol": symbol, "days": lookback_days, "start_ms": start_ms, "end_ms": now_ms},
-    )
-
+def _latest_stream_sample(symbol: str) -> Optional[Dict[str, Any]]:
     store = get_store()
-    datasets: List[str] = []
-    days_span: List[date] = []
-    start_day = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).date()
-    end_day = datetime.fromtimestamp((now_ms - MINUTE_MS) / 1000, tz=timezone.utc).date()
-    cursor = start_day
-    while cursor <= end_day:
-        days_span.append(cursor)
-        cursor += timedelta(days=1)
-    last_closed_day = datetime.now(timezone.utc).date() - timedelta(days=1)
-    days_span = [day for day in days_span if day <= last_closed_day]
+    try:
+        record = store.fetch_latest_kline(symbol, "1m")
+    except Exception:
+        return None
+    if not record:
+        return None
+    try:
+        price = float(record.get("close"))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    ts_raw = record.get("close_time") or record.get("ts")
+    try:
+        ts = int(ts_raw)
+    except (TypeError, ValueError):
+        return None
+    if ts < 10_000_000_000:
+        ts *= 1000
+    payload = {
+        "price": price,
+        "ts": ts,
+        "interval": "1m",
+        "source": "store",
+    }
+    volume = record.get("volume")
+    if volume is not None:
+        try:
+            payload["volume"] = float(volume)
+        except (TypeError, ValueError):
+            pass
+    return payload
+
+
+async def _plan_bootstrap_backfill(
+    symbol: str,
+    store,
+    days_span: Sequence[date],
+) -> Tuple[List[str], Dict[str, Any]]:
+    """Inspect stored datasets and build a sequential backfill plan."""
 
     if not days_span:
-        LOGGER.info(
-            "app.bootstrap.vision_ingest.skipped",
-            extra={"symbol": symbol, "reason": "no_closed_days"},
-        )
-        return {
-            "status": "cached",
-            "symbol": symbol,
-            "range": {"start": start_ms, "end": now_ms},
-            "ingested": {},
-            "errors": [],
-            "missing": [],
-        }
+        return [], {"klines_1m": {"missing_days": []}, "agg_trades": {"missing_days": []}}
 
     async def _present_days(dataset: str, interval: str | None = None) -> set[str]:
         try:
@@ -922,60 +1014,102 @@ async def _ingest_bootstrap_minutes(symbol: str, days: int) -> Dict[str, Any]:
                 seen.add(day_value)
         return seen
 
-    # Check 1m candles coverage
-    klines_missing = True
-    try:
-        present = await _present_days(DATASET_KLINES, "1m")
-        klines_missing = any(day.isoformat() not in present for day in days_span)
-        if klines_missing:
-            klines_missing = False
-            for day in days_span:
-                if day.isoformat() in present:
-                    continue
-                day_start = int(datetime.combine(day, dtime.min, tzinfo=timezone.utc).timestamp() * 1000)
-                day_end = day_start + DAY_MS
-                sample = await asyncio.to_thread(
-                    store.fetch_klines,
-                    symbol,
-                    "1m",
-                    day_start,
-                    day_end,
-                    1,
-                )
-                if not sample:
-                    klines_missing = True
-                    break
-    except Exception:
-        klines_missing = True
-    if klines_missing:
-        datasets.append(DATASET_KLINES)
+    plan: List[str] = []
+    report: Dict[str, Any] = {}
 
-    # Check agg trades coverage
-    agg_missing = True
+    klines_missing_days: List[str] = []
     try:
-        present = await _present_days(DATASET_AGG_TRADES, None)
-        agg_missing = any(day.isoformat() not in present for day in days_span)
-        if agg_missing:
-            agg_missing = False
-            for day in days_span:
-                if day.isoformat() in present:
-                    continue
-                day_start = int(datetime.combine(day, dtime.min, tzinfo=timezone.utc).timestamp() * 1000)
-                day_end = day_start + DAY_MS
-                trade_sample = await asyncio.to_thread(
-                    store.fetch_agg_trades,
-                    symbol,
-                    day_start,
-                    day_end,
-                    1,
-                )
-                if not trade_sample:
-                    agg_missing = True
-                    break
+        present_klines = await _present_days(DATASET_KLINES, "1m")
+        for day in days_span:
+            day_key = day.isoformat()
+            if day_key in present_klines:
+                continue
+            day_start = int(datetime.combine(day, dtime.min, tzinfo=timezone.utc).timestamp() * 1000)
+            day_end = day_start + DAY_MS
+            sample = await asyncio.to_thread(
+                store.fetch_klines,
+                symbol,
+                "1m",
+                day_start,
+                day_end,
+                1,
+            )
+            if not sample:
+                klines_missing_days.append(day_key)
     except Exception:
-        agg_missing = True
-    if agg_missing:
-        datasets.append(DATASET_AGG_TRADES)
+        klines_missing_days = [day.isoformat() for day in days_span]
+
+    if klines_missing_days:
+        plan.append(DATASET_KLINES)
+    report["klines_1m"] = {"missing_days": klines_missing_days}
+
+    agg_missing_days: List[str] = []
+    try:
+        present_agg = await _present_days(DATASET_AGG_TRADES, None)
+        for day in days_span:
+            day_key = day.isoformat()
+            if day_key in present_agg:
+                continue
+            day_start = int(datetime.combine(day, dtime.min, tzinfo=timezone.utc).timestamp() * 1000)
+            day_end = day_start + DAY_MS
+            trade_sample = await asyncio.to_thread(
+                store.fetch_agg_trades,
+                symbol,
+                day_start,
+                day_end,
+                1,
+            )
+            if not trade_sample:
+                agg_missing_days.append(day_key)
+    except Exception:
+        agg_missing_days = [day.isoformat() for day in days_span]
+
+    if agg_missing_days:
+        plan.append(DATASET_AGG_TRADES)
+    report["agg_trades"] = {"missing_days": agg_missing_days}
+
+    return plan, report
+
+
+async def _ingest_bootstrap_minutes(symbol: str, days: int) -> Dict[str, Any]:
+    lookback_days = max(1, int(days))
+    now_ms = _utc_now_ms()
+    start_ms = max(0, now_ms - lookback_days * DAY_MS)
+    LOGGER.info(
+        "app.bootstrap.vision_ingest.start",
+        extra={"symbol": symbol, "days": lookback_days, "start_ms": start_ms, "end_ms": now_ms},
+    )
+
+    store = get_store()
+    days_span: List[date] = []
+    start_day = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).date()
+    end_day = datetime.fromtimestamp((now_ms - MINUTE_MS) / 1000, tz=timezone.utc).date()
+    cursor = start_day
+    while cursor <= end_day:
+        days_span.append(cursor)
+        cursor += timedelta(days=1)
+    last_closed_day = datetime.now(timezone.utc).date() - timedelta(days=1)
+    days_span = [day for day in days_span if day <= last_closed_day]
+
+    if not days_span:
+        LOGGER.info(
+            "app.bootstrap.vision_ingest.skipped",
+            extra={"symbol": symbol, "reason": "no_closed_days"},
+        )
+        return {
+            "status": "cached",
+            "symbol": symbol,
+            "range": {"start": start_ms, "end": now_ms},
+            "ingested": {},
+            "errors": [],
+            "missing": [],
+        }
+
+    datasets, readiness = await _plan_bootstrap_backfill(symbol, store, days_span)
+    LOGGER.info(
+        "app.bootstrap.data_check",
+        extra={"symbol": symbol, "missing": readiness},
+    )
 
     if not datasets:
         LOGGER.info(
@@ -1073,6 +1207,19 @@ async def _run_bootstrap(app: FastAPI) -> None:
 
             symbol_key = symbol.upper()
             try:
+                await collect_last_session_detailed(
+                    symbol_key,
+                    now_override=None,
+                    progress=None,
+                    allow_rest=True,
+                )
+            except Exception as exc:  # pragma: no cover - prefetch is opportunistic
+                LOGGER.warning(
+                    "app.bootstrap.session_prefetch_failed",
+                    extra={"symbol": symbol_key, "error": str(exc)},
+                )
+
+            try:
                 placeholder_snapshot = _build_ephemeral_snapshot(symbol_key, lookback_days=days, mode="prebuilt")
                 payload = await build_check_all_datas_async(
                     placeholder_snapshot,
@@ -1154,6 +1301,63 @@ async def _run_bootstrap(app: FastAPI) -> None:
         )
 
 
+async def _session_prefetch_loop(app: FastAPI) -> None:
+    _, symbols, _, _ = _load_bootstrap_settings()
+    tracked_symbols = {symbol.strip().upper() for symbol in symbols if symbol}
+    if not tracked_symbols:
+        return
+    interval_seconds = max(120, int(os.getenv("SESSION_PREFETCH_INTERVAL", "300")))
+    last_prefetched: Dict[str, str] = {}
+    store = get_store()
+    while True:
+        now_utc = datetime.now(timezone.utc)
+        for symbol in tracked_symbols:
+            try:
+                session_window = session_collector_module._resolve_session_window(now_utc)
+                previous_window = session_collector_module._previous_session(session_window)
+                previous_segment = session_collector_module._build_session_segment(
+                    previous_window,
+                    reference=previous_window.close_utc,
+                )
+            except Exception as exc:
+                LOGGER.debug(
+                    "session_prefetch.resolve_failed",
+                    extra={"symbol": symbol, "error": str(exc)},
+                )
+                continue
+
+            cache_key = f"{symbol}:{previous_segment.start_ms}"
+            if last_prefetched.get(symbol) == cache_key:
+                continue
+
+            if store.fetch_session_payload(symbol, previous_segment.start_ms, previous_segment.name):
+                last_prefetched[symbol] = cache_key
+                continue
+
+            try:
+                await collect_last_session_detailed(
+                    symbol,
+                    now_override=previous_window.close_utc - timedelta(minutes=1),
+                    progress=None,
+                    allow_rest=True,
+                )
+                last_prefetched[symbol] = cache_key
+                LOGGER.debug(
+                    "session_prefetch.completed",
+                    extra={
+                        "symbol": symbol,
+                        "session": previous_segment.name,
+                        "start_ms": previous_segment.start_ms,
+                    },
+                )
+            except Exception as exc:
+                LOGGER.warning(
+                    "session_prefetch.failed",
+                    extra={"symbol": symbol, "error": str(exc)},
+                )
+        await asyncio.sleep(interval_seconds)
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     if not hasattr(app.state, "ohlcv_cache"):
@@ -1166,7 +1370,23 @@ async def _lifespan(app: FastAPI):
     app.state.bootstrap_vision_ingest = {}
     app.state.bootstrap_prebuilt = {}
     await _run_bootstrap(app)
-    yield
+    _, symbols, _, _ = _load_bootstrap_settings()
+    stream_manager = BinanceStreamManager(symbols)
+    await stream_manager.start()
+    app.state.binance_stream = stream_manager
+    session_prefetch_task: asyncio.Task | None = None
+    try:
+        session_prefetch_task = asyncio.create_task(_session_prefetch_loop(app))
+        yield
+    finally:
+        if session_prefetch_task is not None:
+            session_prefetch_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await session_prefetch_task
+        streamer: BinanceStreamManager | None = getattr(app.state, "binance_stream", None)
+        if streamer is not None:
+            with suppress(Exception):
+                await streamer.stop()
 
 
 app = FastAPI(title="Chart OHLC API", lifespan=_lifespan)
@@ -3674,6 +3894,11 @@ async def inspection_check_all(
             )
             raise HTTPException(status_code=500, detail="Session collection failed") from exc
         payload = session_result.as_dict()
+        _append_check_all_diagnostics(
+            payload,
+            mode=mode_value,
+            snapshot_id=target_snapshot.get("id"),
+        )
         LOGGER.info(
             "inspection_check_all:finished",
             extra={**log_extra, "mode": mode_value, "status": payload.get("status")},
@@ -3861,7 +4086,13 @@ async def collection_session_detailed_endpoint(
             detail="Session collection failed",
         ) from exc
 
-    return JSONResponse(session_result.as_dict())
+    payload = session_result.as_dict()
+    _append_check_all_diagnostics(
+        payload,
+        mode="collection.session_detailed",
+        snapshot_id=symbol,
+    )
+    return JSONResponse(payload)
 
 
 @app.post("/collection/topup")
