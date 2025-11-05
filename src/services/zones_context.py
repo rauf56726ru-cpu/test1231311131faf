@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
+from src.analysis.bias import compute_bias
 from src.common.config import AppConfig
 from src.storage.parquet import ParquetStorage
 
@@ -87,6 +88,123 @@ class TouchRecord:
             "touch_kind": self.touch_kind,
             "depth": round(self.depth, 4),
         }
+
+
+def _coerce_depth(value: float | int | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric):
+        return None
+    return round(numeric, 4)
+
+
+def _empty_touch_stats() -> Dict[str, Any]:
+    return {
+        "total": 0,
+        "filled": 0,
+        "wick_only": 0,
+        "first_ms": None,
+        "last_ms": None,
+        "max_depth": None,
+        "last_kind": None,
+        "sampled": 0,
+        "truncated": False,
+    }
+
+
+def summarise_touch_records(
+    records: Sequence[TouchRecord],
+    *,
+    recent_tail: int = 3,
+) -> tuple[list[Dict[str, Any]], Dict[str, Any]]:
+    """Compress raw touch records into key checkpoints and summary stats."""
+
+    if not records:
+        return [], _empty_touch_stats()
+
+    ordered = sorted(records, key=lambda item: item.at_ts)
+    events: list[Dict[str, Any]] = [
+        {
+            "ts_ms": int(record.at_ts),
+            "kind": str(record.touch_kind),
+            "depth": _coerce_depth(record.depth),
+        }
+        for record in ordered
+    ]
+
+    total = len(events)
+    filled = sum(1 for event in events if event["kind"] == "filled")
+    wick_only = total - filled
+    depths = [event["depth"] for event in events if event["depth"] is not None]
+    max_depth = round(max(depths), 4) if depths else None
+    first_ms = events[0]["ts_ms"]
+    last_ms = events[-1]["ts_ms"]
+    last_kind = events[-1]["kind"]
+
+    keypoints: Dict[int, Dict[str, Any]] = {}
+
+    def _mark(event: Dict[str, Any], label: str) -> None:
+        ts = event["ts_ms"]
+        item = keypoints.get(ts)
+        if item is None:
+            item = {
+                "ts_ms": ts,
+                "kind": event["kind"],
+                "depth": event.get("depth"),
+                "labels": [label],
+            }
+            keypoints[ts] = item
+            return
+        if label not in item["labels"]:
+            item["labels"].append(label)
+        if item["kind"] != "filled" and event["kind"] == "filled":
+            item["kind"] = event["kind"]
+        depth = event.get("depth")
+        if depth is not None:
+            current = item.get("depth")
+            if current is None or depth > current:
+                item["depth"] = depth
+
+    _mark(events[0], "first")
+    _mark(events[-1], "last")
+
+    filled_indexes = [idx for idx, event in enumerate(events) if event["kind"] == "filled"]
+    if filled_indexes:
+        _mark(events[filled_indexes[0]], "filled_first")
+        _mark(events[filled_indexes[-1]], "filled_last")
+
+    if depths:
+        deepest_idx = max(range(len(events)), key=lambda idx: events[idx]["depth"] or -1.0)
+        _mark(events[deepest_idx], "max_depth")
+
+    if recent_tail > 0:
+        tail = max(1, int(recent_tail))
+        for event in events[-tail:]:
+            _mark(event, "recent")
+
+    checkpoints = sorted(keypoints.values(), key=lambda item: item["ts_ms"])
+    for entry in checkpoints:
+        labels = entry.get("labels")
+        if isinstance(labels, list):
+            entry["labels"] = sorted(set(labels))
+
+    stats = {
+        "total": total,
+        "filled": filled,
+        "wick_only": wick_only,
+        "first_ms": first_ms,
+        "last_ms": last_ms,
+        "max_depth": max_depth,
+        "last_kind": last_kind,
+        "sampled": len(checkpoints),
+        "truncated": total > len(checkpoints),
+    }
+
+    return checkpoints, stats
 
 
 class ZoneCache:
@@ -204,6 +322,45 @@ def build_zones_context(
 
     coverage = _compute_coverage(frame, start_ms, end_ms)
     metrics = _compute_metrics(frame)
+    frame_for_metrics = frame.assign(ts_open=frame["ts_open"].astype("int64"))
+    bias_block = compute_bias(
+        frame_for_metrics,
+        timeframes=("1h", "4h", "1d"),
+        neutral_pct=0.1,
+    )
+    if bias_block:
+        metrics["bias"] = bias_block
+    vwap_context = _build_vwap_context(frame_for_metrics[["ts_open", "open", "high", "low", "close", "volume"]])
+    if vwap_context:
+        metrics["vwap_context"] = vwap_context
+    tpo_context = _build_tpo_context(frame_for_metrics[["ts_open", "open", "high", "low", "close", "volume"]])
+    if tpo_context:
+        metrics["tpo_context"] = tpo_context
+    session_ib = _build_session_ib(frame_for_metrics[["ts_open", "high", "low"]], session_end_ms)
+    if session_ib:
+        metrics.setdefault("sessions", {})["last_closed"] = session_ib
+
+    touch_map: Dict[str, List[TouchRecord]] = {}
+    for touch in touches:
+        touch_map.setdefault(touch.zone_id, []).append(touch)
+
+    zones_payload: List[Dict[str, Any]] = []
+    touches_payload: List[Dict[str, Any]] = []
+    touch_stats_map: Dict[str, Dict[str, Any]] = {}
+
+    for zone in top_zones:
+        raw_records = touch_map.get(zone.id, [])
+        checkpoints, stats = summarise_touch_records(raw_records or [])
+        zone_payload = zone.to_dict()
+        zone_payload["touch_count"] = zone_payload.get("touches", 0)
+        zone_payload["touches"] = checkpoints
+        zone_payload["touch_stats"] = stats
+        for checkpoint in checkpoints:
+            merged = dict(checkpoint)
+            merged["zone_id"] = zone.id
+            touches_payload.append(merged)
+        zones_payload.append(zone_payload)
+        touch_stats_map[zone.id] = stats
 
     payload = {
         "schema": "SMC_72h_ctx_v1",
@@ -215,8 +372,9 @@ def build_zones_context(
         },
         "metrics": metrics,
         "coverage": coverage,
-        "zones": [zone.to_dict() for zone in top_zones],
-        "touches": [touch.to_dict() for touch in touches],
+        "zones": zones_payload,
+        "touches": touches_payload,
+        "touch_stats": touch_stats_map,
     }
 
     payload_bytes = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
@@ -274,6 +432,32 @@ def _compute_atr(high: pd.Series, low: pd.Series, close: pd.Series, *, period: i
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     atr = tr.rolling(window=period, min_periods=period).mean().bfill()
     return atr.bfill().ffill()
+
+
+def _build_vwap_context(frame: pd.DataFrame) -> Dict[str, Any]:
+    from src.analysis.vwap_context import build_vwap_context as _build
+
+    return _build(frame)
+
+
+def _build_tpo_context(frame: pd.DataFrame) -> Dict[str, Any]:
+    from src.analysis.tpo_context import build_tpo_context as _build
+
+    return _build(frame)
+
+
+def _build_session_ib(frame: pd.DataFrame, session_end_ms: int) -> Dict[str, Any]:
+    from src.analysis.session_ib import compute_session_ib
+
+    session_start_ms = session_end_ms - (24 * 60 * 60 * 1000)
+    if session_start_ms < 0:
+        session_start_ms = 0
+    return compute_session_ib(
+        frame,
+        session_start_ms=session_start_ms,
+        session_end_ms=session_end_ms,
+        ib_minutes=60,
+    )
 
 
 class ZoneDetector:

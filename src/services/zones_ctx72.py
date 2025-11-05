@@ -9,8 +9,9 @@ from typing import Any, Dict, List, Sequence
 import numpy as np
 import pandas as pd
 
+from src.analysis.bias import compute_bias
 from src.common.ts import ensure_epoch_ms
-from src.services.zones_context import ZoneDetector, ZoneRecord, TouchRecord
+from src.services.zones_context import ZoneDetector, ZoneRecord, TouchRecord, summarise_touch_records
 
 MINUTE_MS = 60_000
 EXPECTED_BARS = 72 * 60
@@ -52,7 +53,39 @@ def _prepare_frame(df: pd.DataFrame, start_ms: int, end_ms: int) -> pd.DataFrame
     return frame
 
 
-def _to_zone_contract(zone: ZoneRecord, touches: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+def _build_vwap_context(frame: pd.DataFrame) -> Dict[str, Any]:
+    from src.analysis.vwap_context import build_vwap_context as _build
+
+    return _build(frame)
+
+
+def _build_tpo_context(frame: pd.DataFrame) -> Dict[str, Any]:
+    from src.analysis.tpo_context import build_tpo_context as _build
+
+    return _build(frame)
+
+
+def _build_session_ib(frame: pd.DataFrame, session_split_ms: int) -> Dict[str, Any]:
+    from src.analysis.session_ib import compute_session_ib
+
+    session_end_ms = session_split_ms
+    session_start_ms = session_end_ms - (24 * 60 * 60 * 1000)
+    if session_start_ms < 0:
+        session_start_ms = 0
+    payload = compute_session_ib(
+        frame,
+        session_start_ms=session_start_ms,
+        session_end_ms=session_end_ms,
+        ib_minutes=60,
+    )
+    return payload
+
+
+def _to_zone_contract(zone: ZoneRecord, touch_bundle: Dict[str, Any] | None) -> Dict[str, Any]:
+    events = list(touch_bundle.get("events") or []) if touch_bundle else []
+    stats = dict(touch_bundle.get("stats") or {}) if touch_bundle else {}
+    if not stats:
+        _, stats = summarise_touch_records([])
     payload = {
         "id": zone.id,
         "type": zone.type,
@@ -62,28 +95,29 @@ def _to_zone_contract(zone: ZoneRecord, touches: Sequence[Dict[str, Any]]) -> Di
         "formed_ms": int(zone.created_ts),
         "strength": _safe_float(zone.strength),
         "status": zone.status,
-        "touches": touches,
     }
+    payload["touch_count"] = int(zone.touches)
+    payload["touches"] = events
+    payload["touch_stats"] = stats
     if zone.last_seen_ts:
         payload["last_seen_ms"] = int(zone.last_seen_ts)
     return payload
 
 
-def _touches_by_zone(touches: Sequence[TouchRecord], zone_ids: set[str]) -> Dict[str, List[Dict[str, Any]]]:
-    grouped: Dict[str, List[Dict[str, Any]]] = {zone_id: [] for zone_id in zone_ids}
+def _touches_by_zone(
+    touches: Sequence[TouchRecord],
+    zone_ids: set[str],
+) -> Dict[str, Dict[str, Any]]:
+    grouped: Dict[str, List[TouchRecord]] = {zone_id: [] for zone_id in zone_ids}
     for touch in touches:
         if touch.zone_id not in grouped:
             continue
-        grouped[touch.zone_id].append(
-            {
-                "ts_ms": int(touch.at_ts),
-                "kind": touch.touch_kind,
-                "depth": _safe_float(touch.depth),
-            }
-        )
-    for items in grouped.values():
-        items.sort(key=lambda item: item["ts_ms"])
-    return grouped
+        grouped[touch.zone_id].append(touch)
+    compressed: Dict[str, Dict[str, Any]] = {}
+    for zone_id, records in grouped.items():
+        events, stats = summarise_touch_records(records)
+        compressed[zone_id] = {"events": events, "stats": stats}
+    return compressed
 
 
 def build_smc_72h_ctx_v1(
@@ -142,8 +176,15 @@ def build_smc_72h_ctx_v1(
     if coverage < 0.99:
         raise RuntimeError("insufficient_coverage")
 
+    frame_for_metrics = frame.assign(ts_open=frame["ts_open"].astype("int64"))
+    bias_block = compute_bias(
+        frame_for_metrics,
+        timeframes=("1h", "4h", "1d"),
+        neutral_pct=0.1,
+    )
+
     zones_payload = [
-        _to_zone_contract(zone, touches_map.get(zone.id, []))
+        _to_zone_contract(zone, touches_map.get(zone.id))
         for zone in zones_top
     ]
 
@@ -155,6 +196,22 @@ def build_smc_72h_ctx_v1(
 
     latency_ms = int((time.perf_counter() - build_started) * 1000)
 
+    aggregates = {
+        "atr14_mean": atr14_mean,
+        "rvol_mean": rvol_mean,
+    }
+    if bias_block:
+        aggregates["bias"] = bias_block
+    vwap_context = _build_vwap_context(frame_for_metrics[["ts_open", "open", "high", "low", "close", "volume"]])
+    if vwap_context:
+        aggregates["vwap_context"] = vwap_context
+    tpo_context = _build_tpo_context(frame_for_metrics[["ts_open", "open", "high", "low", "close", "volume"]])
+    if tpo_context:
+        aggregates["tpo_context"] = tpo_context
+    session_ib = _build_session_ib(frame_for_metrics[["ts_open", "open", "high", "low", "close"]], session_split_ms)
+    if session_ib:
+        aggregates["sessions"] = {"last_closed": session_ib}
+
     return {
         "symbol": symbol.upper(),
         "window": {
@@ -164,10 +221,7 @@ def build_smc_72h_ctx_v1(
             "coverage_pct": round(coverage * 100.0, 4),
             "source_seq": source_seq,
         },
-        "aggregates": {
-            "atr14_mean": atr14_mean,
-            "rvol_mean": rvol_mean,
-        },
+        "aggregates": aggregates,
         "zones_top": zones_payload,
         "counts": counts,
         "latency_ms": latency_ms,

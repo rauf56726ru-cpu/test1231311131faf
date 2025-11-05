@@ -127,6 +127,165 @@
     return `${datePart} ${timePart}`;
   }
 
+  function summariseTouchEvents(events, recentTail = 3) {
+    if (!Array.isArray(events) || events.length === 0) {
+      return {
+        events: [],
+        stats: {
+          total: 0,
+          filled: 0,
+          wick_only: 0,
+          first_ms: null,
+          last_ms: null,
+          max_depth: null,
+          last_kind: null,
+          sampled: 0,
+          truncated: false,
+        },
+      };
+    }
+
+    const normalised = events
+      .map((entry) => {
+        const tsCandidates = [entry.ts_ms, entry.ts, entry.timestamp, entry.t, entry.time];
+        let tsValue = null;
+        for (const candidate of tsCandidates) {
+          const numeric = Number(candidate);
+          if (Number.isFinite(numeric)) {
+            tsValue = numeric;
+            break;
+          }
+        }
+        if (!Number.isFinite(tsValue)) return null;
+        const rawKind = String(entry.kind ?? entry.touch_kind ?? entry.status ?? "").toLowerCase();
+        const kind = rawKind.includes("fill") ? "filled" : rawKind.includes("wick") ? "wick_only" : rawKind || "wick_only";
+        const depthCandidates = [entry.depth, entry.penetration, entry.fill_pct, entry.filled_pct];
+        let depthValue = null;
+        for (const candidate of depthCandidates) {
+          if (candidate == null) continue;
+          const numeric = Number(candidate);
+          if (Number.isFinite(numeric)) {
+            depthValue = Math.max(0, Math.min(1, numeric));
+            break;
+          }
+        }
+        return {
+          ts_ms: tsValue,
+          kind,
+          depth: Number.isFinite(depthValue) ? depthValue : null,
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => a.ts_ms - b.ts_ms);
+
+    if (!normalised.length) {
+      return {
+        events: [],
+        stats: {
+          total: 0,
+          filled: 0,
+          wick_only: 0,
+          first_ms: null,
+          last_ms: null,
+          max_depth: null,
+          last_kind: null,
+          sampled: 0,
+          truncated: false,
+        },
+      };
+    }
+
+    const total = normalised.length;
+    const filled = normalised.reduce((acc, item) => (item.kind === "filled" ? acc + 1 : acc), 0);
+    const wickOnly = total - filled;
+    const depths = normalised.map((item) => item.depth).filter((value) => Number.isFinite(value));
+    const maxDepth = depths.length ? Math.max(...depths) : null;
+
+    const keypoints = new Map();
+
+    const mark = (event, label) => {
+      const existing = keypoints.get(event.ts_ms);
+      if (!existing) {
+        keypoints.set(event.ts_ms, {
+          ts_ms: event.ts_ms,
+          kind: event.kind,
+          depth: event.depth,
+          labels: [label],
+        });
+        return;
+      }
+      if (!existing.labels.includes(label)) {
+        existing.labels.push(label);
+      }
+      if (existing.kind !== "filled" && event.kind === "filled") {
+        existing.kind = event.kind;
+      }
+      if (Number.isFinite(event.depth)) {
+        const currentDepth = Number(existing.depth);
+        if (!Number.isFinite(currentDepth) || event.depth > currentDepth) {
+          existing.depth = event.depth;
+        }
+      }
+    };
+
+    const firstEvent = normalised[0];
+    const lastEvent = normalised[normalised.length - 1];
+    mark(firstEvent, "first");
+    mark(lastEvent, "last");
+
+    const filledIndexes = normalised.reduce((indexes, item, index) => {
+      if (item.kind === "filled") {
+        indexes.push(index);
+      }
+      return indexes;
+    }, []);
+    if (filledIndexes.length) {
+      mark(normalised[filledIndexes[0]], "filled_first");
+      mark(normalised[filledIndexes[filledIndexes.length - 1]], "filled_last");
+    }
+
+    if (maxDepth != null) {
+      let deepestIndex = 0;
+      let deepestDepth = -Infinity;
+      normalised.forEach((item, index) => {
+        const depth = Number(item.depth);
+        if (Number.isFinite(depth) && depth >= deepestDepth) {
+          deepestDepth = depth;
+          deepestIndex = index;
+        }
+      });
+      mark(normalised[deepestIndex], "max_depth");
+    }
+
+    if (recentTail > 0) {
+      const tailCount = Math.max(1, parseInt(recentTail, 10) || 1);
+      const tailEvents = normalised.slice(-tailCount);
+      tailEvents.forEach((event) => mark(event, "recent"));
+    }
+
+    const samples = Array.from(keypoints.values()).sort((a, b) => a.ts_ms - b.ts_ms);
+    samples.forEach((item) => {
+      if (Array.isArray(item.labels)) {
+        item.labels = Array.from(new Set(item.labels)).sort();
+      }
+    });
+
+    return {
+      events: samples,
+      stats: {
+        total,
+        filled,
+        wick_only: wickOnly,
+        first_ms: firstEvent.ts_ms,
+        last_ms: lastEvent.ts_ms,
+        max_depth: maxDepth != null ? Number(maxDepth.toFixed(4)) : null,
+        last_kind: lastEvent.kind,
+        sampled: samples.length,
+        truncated: total > samples.length,
+      },
+    };
+  }
+
   function showToast(message, variant = "info", timeout = 4000) {
     if (!toastContainer) return;
     const toast = document.createElement("div");
@@ -752,7 +911,6 @@
   fetchPreset(state.symbol);
   setActiveSymbolButton(state.symbol);
   loadSymbol(state.symbol, state.interval);
-})();
   function showAnalysisPanel() {
     if (!analysisPanel) return;
     analysisPanel.hidden = false;
@@ -841,30 +999,227 @@
       return;
     }
 
-    const zones = Array.isArray(payload.zones_top) ? payload.zones_top : [];
+    const aggregates = payload.aggregates || {};
+    const biasBlock = aggregates.bias && typeof aggregates.bias === "object" ? aggregates.bias : null;
+    const vwapContext = aggregates.vwap_context && typeof aggregates.vwap_context === "object" ? aggregates.vwap_context : null;
+    const tpoContext = aggregates.tpo_context && typeof aggregates.tpo_context === "object" ? aggregates.tpo_context : null;
+    const sessionsContext = aggregates.sessions && typeof aggregates.sessions === "object" ? aggregates.sessions : null;
+    const biasMarkup = biasBlock
+      ? Object.entries(biasBlock)
+          .map(([tf, info]) => {
+            const direction = String(info.direction || "—").toUpperCase();
+            const change = Number.isFinite(info.change_pct) ? Number(info.change_pct).toFixed(2) : "—";
+            const confidence = Number.isFinite(info.confidence) ? (Number(info.confidence) * 100).toFixed(1) : "—";
+            return `<li><span class="badge badge--outline">${tf}</span> <strong>${direction}</strong> Δ ${change}% · Conf ${confidence}%</li>`;
+          })
+          .join("")
+      : "";
+
+    const dailyBlock = vwapContext && typeof vwapContext.daily === "object" ? vwapContext.daily : null;
+    const sessionsBlock = vwapContext && typeof vwapContext.sessions === "object" ? vwapContext.sessions : null;
+
+    const vwapDailyMarkup = dailyBlock && Object.values(dailyBlock).some((value) => value != null)
+      ? (() => {
+          const pairs = [
+            ["VWAP", dailyBlock.vwap],
+            ["POC", dailyBlock.poc],
+            ["VAH", dailyBlock.vah],
+            ["VAL", dailyBlock.val],
+            ["SD1+", dailyBlock.sd1_plus],
+            ["SD1-", dailyBlock.sd1_minus],
+            ["SD2+", dailyBlock.sd2_plus],
+            ["SD2-", dailyBlock.sd2_minus],
+          ];
+          const items = pairs
+            .filter(([, value]) => value != null)
+            .map(([label, value]) => `<li><span class="badge badge--muted">${label}</span> ${formatNumber(value)}</li>`)
+            .join("");
+          const dateLabel = dailyBlock.date ? `<p class="counts">${dailyBlock.date}</p>` : "";
+          return `<div><h5>Daily</h5>${dateLabel}<ol class="list-tight">${items || '<li>Нет данных</li>'}</ol></div>`;
+        })()
+      : "";
+
+    const vwapSessionsMarkup = sessionsBlock
+      ? Object.entries(sessionsBlock)
+          .map(([name, info]) => {
+            if (!info || typeof info !== "object") {
+              return `<li><span class="badge badge--muted">${name}</span> —</li>`;
+            }
+            const label = name.charAt(0).toUpperCase() + name.slice(1);
+            const corePairs = [
+              ["VWAP", info.vwap],
+              ["POC", info.poc],
+              ["VAH", info.vah],
+              ["VAL", info.val],
+            ];
+            const rangePairs = [
+              ["High", info.high],
+              ["Low", info.low],
+              ["IBH", info.ib_high],
+              ["IBL", info.ib_low],
+            ];
+            const list = [...corePairs, ...rangePairs]
+              .filter(([, value]) => value != null)
+              .map(([labelKey, value]) => `<span class="badge badge--outline">${labelKey}</span> ${formatNumber(value)}`)
+              .join(" · ");
+            return `<li><strong>${label}</strong>: ${list || "—"}</li>`;
+          })
+          .join("")
+      : "";
+
+    const vwapSection = vwapDailyMarkup || vwapSessionsMarkup
+      ? `<section>
+            <h4>VWAP / TPO</h4>
+            ${vwapDailyMarkup}
+            ${vwapSessionsMarkup ? `<ol class="list-tight">${vwapSessionsMarkup}</ol>` : ""}
+         </section>`
+      : "";
+
+    const tpoDays = tpoContext && Array.isArray(tpoContext.days) ? tpoContext.days : [];
+    const tpoMarkup = tpoDays.length
+      ? `<section>
+            <h4>TPO Days</h4>
+            <ol class="list-tight">
+              ${tpoDays
+                .map((entry) => {
+                  const date = entry.date || "—";
+                  const poc = formatNumber(entry.poc);
+                  const vah = formatNumber(entry.vah);
+                  const val = formatNumber(entry.val);
+                  return `<li><span class="badge badge--muted">${date}</span> POC ${poc} · VAH ${vah} · VAL ${val}</li>`;
+                })
+                .join("")}
+            </ol>
+          </section>`
+      : "";
+
+    const sessionLast = sessionsContext && typeof sessionsContext.last_closed === "object" ? sessionsContext.last_closed : null;
+    const sessionMarkup = sessionLast
+      ? `<section>
+            <h4>Last Session (UTC)</h4>
+            <p class="counts">${formatUtc(sessionLast.session_start_ms)} → ${formatUtc(sessionLast.session_end_ms)}</p>
+            <ol class="list-tight">
+              <li><span class="badge badge--muted">High</span> ${formatNumber(sessionLast.high)}</li>
+              <li><span class="badge badge--muted">Low</span> ${formatNumber(sessionLast.low)}</li>
+              <li><span class="badge badge--muted">IB High</span> ${formatNumber(sessionLast.ib_high)}</li>
+              <li><span class="badge badge--muted">IB Low</span> ${formatNumber(sessionLast.ib_low)}</li>
+            </ol>
+          </section>`
+      : "";
+
+    const zonesRaw = Array.isArray(payload.zones_top) ? payload.zones_top : [];
+    const zones = zonesRaw.map((zone) => {
+      const baseEvents = Array.isArray(zone.touches) ? zone.touches : [];
+      const hasStats = zone.touch_stats && typeof zone.touch_stats === "object";
+      let touchStats;
+      let events;
+      if (hasStats) {
+        touchStats = { ...zone.touch_stats };
+        const normalisedEvents = baseEvents
+          .map((event) => {
+            const tsCandidates = [event.ts_ms, event.ts, event.timestamp, event.t, event.time];
+            let tsValue = null;
+            for (const candidate of tsCandidates) {
+              const numeric = Number(candidate);
+              if (Number.isFinite(numeric)) {
+                tsValue = numeric;
+                break;
+              }
+            }
+            if (!Number.isFinite(tsValue)) return null;
+            const rawKind = String(event.kind ?? event.touch_kind ?? "").toLowerCase();
+            const kind = rawKind.includes("fill") ? "filled" : rawKind.includes("wick") ? "wick_only" : rawKind || "wick_only";
+            const depthNumeric = Number(event.depth);
+            const depth = Number.isFinite(depthNumeric) ? depthNumeric : null;
+            const labels = Array.isArray(event.labels) ? Array.from(new Set(event.labels)) : [];
+            return {
+              ts_ms: tsValue,
+              kind,
+              depth,
+              labels,
+            };
+          })
+          .filter(Boolean)
+          .sort((a, b) => a.ts_ms - b.ts_ms);
+        events = normalisedEvents;
+        if (typeof touchStats.total !== "number" && Number.isFinite(Number(touchStats.total))) {
+          touchStats.total = Number(touchStats.total);
+        }
+        if (typeof touchStats.filled !== "number" && Number.isFinite(Number(touchStats.filled))) {
+          touchStats.filled = Number(touchStats.filled);
+        }
+        if (typeof touchStats.wick_only !== "number" && Number.isFinite(Number(touchStats.wick_only))) {
+          touchStats.wick_only = Number(touchStats.wick_only);
+        }
+        if (typeof touchStats.max_depth !== "number" && Number.isFinite(Number(touchStats.max_depth))) {
+          touchStats.max_depth = Number(touchStats.max_depth);
+        }
+      } else {
+        const summarised = summariseTouchEvents(baseEvents);
+        touchStats = summarised.stats;
+        events = summarised.events;
+      }
+      let touchCount = Number(zone.touch_count);
+      if (!Number.isFinite(touchCount) || touchCount < 0) {
+        touchCount = Number.isFinite(touchStats.total) ? Number(touchStats.total) : baseEvents.length;
+      }
+      return {
+        ...zone,
+        touch_count: touchCount,
+        touch_stats: touchStats,
+        touches: events,
+      };
+    });
+
     const zonesMarkup = zones
       .map((zone) => {
         const strength = typeof zone.strength === "number" ? zone.strength.toFixed(2) : "—";
         const priceLo = formatNumber(zone.price_lo);
         const priceHi = formatNumber(zone.price_hi);
-        return `<li><span class="badge badge--muted">${zone.type}</span> <strong>${priceLo} → ${priceHi}</strong> <span class="badge">S=${strength}</span> <span class="badge badge--outline">${zone.status}</span></li>`;
+        const stats = zone.touch_stats && typeof zone.touch_stats === "object" ? zone.touch_stats : {};
+        const totalTouches = Number.isFinite(stats.total) ? Number(stats.total) : Number(zone.touch_count) || 0;
+        const filledTouches = Number.isFinite(stats.filled) ? Number(stats.filled) : 0;
+        const touchesBadge =
+          totalTouches > 0
+            ? `<span class="badge">T=${totalTouches} · F=${filledTouches}</span>`
+            : `<span class="badge badge--muted">T=0</span>`;
+        const truncatedBadge = stats.truncated ? `<span class="badge badge--outline">compact</span>` : "";
+        return `<li><span class="badge badge--muted">${zone.type}</span> <strong>${priceLo} → ${priceHi}</strong> <span class="badge">S=${strength}</span> <span class="badge badge--outline">${zone.status}</span> ${touchesBadge} ${truncatedBadge}</li>`;
       })
       .join("");
 
-    const touches = zones.flatMap((zone) =>
-      Array.isArray(zone.touches)
-        ? zone.touches.map((touch) => ({
-            id: zone.id,
-            ...touch,
-          }))
-        : []
-    );
+    const touches = zones.flatMap((zone) => {
+      const events = Array.isArray(zone.touches) ? zone.touches : [];
+      const stats = zone.touch_stats && typeof zone.touch_stats === "object" ? zone.touch_stats : {};
+      const total = Number.isFinite(Number(stats.total)) ? Number(stats.total) : events.length;
+      const truncatedFlag = typeof stats.truncated === "string" ? stats.truncated === "true" : Boolean(stats.truncated);
+      const truncated = Boolean(truncatedFlag && total > events.length);
+      return events.map((touch) => ({
+        id: zone.id,
+        total,
+        truncated,
+        ...touch,
+      }));
+    });
     const touchesMarkup = touches
       .map((touch) => {
         const depthPct = touch.depth != null ? (Number(touch.depth) * 100).toFixed(1) : "—";
-        return `<li><code>${touch.id}</code> — ${touch.kind} (${depthPct}%)</li>`;
+        const labels = Array.isArray(touch.labels) && touch.labels.length ? ` <span class="badge badge--muted">${touch.labels.join(" · ")}</span>` : "";
+        const tsLabel = touch.ts_ms != null ? ` <span class="badge badge--muted">${formatUtc(touch.ts_ms)}</span>` : "";
+        return `<li><code>${touch.id}</code> — ${touch.kind} (${depthPct}%)${labels}${tsLabel}</li>`;
       })
       .join("");
+    const truncatedList = zones
+      .filter((zone) => {
+        const stats = zone.touch_stats;
+        if (!stats || typeof stats !== "object") return false;
+        return typeof stats.truncated === "string" ? stats.truncated === "true" : Boolean(stats.truncated);
+      })
+      .map((zone) => `<code>${zone.id}</code>`)
+      .join(", ");
+    const touchNote = truncatedList
+      ? `<p class="counts">Компактный режим для зон: ${truncatedList}</p>`
+      : "";
 
     const counts = payload.counts || {};
 
@@ -878,7 +1233,17 @@
         <section>
           <h4>Касания</h4>
           <ol class="list-tight">${touchesMarkup || '<li>Нет касаний в последней сессии</li>'}</ol>
+          ${touchNote}
         </section>
+        ${biasMarkup
+          ? `<section>
+              <h4>Bias</h4>
+              <ol class="list-tight">${biasMarkup}</ol>
+            </section>`
+          : ""}
+        ${vwapSection}
+        ${tpoMarkup}
+        ${sessionMarkup}
       </div>
     `;
 
@@ -1032,3 +1397,5 @@
   if (downloadAnalysisBtn) {
     downloadAnalysisBtn.addEventListener("click", downloadAnalysis);
   }
+
+})();
